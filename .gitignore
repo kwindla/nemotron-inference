@@ -1,0 +1,6 @@
+build/
+artifacts/
+testing/oracle/**/*.bin
+claude-todo.md
+**/__pycache__/
+*.pyc

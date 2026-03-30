@@ -1,0 +1,87 @@
+{
+  "target_shared_system_root_tokens": 8192,
+  "target_committed_head_tokens": 49152,
+  "seed_prefix_replay_steps": 128,
+  "shared_system_root": {
+    "role": "system",
+    "repeat": 20,
+    "joiner": "\n\n",
+    "content": "### Runtime Playbook {index}\n\nPreserve exact committed-head reuse semantics. Keep separate notes for `ttft`, `user_tail`, `assistant_decode`, and `mamba_drift`. When summarizing evidence, include `artifact_path`, `phase_kind`, `format_choice`, and `next_gate`. If a statement is speculative, label it as speculative instead of measured."
+  },
+  "committed_history": [
+    {
+      "role": "user",
+      "repeat": 8,
+      "joiner": "\n\n",
+      "content": "## Prior Thread {index}\n\nPlease restate the serving assumptions as a markdown brief. Include a short intro paragraph, three short evidence sentences, and one inline code span for each of `shared_root`, `committed_head`, and `bytes_not_entries`."
+    },
+    {
+      "role": "assistant",
+      "repeat": 8,
+      "joiner": "\n\n",
+      "content": "### Brief {index}\n\nThe runtime serves append-only chat and treats the latest committed assistant boundary as the primary reuse point.\n\n`shared_root` caches the common system instruction when it is hot. `committed_head` restores KV and Mamba state together. `bytes_not_entries` means the cache is sized and evicted by bytes. Measured artifacts should drive policy changes."
+    },
+    {
+      "role": "user",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "### Review Request {index}\n\nConvert the same evidence into a markdown-heavy style with headings, short paragraphs, and quoted reminders. Keep phase-end drift, seed variance, and cache-format risk separate."
+    },
+    {
+      "role": "assistant",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "> Reminder {index}: do not freeze policy from one realism anchor.\n\n#### Current Readout\n\n`fp32` remains the correctness baseline. `fp16_sr` remains the best optimized candidate. `fp16` accumulates more drift on realistic traces. More oracle profiles are still required before final guardrails."
+    }
+  ],
+  "trace_phases": [
+    {
+      "name": "user_turn_1_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "## Current Ask {index}\n\nWrite a markdown incident note with a short problem statement, a compact evidence paragraph, a quote block naming the current blocker, and one line that names the next gate. Keep the content tied to real benchmark artifacts."
+    },
+    {
+      "name": "assistant_turn_1_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 6,
+      "joiner": "\n\n",
+      "content": "### Incident Note {index}\n\nThe cache-format decision still depends on realistic multi-turn traces.\n\nEvidence: synthetic control and oracle-derived traces disagree on margin size. Evidence: `fp16_sr` still leads on mean drift. Evidence: max spikes and variance still need family-level review.\n\n> blocker: the profile family is not broad enough yet\n\nnext_gate: add another oracle-derived trace and refresh the guardrail summary"
+    },
+    {
+      "name": "user_turn_2_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 6,
+      "joiner": "\n",
+      "content": "### Follow-up {index}\nPlease keep the same content but rewrite it as a checklist-style paragraph with explicit `phase=user_tail`, `phase=assistant_decode`, `metric=mean_drift`, and `metric=max_spike` markers, plus one quoted constraint line."
+    },
+    {
+      "name": "assistant_turn_2_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 5,
+      "joiner": "\n\n",
+      "content": "Checklist {index}\n\nphase=user_tail means keep tail-prefill drift visible. phase=assistant_decode means watch late-phase spikes. metric=mean_drift shows `fp16_sr` remains ahead. metric=max_spike still needs guardrails.\n\n> constraint: do not replace measured policy with assumed service behavior"
+    },
+    {
+      "name": "user_turn_3_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 5,
+      "joiner": "\n\n",
+      "content": "### Final Pass {index}\nSummarize the remaining risk as a markdown handoff with headings `Scope`, `Observed Floor`, `Observed Ceiling`, and `Next Gate`. Mention the weakest-margin phase explicitly."
+    },
+    {
+      "name": "assistant_turn_3_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 4,
+      "joiner": "\n\n",
+      "content": "#### Handoff {index}\n\n**Scope**: GB10 Mamba cache-format choice for append-only multi-turn chat.\n\n**Observed Floor**: the weakest `fp16/fp16_sr` advantage appears in the early user-tail phase.\n\n**Observed Ceiling**: late decode phases still show larger max spikes.\n\n**Next Gate**: add one more oracle profile or longer variant before freezing runtime guardrails."
+    }
+  ]
+}

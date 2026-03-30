@@ -1,0 +1,87 @@
+{
+  "target_shared_system_root_tokens": 8192,
+  "target_committed_head_tokens": 49152,
+  "seed_prefix_replay_steps": 128,
+  "shared_system_root": {
+    "role": "system",
+    "repeat": 24,
+    "joiner": "\n\n",
+    "content": "SYSTEM POLICY BLOCK {index}\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact"
+  },
+  "committed_history": [
+    {
+      "role": "user",
+      "repeat": 9,
+      "joiner": "\n",
+      "content": "Prior request {index}: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput."
+    },
+    {
+      "role": "assistant",
+      "repeat": 9,
+      "joiner": "\n\n",
+      "content": "Committed note {index}: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format."
+    },
+    {
+      "role": "user",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "Background item {index}: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy."
+    },
+    {
+      "role": "assistant",
+      "repeat": 7,
+      "joiner": "\n",
+      "content": "Committed reply {index}: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough."
+    }
+  ],
+  "trace_phases": [
+    {
+      "name": "user_turn_1_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "Current request {index}: write a compact status object with fields objective, measured_risk, current_baseline, optimized_candidate, blocker, and follow_up. Keep the answer grounded in the exact benchmark artifacts and state whether the evidence comes from synthetic control, oracle trace, or direct runtime execution."
+    },
+    {
+      "name": "assistant_turn_1_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 6,
+      "joiner": "\n",
+      "content": "Status block {index}: objective=freeze the cache format only after realistic traces. measured_risk=synthetic traces overstate the FP16_SR margin. current_baseline=FP32. optimized_candidate=FP16_SR. blocker=too few oracle profiles. follow_up=compare phase_end drift before changing runtime defaults."
+    },
+    {
+      "name": "user_turn_2_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 6,
+      "joiner": "\n",
+      "content": "Follow-up {index}: reframe the same evidence as a numbered checklist with tighter punctuation, require explicit references to user_tail and assistant_decode boundaries, and note whether the data comes from decode-like replay or from one-step oracle fixtures."
+    },
+    {
+      "name": "assistant_turn_2_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 5,
+      "joiner": "\n\n",
+      "content": "Checklist item {index}: 1. keep FP32 as truth. 2. keep FP16_SR as the best current candidate. 3. record mean, max, and variance together. 4. compare synthetic control and oracle traces. 5. do not assume service-scale behavior from a single scaled proxy trace."
+    },
+    {
+      "name": "user_turn_3_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 5,
+      "joiner": "\n\n",
+      "content": "Final clarification {index}: summarize the cache-format evidence in a stricter schema, distinguish control traces from realism anchors, and keep separate notes for phase_end drift, max spikes, and the remaining work needed before production thresholds are locked."
+    },
+    {
+      "name": "assistant_turn_3_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 4,
+      "joiner": "\n",
+      "content": "Final status {index}: control_trace=synthetic phase_end replay. realism_anchor=oracle-derived tokenized trace. current_reading=FP16_SR still wins on mean drift but with a smaller margin. next_gate=add another oracle profile and keep comparing artifacts before fixing the runtime policy."
+    }
+  ]
+}

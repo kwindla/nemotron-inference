@@ -1,0 +1,87 @@
+{
+  "target_shared_system_root_tokens": 8192,
+  "target_committed_head_tokens": 49152,
+  "seed_prefix_replay_steps": 128,
+  "shared_system_root": {
+    "role": "system",
+    "repeat": 22,
+    "joiner": "\n\n",
+    "content": "policy_frame[{index}] { mode=runtime_audit; constraints=[no_runtime_repack, measured_artifacts_only, stable_regenerate_behavior]; cache_boundary={restore=committed_head, append=user_tail, decode=assistant_decode}; output_schema={section:summary, fields:[risk,evidence,next_gate,artifact_refs]} }"
+  },
+  "committed_history": [
+    {
+      "role": "user",
+      "repeat": 8,
+      "joiner": "\n",
+      "content": "ticket/{index}: please explain the serving state as if it were an API response. include keys=request_pattern, cache_scope, memory_budget, and verification_status. keep the values short but exact."
+    },
+    {
+      "role": "assistant",
+      "repeat": 8,
+      "joiner": "\n\n",
+      "content": "response/{index}: request_pattern=append_only_chat; cache_scope=shared_root+conversation_head; memory_budget=bytes_not_entries; verification_status=benchmark_backed. notes=[restore kv+mamba together, measure hot/cold ttft separately, do not generalize from one trace]."
+    },
+    {
+      "role": "user",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "audit/{index}: recast the same evidence using path-like labels such as cache/restore, trace/phase_end, mamba/drift, and policy/next_gate, then note whether the conclusion changes when the answer is written in a tool-oriented schema."
+    },
+    {
+      "role": "assistant",
+      "repeat": 7,
+      "joiner": "\n",
+      "content": "state/{index}: cache/restore=committed_head_exact_match; trace/phase_end=required; mamba/drift=profile_sensitive; policy/next_gate=add_more_oracle_profiles; caution/do_not=freeze_thresholds_from_single_trace."
+    }
+  ],
+  "trace_phases": [
+    {
+      "name": "user_turn_1_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 7,
+      "joiner": "\n\n",
+      "content": "request/{index}: emit a compact tool payload with fields objective, baseline, candidate, evidence, and blocker. use slash-style labels like mamba/format and trace/source, and keep the payload tied to real benchmark artifacts."
+    },
+    {
+      "name": "assistant_turn_1_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 6,
+      "joiner": "\n",
+      "content": "payload/{index}: objective=freeze_mamba_policy_only_after_realism_checks; baseline=mamba/format:fp32; candidate=mamba/format:fp16_sr; evidence=trace/source:oracle+synthetic; blocker=policy/next_gate:add_profile_family_coverage."
+    },
+    {
+      "name": "user_turn_2_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 6,
+      "joiner": "\n",
+      "content": "followup/{index}: now express the same request with more delimiters and key=value fragments, and require explicit references to phase/user_tail, phase/assistant_decode, and drift/variance."
+    },
+    {
+      "name": "assistant_turn_2_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 5,
+      "joiner": "\n\n",
+      "content": "result/{index}: phase/user_tail=carry_tail_prefill; phase/assistant_decode=carry_decode_chain; drift/variance=bounded_but_not_sufficient; policy/readout=fp16_sr_still_leads; policy/guardrail=do_not_freeze_from_single_profile."
+    },
+    {
+      "name": "user_turn_3_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 5,
+      "joiner": "\n\n",
+      "content": "final_request/{index}: summarize remaining risk as a machine-friendly record and keep separate keys for mean_drift, max_spike, seed_spread, and profile_family_size."
+    },
+    {
+      "name": "assistant_turn_3_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 4,
+      "joiner": "\n",
+      "content": "final_record/{index}: mean_drift=fp16_sr_better_than_fp16; max_spike=still_watch_closely; seed_spread=bounded_on_current_profiles; profile_family_size=insufficient_for_threshold_lock; next_action=add_another_oracle_trace_and_recompare."
+    }
+  ]
+}

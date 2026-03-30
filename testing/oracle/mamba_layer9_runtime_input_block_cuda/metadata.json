@@ -1,0 +1,35 @@
+{
+  "fixture_kind": "mamba_layer_decode_oracle_v1",
+  "layer_index": 9,
+  "hidden_size": 4096,
+  "intermediate_size": 8192,
+  "num_heads": 128,
+  "head_dim": 64,
+  "state_size": 128,
+  "n_groups": 8,
+  "conv_kernel_size": 4,
+  "input_rms_epsilon": 1e-05,
+  "mixer_rms_epsilon": 1e-05,
+  "time_step_min": 0.001,
+  "source_tensors": {
+    "input_norm_weight": "backbone.layers.9.norm.weight",
+    "mixer_norm_weight": "backbone.layers.9.mixer.norm.weight",
+    "in_proj_weight": "backbone.layers.9.mixer.in_proj.weight",
+    "conv1d_weight": "backbone.layers.9.mixer.conv1d.weight",
+    "conv1d_bias": "backbone.layers.9.mixer.conv1d.bias",
+    "A_log": "backbone.layers.9.mixer.A_log",
+    "D": "backbone.layers.9.mixer.D",
+    "dt_bias": "backbone.layers.9.mixer.dt_bias",
+    "out_proj_weight": "backbone.layers.9.mixer.out_proj.weight",
+    "in_proj_weight_scale": "backbone.layers.9.mixer.in_proj.weight_scale",
+    "in_proj_input_scale": "backbone.layers.9.mixer.in_proj.input_scale",
+    "out_proj_weight_scale": "backbone.layers.9.mixer.out_proj.weight_scale",
+    "out_proj_input_scale": "backbone.layers.9.mixer.out_proj.input_scale"
+  },
+  "notes": [
+    "The input hidden state and initial conv/SSM state are deterministic synthetic tensors unless explicit input/state binaries are provided.",
+    "The fixture uses real layer-0 Mamba weights from the checkpoint.",
+    "Scaled FP8 in_proj and out_proj expectations mirror the current correctness-first runtime contract: input round-trip through E4M3 using input_scale, then dequantized-weight linear math.",
+    "expected_final_output_fp32 includes the outer block residual add."
+  ]
+}

@@ -1,0 +1,7 @@
+add_executable(
+  gb10_paged_attention_bench
+  gb10_paged_attention_bench.cpp
+)
+
+target_link_libraries(gb10_paged_attention_bench PRIVATE nemotron_runtime_backend)
+target_compile_features(gb10_paged_attention_bench PRIVATE cxx_std_17)

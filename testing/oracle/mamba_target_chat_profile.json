@@ -1,0 +1,87 @@
+{
+  "target_shared_system_root_tokens": 8192,
+  "target_committed_head_tokens": 49152,
+  "seed_prefix_replay_steps": 128,
+  "shared_system_root": {
+    "role": "system",
+    "repeat": 36,
+    "joiner": "\n",
+    "content": "Runtime policy section {index}: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration."
+  },
+  "committed_history": [
+    {
+      "role": "user",
+      "repeat": 10,
+      "joiner": " ",
+      "content": "Background note {index}: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread."
+    },
+    {
+      "role": "assistant",
+      "repeat": 10,
+      "joiner": " ",
+      "content": "Committed answer {index}: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count."
+    },
+    {
+      "role": "user",
+      "repeat": 8,
+      "joiner": " ",
+      "content": "Prior request {index}: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary."
+    },
+    {
+      "role": "assistant",
+      "repeat": 8,
+      "joiner": " ",
+      "content": "Prior reply {index}: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately."
+    }
+  ],
+  "trace_phases": [
+    {
+      "name": "user_turn_1_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 8,
+      "joiner": " ",
+      "content": "Current turn request {index}: refine the C++ runtime plan, quantify remaining Mamba drift risk, describe the next verification gate, and keep the answer anchored to the actual GB10 measurements."
+    },
+    {
+      "name": "assistant_turn_1_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 7,
+      "joiner": " ",
+      "content": "Assistant draft {index}: the runtime should keep FP32 as the correctness baseline, prefer FP16 plus stochastic rounding as the optimized cache candidate, and preserve phase-boundary metrics while target traces become more realistic."
+    },
+    {
+      "name": "user_turn_2_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 7,
+      "joiner": " ",
+      "content": "Follow-up request {index}: expand the benchmark toward the service envelope, compare user-tail and assistant-decode drift separately, and avoid changing the cache architecture before the data is in hand."
+    },
+    {
+      "name": "assistant_turn_2_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 6,
+      "joiner": " ",
+      "content": "Assistant reply {index}: the benchmark already shows that plain FP16 accumulates materially more drift than FP16 plus stochastic rounding, while seed-to-seed spread remains bounded on the GB10 stack."
+    },
+    {
+      "name": "user_turn_3_tail_prefill",
+      "kind": "user_tail",
+      "role": "user",
+      "repeat": 6,
+      "joiner": " ",
+      "content": "Final clarification {index}: keep documentation synchronized with each implementation stage, record exact artifacts and seeds, and prioritize the next improvement that most directly reduces serving risk."
+    },
+    {
+      "name": "assistant_turn_3_decode",
+      "kind": "assistant_decode",
+      "role": "assistant",
+      "repeat": 5,
+      "joiner": " ",
+      "content": "Final answer {index}: use richer oracle-derived traces, preserve the fast synthetic anchors, and only freeze the production Mamba cache format after both latency and accumulated drift stay within the measured policy bounds."
+    }
+  ]
+}

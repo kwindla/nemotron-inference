@@ -1,0 +1,738 @@
+#include "nemotron/single_token_forward_model.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "nemotron/attention_layer.h"
+#include "nemotron/cublaslt_handle.h"
+#include "nemotron/cudnn_handle.h"
+#include "nemotron/device_tensor.h"
+#include "nemotron/embedding_catalog.h"
+#include "nemotron/embedding_table.h"
+#include "nemotron/expert_layer.h"
+#include "nemotron/gemm_catalog.h"
+#include "nemotron/gemm_planner.h"
+#include "nemotron/kernel_catalog.h"
+#include "nemotron/linear_op.h"
+#include "nemotron/mamba_layer.h"
+#include "nemotron/model_schedule.h"
+#include "nemotron/paged_kv_cache.h"
+#include "nemotron/primitive_ops.h"
+#include "nemotron/runtime_environment.h"
+
+namespace nemotron {
+namespace {
+
+bool ContainsName(
+    const std::vector<GlobalTensorBinding>& bindings,
+    ModelGlobalRole role,
+    const std::string& tensor_name) {
+  for (const GlobalTensorBinding& binding : bindings) {
+    if (binding.role == role && binding.tensor_name == tensor_name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename DescriptorT, typename LookupFn>
+const DescriptorT* FindGlobalDescriptorByCandidates(
+    const std::vector<GlobalTensorBinding>& bindings,
+    ModelGlobalRole role,
+    LookupFn lookup,
+    const std::vector<std::string>& candidates) {
+  for (const GlobalTensorBinding& binding : bindings) {
+    if (binding.role != role) {
+      continue;
+    }
+    if (const DescriptorT* descriptor = lookup(binding.tensor_name); descriptor != nullptr) {
+      return descriptor;
+    }
+  }
+  for (const std::string& candidate : candidates) {
+    if (const DescriptorT* descriptor = lookup(candidate); descriptor != nullptr) {
+      return descriptor;
+    }
+  }
+  return nullptr;
+}
+
+std::size_t MaxLayerIndex(const std::vector<LayerScheduleEntry>& layers) {
+  std::size_t max_index = 0;
+  for (const LayerScheduleEntry& layer : layers) {
+    max_index = std::max(max_index, layer.layer_index);
+  }
+  return max_index;
+}
+
+std::size_t RequiredMambaConvStateElems(const SingleTokenForwardConfig& config) {
+  const std::size_t conv_dim =
+      config.mamba_intermediate_size + (2 * config.mamba_n_groups * config.mamba_state_size);
+  return conv_dim * config.mamba_conv_kernel_size;
+}
+
+std::size_t RequiredMambaStateElems(const SingleTokenForwardConfig& config) {
+  return config.mamba_num_heads * config.mamba_head_dim * config.mamba_state_size;
+}
+
+std::vector<float> CopyTensorToHost(const DeviceTensorFp32& tensor) {
+  std::vector<float> host(tensor.numel(), 0.0f);
+  if (!tensor.CopyToHost(host.data(), host.size())) {
+    return {};
+  }
+  return host;
+}
+
+}  // namespace
+
+SingleTokenForwardConfig KnownNemotron3Super120BA12BConfig() {
+  SingleTokenForwardConfig config;
+  config.hidden_size = 4096;
+  config.total_layer_count = 88;
+  config.vocab_size = 131072;
+  config.max_tokens = 1;
+
+  config.attention_head_count = 32;
+  config.attention_kv_head_count = 2;
+  config.attention_head_dim = 128;
+  config.attention_tokens_per_page = 16;
+
+  config.mamba_intermediate_size = 8192;
+  config.mamba_num_heads = 128;
+  config.mamba_head_dim = 64;
+  config.mamba_state_size = 128;
+  config.mamba_n_groups = 8;
+  config.mamba_conv_kernel_size = 4;
+
+  config.moe_latent_size = 1024;
+  config.routed_expert_intermediate_size = 2688;
+  config.shared_expert_intermediate_size = 5376;
+  config.n_routed_experts = 512;
+  config.experts_per_token = 22;
+  config.expert_n_group = 1;
+  config.expert_topk_group = 1;
+
+  config.layer_norm_epsilon = 1.0e-5f;
+  config.mamba_time_step_min = 1.0e-3f;
+  config.routed_scaling_factor = 5.0f;
+  config.norm_topk_prob = true;
+  return config;
+}
+
+std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
+    const ModelSchedule& schedule,
+    const SingleTokenForwardConfig& config) {
+  if (!schedule.valid() ||
+      config.hidden_size == 0 ||
+      config.total_layer_count == 0 ||
+      config.vocab_size == 0 ||
+      config.max_tokens == 0 ||
+      config.attention_head_count == 0 ||
+      config.attention_kv_head_count == 0 ||
+      config.attention_head_dim == 0 ||
+      config.attention_tokens_per_page == 0 ||
+      config.mamba_intermediate_size == 0 ||
+      config.mamba_num_heads == 0 ||
+      config.mamba_head_dim == 0 ||
+      config.mamba_state_size == 0 ||
+      config.mamba_n_groups == 0 ||
+      config.mamba_conv_kernel_size == 0 ||
+      config.moe_latent_size == 0 ||
+      config.routed_expert_intermediate_size == 0 ||
+      config.shared_expert_intermediate_size == 0 ||
+      config.n_routed_experts == 0 ||
+      config.experts_per_token == 0 ||
+      config.expert_n_group == 0 ||
+      config.expert_topk_group == 0 ||
+      config.layer_norm_epsilon <= 0.0f ||
+      config.mamba_time_step_min <= 0.0f) {
+    return std::nullopt;
+  }
+
+  const auto& layers = schedule.ordered_layers();
+  if (layers.empty()) {
+    return std::nullopt;
+  }
+  const std::size_t max_layer_index = MaxLayerIndex(layers);
+  if (config.total_layer_count <= max_layer_index) {
+    return std::nullopt;
+  }
+
+  SingleTokenForwardPlan plan;
+  std::size_t mamba_conv_offset = 0;
+  std::size_t mamba_state_offset = 0;
+  const std::size_t per_layer_conv_state = RequiredMambaConvStateElems(config);
+  const std::size_t per_layer_ssm_state = RequiredMambaStateElems(config);
+
+  for (const LayerScheduleEntry& layer : layers) {
+    const bool is_attention = layer.has_attention;
+    const bool is_mamba = layer.has_mamba;
+    const bool is_expert = layer.has_router || layer.has_routed_experts || layer.has_shared_experts;
+    const std::size_t family_count =
+        static_cast<std::size_t>(is_attention) +
+        static_cast<std::size_t>(is_mamba) +
+        static_cast<std::size_t>(is_expert);
+    if (family_count != 1) {
+      return std::nullopt;
+    }
+
+    ForwardLayerPlanEntry entry;
+    entry.layer_index = layer.layer_index;
+    if (is_attention) {
+      entry.kind = ForwardLayerKind::kAttention;
+      ++plan.attention_layer_count;
+    } else if (is_mamba) {
+      entry.kind = ForwardLayerKind::kMamba;
+      entry.mamba_conv_state_offset_elems = mamba_conv_offset;
+      entry.mamba_state_offset_elems = mamba_state_offset;
+      mamba_conv_offset += per_layer_conv_state;
+      mamba_state_offset += per_layer_ssm_state;
+      ++plan.mamba_layer_count;
+    } else {
+      entry.kind = ForwardLayerKind::kExpert;
+      ++plan.expert_layer_count;
+    }
+    plan.layers.push_back(entry);
+  }
+
+  plan.request_config.hidden_size = config.hidden_size;
+  plan.request_config.max_tokens = config.max_tokens;
+  plan.request_config.scratch_tokens = config.max_tokens;
+  plan.request_config.mamba_conv_state_bytes_fp32 = mamba_conv_offset * sizeof(float);
+  plan.request_config.mamba_state_bytes_fp32 = mamba_state_offset * sizeof(float);
+  if (plan.attention_layer_count != 0) {
+    plan.request_config.attention_kv_cache.layer_count = max_layer_index + 1;
+    plan.request_config.attention_kv_cache.kv_head_count = config.attention_kv_head_count;
+    plan.request_config.attention_kv_cache.head_dim = config.attention_head_dim;
+    plan.request_config.attention_kv_cache.tokens_per_page = config.attention_tokens_per_page;
+    plan.request_config.attention_kv_cache.dtype = KvCacheDataType::kBf16;
+    plan.request_config.attention_total_pages =
+        plan.request_config.attention_kv_cache.layer_count *
+        RequiredPagesForTokens(plan.request_config.attention_kv_cache, config.max_tokens);
+  }
+
+  plan.valid = !plan.layers.empty();
+  if (!plan.valid) {
+    return std::nullopt;
+  }
+  return plan;
+}
+
+struct SingleTokenForwardModel::Impl {
+  struct LayerEntry {
+    ForwardLayerPlanEntry plan;
+    std::unique_ptr<AttentionLayerSlice> attention_slice;
+    std::unique_ptr<MambaLayerSlice> mamba_slice;
+    std::unique_ptr<ExpertLayerSlice> expert_slice;
+  };
+
+  SingleTokenForwardConfig config;
+  SingleTokenForwardPlan plan;
+  const EmbeddingDescriptor* embedding = nullptr;
+  const KernelTensorDescriptor* final_norm = nullptr;
+  const GemmDescriptor* lm_head = nullptr;
+  std::unique_ptr<CublasLtHandle> cublas;
+  std::unique_ptr<CudnnHandle> cudnn;
+  std::unique_ptr<GemmHeuristicCache> heuristic_cache;
+  std::unique_ptr<DeviceEmbeddingTableFp32> embedding_table;
+  std::unique_ptr<UploadedLinearOp> lm_head_op;
+  std::unique_ptr<DeviceTensorFp32> final_norm_weight;
+  std::vector<LayerEntry> layers;
+};
+
+std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
+    const RuntimeEnvironment& environment,
+    const SingleTokenForwardConfig& config) {
+  if (!environment.has_model_schedule() ||
+      !environment.has_kernel_catalog() ||
+      !environment.has_gemm_catalog() ||
+      !environment.has_embedding_catalog()) {
+    return nullptr;
+  }
+  const ModelSchedule& schedule = *environment.model_schedule();
+  const auto plan = BuildSingleTokenForwardPlan(schedule, config);
+  if (!plan.has_value()) {
+    return nullptr;
+  }
+
+  const KernelCatalog& kernel_catalog = *environment.kernel_catalog();
+  const GemmCatalog& gemm_catalog = *environment.gemm_catalog();
+  const EmbeddingCatalog& embedding_catalog = *environment.embedding_catalog();
+
+  const EmbeddingDescriptor* embedding = FindGlobalDescriptorByCandidates<EmbeddingDescriptor>(
+      schedule.global_bindings(),
+      ModelGlobalRole::kEmbedding,
+      [&](const std::string& name) { return embedding_catalog.FindDescriptor(name); },
+      {"backbone.embeddings.weight", "embeddings.weight"});
+  const GemmDescriptor* lm_head = FindGlobalDescriptorByCandidates<GemmDescriptor>(
+      schedule.global_bindings(),
+      ModelGlobalRole::kLogits,
+      [&](const std::string& name) { return gemm_catalog.FindDescriptor(name); },
+      {"lm_head.weight", "logits.weight", "output.weight"});
+  const KernelTensorDescriptor* final_norm = FindGlobalDescriptorByCandidates<KernelTensorDescriptor>(
+      schedule.global_bindings(),
+      ModelGlobalRole::kFinalNorm,
+      [&](const std::string& name) { return kernel_catalog.FindTensor(name); },
+      {"backbone.norm_f.weight",
+       "norm_f.weight",
+       "backbone.final_norm.weight",
+       "final_norm.weight"});
+  if (embedding == nullptr || lm_head == nullptr) {
+    return nullptr;
+  }
+  if (embedding->embedding_dim != config.hidden_size ||
+      embedding->vocab_size != config.vocab_size ||
+      lm_head->input_cols != config.hidden_size ||
+      lm_head->output_rows != config.vocab_size) {
+    return nullptr;
+  }
+  if (final_norm != nullptr &&
+      (final_norm->logical_shape.size() != 1 || final_norm->logical_shape.front() != config.hidden_size)) {
+    return nullptr;
+  }
+
+  auto cublas = CublasLtHandle::Create();
+  auto heuristic_cache = std::make_unique<GemmHeuristicCache>();
+  if (!cublas || !cublas->valid()) {
+    return nullptr;
+  }
+
+  std::unique_ptr<CudnnHandle> cudnn;
+  if (plan->attention_layer_count != 0) {
+    cudnn = CudnnHandle::Create();
+    if (!cudnn || !cudnn->valid()) {
+      return nullptr;
+    }
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->config = config;
+  impl->plan = *plan;
+  impl->embedding = embedding;
+  impl->final_norm = final_norm;
+  impl->lm_head = lm_head;
+  impl->cublas = std::move(cublas);
+  impl->cudnn = std::move(cudnn);
+  impl->heuristic_cache = std::move(heuristic_cache);
+  impl->embedding_table = DeviceEmbeddingTableFp32::Upload(*embedding);
+  impl->lm_head_op = UploadedLinearOp::Create(*lm_head);
+  if (!impl->embedding_table || !impl->embedding_table->valid() ||
+      !impl->lm_head_op || !impl->lm_head_op->valid()) {
+    return nullptr;
+  }
+  if (final_norm != nullptr) {
+    impl->final_norm_weight = UploadVectorWeightToDeviceFp32(*final_norm);
+    if (!impl->final_norm_weight || !impl->final_norm_weight->valid()) {
+      return nullptr;
+    }
+  }
+  impl->layers.reserve(plan->layers.size());
+
+  for (const ForwardLayerPlanEntry& plan_entry : plan->layers) {
+    const LayerScheduleEntry* layer = schedule.FindLayer(plan_entry.layer_index);
+    if (layer == nullptr) {
+      return nullptr;
+    }
+
+    Impl::LayerEntry layer_entry;
+    layer_entry.plan = plan_entry;
+    switch (plan_entry.kind) {
+      case ForwardLayerKind::kAttention: {
+        const auto bindings = BuildAttentionLayerBindings(*layer, kernel_catalog, gemm_catalog);
+        if (!bindings.has_value()) {
+          return nullptr;
+        }
+        AttentionLayerConfig attention_config;
+        attention_config.layer_index = plan_entry.layer_index;
+        attention_config.hidden_size = config.hidden_size;
+        attention_config.query_head_count = config.attention_head_count;
+        attention_config.kv_head_count = config.attention_kv_head_count;
+        attention_config.head_dim = config.attention_head_dim;
+        attention_config.rms_epsilon = config.layer_norm_epsilon;
+        layer_entry.attention_slice = AttentionLayerSlice::Create(attention_config, *bindings);
+        if (!layer_entry.attention_slice || !layer_entry.attention_slice->valid()) {
+          return nullptr;
+        }
+        break;
+      }
+      case ForwardLayerKind::kMamba: {
+        const auto bindings = BuildMambaLayerBindings(*layer, kernel_catalog, gemm_catalog);
+        if (!bindings.has_value()) {
+          return nullptr;
+        }
+        MambaLayerConfig mamba_config;
+        mamba_config.layer_index = plan_entry.layer_index;
+        mamba_config.hidden_size = config.hidden_size;
+        mamba_config.intermediate_size = config.mamba_intermediate_size;
+        mamba_config.num_heads = config.mamba_num_heads;
+        mamba_config.head_dim = config.mamba_head_dim;
+        mamba_config.state_size = config.mamba_state_size;
+        mamba_config.n_groups = config.mamba_n_groups;
+        mamba_config.conv_kernel_size = config.mamba_conv_kernel_size;
+        mamba_config.conv_state_offset_elems = plan_entry.mamba_conv_state_offset_elems;
+        mamba_config.ssm_state_offset_elems = plan_entry.mamba_state_offset_elems;
+        mamba_config.input_rms_epsilon = config.layer_norm_epsilon;
+        mamba_config.mixer_rms_epsilon = config.layer_norm_epsilon;
+        mamba_config.time_step_min = config.mamba_time_step_min;
+        layer_entry.mamba_slice = MambaLayerSlice::Create(mamba_config, *bindings);
+        if (!layer_entry.mamba_slice || !layer_entry.mamba_slice->valid()) {
+          return nullptr;
+        }
+        break;
+      }
+      case ForwardLayerKind::kExpert: {
+        const auto bindings = BuildExpertLayerBindings(
+            *layer,
+            kernel_catalog,
+            gemm_catalog,
+            config.n_routed_experts);
+        if (!bindings.has_value()) {
+          return nullptr;
+        }
+        ExpertLayerConfig expert_config;
+        expert_config.layer_index = plan_entry.layer_index;
+        expert_config.hidden_size = config.hidden_size;
+        expert_config.moe_latent_size = config.moe_latent_size;
+        expert_config.routed_expert_intermediate_size = config.routed_expert_intermediate_size;
+        expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
+        expert_config.n_routed_experts = config.n_routed_experts;
+        expert_config.top_k = config.experts_per_token;
+        expert_config.n_group = config.expert_n_group;
+        expert_config.topk_group = config.expert_topk_group;
+        expert_config.rms_epsilon = config.layer_norm_epsilon;
+        expert_config.routed_scaling_factor = config.routed_scaling_factor;
+        expert_config.norm_topk_prob = config.norm_topk_prob;
+        layer_entry.expert_slice = ExpertLayerSlice::Create(expert_config, *bindings);
+        if (!layer_entry.expert_slice || !layer_entry.expert_slice->valid()) {
+          return nullptr;
+        }
+        break;
+      }
+    }
+
+    impl->layers.push_back(std::move(layer_entry));
+  }
+
+  return std::unique_ptr<SingleTokenForwardModel>(new SingleTokenForwardModel(std::move(impl)));
+}
+
+SingleTokenForwardModel::SingleTokenForwardModel(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+SingleTokenForwardModel::SingleTokenForwardModel(SingleTokenForwardModel&&) noexcept = default;
+SingleTokenForwardModel& SingleTokenForwardModel::operator=(SingleTokenForwardModel&&) noexcept = default;
+SingleTokenForwardModel::~SingleTokenForwardModel() = default;
+
+bool SingleTokenForwardModel::valid() const {
+  return impl_ != nullptr &&
+         impl_->embedding != nullptr &&
+         impl_->lm_head != nullptr &&
+         impl_->cublas != nullptr &&
+         impl_->cublas->valid() &&
+         impl_->heuristic_cache != nullptr &&
+         impl_->plan.valid &&
+         impl_->layers.size() == impl_->plan.layers.size();
+}
+
+const SingleTokenForwardConfig& SingleTokenForwardModel::config() const {
+  return impl_->config;
+}
+
+const SingleTokenForwardPlan& SingleTokenForwardModel::plan() const {
+  return impl_->plan;
+}
+
+std::unique_ptr<RequestExecutionContext> SingleTokenForwardModel::CreateRequestContext() const {
+  if (!valid()) {
+    return nullptr;
+  }
+  return RequestExecutionContext::Create(impl_->plan.request_config);
+}
+
+bool SingleTokenForwardModel::RunSingleToken(
+    std::int32_t token_id,
+    RequestExecutionContext& request_context,
+    DeviceTensorFp32* logits,
+    const std::vector<std::size_t>& capture_layer_indices,
+    SingleTokenForwardTrace* trace,
+    std::optional<std::size_t> stop_layer_index) const {
+  return RunPrefill(
+      &token_id,
+      1,
+      request_context,
+      logits,
+      capture_layer_indices,
+      trace,
+      stop_layer_index);
+}
+
+bool SingleTokenForwardModel::RunPrefill(
+    const std::int32_t* token_ids,
+    std::size_t token_count,
+    RequestExecutionContext& request_context,
+    DeviceTensorFp32* logits,
+    const std::vector<std::size_t>& capture_layer_indices,
+    SingleTokenForwardTrace* trace,
+    std::optional<std::size_t> stop_layer_index) const {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+
+  const bool model_valid = valid();
+  const bool have_tokens = token_ids != nullptr;
+  const bool nonzero_token_count = token_count != 0;
+  const bool request_valid = request_context.valid();
+  const bool hidden_size_match = request_context.config().hidden_size == impl_->config.hidden_size;
+  const bool token_capacity_ok = request_context.config().max_tokens >= token_count;
+  const bool have_logits = logits != nullptr;
+  const bool logits_valid = have_logits && logits->valid();
+  const std::vector<std::size_t> expected_logits_shape = {token_count, impl_->config.vocab_size};
+  const bool logits_shape_ok = logits_valid && logits->shape() == expected_logits_shape;
+
+  if (!model_valid ||
+      !have_tokens ||
+      !nonzero_token_count ||
+      !request_valid ||
+      !hidden_size_match ||
+      !token_capacity_ok ||
+      !have_logits ||
+      !logits_valid ||
+      !logits_shape_ok) {
+    std::cerr << "single_token_forward_model: invalid RunPrefill arguments or state"
+              << " model_valid=" << model_valid
+              << " have_tokens=" << have_tokens
+              << " nonzero_token_count=" << nonzero_token_count
+              << " request_valid=" << request_valid
+              << " hidden_size_match=" << hidden_size_match
+              << " token_capacity_ok=" << token_capacity_ok
+              << " have_logits=" << have_logits
+              << " logits_valid=" << logits_valid
+              << " logits_shape_ok=" << logits_shape_ok
+              << " request_hidden_size=" << request_context.config().hidden_size
+              << " model_hidden_size=" << impl_->config.hidden_size
+              << " request_max_tokens=" << request_context.config().max_tokens
+              << " token_count=" << token_count;
+    if (have_logits && logits_valid) {
+      std::cerr << " logits_shape=[";
+      for (std::size_t i = 0; i < logits->shape().size(); ++i) {
+        if (i != 0) {
+          std::cerr << ",";
+        }
+        std::cerr << logits->shape()[i];
+      }
+      std::cerr << "]";
+    }
+    std::cerr << " expected_logits_shape=[" << expected_logits_shape[0]
+              << "," << expected_logits_shape[1] << "]\n";
+    return false;
+  }
+  if (impl_->plan.attention_layer_count != 0 &&
+      (impl_->cudnn == nullptr || !impl_->cudnn->valid())) {
+    std::cerr << "single_token_forward_model: cuDNN handle unavailable\n";
+    return false;
+  }
+  if (!request_context.ResetForNewRequest()) {
+    std::cerr << "single_token_forward_model: request context reset failed\n";
+    return false;
+  }
+
+  DeviceTensorFp32* current = request_context.hidden();
+  DeviceTensorFp32* next = request_context.residual();
+  DeviceTensorFp32* scratch = request_context.scratch();
+  if (current == nullptr || next == nullptr || scratch == nullptr) {
+    std::cerr << "single_token_forward_model: request context buffers unavailable\n";
+    return false;
+  }
+
+  if (!impl_->embedding_table || !impl_->embedding_table->valid() ||
+      !impl_->lm_head_op || !impl_->lm_head_op->valid()) {
+    std::cerr << "single_token_forward_model: cached embeddings or lm_head unavailable\n";
+    return false;
+  }
+  if (impl_->final_norm != nullptr &&
+      (!impl_->final_norm_weight || !impl_->final_norm_weight->valid())) {
+    std::cerr << "single_token_forward_model: cached final norm weight unavailable\n";
+    return false;
+  }
+
+  if (!LookupEmbeddingRowsFp32(*impl_->embedding_table, token_ids, token_count, current).has_value()) {
+    std::cerr << "single_token_forward_model: embedding lookup failed\n";
+    return false;
+  }
+  if (debug) {
+    std::cout << "single_token_forward_model: embedding lookup ok for "
+              << token_count << " token(s)\n";
+  }
+  if (trace != nullptr) {
+    trace->embedding_output = CopyTensorToHost(*current);
+    if (trace->embedding_output.empty()) {
+      return false;
+    }
+    trace->captured_layers.clear();
+    trace->final_hidden.clear();
+    trace->final_hidden_normed.clear();
+    trace->logits.clear();
+  }
+
+  const std::unordered_set<std::size_t> capture_set(
+      capture_layer_indices.begin(),
+      capture_layer_indices.end());
+
+  for (const Impl::LayerEntry& layer : impl_->layers) {
+    if (debug) {
+      std::cout << "single_token_forward_model: running layer "
+                << layer.plan.layer_index
+                << " kind=" << static_cast<int>(layer.plan.kind) << "\n";
+    }
+    bool ok = false;
+    switch (layer.plan.kind) {
+      case ForwardLayerKind::kAttention: {
+        const bool created = layer.attention_slice != nullptr;
+        const bool valid_slice = created && layer.attention_slice->valid();
+        const bool ran =
+            valid_slice &&
+            layer.attention_slice->Run(
+                *impl_->cublas,
+                *impl_->cudnn,
+                impl_->heuristic_cache.get(),
+                request_context,
+                *current,
+                next);
+        if (debug && (!created || !valid_slice || !ran)) {
+          std::cout << "single_token_forward_model: attention failure"
+                    << " created=" << created
+                    << " valid=" << valid_slice
+                    << " ran=" << ran << "\n";
+        }
+        ok = created && valid_slice && ran;
+        break;
+      }
+      case ForwardLayerKind::kMamba: {
+        const bool created = layer.mamba_slice != nullptr;
+        const bool valid_slice = created && layer.mamba_slice->valid();
+        const bool ran =
+            valid_slice &&
+            layer.mamba_slice->Run(
+                *impl_->cublas,
+                impl_->heuristic_cache.get(),
+                request_context,
+                *current,
+                next);
+        if (debug && (!created || !valid_slice || !ran)) {
+          std::cout << "single_token_forward_model: mamba failure"
+                    << " created=" << created
+                    << " valid=" << valid_slice
+                    << " ran=" << ran << "\n";
+        }
+        ok = created && valid_slice && ran;
+        break;
+      }
+      case ForwardLayerKind::kExpert: {
+        const bool created = layer.expert_slice != nullptr;
+        const bool valid_slice = created && layer.expert_slice->valid();
+        const bool ran =
+            valid_slice &&
+            layer.expert_slice->Run(
+                *impl_->cublas,
+                impl_->heuristic_cache.get(),
+                *current,
+                next,
+                nullptr);
+        if (debug && (!created || !valid_slice || !ran)) {
+          std::cout << "single_token_forward_model: expert failure"
+                    << " created=" << created
+                    << " valid=" << valid_slice
+                    << " ran=" << ran << "\n";
+        }
+        ok = created && valid_slice && ran;
+        break;
+      }
+    }
+    if (!ok) {
+      std::cerr << "single_token_forward_model: layer "
+                << layer.plan.layer_index
+                << " kind=" << static_cast<int>(layer.plan.kind)
+                << " execution failed\n";
+      return false;
+    }
+    std::swap(current, next);
+    if (debug) {
+      std::cout << "single_token_forward_model: layer "
+                << layer.plan.layer_index << " ok\n";
+    }
+
+    if (trace != nullptr && capture_set.find(layer.plan.layer_index) != capture_set.end()) {
+      CapturedLayerOutput captured;
+      captured.layer_index = layer.plan.layer_index;
+      captured.hidden = CopyTensorToHost(*current);
+      if (captured.hidden.empty()) {
+        std::cerr << "single_token_forward_model: failed to capture layer " << layer.plan.layer_index << "\n";
+        return false;
+      }
+      trace->captured_layers.push_back(std::move(captured));
+    }
+
+    if (stop_layer_index.has_value() && layer.plan.layer_index >= *stop_layer_index) {
+      break;
+    }
+  }
+
+  if (trace != nullptr) {
+    trace->final_hidden = CopyTensorToHost(*current);
+    if (trace->final_hidden.empty()) {
+      std::cerr << "single_token_forward_model: failed to capture final hidden state\n";
+      return false;
+    }
+  }
+
+  const DeviceTensorFp32* logits_input = current;
+  if (impl_->final_norm_weight != nullptr) {
+    if (!RmsNormFp32(
+            *current,
+            *impl_->final_norm_weight,
+            impl_->config.layer_norm_epsilon,
+            scratch)) {
+      std::cerr << "single_token_forward_model: final RMSNorm failed\n";
+      return false;
+    }
+    logits_input = scratch;
+  }
+
+  if (trace != nullptr) {
+    trace->final_hidden_normed = CopyTensorToHost(*logits_input);
+    if (trace->final_hidden_normed.empty()) {
+      std::cerr << "single_token_forward_model: failed to capture final normalized hidden state\n";
+      return false;
+    }
+  }
+
+  if (!impl_->lm_head_op->Run(
+          *impl_->cublas,
+          impl_->heuristic_cache.get(),
+          *logits_input,
+          logits)) {
+    std::cerr << "single_token_forward_model: lm_head projection failed\n";
+    return false;
+  }
+  if (debug) {
+    std::cout << "single_token_forward_model: lm_head ok\n";
+  }
+
+  if (trace != nullptr) {
+    trace->logits = CopyTensorToHost(*logits);
+    if (trace->logits.empty()) {
+      std::cerr << "single_token_forward_model: failed to capture logits\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace nemotron

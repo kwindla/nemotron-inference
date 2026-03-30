@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "name": "short_chat",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a precise assistant. Follow instructions exactly."
+        },
+        {
+          "role": "user",
+          "content": "Return exactly the text NEMOTRON_TEST and nothing else."
+        }
+      ],
+      "add_generation_prompt": true
+    },
+    {
+      "name": "shared_prefix_a",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a code review assistant. Keep answers concise, focus on correctness, and do not invent facts."
+        },
+        {
+          "role": "user",
+          "content": "Project context: build a C++/CUDA inference runtime for a hybrid Mamba and attention model with prefix-state reuse. Summarize the critical risks in 3 bullets."
+        }
+      ],
+      "add_generation_prompt": true
+    },
+    {
+      "name": "shared_prefix_b",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a code review assistant. Keep answers concise, focus on correctness, and do not invent facts."
+        },
+        {
+          "role": "user",
+          "content": "Project context: build a C++/CUDA inference runtime for a hybrid Mamba and attention model with prefix-state reuse. Summarize the required validation tests in 3 bullets."
+        }
+      ],
+      "add_generation_prompt": true
+    }
+  ]
+}
