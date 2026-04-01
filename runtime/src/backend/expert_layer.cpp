@@ -1543,7 +1543,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
 
     // CUDA graph scratch buffers (fixed-address copies of variable inputs)
-    impl->moe_graph_enabled = std::getenv("NEMOTRON_CUDA_GRAPH_MOE") != nullptr;
+    static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
+    impl->moe_graph_enabled = kMoeGraphEnabled;
     if (impl->moe_graph_enabled) {
       impl->scratch_graph_indices.Resize(top_k);
       impl->scratch_graph_weights.Resize(top_k);
@@ -1962,7 +1963,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     impl->scratch_aligned_act_scales.Resize(top_k * aligned_scale_row);
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
 
-    impl->moe_graph_enabled = std::getenv("NEMOTRON_CUDA_GRAPH_MOE") != nullptr;
+    static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
+    impl->moe_graph_enabled = kMoeGraphEnabled;
     if (impl->moe_graph_enabled) {
       impl->scratch_graph_indices.Resize(top_k);
       impl->scratch_graph_weights.Resize(top_k);
@@ -2757,6 +2759,7 @@ bool RunExpertLayerImpl(
           graph_ok = cudaGraphInstantiate(&impl.moe_graph_exec, impl.moe_graph, 0) == cudaSuccess;
         }
         if (graph_ok) {
+          RecordMoeGraphCapture();
           impl.moe_graph_captured = true;
         } else {
           if (impl.moe_graph != nullptr) {
@@ -2769,6 +2772,7 @@ bool RunExpertLayerImpl(
 
       if (impl.moe_graph_captured) {
         cudaGraphLaunch(impl.moe_graph_exec, nullptr);
+        RecordMoeGraphReplay();
         cudaMemcpyAsync(routed_tensor->data(), impl.scratch_graph_output.data(),
                         impl.config.moe_latent_size * sizeof(float), cudaMemcpyDeviceToDevice);
         RecordGroupedRoutedExpertFastpathUse();

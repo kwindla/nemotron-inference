@@ -446,6 +446,8 @@ bool WriteJsonReport(
          << runtime_stats.flashinfer_routed_expert_fallbacks << ",\n";
   output << "    \"grouped_routed_expert_fastpath_uses\": "
          << runtime_stats.grouped_routed_expert_fastpath_uses << ",\n";
+  output << "    \"moe_graph_captures\": " << runtime_stats.moe_graph_captures << ",\n";
+  output << "    \"moe_graph_replays\": " << runtime_stats.moe_graph_replays << ",\n";
   output << "    \"grouped_routed_expert_fastpath_fallbacks\": "
          << runtime_stats.grouped_routed_expert_fastpath_fallbacks << ",\n";
   output << "    \"grouped_routed_expert_prereq_fallbacks\": "
@@ -1070,6 +1072,8 @@ int main(int argc, char** argv) {
             << runtime_stats.flashinfer_routed_expert_fallbacks << "\n"
             << "grouped_routed_expert_fastpath_uses="
             << runtime_stats.grouped_routed_expert_fastpath_uses << "\n"
+            << "moe_graph_captures=" << runtime_stats.moe_graph_captures << "\n"
+            << "moe_graph_replays=" << runtime_stats.moe_graph_replays << "\n"
             << "grouped_routed_expert_fastpath_fallbacks="
             << runtime_stats.grouped_routed_expert_fastpath_fallbacks << "\n"
             << "grouped_routed_expert_prereq_fallbacks="

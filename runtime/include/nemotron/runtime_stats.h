@@ -53,6 +53,8 @@ struct RuntimeExecutionStatsSnapshot {
   std::uint64_t flashinfer_routed_expert_uses = 0;
   std::uint64_t flashinfer_routed_expert_fallbacks = 0;
   std::uint64_t grouped_routed_expert_fastpath_uses = 0;
+  std::uint64_t moe_graph_captures = 0;
+  std::uint64_t moe_graph_replays = 0;
   std::uint64_t grouped_routed_expert_fastpath_fallbacks = 0;
   std::uint64_t grouped_routed_expert_prereq_fallbacks = 0;
   std::uint64_t grouped_routed_expert_lookup_fallbacks = 0;
@@ -103,6 +105,8 @@ void RecordRoutedExpertMaterialization();
 void RecordFlashInferRoutedExpertUse();
 void RecordFlashInferRoutedExpertFallback();
 void RecordGroupedRoutedExpertFastpathUse();
+void RecordMoeGraphCapture();
+void RecordMoeGraphReplay();
 void RecordGroupedRoutedExpertFastpathFallback();
 void RecordGroupedRoutedExpertPrereqFallback();
 void RecordGroupedRoutedExpertLookupFallback();
