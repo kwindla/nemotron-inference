@@ -382,7 +382,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
         source.data(),
         numel,
         global_max_bits);
-    if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
+    if (!CheckCuda(cudaGetLastError())) {
       cudaFree(global_max_bits);
       return nullptr;
     }
@@ -390,7 +390,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
     WriteTensorScaleKernel<<<1, 1>>>(
         global_max_bits,
         reinterpret_cast<float*>(const_cast<std::uint8_t*>(packed->tensor_scale_data())));
-    if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
+    if (!CheckCuda(cudaGetLastError())) {
       cudaFree(global_max_bits);
       return nullptr;
     }
@@ -407,7 +407,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
       reinterpret_cast<const float*>(packed->tensor_scale_data()),
       const_cast<std::uint8_t*>(packed->packed_data()),
       const_cast<std::uint8_t*>(packed->block_scales_data()));
-  if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
+  if (!CheckCuda(cudaGetLastError())) {
     return nullptr;
   }
 
@@ -427,7 +427,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
       layout->logical_blocks_per_row,
       layout->padded_blocks_per_row,
       const_cast<std::uint8_t*>(packed->matmul_block_scales_data()));
-  if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
+  if (!CheckCuda(cudaGetLastError())) {
     return nullptr;
   }
 
