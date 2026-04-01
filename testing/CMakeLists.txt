@@ -687,6 +687,16 @@ target_compile_features(nano_16_token_correctness_test PRIVATE cxx_std_17)
 nemotron_add_test(nano_16_token_correctness_test)
 
 add_executable(
+  nano_save_prompt_oracle
+  api/nano_save_prompt_oracle.cpp
+)
+
+target_link_libraries(nano_save_prompt_oracle PRIVATE nemotron_runtime_api)
+target_compile_features(nano_save_prompt_oracle PRIVATE cxx_std_17)
+
+nemotron_add_test(nano_save_prompt_oracle)
+
+add_executable(
   prefill_prefix_oracle_test
   api/prefill_prefix_oracle_test.cpp
 )

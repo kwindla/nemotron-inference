@@ -42,7 +42,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
   - Wire into the benchmark's `--strict-linear` output so it reports exactly which tensors fell back
   Key files: `runtime/include/nemotron/linear_op_trace.h` (new), `runtime/src/backend/linear_op_trace.cpp` (new), `runtime/src/backend/linear_op.cpp`, `runtime/src/backend/scaled_fp8_linear.cu`, `runtime/CMakeLists.txt`
 
-- [ ] **5. Add saved-token oracle for the fixed 16-token prompt**
+- [x] **5. Add saved-token oracle for the fixed 16-token prompt**
   Create a small utility that runs the reference path (Route A) on the fixed 16-token prompt and saves the per-token argmax sequence plus the prompt-boundary logits row as a JSON file under `artifacts/oracles/`. This gives a stable reference that doesn't require re-running the expensive reference path every time.
   - Create `testing/api/nano_save_prompt_oracle.cpp` as a standalone binary
   - Run Route A prefill, save: prompt tokens, boundary token ID, top-5 logits with indices, max logit value
@@ -79,8 +79,15 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 | 1 | Embedding and final-norm trace comparison | done | 534ba08 | nano-prompt-parity (diagnosis) |
 | 2 | GEMM plan-build diagnostic logging | done | 5edd6f9 | nano-linear-fastpath (diagnostics) |
 | 3 | Linear counter breakdown in layer probes | done | ac16b68 | nano-linear-fastpath (per-layer) |
-| 4 | Per-operator linear counter tracking | done | — | nano-linear-fastpath (per-tensor) |
-| 5 | Saved-token oracle for fixed prompt | pending | — | nano-prompt-parity (oracle) |
+| 4 | Per-operator linear counter tracking | done | 241c4be | nano-linear-fastpath (per-tensor) |
+| 5 | Saved-token oracle for fixed prompt | done | — | nano-prompt-parity (oracle) |
 | 6 | Load-and-compare oracle mode | pending | — | nano-prompt-parity (fast compare) |
 | 7 | Expert staging counters in correctness test | pending | — | counter coverage |
 | 8 | Benchmark regression comparison script | pending | — | nano-roofline-loop (foundation) |
+
+## Progress Log
+
+- 2026-04-01 step-5: Changed `testing/api/nano_save_prompt_oracle.cpp` and `testing/CMakeLists.txt` to add a standalone Route A oracle writer for the fixed 16-token Nano prompt, with `--output` support, default `artifacts/oracles/nano_16_token_oracle_<timestamp>.json`, ISO 8601 UTC timestamps, manual JSON serialization, prompt-boundary top-5 capture, and 16-token greedy decode capture.
+- 2026-04-01 step-5: Verified `cmake -S . -B build-phase1-tests` and `cmake --build build-phase1-tests --target nano_save_prompt_oracle 2>&1 | tail -20`; the target builds cleanly. The first configure/build attempt was launched in parallel against a fresh build tree and raced before the target metadata existed, so the build was rerun sequentially.
+- 2026-04-01 step-5: Risk remaining: this checkpoint verified compilation only. The binary still needs an end-to-end run with `NEMOTRON_FORWARD_MANIFEST` and CUDA available to validate emitted JSON contents and the saved Route A token sequence.
+- 2026-04-01 step-5: Next step is step 6, adding oracle load-and-compare mode to `testing/api/nano_16_token_correctness_test.cpp`.
