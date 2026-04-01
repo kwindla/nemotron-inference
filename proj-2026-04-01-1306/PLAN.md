@@ -83,7 +83,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 | 5 | Saved-token oracle for fixed prompt | done | 9fdad33 | nano-prompt-parity (oracle) |
 | 6 | Load-and-compare oracle mode | done | 52cf0f5 | nano-prompt-parity (fast compare) |
 | 7 | Expert staging counters in correctness test | done | 87e6ea5 | counter coverage |
-| 8 | Benchmark regression comparison script | done | — | nano-roofline-loop (foundation) |
+| 8 | Benchmark regression comparison script | done | b798345 | nano-roofline-loop (foundation) |
 
 ## Progress Log
 
