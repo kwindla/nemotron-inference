@@ -29,7 +29,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Provide a thread-safe global accessor `GetLinearOpCounters()` and a `ResetLinearOpCounters()`. Instrument `UploadedLinearOp::Run()` in `linear_op.cpp` and `ScaledFp8LinearOp::Run()` in `scaled_fp8_linear.cu` to increment the appropriate counters on each code path. Add a `PrintLinearOpCounterSummary(std::ostream&)` helper. No behavior change to existing code—purely additive.
   Key files: `runtime/include/nemotron/linear_op_counters.h` (new), `runtime/src/backend/linear_op_counters.cpp` (new), `runtime/src/backend/linear_op.cpp`, `runtime/src/backend/scaled_fp8_linear.cu`, `runtime/CMakeLists.txt`
 
-- [ ] **3. Steady-state decode benchmark mode**
+- [x] **3. Steady-state decode benchmark mode**
   Add a `--mode=steady-state` option to `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp` that:
   - Runs prompt prefill once (using the same 16-token prompt)
   - Then times N repeated `ContinueSingleToken(...)` calls individually (default N=16, configurable via `--decode-tokens=N`)
@@ -108,8 +108,8 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Route-separating prompt comparison matrix | done | 34eefe4 | preflight-prompt-matrix |
-| 2 | Linear operator execution counters | done | — | preflight-linear-counters |
-| 3 | Steady-state decode benchmark mode | pending | — | preflight-steady-bench |
+| 2 | Linear operator execution counters | done | 9db3589 | preflight-linear-counters |
+| 3 | Steady-state decode benchmark mode | done | — | preflight-steady-bench |
 | 4 | cuDNN FE attention feasibility report | pending | — | preflight-attention-feasibility |
 | 5 | Expert staging cost metrics | pending | — | preflight-expert-staging-metrics |
 | 6 | Device-side argmax kernel | pending | — | nano-device-token-select (kernel) |
