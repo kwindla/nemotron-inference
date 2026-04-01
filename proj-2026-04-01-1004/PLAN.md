@@ -39,7 +39,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Keep the existing default mode (`--mode=phased` or no flag) unchanged. Also wire `PrintLinearOpCounterSummary()` from step 2 into both benchmark modes so the JSON artifact includes actual linear backend usage counts.
   Key files: `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`
 
-- [ ] **4. cuDNN FE attention feasibility report**
+- [x] **4. cuDNN FE attention feasibility report**
   The existing `cudnn_handle_stub.cpp` and `cudnn_paged_attention_stub.cpp` always return `valid()=false` and `nullptr`. This means cuDNN FE paged attention is definitively not available in this build.
   Add a small standalone test `testing/api/cudnn_feasibility_test.cpp` that:
   - Creates a `CudnnHandle` and reports `valid()`, `version()`
@@ -109,8 +109,8 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 |---|------|--------|--------|-------|
 | 1 | Route-separating prompt comparison matrix | done | 34eefe4 | preflight-prompt-matrix |
 | 2 | Linear operator execution counters | done | 9db3589 | preflight-linear-counters |
-| 3 | Steady-state decode benchmark mode | done | — | preflight-steady-bench |
-| 4 | cuDNN FE attention feasibility report | pending | — | preflight-attention-feasibility |
+| 3 | Steady-state decode benchmark mode | done | 80256a1 | preflight-steady-bench |
+| 4 | cuDNN FE attention feasibility report | done | — | preflight-attention-feasibility; confirmed NOT AVAILABLE (stub build) |
 | 5 | Expert staging cost metrics | pending | — | preflight-expert-staging-metrics |
 | 6 | Device-side argmax kernel | pending | — | nano-device-token-select (kernel) |
 | 7 | Integrate device argmax into decode loop | pending | — | nano-device-token-select (integration) |

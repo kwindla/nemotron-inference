@@ -223,6 +223,16 @@ target_compile_features(dense_weight_test PRIVATE cxx_std_17)
 nemotron_add_test(dense_weight_test)
 
 add_executable(
+  linear_op_test
+  backend/linear_op_test.cpp
+)
+
+target_link_libraries(linear_op_test PRIVATE nemotron_runtime_backend)
+target_compile_features(linear_op_test PRIVATE cxx_std_17)
+
+nemotron_add_test(linear_op_test)
+
+add_executable(
   scaled_fp8_linear_test
   backend/scaled_fp8_linear_test.cpp
 )
@@ -627,6 +637,26 @@ target_compile_features(runtime_environment_test PRIVATE cxx_std_17)
 nemotron_add_test(runtime_environment_test)
 
 add_executable(
+  cudnn_feasibility_test
+  api/cudnn_feasibility_test.cpp
+)
+
+target_link_libraries(cudnn_feasibility_test PRIVATE nemotron_runtime_api)
+target_compile_features(cudnn_feasibility_test PRIVATE cxx_std_17)
+
+nemotron_add_test(cudnn_feasibility_test)
+
+add_executable(
+  state_snapshot_test
+  api/state_snapshot_test.cpp
+)
+
+target_link_libraries(state_snapshot_test PRIVATE nemotron_runtime_api)
+target_compile_features(state_snapshot_test PRIVATE cxx_std_17)
+
+nemotron_add_test(state_snapshot_test)
+
+add_executable(
   full_forward_manifest_smoke_test
   api/full_forward_manifest_smoke_test.cpp
 )
@@ -635,6 +665,16 @@ target_link_libraries(full_forward_manifest_smoke_test PRIVATE nemotron_runtime_
 target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_17)
 
 nemotron_add_test(full_forward_manifest_smoke_test)
+
+add_executable(
+  nano_16_token_correctness_test
+  api/nano_16_token_correctness_test.cpp
+)
+
+target_link_libraries(nano_16_token_correctness_test PRIVATE nemotron_runtime_api)
+target_compile_features(nano_16_token_correctness_test PRIVATE cxx_std_17)
+
+nemotron_add_test(nano_16_token_correctness_test)
 
 add_executable(
   prefill_prefix_oracle_test
