@@ -13,7 +13,6 @@ namespace nemotron {
 namespace {
 
 constexpr std::size_t kBlockWidth = 16;
-constexpr std::size_t kScaleRowTile = 128;
 constexpr std::size_t kScaleBlockTile = 4;
 constexpr float kFp4MaxFinite = 6.0f;
 constexpr float kFp8E4M3MaxFinite = 448.0f;
@@ -35,9 +34,24 @@ std::size_t RoundUp(std::size_t value, std::size_t alignment) {
   return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
 }
 
-std::size_t MatmulScaleBytes(std::size_t rows, std::size_t cols) {
-  return cols % kBlockWidth == 0 ? RoundUp(rows, kScaleRowTile) * RoundUp(cols / kBlockWidth, kScaleBlockTile)
-                                 : 0;
+std::size_t RowTile(Nvfp4ScaleLayout scale_layout) {
+  switch (scale_layout) {
+    case Nvfp4ScaleLayout::kSwizzled128x4:
+      return 128;
+    case Nvfp4ScaleLayout::kSwizzled8x4:
+      return 8;
+  }
+  return 128;
+}
+
+std::size_t MatmulScaleBytes(
+    std::size_t rows,
+    std::size_t cols,
+    Nvfp4ScaleLayout scale_layout) {
+  return cols % kBlockWidth == 0
+             ? RoundUp(rows, RowTile(scale_layout)) *
+                   RoundUp(cols / kBlockWidth, kScaleBlockTile)
+             : 0;
 }
 
 __device__ float ClampScale(float value) {
@@ -138,17 +152,30 @@ __global__ void PackRowMajorFp32ToNvfp4Kernel(
 __device__ std::size_t ExecutionScaleOffset(
     std::size_t row,
     std::size_t block_col,
-    std::size_t padded_blocks_per_row) {
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout) {
   const std::size_t num_k_tiles = padded_blocks_per_row / kScaleBlockTile;
-  const std::size_t m_tile = row / kScaleRowTile;
-  const std::size_t outer_m = row & 31u;
-  const std::size_t inner_m = (row >> 5u) & 3u;
   const std::size_t k_tile = block_col / kScaleBlockTile;
   const std::size_t inner_k = block_col & 3u;
-  return ((((m_tile * num_k_tiles) + k_tile) << 9u) |
-          (outer_m << 4u) |
-          (inner_m << 2u) |
-          inner_k);
+  switch (scale_layout) {
+    case Nvfp4ScaleLayout::kSwizzled128x4: {
+      const std::size_t m_tile = row / 128u;
+      const std::size_t outer_m = row & 31u;
+      const std::size_t inner_m = (row >> 5u) & 3u;
+      return ((((m_tile * num_k_tiles) + k_tile) << 9u) |
+              (outer_m << 4u) |
+              (inner_m << 2u) |
+              inner_k);
+    }
+    case Nvfp4ScaleLayout::kSwizzled8x4: {
+      const std::size_t m_tile = row / 8u;
+      const std::size_t inner_m = row & 7u;
+      return (((m_tile * num_k_tiles) + k_tile) << 5u) |
+             (inner_m << 2u) |
+             inner_k;
+    }
+  }
+  return 0;
 }
 
 __global__ void SwizzleBlockScalesForMatmulKernel(
@@ -156,6 +183,7 @@ __global__ void SwizzleBlockScalesForMatmulKernel(
     std::size_t rows,
     std::size_t logical_blocks_per_row,
     std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
     std::uint8_t* matmul_scales) {
   const std::size_t scale_index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
   const std::size_t total_scales = rows * logical_blocks_per_row;
@@ -166,13 +194,14 @@ __global__ void SwizzleBlockScalesForMatmulKernel(
   const std::size_t row = scale_index / logical_blocks_per_row;
   const std::size_t block_col = scale_index % logical_blocks_per_row;
   const std::size_t destination_offset =
-      ExecutionScaleOffset(row, block_col, padded_blocks_per_row);
+      ExecutionScaleOffset(row, block_col, padded_blocks_per_row, scale_layout);
   matmul_scales[destination_offset] = row_major_scales[scale_index];
 }
 
 }  // namespace
 
 struct DeviceNvfp4Matrix::Impl {
+  Nvfp4ScaleLayout scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
   std::size_t rows = 0;
   std::size_t cols = 0;
   std::size_t packed_nbytes = 0;
@@ -185,7 +214,10 @@ struct DeviceNvfp4Matrix::Impl {
   std::uint8_t* tensor_scale_data = nullptr;
 };
 
-std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(std::size_t rows, std::size_t cols) {
+std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
+    std::size_t rows,
+    std::size_t cols,
+    Nvfp4ScaleLayout scale_layout) {
   if (rows == 0 || cols == 0 || cols % kBlockWidth != 0) {
     return nullptr;
   }
@@ -196,11 +228,12 @@ std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(std::size_t rows, s
   }
 
   auto impl = std::make_unique<Impl>();
+  impl->scale_layout = scale_layout;
   impl->rows = rows;
   impl->cols = cols;
   impl->packed_nbytes = PackedBytes(rows, cols);
   impl->block_scales_nbytes = BlockScaleBytes(rows, cols);
-  impl->matmul_block_scales_nbytes = MatmulScaleBytes(rows, cols);
+  impl->matmul_block_scales_nbytes = MatmulScaleBytes(rows, cols, scale_layout);
   impl->tensor_scale_nbytes = sizeof(float);
 
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->packed_data), impl->packed_nbytes)) ||
@@ -299,6 +332,10 @@ const std::uint8_t* DeviceNvfp4Matrix::tensor_scale_data() const {
   return impl_ ? impl_->tensor_scale_data : nullptr;
 }
 
+Nvfp4ScaleLayout DeviceNvfp4Matrix::scale_layout() const {
+  return impl_ ? impl_->scale_layout : Nvfp4ScaleLayout::kSwizzled128x4;
+}
+
 bool DeviceNvfp4Matrix::CopyPackedToHost(std::vector<std::uint8_t>* output) const {
   if (!valid() || output == nullptr) {
     return false;
@@ -345,7 +382,9 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
 
   const std::size_t rows = source.shape()[0];
   const std::size_t cols = source.shape()[1];
-  auto packed = DeviceNvfp4Matrix::Create(rows, cols);
+  const Nvfp4ScaleLayout scale_layout =
+      ResolveActivationNvfp4ScaleLayout(rows, options.execution_scale_layout);
+  auto packed = DeviceNvfp4Matrix::Create(rows, cols, scale_layout);
   if (!packed || !packed->valid()) {
     return nullptr;
   }
@@ -411,7 +450,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
     return nullptr;
   }
 
-  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols);
+  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols, scale_layout);
   if (!layout.has_value()) {
     return nullptr;
   }
@@ -426,6 +465,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
       rows,
       layout->logical_blocks_per_row,
       layout->padded_blocks_per_row,
+      scale_layout,
       const_cast<std::uint8_t*>(packed->matmul_block_scales_data()));
   if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
     return nullptr;

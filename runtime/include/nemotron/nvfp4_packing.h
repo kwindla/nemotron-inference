@@ -5,10 +5,13 @@
 #include <optional>
 #include <vector>
 
+#include "nemotron/nvfp4_scale_layout.h"
+
 namespace nemotron {
 
 struct Nvfp4PackOptions {
   std::optional<float> fixed_tensor_scale;
+  std::optional<Nvfp4ScaleLayout> execution_scale_layout;
 };
 
 struct HostNvfp4Matrix {

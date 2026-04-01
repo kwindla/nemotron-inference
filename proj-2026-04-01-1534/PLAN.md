@@ -95,7 +95,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 ## Steps
 
-- [ ] **1. Make the linear fastpath correct on the real benchmark path**
+- [x] **1. Make the linear fastpath correct on the real benchmark path**
   Goal:
   - turn `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` from a diagnostic mode into a correct hot path
   Scope:
@@ -323,7 +323,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Linear fastpath correctness + layout translation | pending | — | correctness gate before any roofline claim |
+| 1 | Linear fastpath correctness + layout translation | done | — | NVFP4 8x4 scale layout for M<=32 decode activations |
 | 2 | Re-baseline with counters and Nsight | pending | — | choose next bottleneck from evidence |
 | 3 | Attention metadata/workspace ownership + sync cleanup | pending | — | no new attention math in this step |
 | 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
@@ -339,3 +339,8 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - step 4 now has an explicit decision rule: full routed-expert residency first if it fits, otherwise a single globally budgeted residency manager
   - step 5 now mirrors the reference split between context/prefill and generation kernels instead of proposing one generic replacement kernel
   - every step now has enough scope, reference, implementation, and verification detail to iterate independently
+- 2026-04-01: Step 1 checkpoint: translated the activation-side NVFP4 execution-scale layout selection so runtime packing now uses `8x4` for small-`M` (`M <= 32`) and keeps `128x4` for larger shapes, matching the vLLM/TensorRT-LLM reference split.
+  - what changed: added explicit NVFP4 execution-scale layout plumbing, taught `PackDeviceRowMajorFp32ToNvfp4` to auto-select `8x4` for decode-like activations, kept weight swizzling on the existing `128x4` path, and improved failure diagnostics so cuBLASLt runner failures print exact status codes while plan-build rejects print the concrete nullopt reason and activation scale layout.
+  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend`, `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test`, and `cmake --build build-benchmarks --target nano_fused_decode_bench` all passed; targeted NVFP4 tests `device_nvfp4_matrix_test`, `linear_op_test`, and `nvfp4_gemm_runner_test` also passed.
+  - what risk remains: the full real-model split-prefill parity path with `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` was not rerun in this checkpoint, so expert-layer-13 may still hide a second issue in routed-expert weight preparation or another cuBLASLt path.
+  - what the next step is: rerun the step-1 smoke and Nano parity commands with fastpath tracing enabled, confirm whether the expert-layer-13 divergence disappears, and only then decide whether routed-expert weight repacking or additional cuBLASLt path fixes are still needed.

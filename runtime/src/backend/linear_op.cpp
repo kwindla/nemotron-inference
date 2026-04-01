@@ -92,34 +92,53 @@ void LogGemmPlanBuildFailure(
     const GemmDescriptor& descriptor,
     std::size_t rows,
     const char* plan_source,
-    GemmPlanFailureStep failure_step) {
+    GemmPlanFailureStep failure_step,
+    std::optional<Nvfp4ScaleLayout> activation_scale_layout = std::nullopt) {
   std::cerr << "linear_op: plan build failed for " << descriptor.tensor_name
             << " M=" << rows
             << " N=" << descriptor.output_rows
             << " K=" << descriptor.input_cols
             << " step=plan_build"
             << " plan_source=" << plan_source
-            << " sub_step=" << GemmPlanFailureStepName(failure_step)
-            << "\n";
+            << " sub_step=" << GemmPlanFailureStepName(failure_step);
+  if (activation_scale_layout.has_value()) {
+    std::cerr << " activation_scale_layout=" << ToString(*activation_scale_layout);
+  }
+  std::cerr << "\n";
 }
 
 void LogGemmExecuteFailure(
     const GemmDescriptor& descriptor,
     std::size_t rows,
-    const char* plan_source) {
+    const char* plan_source,
+    std::optional<Nvfp4ScaleLayout> activation_scale_layout = std::nullopt) {
   std::cerr << "linear_op: execute failed for " << descriptor.tensor_name
             << " M=" << rows
             << " N=" << descriptor.output_rows
             << " K=" << descriptor.input_cols
             << " step=execute"
-            << " plan_source=" << plan_source
-            << "\n";
+            << " plan_source=" << plan_source;
+  if (activation_scale_layout.has_value()) {
+    std::cerr << " activation_scale_layout=" << ToString(*activation_scale_layout);
+  }
+  std::cerr << "\n";
 }
 
-Nvfp4PackOptions RuntimeNvfp4PackOptions(bool debug, const GemmDescriptor& descriptor) {
+Nvfp4PackOptions RuntimeNvfp4PackOptions(
+    bool debug,
+    const GemmDescriptor& descriptor,
+    std::size_t rows) {
   Nvfp4PackOptions options;
+  options.execution_scale_layout = ResolveActivationNvfp4ScaleLayout(rows);
   const char* raw_value = std::getenv(kNvfp4ActivationTensorScaleEnvVar);
   if (raw_value == nullptr || raw_value[0] == '\0') {
+    if (debug) {
+      std::cerr << "linear_op: NVFP4 activation pack options for "
+                << descriptor.tensor_name
+                << " M=" << rows
+                << " scale_layout=" << ToString(*options.execution_scale_layout)
+                << " tensor_scale=dynamic\n";
+    }
     return options;
   }
   const auto fixed_tensor_scale = ParsePositiveFloatEnv(kNvfp4ActivationTensorScaleEnvVar);
@@ -133,9 +152,13 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(bool debug, const GemmDescriptor& descr
   }
   options.fixed_tensor_scale = *fixed_tensor_scale;
   if (debug) {
-    std::cerr << "linear_op: using fixed NVFP4 activation tensor scale "
+    std::cerr << "linear_op: NVFP4 activation pack options for "
+              << descriptor.tensor_name
+              << " M=" << rows
+              << " scale_layout=" << ToString(*options.execution_scale_layout)
+              << " tensor_scale=fixed:"
               << *fixed_tensor_scale
-              << " for " << descriptor.tensor_name << "\n";
+              << "\n";
   }
   return options;
 }
@@ -431,7 +454,10 @@ bool UploadedLinearOp::Run(
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       {
-        const Nvfp4PackOptions pack_options = RuntimeNvfp4PackOptions(debug, impl_->descriptor);
+        const Nvfp4PackOptions pack_options =
+            RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows);
+        const std::optional<Nvfp4ScaleLayout> activation_scale_layout =
+            pack_options.execution_scale_layout;
         const char* plan_source = "descriptor";
         GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
         auto plan = BuildDescriptorGemmPlan(
@@ -444,7 +470,8 @@ bool UploadedLinearOp::Run(
               impl_->descriptor,
               rows,
               plan_source,
-              failure_step);
+              failure_step,
+              activation_scale_layout);
         }
         if (!plan.has_value() && LinearDeviceFastpathEnabled()) {
           plan_source = "runtime";
@@ -460,7 +487,8 @@ bool UploadedLinearOp::Run(
                 impl_->descriptor,
                 rows,
                 plan_source,
-                failure_step);
+                failure_step,
+                activation_scale_layout);
           }
         }
         if (plan.has_value()) {
@@ -494,7 +522,11 @@ bool UploadedLinearOp::Run(
           counters.nvfp4_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
         }
         if (debug && plan.has_value()) {
-          LogGemmExecuteFailure(impl_->descriptor, rows, plan_source);
+          LogGemmExecuteFailure(
+              impl_->descriptor,
+              rows,
+              plan_source,
+              activation_scale_layout);
         }
         break;
       }
@@ -519,7 +551,7 @@ bool UploadedLinearOp::Run(
               activations,
               *impl_->nvfp4_weight,
               output,
-              RuntimeNvfp4PackOptions(debug, impl_->descriptor));
+              RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows));
       break;
   }
   if (!device_reference_ok) {

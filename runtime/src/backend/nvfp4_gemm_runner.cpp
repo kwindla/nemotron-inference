@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 
+#include <cstdlib>
+#include <iostream>
 #include <optional>
 
 namespace nemotron {
@@ -14,6 +16,86 @@ bool CheckCuda(cudaError_t status) {
 
 bool CheckCublas(cublasStatus_t status) {
   return status == CUBLAS_STATUS_SUCCESS;
+}
+
+bool DebugEnabled() {
+  return std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+}
+
+const char* CublasStatusName(cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+      return "CUBLAS_STATUS_NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR:
+      return "CUBLAS_STATUS_LICENSE_ERROR";
+  }
+  return "CUBLAS_STATUS_UNKNOWN";
+}
+
+void LogCublasFailure(
+    const char* op,
+    cublasStatus_t status,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k) {
+  if (!DebugEnabled()) {
+    return;
+  }
+  std::cerr << "nvfp4_gemm_runner: " << op
+            << " failed"
+            << " status=" << CublasStatusName(status)
+            << "(" << static_cast<int>(status) << ")"
+            << " M=" << m
+            << " N=" << n
+            << " K=" << k
+            << "\n";
+}
+
+void LogCudaFailure(
+    const char* op,
+    cudaError_t status,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k) {
+  if (!DebugEnabled()) {
+    return;
+  }
+  std::cerr << "nvfp4_gemm_runner: " << op
+            << " failed"
+            << " status=" << cudaGetErrorName(status)
+            << "(" << static_cast<int>(status) << ")"
+            << " detail=" << cudaGetErrorString(status)
+            << " M=" << m
+            << " N=" << n
+            << " K=" << k
+            << "\n";
+}
+
+void LogHeuristicFailure(std::size_t m, std::size_t n, std::size_t k) {
+  if (!DebugEnabled()) {
+    return;
+  }
+  std::cerr << "nvfp4_gemm_runner: cublasLtMatmulAlgoGetHeuristic returned 0 results"
+            << " M=" << m
+            << " N=" << n
+            << " K=" << k
+            << "\n";
 }
 
 cublasOperation_t ToCublasOp(CublasLtTransform transform) {
@@ -139,108 +221,139 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
   cublasLtMatmulHeuristicResult_t heuristic{};
   int returned_results = 0;
   bool ok = true;
+  const auto check_cublas = [&](cublasStatus_t status, const char* op) {
+    if (CheckCublas(status)) {
+      return true;
+    }
+    LogCublasFailure(op, status, m, n, k);
+    return false;
+  };
+  const auto check_cuda = [&](cudaError_t status, const char* op) {
+    if (CheckCuda(status)) {
+      return true;
+    }
+    LogCudaFailure(op, status, m, n, k);
+    return false;
+  };
 
   ok &= output->FillZero();
 
-  ok &= CheckCublas(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  ok &= check_cublas(
+      cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+      "cublasLtMatmulDescCreate");
   const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
   const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
   const cublasLtMatmulMatrixScale_t scale_mode = ToCublasScaleMode(plan.scale_mode);
-  ok &= CheckCublas(
+  ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
           CUBLASLT_MATMUL_DESC_TRANSA,
           &trans_a,
-          sizeof(trans_a)));
-  ok &= CheckCublas(
+          sizeof(trans_a)),
+      "cublasLtMatmulDescSetAttribute(TRANSA)");
+  ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
           CUBLASLT_MATMUL_DESC_TRANSB,
           &trans_b,
-          sizeof(trans_b)));
-  ok &= CheckCublas(
+          sizeof(trans_b)),
+      "cublasLtMatmulDescSetAttribute(TRANSB)");
+  ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
           CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
           &scale_mode,
-          sizeof(scale_mode)));
-  ok &= CheckCublas(
+          sizeof(scale_mode)),
+      "cublasLtMatmulDescSetAttribute(A_SCALE_MODE)");
+  ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
           CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
           &scale_mode,
-          sizeof(scale_mode)));
+          sizeof(scale_mode)),
+      "cublasLtMatmulDescSetAttribute(B_SCALE_MODE)");
 
   const void* activation_block_scales = activations.block_scales_data;
   const void* weight_block_scales = weights.matmul_block_scales_data();
-  ok &= CheckCublas(
+  ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
           CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
           &activation_block_scales,
-          sizeof(activation_block_scales)));
-  ok &= CheckCublas(
+          sizeof(activation_block_scales)),
+      "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER)");
+  ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
           CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
           &weight_block_scales,
-          sizeof(weight_block_scales)));
+          sizeof(weight_block_scales)),
+      "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER)");
 
-  ok &= CheckCublas(
+  ok &= check_cublas(
       cublasLtMatrixLayoutCreate(
           &a_desc,
           CUDA_R_4F_E2M1,
           static_cast<std::uint64_t>(m),
           static_cast<std::uint64_t>(k),
-          static_cast<std::int64_t>(plan.lda)));
-  ok &= CheckCublas(
+          static_cast<std::int64_t>(plan.lda)),
+      "cublasLtMatrixLayoutCreate(A)");
+  ok &= check_cublas(
       cublasLtMatrixLayoutCreate(
           &b_desc,
           CUDA_R_4F_E2M1,
           static_cast<std::uint64_t>(n),
           static_cast<std::uint64_t>(k),
-          static_cast<std::int64_t>(plan.ldb)));
-  ok &= CheckCublas(
+          static_cast<std::int64_t>(plan.ldb)),
+      "cublasLtMatrixLayoutCreate(B)");
+  ok &= check_cublas(
       cublasLtMatrixLayoutCreate(
           &c_desc,
           CUDA_R_32F,
           static_cast<std::uint64_t>(m),
           static_cast<std::uint64_t>(n),
-          static_cast<std::int64_t>(plan.ldc)));
+          static_cast<std::int64_t>(plan.ldc)),
+      "cublasLtMatrixLayoutCreate(C)");
 
   const cublasLtOrder_t order_a = ToCublasOrder(plan.order_a);
   const cublasLtOrder_t order_b = ToCublasOrder(plan.order_b);
   const cublasLtOrder_t order_c = ToCublasOrder(plan.order_c);
-  ok &= CheckCublas(
+  ok &= check_cublas(
       cublasLtMatrixLayoutSetAttribute(
           a_desc,
           CUBLASLT_MATRIX_LAYOUT_ORDER,
           &order_a,
-          sizeof(order_a)));
-  ok &= CheckCublas(
+          sizeof(order_a)),
+      "cublasLtMatrixLayoutSetAttribute(A_ORDER)");
+  ok &= check_cublas(
       cublasLtMatrixLayoutSetAttribute(
           b_desc,
           CUBLASLT_MATRIX_LAYOUT_ORDER,
           &order_b,
-          sizeof(order_b)));
-  ok &= CheckCublas(
+          sizeof(order_b)),
+      "cublasLtMatrixLayoutSetAttribute(B_ORDER)");
+  ok &= check_cublas(
       cublasLtMatrixLayoutSetAttribute(
           c_desc,
           CUBLASLT_MATRIX_LAYOUT_ORDER,
           &order_c,
-          sizeof(order_c)));
+          sizeof(order_c)),
+      "cublasLtMatrixLayoutSetAttribute(C_ORDER)");
 
-  ok &= CheckCublas(cublasLtMatmulPreferenceCreate(&preference));
+  ok &= check_cublas(
+      cublasLtMatmulPreferenceCreate(&preference),
+      "cublasLtMatmulPreferenceCreate");
   const std::size_t max_workspace = handle.workspace_bytes();
-  ok &= CheckCublas(
+  ok &= check_cublas(
       cublasLtMatmulPreferenceSetAttribute(
           preference,
           CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
           &max_workspace,
-          sizeof(max_workspace)));
+          sizeof(max_workspace)),
+      "cublasLtMatmulPreferenceSetAttribute(MAX_WORKSPACE_BYTES)");
 
   if (ok) {
-    ok &= CheckCublas(
+    ok &= check_cublas(
         cublasLtMatmulAlgoGetHeuristic(
             handle.handle(),
             op_desc,
@@ -251,14 +364,18 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
             preference,
             1,
             &heuristic,
-            &returned_results));
+            &returned_results),
+        "cublasLtMatmulAlgoGetHeuristic");
     ok &= returned_results > 0;
+    if (!ok && returned_results == 0) {
+      LogHeuristicFailure(m, n, k);
+    }
   }
 
   if (ok) {
     const float alpha = activation_tensor_scale * weight_tensor_scale;
     const float beta = 0.0f;
-    ok &= CheckCublas(
+    ok &= check_cublas(
         cublasLtMatmul(
             handle.handle(),
             op_desc,
@@ -275,8 +392,9 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
             &heuristic.algo,
             handle.workspace(),
             handle.workspace_bytes(),
-            nullptr));
-    ok &= CheckCuda(cudaDeviceSynchronize());
+            nullptr),
+        "cublasLtMatmul");
+    ok &= check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   }
 
   if (preference != nullptr) {

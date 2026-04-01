@@ -7,12 +7,16 @@
 
 #include "nemotron/device_tensor.h"
 #include "nemotron/nvfp4_packing.h"
+#include "nemotron/nvfp4_scale_layout.h"
 
 namespace nemotron {
 
 class DeviceNvfp4Matrix {
  public:
-  static std::unique_ptr<DeviceNvfp4Matrix> Create(std::size_t rows, std::size_t cols);
+  static std::unique_ptr<DeviceNvfp4Matrix> Create(
+      std::size_t rows,
+      std::size_t cols,
+      Nvfp4ScaleLayout scale_layout = Nvfp4ScaleLayout::kSwizzled128x4);
 
   DeviceNvfp4Matrix(DeviceNvfp4Matrix&&) noexcept;
   DeviceNvfp4Matrix& operator=(DeviceNvfp4Matrix&&) noexcept;
@@ -32,6 +36,7 @@ class DeviceNvfp4Matrix {
   const std::uint8_t* block_scales_data() const;
   const std::uint8_t* matmul_block_scales_data() const;
   const std::uint8_t* tensor_scale_data() const;
+  Nvfp4ScaleLayout scale_layout() const;
 
   bool CopyPackedToHost(std::vector<std::uint8_t>* output) const;
   bool CopyBlockScalesToHost(std::vector<std::uint8_t>* output) const;
