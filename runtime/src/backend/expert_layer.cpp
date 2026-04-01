@@ -2702,7 +2702,7 @@ bool RunExpertLayerImpl(
         graph_ok = graph_latent_view && graph_grouped_up && graph_output;
 
         if (graph_ok) {
-          cudaStream_t stream = nullptr;
+          cudaStream_t stream = cudaStreamPerThread;
           graph_ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
 
           if (graph_ok) {
@@ -2716,7 +2716,7 @@ bool RunExpertLayerImpl(
                 impl.routed_down_tensor_scale_lookup_device,
                 impl.scratch_down_packed_ptrs, impl.scratch_down_raw_scale_ptrs,
                 impl.scratch_selected_down_tensor_scales,
-                impl.scratch_missing_count, impl.scratch_missing_indices);
+                impl.scratch_missing_count, impl.scratch_missing_indices, stream);
 
             PackDeviceRowMajorFp32ToNvfp4InPlace(
                 *graph_latent_view, {},
@@ -2724,7 +2724,7 @@ bool RunExpertLayerImpl(
                 impl.scratch_latent_block_scales.data(),
                 impl.scratch_latent_matmul_scales.data(),
                 reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-                impl.scratch_global_max_bits.data());
+                impl.scratch_global_max_bits.data(), stream);
 
             FusedRoutedUpProjPackedNvfp4SingleToken(
                 impl.scratch_latent_packed_data.data(),
@@ -2732,15 +2732,15 @@ bool RunExpertLayerImpl(
                 reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
                 impl.config.moe_latent_size,
                 impl.scratch_up_packed_ptrs, impl.scratch_up_raw_scale_ptrs,
-                impl.scratch_selected_up_tensor_scales, graph_grouped_up.get());
+                impl.scratch_selected_up_tensor_scales, graph_grouped_up.get(), stream);
 
             ScaleRelu2PackRowsToNvfp4InPlace(
                 *graph_grouped_up, impl.scratch_row_scales.data(),
                 impl.scratch_down_act_packed, impl.scratch_down_act_block_scales,
-                impl.scratch_down_act_tensor_scales);
+                impl.scratch_down_act_tensor_scales, stream);
 
             cudaMemsetAsync(impl.scratch_graph_output.data(), 0,
-                            impl.config.moe_latent_size * sizeof(float));
+                            impl.config.moe_latent_size * sizeof(float), stream);
 
             FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
                 impl.scratch_down_act_packed.data(),
@@ -2749,7 +2749,7 @@ bool RunExpertLayerImpl(
                 impl.scratch_graph_weights.data(),
                 impl.config.routed_expert_intermediate_size,
                 impl.scratch_down_packed_ptrs, impl.scratch_down_raw_scale_ptrs,
-                impl.scratch_selected_down_tensor_scales, graph_output.get());
+                impl.scratch_selected_down_tensor_scales, graph_output.get(), stream);
 
             graph_ok = cudaStreamEndCapture(stream, &impl.moe_graph) == cudaSuccess &&
                        impl.moe_graph != nullptr;
