@@ -1449,6 +1449,59 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       entry.grouped_lookup_ready = true;
     }
   }
+  // Pre-allocate scratch buffers for try_grouped_routed_single_token.
+  // All sizes derive from config and are stable for the lifetime of this layer.
+  {
+    constexpr std::size_t kNvfp4BlockWidth = 16;
+    constexpr std::size_t kScaleRowTile = 128;
+    constexpr std::size_t kScaleBlockTile = 4;
+    constexpr std::size_t kCutlassAlign = 256;
+    const auto round_up = [](std::size_t value, std::size_t alignment) -> std::size_t {
+      return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
+    };
+
+    const std::size_t top_k = config.top_k;
+    const std::size_t latent = config.moe_latent_size;
+    const std::size_t intermediate = config.routed_expert_intermediate_size;
+
+    // -- Gather output buffers (sized for top_k selections) --
+    impl->scratch_up_packed_ptrs.Resize(top_k);
+    impl->scratch_up_raw_scale_ptrs.Resize(top_k);
+    impl->scratch_down_packed_ptrs.Resize(top_k);
+    impl->scratch_down_raw_scale_ptrs.Resize(top_k);
+    impl->scratch_missing_count.Resize(1);
+    impl->scratch_missing_indices.Resize(top_k);
+    impl->scratch_selected_up_tensor_scales.Resize(top_k);
+    impl->scratch_selected_down_tensor_scales.Resize(top_k);
+
+    // -- NVFP4 packing buffers for latent activation (M=1, K=latent) --
+    impl->scratch_latent_packed_data.Resize((1 * latent + 1u) / 2u);
+    impl->scratch_latent_block_scales.Resize(latent / kNvfp4BlockWidth);
+    impl->scratch_latent_matmul_scales.Resize(
+        round_up(1, kScaleRowTile) * round_up(latent / kNvfp4BlockWidth, kScaleBlockTile));
+    impl->scratch_latent_tensor_scale.Resize(sizeof(float));
+    impl->scratch_global_max_bits.Resize(1);
+
+    // -- ScaleRelu2 output buffers (top_k rows, intermediate cols) --
+    impl->scratch_down_act_packed.Resize((top_k * intermediate + 1u) / 2u);
+    impl->scratch_down_act_block_scales.Resize(top_k * (intermediate / kNvfp4BlockWidth));
+    impl->scratch_down_act_tensor_scales.Resize(top_k);
+
+    // -- Pre-filled row scales (constant 1.0f, avoids per-token H→D copy) --
+    if (impl->scratch_row_scales.Resize(top_k)) {
+      std::vector<float> ones(top_k, 1.0f);
+      impl->scratch_row_scales.CopyFromHost(ones);
+    }
+
+    // -- CUTLASS path aligned buffers --
+    const std::size_t act_packed_row_bytes = intermediate / 2;
+    const std::size_t act_scale_row_bytes = intermediate / kNvfp4BlockWidth;
+    const std::size_t aligned_packed_row = round_up(act_packed_row_bytes, kCutlassAlign);
+    const std::size_t aligned_scale_row = round_up(act_scale_row_bytes, kCutlassAlign);
+    impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
+    impl->scratch_aligned_act_scales.Resize(top_k * aligned_scale_row);
+  }
+
   std::string strict_failure_reason;
   if (!ConfigureRoutedMoEBackend(
           impl.get(),
