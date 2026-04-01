@@ -50,4 +50,16 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
     const DeviceTensorFp32& source,
     const Nvfp4PackOptions& options = {});
 
+// Same as PackDeviceRowMajorFp32ToNvfp4 but writes into pre-allocated buffers.
+// Zero cudaMalloc on the hot path. All output pointers must be device-resident
+// and pre-sized for the given source dimensions.
+bool PackDeviceRowMajorFp32ToNvfp4InPlace(
+    const DeviceTensorFp32& source,
+    const Nvfp4PackOptions& options,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch);
+
 }  // namespace nemotron

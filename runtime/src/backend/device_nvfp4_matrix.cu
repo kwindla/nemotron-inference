@@ -434,4 +434,93 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
   return packed;
 }
 
+bool PackDeviceRowMajorFp32ToNvfp4InPlace(
+    const DeviceTensorFp32& source,
+    const Nvfp4PackOptions& options,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch) {
+  if (!source.valid() || source.shape().size() != 2 ||
+      packed_data == nullptr || block_scales_data == nullptr ||
+      matmul_block_scales_data == nullptr || tensor_scale_data == nullptr) {
+    return false;
+  }
+
+  const std::size_t rows = source.shape()[0];
+  const std::size_t cols = source.shape()[1];
+  if (rows == 0 || cols == 0 || cols % kBlockWidth != 0) {
+    return false;
+  }
+
+  const std::optional<float> fixed_tensor_scale = NormalizeFixedTensorScale(options);
+  if (options.fixed_tensor_scale.has_value() && !fixed_tensor_scale.has_value()) {
+    return false;
+  }
+
+  if (fixed_tensor_scale.has_value()) {
+    const float host_tensor_scale = *fixed_tensor_scale;
+    if (!CheckCuda(cudaMemcpy(
+            tensor_scale_data, &host_tensor_scale,
+            sizeof(host_tensor_scale), cudaMemcpyHostToDevice))) {
+      return false;
+    }
+  } else {
+    if (global_max_bits_scratch == nullptr) {
+      return false;
+    }
+    if (!CheckCuda(cudaMemset(global_max_bits_scratch, 0, sizeof(unsigned int)))) {
+      return false;
+    }
+
+    const std::size_t numel = rows * cols;
+    constexpr std::size_t kThreadsPerBlock = 128;
+    const std::size_t reduction_grid_size = (numel + kThreadsPerBlock - 1u) / kThreadsPerBlock;
+    ComputeGlobalMaxAbsKernel<<<static_cast<unsigned int>(reduction_grid_size), kThreadsPerBlock>>>(
+        source.data(),
+        numel,
+        global_max_bits_scratch);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+
+    WriteTensorScaleKernel<<<1, 1>>>(
+        global_max_bits_scratch,
+        tensor_scale_data);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+  }
+
+  constexpr std::size_t kThreadsPerBlock = 128;
+  const std::size_t total_blocks = rows * (cols / kBlockWidth);
+  const std::size_t grid_size = (total_blocks + kThreadsPerBlock - 1u) / kThreadsPerBlock;
+  PackRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+      source.data(),
+      rows,
+      cols,
+      tensor_scale_data,
+      packed_data,
+      block_scales_data);
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols);
+  if (!layout.has_value()) {
+    return false;
+  }
+  if (!CheckCuda(cudaMemset(matmul_block_scales_data, 0, MatmulScaleBytes(rows, cols)))) {
+    return false;
+  }
+  SwizzleBlockScalesForMatmulKernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+      block_scales_data,
+      rows,
+      layout->logical_blocks_per_row,
+      layout->padded_blocks_per_row,
+      matmul_block_scales_data);
+  return CheckCuda(cudaGetLastError());
+}
+
 }  // namespace nemotron
