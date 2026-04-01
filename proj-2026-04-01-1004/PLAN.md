@@ -67,7 +67,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Add to `runtime/CMakeLists.txt`. Add a unit test `testing/backend/device_argmax_test.cpp` that validates the kernel against known inputs (uniform, single-max, tie-breaking, large vocab).
   Key files: `runtime/include/nemotron/device_argmax.h` (new), `runtime/src/backend/device_argmax.cu` (new), `testing/backend/device_argmax_test.cpp` (new), `runtime/CMakeLists.txt`, `testing/CMakeLists.txt`
 
-- [ ] **7. Integrate device argmax into hot decode loop**
+- [x] **7. Integrate device argmax into hot decode loop**
   Wire the device argmax from step 6 into `SingleTokenForwardModel`'s continuation path so the default greedy decode no longer copies the full logits row to host for token selection.
   In `runtime/src/api/single_token_forward_model.cpp`:
   - Add an env gate `NEMOTRON_FORWARD_DEVICE_TOKEN_SELECT` (default: enabled when not in debug/trace mode)
@@ -112,8 +112,8 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 3 | Steady-state decode benchmark mode | done | 80256a1 | preflight-steady-bench |
 | 4 | cuDNN FE attention feasibility report | done | b13f0e9 | preflight-attention-feasibility; confirmed NOT AVAILABLE (stub build) |
 | 5 | Expert staging cost metrics | done | f76eaeb | preflight-expert-staging-metrics |
-| 6 | Device-side argmax kernel | done | — | nano-device-token-select (kernel) |
-| 7 | Integrate device argmax into decode loop | pending | — | nano-device-token-select (integration) |
+| 6 | Device-side argmax kernel | done | 972bdfb | nano-device-token-select (kernel) |
+| 7 | Integrate device argmax into decode loop | done | — | nano-device-token-select (integration) |
 | 8 | Linear fastpath strict mode | pending | — | nano-linear-fastpath (strict gate) |
 | 9 | Cached-head and profiler-ready benchmark modes | pending | — | nano-hotpath-measure |
 | 10 | Wire all counters into benchmark JSON artifact | pending | — | nano-hotpath-measure (integration) |
