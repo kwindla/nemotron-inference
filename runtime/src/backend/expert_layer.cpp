@@ -681,6 +681,8 @@ struct ExpertLayerSlice::Impl {
   std::string routed_backend_detail = "custom fused routed nvfp4";
   std::unique_ptr<FlashInferRoutedMoEBackend> flashinfer_routed_backend;
   mutable std::atomic<bool> grouped_routed_nvfp4_enabled{true};
+  mutable std::atomic<std::size_t> routed_lookups_materialized_count{0};
+  mutable bool all_routed_lookups_ready = false;
   std::unique_ptr<CutlassNvfp4GroupedGemmPlan> cutlass_up_plan;
   std::unique_ptr<CutlassNvfp4GroupedGemmPlan> cutlass_down_plan;
   // Pre-allocated device pointer arrays for CUTLASS dispatch (sized for top_k).
@@ -2333,6 +2335,10 @@ bool RunExpertLayerImpl(
       return false;
     }
     entry.grouped_lookup_ready = true;
+    if (impl.routed_lookups_materialized_count.fetch_add(1, std::memory_order_relaxed) + 1 >=
+        impl.routed_experts.size()) {
+      impl.all_routed_lookups_ready = true;
+    }
     return true;
   };
 
@@ -2340,6 +2346,10 @@ bool RunExpertLayerImpl(
       [&](DeviceBuffer<std::uint32_t>& missing_lookup_count_device,
           DeviceBuffer<std::int32_t>& missing_lookup_indices_device,
           std::uint32_t* missing_lookup_count_out) -> bool {
+    if (impl.all_routed_lookups_ready) {
+      *missing_lookup_count_out = 0;
+      return true;
+    }
     if (missing_lookup_count_out == nullptr ||
         !missing_lookup_count_device.CopyToHost(missing_lookup_count_out, 1)) {
       return false;
