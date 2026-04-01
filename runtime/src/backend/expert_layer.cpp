@@ -2499,33 +2499,26 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
-    DeviceBuffer<const void*> up_weights_packed_ptrs_device;
-    DeviceBuffer<const void*> up_weights_raw_scale_ptrs_device;
-    DeviceBuffer<const void*> down_weights_packed_ptrs_device;
-    DeviceBuffer<const void*> down_weights_raw_scale_ptrs_device;
-    DeviceBuffer<std::uint32_t> missing_lookup_count_device;
-    DeviceBuffer<std::int32_t> missing_lookup_indices_device;
-    DeviceBuffer<float> selected_up_tensor_scales_device;
-    if (!GatherExpertSelectionLookupsChecked(
+    if (!GatherExpertSelectionLookupsCheckedInPlace(
             selected_indices_device,
             batch_count,
             impl.routed_experts.size(),
             impl.routed_up_packed_lookup_device,
             impl.routed_up_raw_scale_lookup_device,
             impl.routed_up_tensor_scale_lookup_device,
-            &up_weights_packed_ptrs_device,
-            &up_weights_raw_scale_ptrs_device,
-            &selected_up_tensor_scales_device,
-            &missing_lookup_count_device,
-            &missing_lookup_indices_device)) {
+            impl.scratch_up_packed_ptrs,
+            impl.scratch_up_raw_scale_ptrs,
+            impl.scratch_selected_up_tensor_scales,
+            impl.scratch_missing_count,
+            impl.scratch_missing_indices)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertLookupFallback();
       return GroupedRoutedResult::kFallback;
     }
     std::uint32_t missing_lookup_count = 0;
     if (!repair_missing_routed_lookups(
-            missing_lookup_count_device,
-            missing_lookup_indices_device,
+            impl.scratch_missing_count,
+            impl.scratch_missing_indices,
             &missing_lookup_count)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertLookupFallback();
@@ -2533,21 +2526,21 @@ bool RunExpertLayerImpl(
     }
     if (missing_lookup_count != 0) {
       if ((!maybe_prefetch_routed_lookups(token_index) && routed_prefetch_topn != 0) ||
-          !GatherExpertSelectionLookupsChecked(
+          !GatherExpertSelectionLookupsCheckedInPlace(
               selected_indices_device,
               batch_count,
               impl.routed_experts.size(),
               impl.routed_up_packed_lookup_device,
               impl.routed_up_raw_scale_lookup_device,
               impl.routed_up_tensor_scale_lookup_device,
-              &up_weights_packed_ptrs_device,
-              &up_weights_raw_scale_ptrs_device,
-              &selected_up_tensor_scales_device,
-              &missing_lookup_count_device,
-              &missing_lookup_indices_device) ||
+              impl.scratch_up_packed_ptrs,
+              impl.scratch_up_raw_scale_ptrs,
+              impl.scratch_selected_up_tensor_scales,
+              impl.scratch_missing_count,
+              impl.scratch_missing_indices) ||
           !repair_missing_routed_lookups(
-              missing_lookup_count_device,
-              missing_lookup_indices_device,
+              impl.scratch_missing_count,
+              impl.scratch_missing_indices,
               &missing_lookup_count) ||
           missing_lookup_count != 0) {
         if (debug) {
@@ -2561,8 +2554,13 @@ bool RunExpertLayerImpl(
       }
     }
 
-    auto latent_packed = PackDeviceRowMajorFp32ToNvfp4(latent_input_row, {});
-    if (!latent_packed || !latent_packed->valid()) {
+    if (!PackDeviceRowMajorFp32ToNvfp4InPlace(
+            latent_input_row, {},
+            impl.scratch_latent_packed_data.data(),
+            impl.scratch_latent_block_scales.data(),
+            impl.scratch_latent_matmul_scales.data(),
+            reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+            impl.scratch_global_max_bits.data())) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPackFallback();
       return GroupedRoutedResult::kFallback;
@@ -2598,11 +2596,11 @@ bool RunExpertLayerImpl(
       // A pointers: all groups share the same packed activation (device fill kernel).
       FillDevicePointerArray(
           const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_ptrs.data())),
-          const_cast<void*>(static_cast<const void*>(latent_packed->packed_data())),
+          const_cast<void*>(static_cast<const void*>(impl.scratch_latent_packed_data.data())),
           batch_count);
       FillDevicePointerArray(
           const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_sf_ptrs.data())),
-          const_cast<void*>(static_cast<const void*>(latent_packed->block_scales_data())),
+          const_cast<void*>(static_cast<const void*>(impl.scratch_latent_block_scales.data())),
           batch_count);
       // D pointers: each group writes to a strided output row (device strided-fill kernel).
       BuildStridedDevicePointerArray(
@@ -2616,20 +2614,20 @@ bool RunExpertLayerImpl(
           grouped_up->data(),
           impl.config.routed_expert_intermediate_size * sizeof(float),
           batch_count);
-      // B pointers: already on device from GatherExpertSelectionLookupsChecked.
+      // B pointers: already on device from GatherExpertSelectionLookupsCheckedInPlace.
       cutlass_up_ok = impl.cutlass_up_plan->Run(
           impl.cutlass_a_ptrs.data(),
           impl.cutlass_a_sf_ptrs.data(),
-          up_weights_packed_ptrs_device.data(),
-          up_weights_raw_scale_ptrs_device.data(),
+          impl.scratch_up_packed_ptrs.data(),
+          impl.scratch_up_raw_scale_ptrs.data(),
           impl.cutlass_c_ptrs.data(),
           impl.cutlass_d_ptrs.data(),
           1.0f, 0.0f, nullptr);
       if (cutlass_up_ok) {
         cutlass_up_ok = ScaleRowsByTensorScaleFp32(
             grouped_up.get(),
-            reinterpret_cast<const float*>(latent_packed->tensor_scale_data()),
-            selected_up_tensor_scales_device.data(),
+            reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+            impl.scratch_selected_up_tensor_scales.data(),
             batch_count);
       }
       if (cutlass_up_ok && debug) {
@@ -2638,13 +2636,13 @@ bool RunExpertLayerImpl(
       }
     }
     if (!cutlass_up_ok && !FusedRoutedUpProjPackedNvfp4SingleToken(
-            latent_packed->packed_data(),
-            latent_packed->block_scales_data(),
-            reinterpret_cast<const float*>(latent_packed->tensor_scale_data()),
+            impl.scratch_latent_packed_data.data(),
+            impl.scratch_latent_block_scales.data(),
+            reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
             impl.config.moe_latent_size,
-            up_weights_packed_ptrs_device,
-            up_weights_raw_scale_ptrs_device,
-            selected_up_tensor_scales_device,
+            impl.scratch_up_packed_ptrs,
+            impl.scratch_up_raw_scale_ptrs,
+            impl.scratch_selected_up_tensor_scales,
             grouped_up.get())) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -2655,49 +2653,36 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
-    std::vector<float> host_row_scales(batch_count, 1.0f);
-    DeviceBuffer<float> up_row_scales_device;
-    if (!up_row_scales_device.Resize(batch_count) ||
-        !up_row_scales_device.CopyFromHost(host_row_scales)) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertPackFallback();
-      return GroupedRoutedResult::kFallback;
-    }
-    DeviceBuffer<std::uint8_t> down_activations_packed;
-    DeviceBuffer<std::uint8_t> down_activations_block_scales;
-    DeviceBuffer<float> down_activations_tensor_scales;
-    if (!ScaleRelu2PackRowsToNvfp4(
+    if (!ScaleRelu2PackRowsToNvfp4InPlace(
             *grouped_up,
-            up_row_scales_device.data(),
-            &down_activations_packed,
-            &down_activations_block_scales,
-            nullptr,
-            &down_activations_tensor_scales)) {
+            impl.scratch_row_scales.data(),
+            impl.scratch_down_act_packed,
+            impl.scratch_down_act_block_scales,
+            impl.scratch_down_act_tensor_scales)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertMergeFallback();
       return GroupedRoutedResult::kFallback;
     }
 
-    DeviceBuffer<float> selected_down_tensor_scales_device;
-    if (!GatherExpertSelectionLookupsChecked(
+    if (!GatherExpertSelectionLookupsCheckedInPlace(
             selected_indices_device,
             batch_count,
             impl.routed_experts.size(),
             impl.routed_down_packed_lookup_device,
             impl.routed_down_raw_scale_lookup_device,
             impl.routed_down_tensor_scale_lookup_device,
-            &down_weights_packed_ptrs_device,
-            &down_weights_raw_scale_ptrs_device,
-            &selected_down_tensor_scales_device,
-            &missing_lookup_count_device,
-            &missing_lookup_indices_device)) {
+            impl.scratch_down_packed_ptrs,
+            impl.scratch_down_raw_scale_ptrs,
+            impl.scratch_selected_down_tensor_scales,
+            impl.scratch_missing_count,
+            impl.scratch_missing_indices)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPackFallback();
       return GroupedRoutedResult::kFallback;
     }
     if (!repair_missing_routed_lookups(
-            missing_lookup_count_device,
-            missing_lookup_indices_device,
+            impl.scratch_missing_count,
+            impl.scratch_missing_indices,
             &missing_lookup_count)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertLookupFallback();
@@ -2705,21 +2690,21 @@ bool RunExpertLayerImpl(
     }
     if (missing_lookup_count != 0) {
       if ((!maybe_prefetch_routed_lookups(token_index) && routed_prefetch_topn != 0) ||
-          !GatherExpertSelectionLookupsChecked(
+          !GatherExpertSelectionLookupsCheckedInPlace(
               selected_indices_device,
               batch_count,
               impl.routed_experts.size(),
               impl.routed_down_packed_lookup_device,
               impl.routed_down_raw_scale_lookup_device,
               impl.routed_down_tensor_scale_lookup_device,
-              &down_weights_packed_ptrs_device,
-              &down_weights_raw_scale_ptrs_device,
-              &selected_down_tensor_scales_device,
-              &missing_lookup_count_device,
-              &missing_lookup_indices_device) ||
+              impl.scratch_down_packed_ptrs,
+              impl.scratch_down_raw_scale_ptrs,
+              impl.scratch_selected_down_tensor_scales,
+              impl.scratch_missing_count,
+              impl.scratch_missing_indices) ||
           !repair_missing_routed_lookups(
-              missing_lookup_count_device,
-              missing_lookup_indices_device,
+              impl.scratch_missing_count,
+              impl.scratch_missing_indices,
               &missing_lookup_count) ||
           missing_lookup_count != 0) {
         if (debug) {
@@ -2743,35 +2728,34 @@ bool RunExpertLayerImpl(
       const std::size_t aligned_packed_row = ((act_packed_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
       const std::size_t aligned_scale_row = ((act_scale_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
 
-      // TODO: pre-allocate these in request context to avoid per-call allocation.
-      DeviceBuffer<std::uint8_t> aligned_act_packed;
-      DeviceBuffer<std::uint8_t> aligned_act_scales;
       auto down_output = DeviceTensorFp32::Create({batch_count, impl.config.moe_latent_size});
 
-      if (aligned_act_packed.Resize(batch_count * aligned_packed_row) &&
-          aligned_act_scales.Resize(batch_count * aligned_scale_row) &&
+      if (impl.scratch_aligned_act_packed.valid() &&
+          impl.scratch_aligned_act_packed.count() >= batch_count * aligned_packed_row &&
+          impl.scratch_aligned_act_scales.valid() &&
+          impl.scratch_aligned_act_scales.count() >= batch_count * aligned_scale_row &&
           down_output && down_output->valid() && down_output->FillZero()) {
         // Copy activation rows to aligned offsets (D→D, no host).
-        cudaMemset(aligned_act_packed.data(), 0, batch_count * aligned_packed_row);
-        cudaMemset(aligned_act_scales.data(), 0, batch_count * aligned_scale_row);
+        cudaMemset(impl.scratch_aligned_act_packed.data(), 0, batch_count * aligned_packed_row);
+        cudaMemset(impl.scratch_aligned_act_scales.data(), 0, batch_count * aligned_scale_row);
         for (std::size_t i = 0; i < batch_count; ++i) {
           cudaMemcpy(
-              aligned_act_packed.data() + i * aligned_packed_row,
-              down_activations_packed.data() + i * act_packed_row_bytes,
+              impl.scratch_aligned_act_packed.data() + i * aligned_packed_row,
+              impl.scratch_down_act_packed.data() + i * act_packed_row_bytes,
               act_packed_row_bytes, cudaMemcpyDeviceToDevice);
           cudaMemcpy(
-              aligned_act_scales.data() + i * aligned_scale_row,
-              down_activations_block_scales.data() + i * act_scale_row_bytes,
+              impl.scratch_aligned_act_scales.data() + i * aligned_scale_row,
+              impl.scratch_down_act_block_scales.data() + i * act_scale_row_bytes,
               act_scale_row_bytes, cudaMemcpyDeviceToDevice);
         }
 
         // Build all pointer arrays on device — zero host involvement.
         BuildStridedDevicePointerArray(
             const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_ptrs.data())),
-            aligned_act_packed.data(), aligned_packed_row, batch_count);
+            impl.scratch_aligned_act_packed.data(), aligned_packed_row, batch_count);
         BuildStridedDevicePointerArray(
             const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_sf_ptrs.data())),
-            aligned_act_scales.data(), aligned_scale_row, batch_count);
+            impl.scratch_aligned_act_scales.data(), aligned_scale_row, batch_count);
         BuildStridedDevicePointerArray(
             impl.cutlass_d_ptrs.data(),
             down_output->data(),
@@ -2781,12 +2765,12 @@ bool RunExpertLayerImpl(
             down_output->data(),
             impl.config.moe_latent_size * sizeof(float), batch_count);
 
-        // B pointers already on device from GatherExpertSelectionLookupsChecked.
+        // B pointers already on device from GatherExpertSelectionLookupsCheckedInPlace.
         cutlass_down_ok = impl.cutlass_down_plan->Run(
             impl.cutlass_a_ptrs.data(),
             impl.cutlass_a_sf_ptrs.data(),
-            down_weights_packed_ptrs_device.data(),
-            down_weights_raw_scale_ptrs_device.data(),
+            impl.scratch_down_packed_ptrs.data(),
+            impl.scratch_down_raw_scale_ptrs.data(),
             impl.cutlass_c_ptrs.data(),
             impl.cutlass_d_ptrs.data(),
             1.0f, 0.0f, nullptr);
@@ -2794,8 +2778,8 @@ bool RunExpertLayerImpl(
         if (cutlass_down_ok) {
           cutlass_down_ok = ScaleWeightedAccumulateRowsFp32(
               *down_output,
-              down_activations_tensor_scales.data(),
-              selected_down_tensor_scales_device.data(),
+              impl.scratch_down_act_tensor_scales.data(),
+              impl.scratch_selected_down_tensor_scales.data(),
               selected_weights_device,
               batch_count,
               routed_tensor.get());
@@ -2807,14 +2791,14 @@ bool RunExpertLayerImpl(
       }
     }
     if (!cutlass_down_ok && !FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
-            down_activations_packed.data(),
-            down_activations_block_scales.data(),
-            down_activations_tensor_scales,
+            impl.scratch_down_act_packed.data(),
+            impl.scratch_down_act_block_scales.data(),
+            impl.scratch_down_act_tensor_scales,
             selected_weights_device,
             impl.config.routed_expert_intermediate_size,
-            down_weights_packed_ptrs_device,
-            down_weights_raw_scale_ptrs_device,
-            selected_down_tensor_scales_device,
+            impl.scratch_down_packed_ptrs,
+            impl.scratch_down_raw_scale_ptrs,
+            impl.scratch_selected_down_tensor_scales,
             routed_tensor.get())) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
