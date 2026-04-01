@@ -458,13 +458,21 @@ bool UploadedLinearOp::Run(
             RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows);
         const std::optional<Nvfp4ScaleLayout> activation_scale_layout =
             pack_options.execution_scale_layout;
-        const char* plan_source = "descriptor";
+        const bool use_runtime_plan = LinearDeviceFastpathEnabled();
+        const char* plan_source = use_runtime_plan ? "runtime" : "descriptor";
         GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
-        auto plan = BuildDescriptorGemmPlan(
-            impl_->descriptor,
-            rows,
-            heuristic_cache,
-            &failure_step);
+        auto plan = use_runtime_plan
+                        ? BuildRuntimeGemmPlan(
+                              impl_->descriptor,
+                              *impl_->nvfp4_weight,
+                              rows,
+                              heuristic_cache,
+                              &failure_step)
+                        : BuildDescriptorGemmPlan(
+                              impl_->descriptor,
+                              rows,
+                              heuristic_cache,
+                              &failure_step);
         if (!plan.has_value() && debug) {
           LogGemmPlanBuildFailure(
               impl_->descriptor,
@@ -472,24 +480,6 @@ bool UploadedLinearOp::Run(
               plan_source,
               failure_step,
               activation_scale_layout);
-        }
-        if (!plan.has_value() && LinearDeviceFastpathEnabled()) {
-          plan_source = "runtime";
-          failure_step = GemmPlanFailureStep::kNone;
-          plan = BuildRuntimeGemmPlan(
-              impl_->descriptor,
-              *impl_->nvfp4_weight,
-              rows,
-              heuristic_cache,
-              &failure_step);
-          if (!plan.has_value() && debug) {
-            LogGemmPlanBuildFailure(
-                impl_->descriptor,
-                rows,
-                plan_source,
-                failure_step,
-                activation_scale_layout);
-          }
         }
         if (plan.has_value()) {
           plan_build_ok = true;

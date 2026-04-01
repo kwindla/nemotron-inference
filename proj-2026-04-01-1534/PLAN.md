@@ -135,7 +135,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - `testing/api/full_forward_manifest_smoke_test.cpp`
   - `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`
 
-- [ ] **2. Re-baseline with real operator evidence before choosing the next bottleneck**
+- [~] **2. Re-baseline with real operator evidence before choosing the next bottleneck**
   Goal:
   - replace guesswork with measured post-fastpath evidence
   Scope:
@@ -323,7 +323,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Linear fastpath correctness + layout translation | done | — | NVFP4 8x4 scale layout for M<=32 decode activations |
+| 1 | Linear fastpath correctness + layout translation | done | d4931e8 | NVFP4 8x4 scale layout for M<=32 decode activations |
 | 2 | Re-baseline with counters and Nsight | pending | — | choose next bottleneck from evidence |
 | 3 | Attention metadata/workspace ownership + sync cleanup | pending | — | no new attention math in this step |
 | 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
@@ -344,3 +344,8 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend`, `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test`, and `cmake --build build-benchmarks --target nano_fused_decode_bench` all passed; targeted NVFP4 tests `device_nvfp4_matrix_test`, `linear_op_test`, and `nvfp4_gemm_runner_test` also passed.
   - what risk remains: the full real-model split-prefill parity path with `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` was not rerun in this checkpoint, so expert-layer-13 may still hide a second issue in routed-expert weight preparation or another cuBLASLt path.
   - what the next step is: rerun the step-1 smoke and Nano parity commands with fastpath tracing enabled, confirm whether the expert-layer-13 divergence disappears, and only then decide whether routed-expert weight repacking or additional cuBLASLt path fixes are still needed.
+- 2026-04-01: Step 1 follow-up: changed NVFP4 fastpath plan selection to use the uploaded-device runtime plan whenever `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` is enabled, instead of probing the descriptor/mmap plan first.
+  - what changed: `UploadedLinearOp::Run()` now routes NVFP4 plan construction directly through `BuildRuntimeGemmPlan()` under fastpath, so cuBLASLt sees the `DeviceNvfp4Weight` buffers allocated with `cudaMalloc` rather than mmap-derived descriptor pointers that may miss the required 16-byte alignment for packed weights or tensor-scale scalars.
+  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend`, `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test -j4`, and `cmake --build build-benchmarks --target nano_fused_decode_bench -j4` all passed after rerunning the phase-1 builds sequentially to avoid a parallel archive-link race in the shared build tree.
+  - what risk remains: this checkpoint intentionally does not add an aligned-buffer workaround to the descriptor path, so any NVFP4 caller that still uses descriptor-backed plans without the device fastpath would retain the original pointer-alignment constraint.
+  - what the next step is: rerun the real-model fastpath smoke/parity commands to confirm the runtime-only NVFP4 path clears the cuBLASLt plan rejects on the benchmark path.
