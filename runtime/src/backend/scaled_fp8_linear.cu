@@ -22,14 +22,11 @@ bool CheckCuda(cudaError_t status) {
 }
 
 bool ExperimentalFp8NativeEnabled() {
-  static const bool enabled = std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE") != nullptr;
-  return enabled;
+  return std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE") != nullptr;
 }
 
 bool ExperimentalScaledFp8DequantizedDenseEnabled() {
-  static const bool enabled =
-      std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_SCALED_FP8_DEQUANTIZED_DENSE") != nullptr;
-  return enabled;
+  return std::getenv("NEMOTRON_DISABLE_SCALED_FP8_DEQUANTIZED_DENSE") == nullptr;
 }
 
 const char* ExperimentalScaledFp8SurfaceFamilyFilter() {
@@ -510,9 +507,8 @@ bool ScaledFp8LinearOp::Run(
     return true;
   }
 
-  // Keep scaled-FP8 on the numerically stable device reference surface for
-  // now. This removes the host roundtrip and CPU fallback while preserving the
-  // current exact-input oracle gates until a native fast path is validated.
+  // Fall back to the reference surface only when the default dequantized-dense
+  // path is explicitly disabled or when plan build/execution still fails.
   if (rollout_plan_build_failed) {
     RecordScaledFp8PlanBuildFailure(impl_->family);
   }
