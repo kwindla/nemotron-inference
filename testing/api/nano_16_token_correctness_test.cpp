@@ -7,11 +7,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -401,6 +403,94 @@ std::optional<std::size_t> ParseEnvSizeT(const char* env_var) {
   }
 }
 
+std::string Trim(std::string value) {
+  const auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+  const auto begin = std::find_if(value.begin(), value.end(), not_space);
+  if (begin == value.end()) {
+    return "";
+  }
+  const auto end = std::find_if(value.rbegin(), value.rend(), not_space).base();
+  return std::string(begin, end);
+}
+
+std::string TrimTrailingComma(std::string value) {
+  value = Trim(std::move(value));
+  if (!value.empty() && value.back() == ',') {
+    value.pop_back();
+  }
+  return Trim(std::move(value));
+}
+
+bool StartsWith(const std::string& value, const char* prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
+
+std::optional<std::string> ExtractJsonLineValue(
+    const std::string& line,
+    const char* key) {
+  const std::string trimmed = Trim(line);
+  if (!StartsWith(trimmed, key)) {
+    return std::nullopt;
+  }
+  const std::size_t colon = trimmed.find(':');
+  if (colon == std::string::npos) {
+    return std::nullopt;
+  }
+  return TrimTrailingComma(trimmed.substr(colon + 1));
+}
+
+std::optional<std::int32_t> ParseInt32Value(const std::string& text) {
+  try {
+    const long long value = std::stoll(TrimTrailingComma(text));
+    if (value < std::numeric_limits<std::int32_t>::min() ||
+        value > std::numeric_limits<std::int32_t>::max()) {
+      return std::nullopt;
+    }
+    return static_cast<std::int32_t>(value);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<float> ParseFloatValue(const std::string& text) {
+  try {
+    return std::stof(TrimTrailingComma(text));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::vector<std::int32_t>> ParseInt32ArrayValue(const std::string& text) {
+  const std::string trimmed = TrimTrailingComma(text);
+  const std::size_t open = trimmed.find('[');
+  const std::size_t close = trimmed.rfind(']');
+  if (open == std::string::npos || close == std::string::npos || close < open) {
+    return std::nullopt;
+  }
+
+  std::string content = Trim(trimmed.substr(open + 1, close - open - 1));
+  std::vector<std::int32_t> values;
+  if (content.empty()) {
+    return values;
+  }
+
+  while (!content.empty()) {
+    const std::size_t comma = content.find(',');
+    const std::string token =
+        comma == std::string::npos ? content : content.substr(0, comma);
+    const auto parsed = ParseInt32Value(token);
+    if (!parsed.has_value()) {
+      return std::nullopt;
+    }
+    values.push_back(*parsed);
+    if (comma == std::string::npos) {
+      break;
+    }
+    content = Trim(content.substr(comma + 1));
+  }
+  return values;
+}
+
 std::vector<float> CopyTensorToHost(const nemotron::DeviceTensorFp32& tensor) {
   std::vector<float> host(tensor.numel(), 0.0f);
   if (!tensor.CopyToHost(host.data(), host.size())) {
@@ -478,15 +568,266 @@ std::string TopKSummary(const std::vector<float>& logits_row, std::size_t k) {
   return out.str();
 }
 
+struct IndexedLogit {
+  std::int32_t index = -1;
+  float value = 0.0f;
+};
+
+std::optional<std::string> ExtractObjectFieldValue(
+    const std::string& object_text,
+    const std::string& key) {
+  const std::size_t key_pos = object_text.find(key);
+  if (key_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const std::size_t colon = object_text.find(':', key_pos + key.size());
+  if (colon == std::string::npos) {
+    return std::nullopt;
+  }
+  const std::size_t comma = object_text.find(',', colon + 1);
+  const std::size_t end = comma == std::string::npos ? object_text.size() : comma;
+  return Trim(object_text.substr(colon + 1, end - colon - 1));
+}
+
+std::optional<std::vector<IndexedLogit>> ParseIndexedLogitArrayValue(
+    const std::string& text) {
+  const std::string trimmed = TrimTrailingComma(text);
+  const std::size_t open = trimmed.find('[');
+  const std::size_t close = trimmed.rfind(']');
+  if (open == std::string::npos || close == std::string::npos || close < open) {
+    return std::nullopt;
+  }
+
+  std::string content = Trim(trimmed.substr(open + 1, close - open - 1));
+  std::vector<IndexedLogit> values;
+  while (!content.empty()) {
+    if (content.front() != '{') {
+      return std::nullopt;
+    }
+    const std::size_t object_end = content.find('}');
+    if (object_end == std::string::npos) {
+      return std::nullopt;
+    }
+    const std::string object_text = content.substr(1, object_end - 1);
+    const auto index_text = ExtractObjectFieldValue(object_text, "\"index\"");
+    const auto value_text = ExtractObjectFieldValue(object_text, "\"value\"");
+    if (!index_text.has_value() || !value_text.has_value()) {
+      return std::nullopt;
+    }
+    const auto index = ParseInt32Value(*index_text);
+    const auto value = ParseFloatValue(*value_text);
+    if (!index.has_value() || !value.has_value()) {
+      return std::nullopt;
+    }
+    values.push_back({*index, *value});
+    content = Trim(content.substr(object_end + 1));
+    if (!content.empty()) {
+      if (content.front() != ',') {
+        return std::nullopt;
+      }
+      content = Trim(content.substr(1));
+    }
+  }
+  return values;
+}
+
+struct SavedPromptOracle {
+  std::filesystem::path path;
+  std::int32_t boundary_token_id = -1;
+  std::vector<IndexedLogit> boundary_top5;
+  std::vector<std::int32_t> generated_token_ids;
+};
+
+std::optional<SavedPromptOracle> LoadSavedPromptOracle(const std::filesystem::path& path) {
+  std::ifstream input(path);
+  if (!input) {
+    std::cerr << "nano_16_token_correctness_test: failed to open oracle JSON "
+              << path.string() << "\n";
+    return std::nullopt;
+  }
+
+  SavedPromptOracle oracle;
+  oracle.path = path;
+  bool found_boundary_token_id = false;
+  bool found_boundary_top5 = false;
+  bool found_generated_token_ids = false;
+
+  std::string line;
+  while (std::getline(input, line)) {
+    if (const auto value = ExtractJsonLineValue(line, "\"boundary_token_id\"");
+        value.has_value()) {
+      const auto parsed = ParseInt32Value(*value);
+      if (!parsed.has_value()) {
+        std::cerr << "nano_16_token_correctness_test: failed to parse boundary_token_id from "
+                  << path.string() << "\n";
+        return std::nullopt;
+      }
+      oracle.boundary_token_id = *parsed;
+      found_boundary_token_id = true;
+      continue;
+    }
+    if (const auto value = ExtractJsonLineValue(line, "\"boundary_top5\"");
+        value.has_value()) {
+      const auto parsed = ParseIndexedLogitArrayValue(*value);
+      if (!parsed.has_value()) {
+        std::cerr << "nano_16_token_correctness_test: failed to parse boundary_top5 from "
+                  << path.string() << "\n";
+        return std::nullopt;
+      }
+      oracle.boundary_top5 = std::move(*parsed);
+      found_boundary_top5 = true;
+      continue;
+    }
+    if (const auto value = ExtractJsonLineValue(line, "\"generated_token_ids\"");
+        value.has_value()) {
+      const auto parsed = ParseInt32ArrayValue(*value);
+      if (!parsed.has_value()) {
+        std::cerr << "nano_16_token_correctness_test: failed to parse generated_token_ids from "
+                  << path.string() << "\n";
+        return std::nullopt;
+      }
+      oracle.generated_token_ids = std::move(*parsed);
+      found_generated_token_ids = true;
+    }
+  }
+
+  if (!input.good() && !input.eof()) {
+    std::cerr << "nano_16_token_correctness_test: failed while reading oracle JSON "
+              << path.string() << "\n";
+    return std::nullopt;
+  }
+  if (!found_boundary_token_id || !found_boundary_top5 || !found_generated_token_ids) {
+    std::cerr << "nano_16_token_correctness_test: oracle JSON missing required fields in "
+              << path.string() << "\n";
+    return std::nullopt;
+  }
+  if (oracle.boundary_top5.empty()) {
+    std::cerr << "nano_16_token_correctness_test: oracle boundary_top5 is empty in "
+              << path.string() << "\n";
+    return std::nullopt;
+  }
+  if (oracle.generated_token_ids.size() != kDecodeTokenCount) {
+    std::cerr << "nano_16_token_correctness_test: expected "
+              << kDecodeTokenCount
+              << " generated_token_ids entries but found "
+              << oracle.generated_token_ids.size()
+              << " in " << path.string() << "\n";
+    return std::nullopt;
+  }
+  if (oracle.generated_token_ids.front() != oracle.boundary_token_id) {
+    std::cerr << "nano_16_token_correctness_test: oracle boundary token "
+              << oracle.boundary_token_id
+              << " does not match generated_token_ids[0]="
+              << oracle.generated_token_ids.front()
+              << " in " << path.string() << "\n";
+    return std::nullopt;
+  }
+
+  return oracle;
+}
+
 struct BoundaryObservation {
   std::int32_t selected_token_id = -1;
   std::vector<float> logits_row;
+  std::vector<IndexedLogit> sparse_logits;
   std::vector<float> prompt_boundary_embedding_row;
   std::vector<float> prompt_boundary_final_hidden_normed_row;
   double elapsed_ms = 0.0;
   std::size_t sequence_length = 0;
   std::size_t decode_position = 0;
 };
+
+BoundaryObservation MakeOracleBoundaryObservation(const SavedPromptOracle& oracle) {
+  BoundaryObservation observation;
+  observation.selected_token_id = oracle.boundary_token_id;
+  observation.sparse_logits = oracle.boundary_top5;
+  observation.sequence_length = kPromptTokenCount;
+  observation.decode_position = kPromptTokenCount - 1;
+  return observation;
+}
+
+std::optional<float> FindIndexedLogitValue(
+    const std::vector<IndexedLogit>& logits,
+    std::int32_t index) {
+  for (const IndexedLogit& logit : logits) {
+    if (logit.index == index) {
+      return logit.value;
+    }
+  }
+  return std::nullopt;
+}
+
+float SparseVsDenseMaxAbsDiff(
+    const std::vector<IndexedLogit>& sparse_logits,
+    const std::vector<float>& dense_logits) {
+  if (sparse_logits.empty() || dense_logits.empty()) {
+    return std::numeric_limits<float>::infinity();
+  }
+  float max_diff = 0.0f;
+  for (const IndexedLogit& logit : sparse_logits) {
+    if (logit.index < 0 ||
+        static_cast<std::size_t>(logit.index) >= dense_logits.size()) {
+      return std::numeric_limits<float>::infinity();
+    }
+    max_diff = std::max(
+        max_diff,
+        std::fabs(logit.value - dense_logits[static_cast<std::size_t>(logit.index)]));
+  }
+  return max_diff;
+}
+
+float MaxAbsDiff(const BoundaryObservation& lhs, const BoundaryObservation& rhs) {
+  if (!lhs.sparse_logits.empty() || !rhs.sparse_logits.empty()) {
+    if (!lhs.sparse_logits.empty() && rhs.sparse_logits.empty()) {
+      return SparseVsDenseMaxAbsDiff(lhs.sparse_logits, rhs.logits_row);
+    }
+    if (lhs.sparse_logits.empty() && !rhs.sparse_logits.empty()) {
+      return SparseVsDenseMaxAbsDiff(rhs.sparse_logits, lhs.logits_row);
+    }
+
+    float max_diff = 0.0f;
+    for (const IndexedLogit& logit : lhs.sparse_logits) {
+      const auto rhs_value = FindIndexedLogitValue(rhs.sparse_logits, logit.index);
+      if (!rhs_value.has_value()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      max_diff = std::max(max_diff, std::fabs(logit.value - *rhs_value));
+    }
+    for (const IndexedLogit& logit : rhs.sparse_logits) {
+      const auto lhs_value = FindIndexedLogitValue(lhs.sparse_logits, logit.index);
+      if (!lhs_value.has_value()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      max_diff = std::max(max_diff, std::fabs(logit.value - *lhs_value));
+    }
+    return max_diff;
+  }
+
+  return MaxAbsDiff(lhs.logits_row, rhs.logits_row);
+}
+
+std::string IndexedTopKSummary(const std::vector<IndexedLogit>& logits) {
+  if (logits.empty()) {
+    return "[]";
+  }
+  std::ostringstream out;
+  out << "[";
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    if (i != 0) {
+      out << ", ";
+    }
+    out << logits[i].index << ":" << logits[i].value;
+  }
+  out << "]";
+  return out.str();
+}
+
+std::string BoundaryTopKSummary(const BoundaryObservation& observation) {
+  if (!observation.sparse_logits.empty()) {
+    return IndexedTopKSummary(observation.sparse_logits);
+  }
+  return TopKSummary(observation.logits_row, 5);
+}
 
 struct LayerObservation {
   std::size_t layer_index = 0;
@@ -534,8 +875,7 @@ BoundaryComparison MakeBoundaryComparison(
   comparison.rhs_route = &rhs_route;
   comparison.lhs_token_id = lhs_observation.selected_token_id;
   comparison.rhs_token_id = rhs_observation.selected_token_id;
-  comparison.max_abs_diff =
-      MaxAbsDiff(lhs_observation.logits_row, rhs_observation.logits_row);
+  comparison.max_abs_diff = MaxAbsDiff(lhs_observation, rhs_observation);
   return comparison;
 }
 
@@ -742,18 +1082,56 @@ void PrintBoundaryMismatch(
             << " " << lhs_route.route_id << "_token=" << lhs_observation.selected_token_id
             << " " << rhs_route.route_id << "_token=" << rhs_observation.selected_token_id
             << " max_abs_diff="
-            << MaxAbsDiff(lhs_observation.logits_row, rhs_observation.logits_row)
+            << MaxAbsDiff(lhs_observation, rhs_observation)
             << "\n";
   std::cerr << lhs_route.route_id << "_top5="
-            << TopKSummary(lhs_observation.logits_row, 5) << "\n";
+            << BoundaryTopKSummary(lhs_observation) << "\n";
   std::cerr << rhs_route.route_id << "_top5="
-            << TopKSummary(rhs_observation.logits_row, 5) << "\n";
+            << BoundaryTopKSummary(rhs_observation) << "\n";
   std::cerr << lhs_route.route_id << "_state=(sequence_length="
             << lhs_observation.sequence_length
             << ", decode_position=" << lhs_observation.decode_position << ")\n";
   std::cerr << rhs_route.route_id << "_state=(sequence_length="
             << rhs_observation.sequence_length
             << ", decode_position=" << rhs_observation.decode_position << ")\n";
+}
+
+void PrintTokenSequence(std::ostream& stream, const std::vector<std::int32_t>& token_ids) {
+  for (std::size_t i = 0; i < token_ids.size(); ++i) {
+    if (i != 0) {
+      stream << ",";
+    }
+    stream << token_ids[i];
+  }
+}
+
+void PrintOracleDecodeMismatch(
+    std::size_t token_index,
+    std::int32_t consume_token_id,
+    std::int32_t expected_token_id,
+    const PrefillRouteConfig& route,
+    const BoundaryObservation& observation,
+    const std::vector<std::int32_t>& oracle_generated_token_ids) {
+  std::cerr << "nano_16_token_correctness_test: divergent decode boundary pair="
+            << PairId(kRouteA, route)
+            << " index=" << token_index
+            << " consume_token=" << consume_token_id
+            << " oracle_token=" << expected_token_id
+            << " " << route.route_id << "_token=" << observation.selected_token_id
+            << "\n";
+  std::cerr << route.route_id << "_top5="
+            << BoundaryTopKSummary(observation) << "\n";
+  std::cerr << route.route_id << "_state=(sequence_length="
+            << observation.sequence_length
+            << ", decode_position=" << observation.decode_position << ")\n";
+  std::cerr << "oracle_generated_tokens_before_divergence=[";
+  PrintTokenSequence(
+      std::cerr,
+      std::vector<std::int32_t>(
+          oracle_generated_token_ids.begin(),
+          oracle_generated_token_ids.begin() +
+              static_cast<std::ptrdiff_t>(token_index)));
+  std::cerr << "]\n";
 }
 
 std::vector<LayerProbe> BuildLayerProbes(
@@ -996,12 +1374,31 @@ bool run_nano_correctness_gate() {
       strict_linear_enabled,
       linear_device_fastpath_enabled);
 
-  auto route_a_context = model->CreateRequestContext();
+  const char* oracle_env = std::getenv("NEMOTRON_NANO_16_ORACLE_PATH");
+  const bool using_saved_oracle = oracle_env != nullptr && oracle_env[0] != '\0';
+  std::optional<SavedPromptOracle> saved_oracle;
+  if (using_saved_oracle) {
+    saved_oracle = LoadSavedPromptOracle(std::filesystem::path(oracle_env));
+    if (!expect(saved_oracle.has_value(), "saved oracle JSON should load")) {
+      return false;
+    }
+    std::cout << "nano_16_token_correctness_test: using saved oracle from "
+              << saved_oracle->path.string() << "\n";
+  } else {
+    std::cout << "nano_16_token_correctness_test: running live Route A reference\n";
+  }
+  std::cout.flush();
+
+  std::unique_ptr<nemotron::RequestExecutionContext> route_a_context;
+  if (!using_saved_oracle) {
+    route_a_context = model->CreateRequestContext();
+  }
   auto route_b_context = model->CreateRequestContext();
   auto route_c_context = model->CreateRequestContext();
-  if (!expect(
-          route_a_context != nullptr && route_a_context->valid(),
-          "Route A request context should create") ||
+  if ((!using_saved_oracle &&
+       !expect(
+           route_a_context != nullptr && route_a_context->valid(),
+           "Route A request context should create")) ||
       !expect(
           route_b_context != nullptr && route_b_context->valid(),
           "Route B request context should create") ||
@@ -1011,46 +1408,140 @@ bool run_nano_correctness_gate() {
     return false;
   }
 
-  const auto route_a_prefill =
-      RunPrefillBoundary(*model, kRouteA, *route_a_context, capture_embedding_trace);
+  std::optional<BoundaryObservation> route_a_live_prefill;
+  if (!using_saved_oracle) {
+    route_a_live_prefill =
+        RunPrefillBoundary(*model, kRouteA, *route_a_context, capture_embedding_trace);
+  }
   const auto route_b_prefill =
       RunPrefillBoundary(*model, kRouteB, *route_b_context, capture_embedding_trace);
   const auto route_c_prefill =
       RunPrefillBoundary(*model, kRouteC, *route_c_context, capture_embedding_trace);
-  if (!expect(route_a_prefill.has_value(), "Route A prefill boundary should succeed") ||
+  if ((!using_saved_oracle &&
+       !expect(route_a_live_prefill.has_value(), "Route A prefill boundary should succeed")) ||
       !expect(route_b_prefill.has_value(), "Route B prefill boundary should succeed") ||
       !expect(route_c_prefill.has_value(), "Route C prefill boundary should succeed")) {
     return false;
   }
+  const BoundaryObservation route_a_prefill =
+      using_saved_oracle ? MakeOracleBoundaryObservation(*saved_oracle) : *route_a_live_prefill;
 
   const BoundaryComparison route_ab_comparison =
-      MakeBoundaryComparison(kRouteA, *route_a_prefill, kRouteB, *route_b_prefill);
+      MakeBoundaryComparison(kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
+  const BoundaryComparison route_ac_comparison =
+      MakeBoundaryComparison(kRouteA, route_a_prefill, kRouteC, *route_c_prefill);
   const BoundaryComparison route_bc_comparison =
       MakeBoundaryComparison(kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
-  const BoundaryComparison route_ac_comparison =
-      MakeBoundaryComparison(kRouteA, *route_a_prefill, kRouteC, *route_c_prefill);
-  PrintPrefillSummaryTable({route_ab_comparison, route_bc_comparison, route_ac_comparison});
+  PrintPrefillSummaryTable(
+      using_saved_oracle
+          ? std::vector<BoundaryComparison>{
+                route_ab_comparison,
+                route_ac_comparison,
+                route_bc_comparison,
+            }
+          : std::vector<BoundaryComparison>{
+                route_ab_comparison,
+                route_bc_comparison,
+                route_ac_comparison,
+            });
   if (capture_embedding_trace) {
-    PrintTraceComparisonSummary(kRouteA, *route_a_prefill, kRouteB, *route_b_prefill);
+    if (!using_saved_oracle) {
+      PrintTraceComparisonSummary(kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
+    }
     PrintTraceComparisonSummary(kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
   }
 
   bool has_prefill_mismatch = false;
-  if (HasSelectedTokenMismatch(route_ab_comparison)) {
-    PrintBoundaryMismatch("prefill", 0, kRouteA, *route_a_prefill, kRouteB, *route_b_prefill);
-    MaybeTraceDivergentPromptLayers(*model, kRouteA, kRouteB);
-    has_prefill_mismatch = true;
-  }
-  if (HasSelectedTokenMismatch(route_bc_comparison)) {
-    PrintBoundaryMismatch("prefill", 0, kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
-    MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
-    has_prefill_mismatch = true;
+  if (using_saved_oracle) {
+    if (HasSelectedTokenMismatch(route_ab_comparison)) {
+      PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
+      has_prefill_mismatch = true;
+    }
+    if (HasSelectedTokenMismatch(route_ac_comparison)) {
+      PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteC, *route_c_prefill);
+      has_prefill_mismatch = true;
+    }
+    if (HasSelectedTokenMismatch(route_bc_comparison)) {
+      PrintBoundaryMismatch("prefill", 0, kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
+      MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
+      has_prefill_mismatch = true;
+    }
+  } else {
+    if (HasSelectedTokenMismatch(route_ab_comparison)) {
+      PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
+      MaybeTraceDivergentPromptLayers(*model, kRouteA, kRouteB);
+      has_prefill_mismatch = true;
+    }
+    if (HasSelectedTokenMismatch(route_bc_comparison)) {
+      PrintBoundaryMismatch("prefill", 0, kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
+      MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
+      has_prefill_mismatch = true;
+    }
   }
   if (has_prefill_mismatch) {
     return false;
   }
 
-  std::int32_t route_a_token = route_a_prefill->selected_token_id;
+  if (using_saved_oracle) {
+    const std::vector<std::int32_t>& generated_token_ids = saved_oracle->generated_token_ids;
+    for (std::size_t token_index = 1; token_index < generated_token_ids.size(); ++token_index) {
+      const std::int32_t consume_token = generated_token_ids[token_index - 1];
+      const std::int32_t expected_token = generated_token_ids[token_index];
+      const auto route_b_step = RunContinuationBoundary(
+          *model,
+          kRouteB,
+          *route_b_context,
+          consume_token,
+          token_index);
+      const auto route_c_step = RunContinuationBoundary(
+          *model,
+          kRouteC,
+          *route_c_context,
+          consume_token,
+          token_index);
+      if (!expect(route_b_step.has_value(), "Route B continuation boundary should succeed") ||
+          !expect(route_c_step.has_value(), "Route C continuation boundary should succeed")) {
+        return false;
+      }
+
+      const bool route_b_match = route_b_step->selected_token_id == expected_token;
+      const bool route_c_match = route_c_step->selected_token_id == expected_token;
+      if (route_b_match && route_c_match) {
+        continue;
+      }
+
+      if (!route_b_match) {
+        PrintOracleDecodeMismatch(
+            token_index,
+            consume_token,
+            expected_token,
+            kRouteB,
+            *route_b_step,
+            generated_token_ids);
+      }
+      if (!route_c_match) {
+        PrintOracleDecodeMismatch(
+            token_index,
+            consume_token,
+            expected_token,
+            kRouteC,
+            *route_c_step,
+            generated_token_ids);
+      }
+      if (route_b_step->selected_token_id != route_c_step->selected_token_id) {
+        PrintBoundaryMismatch("decode", token_index, kRouteB, *route_b_step, kRouteC, *route_c_step);
+        MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
+      }
+      return false;
+    }
+
+    std::cout << "nano_16_token_correctness_test: PASS generated_tokens=[";
+    PrintTokenSequence(std::cout, generated_token_ids);
+    std::cout << "]\n";
+    return true;
+  }
+
+  std::int32_t route_a_token = route_a_prefill.selected_token_id;
   std::int32_t route_c_token = route_c_prefill->selected_token_id;
   std::vector<std::int32_t> generated_token_ids = {route_a_token};
 
@@ -1067,12 +1558,7 @@ bool run_nano_correctness_gate() {
       PrintBoundaryMismatch("decode", token_index, kRouteA, *route_a_step, kRouteC, *route_c_step);
       std::cerr << "route_a_top1=[" << TopKSummary(route_a_step->logits_row, 1) << "]\n";
       std::cerr << "generated_tokens_before_divergence=[";
-      for (std::size_t i = 0; i < generated_token_ids.size(); ++i) {
-        if (i != 0) {
-          std::cerr << ",";
-        }
-        std::cerr << generated_token_ids[i];
-      }
+      PrintTokenSequence(std::cerr, generated_token_ids);
       std::cerr << "]\n";
       MaybeTraceDivergentPromptLayers(*model, kRouteA, kRouteC);
       return false;
@@ -1083,12 +1569,7 @@ bool run_nano_correctness_gate() {
   }
 
   std::cout << "nano_16_token_correctness_test: PASS generated_tokens=[";
-  for (std::size_t i = 0; i < generated_token_ids.size(); ++i) {
-    if (i != 0) {
-      std::cout << ",";
-    }
-    std::cout << generated_token_ids[i];
-  }
+  PrintTokenSequence(std::cout, generated_token_ids);
   std::cout << "]\n";
   return true;
 }

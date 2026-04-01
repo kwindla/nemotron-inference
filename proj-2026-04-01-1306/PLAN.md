@@ -51,7 +51,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
   - Add to `testing/CMakeLists.txt`
   Key files: `testing/api/nano_save_prompt_oracle.cpp` (new), `testing/CMakeLists.txt`
 
-- [ ] **6. Add a load-and-compare mode to the correctness test**
+- [x] **6. Add a load-and-compare mode to the correctness test**
   Add `NEMOTRON_NANO_16_ORACLE_PATH=/path/to/oracle.json` support to `nano_16_token_correctness_test.cpp`. When set:
   - Load the saved oracle (token sequence + boundary logits)
   - Compare each route's output against the oracle instead of running a fresh Route A
@@ -80,8 +80,8 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 | 2 | GEMM plan-build diagnostic logging | done | 5edd6f9 | nano-linear-fastpath (diagnostics) |
 | 3 | Linear counter breakdown in layer probes | done | ac16b68 | nano-linear-fastpath (per-layer) |
 | 4 | Per-operator linear counter tracking | done | 241c4be | nano-linear-fastpath (per-tensor) |
-| 5 | Saved-token oracle for fixed prompt | done | — | nano-prompt-parity (oracle) |
-| 6 | Load-and-compare oracle mode | pending | — | nano-prompt-parity (fast compare) |
+| 5 | Saved-token oracle for fixed prompt | done | 9fdad33 | nano-prompt-parity (oracle) |
+| 6 | Load-and-compare oracle mode | done | — | nano-prompt-parity (fast compare) |
 | 7 | Expert staging counters in correctness test | pending | — | counter coverage |
 | 8 | Benchmark regression comparison script | pending | — | nano-roofline-loop (foundation) |
 
