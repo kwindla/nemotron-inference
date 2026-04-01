@@ -348,6 +348,8 @@ std::string TopKSummary(const std::vector<float>& logits_row, std::size_t k) {
 struct BoundaryObservation {
   std::int32_t selected_token_id = -1;
   std::vector<float> logits_row;
+  std::vector<float> prompt_boundary_embedding_row;
+  std::vector<float> prompt_boundary_final_hidden_normed_row;
   double elapsed_ms = 0.0;
   std::size_t sequence_length = 0;
   std::size_t decode_position = 0;
@@ -371,6 +373,23 @@ struct LayerProbe {
   std::size_t layer_index = 0;
   bool coarse = false;
 };
+
+std::optional<std::vector<float>> ExtractTraceRow(
+    const std::vector<float>& values,
+    std::size_t expected_row_count,
+    std::size_t row_index,
+    std::size_t row_width) {
+  if (row_width == 0 ||
+      row_index >= expected_row_count ||
+      values.size() != expected_row_count * row_width) {
+    return std::nullopt;
+  }
+  const std::vector<float> row = SliceRow(values, row_index, row_width);
+  if (row.size() != row_width) {
+    return std::nullopt;
+  }
+  return row;
+}
 
 BoundaryComparison MakeBoundaryComparison(
     const PrefillRouteConfig& lhs_route,
@@ -425,30 +444,37 @@ void PrintPrefillSummaryTable(
 std::optional<BoundaryObservation> RunPrefillBoundary(
     nemotron::SingleTokenForwardModel& model,
     const PrefillRouteConfig& route,
-    nemotron::RequestExecutionContext& request_context) {
+    nemotron::RequestExecutionContext& request_context,
+    bool capture_trace_rows = false) {
   ScopedRouteOverrides route_overrides(route);
   (void)route_overrides;
+  const auto& prompt_token_ids = FixedPromptTokenIds();
 
-  auto logits = nemotron::DeviceTensorFp32::Create({kPromptTokenCount, model.config().vocab_size});
+  auto logits =
+      nemotron::DeviceTensorFp32::Create({kPromptTokenCount, model.config().vocab_size});
   if (logits == nullptr || !logits->valid()) {
     return std::nullopt;
   }
+  nemotron::SingleTokenForwardTrace trace;
+  nemotron::SingleTokenForwardTrace* trace_ptr = capture_trace_rows ? &trace : nullptr;
 
   std::cout << "nano_16_token_correctness_test: " << RouteDetail(route)
             << " prefill start prompt_tokens=" << kPromptTokenCount << "\n";
   std::cout.flush();
   const auto start = std::chrono::steady_clock::now();
   if (!model.RunPrefill(
-          FixedPromptTokenIds().data(),
-          FixedPromptTokenIds().size(),
+          prompt_token_ids.data(),
+          prompt_token_ids.size(),
           request_context,
-          logits.get())) {
+          logits.get(),
+          /*capture_layer_indices=*/{},
+          trace_ptr)) {
     return std::nullopt;
   }
   const std::vector<float> host_logits = CopyTensorToHost(*logits);
   const auto end = std::chrono::steady_clock::now();
   const std::vector<float> final_row =
-      SliceRow(host_logits, FixedPromptTokenIds().size() - 1, model.config().vocab_size);
+      SliceRow(host_logits, prompt_token_ids.size() - 1, model.config().vocab_size);
   const auto selected_token_id = ArgMaxTokenId(final_row);
   if (!selected_token_id.has_value()) {
     return std::nullopt;
@@ -460,12 +486,70 @@ std::optional<BoundaryObservation> RunPrefillBoundary(
   observation.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
   observation.sequence_length = request_context.sequence_length();
   observation.decode_position = request_context.decode_position();
+  if (capture_trace_rows) {
+    const std::size_t prompt_boundary_index = prompt_token_ids.size() - 1;
+    const std::size_t hidden_size = model.config().hidden_size;
+    auto embedding_row = ExtractTraceRow(
+        trace.embedding_output,
+        prompt_token_ids.size(),
+        prompt_boundary_index,
+        hidden_size);
+    if (!embedding_row.has_value()) {
+      std::cerr << "nano_16_token_correctness_test: failed to capture prompt-boundary embedding row "
+                << "route=" << route.route_id
+                << " trace_values=" << trace.embedding_output.size()
+                << " hidden_size=" << hidden_size << "\n";
+      return std::nullopt;
+    }
+    auto final_hidden_normed_row = ExtractTraceRow(
+        trace.final_hidden_normed,
+        prompt_token_ids.size(),
+        prompt_boundary_index,
+        hidden_size);
+    if (!final_hidden_normed_row.has_value()) {
+      std::cerr
+          << "nano_16_token_correctness_test: failed to capture prompt-boundary final-norm row "
+          << "route=" << route.route_id
+          << " trace_values=" << trace.final_hidden_normed.size()
+          << " hidden_size=" << hidden_size << "\n";
+      return std::nullopt;
+    }
+    observation.prompt_boundary_embedding_row = std::move(*embedding_row);
+    observation.prompt_boundary_final_hidden_normed_row =
+        std::move(*final_hidden_normed_row);
+  }
 
   std::cout << "nano_16_token_correctness_test: " << RouteDetail(route)
             << " prefill complete elapsed_ms=" << observation.elapsed_ms
             << " first_token=" << observation.selected_token_id << "\n";
   std::cout.flush();
   return observation;
+}
+
+void PrintTraceComparisonSummary(
+    const PrefillRouteConfig& lhs_route,
+    const BoundaryObservation& lhs_observation,
+    const PrefillRouteConfig& rhs_route,
+    const BoundaryObservation& rhs_observation) {
+  const std::ios::fmtflags previous_flags = std::cout.flags();
+  const std::streamsize previous_precision = std::cout.precision();
+
+  // Compare the prompt-boundary row only; that's the row that drives the boundary logits.
+  const float embedding_diff = MaxAbsDiff(
+      lhs_observation.prompt_boundary_embedding_row,
+      rhs_observation.prompt_boundary_embedding_row);
+  const float final_norm_diff = MaxAbsDiff(
+      lhs_observation.prompt_boundary_final_hidden_normed_row,
+      rhs_observation.prompt_boundary_final_hidden_normed_row);
+  std::cout << std::fixed << std::setprecision(6)
+            << "nano_16_token_correctness_test: embedding "
+            << PairId(lhs_route, rhs_route) << " max_abs_diff=" << embedding_diff
+            << "  final_norm " << PairId(lhs_route, rhs_route)
+            << " max_abs_diff=" << final_norm_diff << "\n";
+  std::cout.flush();
+
+  std::cout.flags(previous_flags);
+  std::cout.precision(previous_precision);
 }
 
 std::optional<BoundaryObservation> RunContinuationBoundary(
@@ -756,6 +840,8 @@ bool run_nano_correctness_gate() {
       EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_LINEAR", false);
   const bool linear_device_fastpath_enabled =
       EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
+  const bool capture_embedding_trace =
+      EnvEnabledOrDefault("NEMOTRON_NANO_16_TRACE_EMBEDDING", false);
   ScopedLinearCounterReport linear_counter_report(
       strict_linear_enabled,
       linear_device_fastpath_enabled);
@@ -775,9 +861,12 @@ bool run_nano_correctness_gate() {
     return false;
   }
 
-  const auto route_a_prefill = RunPrefillBoundary(*model, kRouteA, *route_a_context);
-  const auto route_b_prefill = RunPrefillBoundary(*model, kRouteB, *route_b_context);
-  const auto route_c_prefill = RunPrefillBoundary(*model, kRouteC, *route_c_context);
+  const auto route_a_prefill =
+      RunPrefillBoundary(*model, kRouteA, *route_a_context, capture_embedding_trace);
+  const auto route_b_prefill =
+      RunPrefillBoundary(*model, kRouteB, *route_b_context, capture_embedding_trace);
+  const auto route_c_prefill =
+      RunPrefillBoundary(*model, kRouteC, *route_c_context, capture_embedding_trace);
   if (!expect(route_a_prefill.has_value(), "Route A prefill boundary should succeed") ||
       !expect(route_b_prefill.has_value(), "Route B prefill boundary should succeed") ||
       !expect(route_c_prefill.has_value(), "Route C prefill boundary should succeed")) {
@@ -791,6 +880,10 @@ bool run_nano_correctness_gate() {
   const BoundaryComparison route_ac_comparison =
       MakeBoundaryComparison(kRouteA, *route_a_prefill, kRouteC, *route_c_prefill);
   PrintPrefillSummaryTable({route_ab_comparison, route_bc_comparison, route_ac_comparison});
+  if (capture_embedding_trace) {
+    PrintTraceComparisonSummary(kRouteA, *route_a_prefill, kRouteB, *route_b_prefill);
+    PrintTraceComparisonSummary(kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
+  }
 
   bool has_prefill_mismatch = false;
   if (HasSelectedTokenMismatch(route_ab_comparison)) {
