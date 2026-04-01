@@ -747,9 +747,10 @@ struct ExpertLayerSlice::Impl {
   mutable DeviceBuffer<float> scratch_down_act_tensor_scales;
   // -- Pre-filled row scales (constant 1.0f, avoids per-token H→D copy) --
   mutable DeviceBuffer<float> scratch_row_scales;
-  // -- CUTLASS path aligned buffers --
+  // -- CUTLASS path aligned/output buffers --
   mutable DeviceBuffer<std::uint8_t> scratch_aligned_act_packed;
   mutable DeviceBuffer<std::uint8_t> scratch_aligned_act_scales;
+  mutable DeviceBuffer<float> scratch_cutlass_down_output;
   // CUDA graph state for MoE layer (gated by NEMOTRON_CUDA_GRAPH_MOE)
   mutable bool moe_graph_enabled = false;
   mutable cudaGraph_t moe_graph = nullptr;
@@ -1539,6 +1540,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     const std::size_t aligned_scale_row = round_up(act_scale_row_bytes, kCutlassAlign);
     impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
     impl->scratch_aligned_act_scales.Resize(top_k * aligned_scale_row);
+    impl->scratch_cutlass_down_output.Resize(top_k * latent);
 
     // CUDA graph scratch buffers (fixed-address copies of variable inputs)
     impl->moe_graph_enabled = std::getenv("NEMOTRON_CUDA_GRAPH_MOE") != nullptr;
@@ -1958,6 +1960,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     const std::size_t aligned_scale_row = round_up(act_scale_row_bytes, kCutlassAlign);
     impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
     impl->scratch_aligned_act_scales.Resize(top_k * aligned_scale_row);
+    impl->scratch_cutlass_down_output.Resize(top_k * latent);
 
     impl->moe_graph_enabled = std::getenv("NEMOTRON_CUDA_GRAPH_MOE") != nullptr;
     if (impl->moe_graph_enabled) {
@@ -2960,25 +2963,36 @@ bool RunExpertLayerImpl(
       constexpr std::size_t kCutlassAlign = 256;
       const std::size_t act_packed_row_bytes = impl.config.routed_expert_intermediate_size / 2;
       const std::size_t act_scale_row_bytes = impl.config.routed_expert_intermediate_size / 16;
-      const std::size_t aligned_packed_row = ((act_packed_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
-      const std::size_t aligned_scale_row = ((act_scale_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
+      const std::size_t aligned_packed_row =
+          ((act_packed_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
+      const std::size_t aligned_scale_row =
+          ((act_scale_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
+      const std::size_t down_output_count = batch_count * impl.config.moe_latent_size;
 
-      auto down_output = DeviceTensorFp32::Create({batch_count, impl.config.moe_latent_size});
+      auto down_output = DeviceTensorFp32::CreateView(
+          {batch_count, impl.config.moe_latent_size},
+          impl.scratch_cutlass_down_output.data());
 
       if (impl.scratch_aligned_act_packed.valid() &&
           impl.scratch_aligned_act_packed.count() >= batch_count * aligned_packed_row &&
           impl.scratch_aligned_act_scales.valid() &&
           impl.scratch_aligned_act_scales.count() >= batch_count * aligned_scale_row &&
-          down_output && down_output->valid() && down_output->FillZero()) {
+          impl.scratch_cutlass_down_output.valid() &&
+          impl.scratch_cutlass_down_output.count() >= down_output_count &&
+          down_output && down_output->valid() &&
+          cudaMemsetAsync(
+              impl.scratch_cutlass_down_output.data(),
+              0,
+              down_output_count * sizeof(float)) == cudaSuccess) {
         // Copy activation rows to aligned offsets (D→D, no host).
         cudaMemsetAsync(impl.scratch_aligned_act_packed.data(), 0, batch_count * aligned_packed_row);
         cudaMemsetAsync(impl.scratch_aligned_act_scales.data(), 0, batch_count * aligned_scale_row);
         for (std::size_t i = 0; i < batch_count; ++i) {
-          cudaMemcpy(
+          cudaMemcpyAsync(
               impl.scratch_aligned_act_packed.data() + i * aligned_packed_row,
               impl.scratch_down_act_packed.data() + i * act_packed_row_bytes,
               act_packed_row_bytes, cudaMemcpyDeviceToDevice);
-          cudaMemcpy(
+          cudaMemcpyAsync(
               impl.scratch_aligned_act_scales.data() + i * aligned_scale_row,
               impl.scratch_down_act_block_scales.data() + i * act_scale_row_bytes,
               act_scale_row_bytes, cudaMemcpyDeviceToDevice);
