@@ -87,7 +87,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Include the counter summary in both JSON and stdout output.
   Key files: `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`, `testing/api/nano_16_token_correctness_test.cpp`
 
-- [ ] **9. Cached-head and profiler-ready benchmark modes**
+- [x] **9. Cached-head and profiler-ready benchmark modes**
   Add two more benchmark modes to `nano_fused_decode_bench.cpp`:
   - `--mode=cached-head`: Restore a cached prompt head (via prefix cache if available, or by running prefill and saving the state), then time continued decode from the cached state. This isolates decode cost when prompt is already cached.
   - `--mode=profile-ready`: Run exactly one prefill + one decode step with `cudaDeviceSynchronize()` barriers placed before and after each step. Print markers like `===PREFILL_START===` / `===PREFILL_END===` / `===DECODE_START===` / `===DECODE_END===` so Nsight Systems captures can be trimmed precisely.
@@ -114,6 +114,6 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 5 | Expert staging cost metrics | done | f76eaeb | preflight-expert-staging-metrics |
 | 6 | Device-side argmax kernel | done | 972bdfb | nano-device-token-select (kernel) |
 | 7 | Integrate device argmax into decode loop | done | f4c4996 | nano-device-token-select (integration) |
-| 8 | Linear fastpath strict mode | done | — | nano-linear-fastpath (strict gate) |
-| 9 | Cached-head and profiler-ready benchmark modes | pending | — | nano-hotpath-measure |
+| 8 | Linear fastpath strict mode | done | 447882f | nano-linear-fastpath (strict gate) |
+| 9 | Cached-head and profiler-ready benchmark modes | done | — | nano-hotpath-measure |
 | 10 | Wire all counters into benchmark JSON artifact | pending | — | nano-hotpath-measure (integration) |

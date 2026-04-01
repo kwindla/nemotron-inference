@@ -34,6 +34,8 @@ constexpr std::size_t kDefaultDecodeTokenCount = 16;
 enum class BenchmarkMode {
   kPhased,
   kSteadyState,
+  kCachedHead,
+  kProfileReady,
 };
 
 constexpr std::size_t GiB(std::size_t value) {
@@ -335,6 +337,10 @@ const char* BenchmarkModeCliName(BenchmarkMode mode) {
   switch (mode) {
     case BenchmarkMode::kSteadyState:
       return "steady-state";
+    case BenchmarkMode::kCachedHead:
+      return "cached-head";
+    case BenchmarkMode::kProfileReady:
+      return "profile-ready";
     case BenchmarkMode::kPhased:
       return "phased";
   }
@@ -345,6 +351,10 @@ const char* BenchmarkModeJsonName(BenchmarkMode mode) {
   switch (mode) {
     case BenchmarkMode::kSteadyState:
       return "steady_state";
+    case BenchmarkMode::kCachedHead:
+      return "cached_head";
+    case BenchmarkMode::kProfileReady:
+      return "profile_ready";
     case BenchmarkMode::kPhased:
       return "phased";
   }
@@ -361,6 +371,14 @@ bool ParseBenchmarkMode(const std::string& value, BenchmarkMode* mode) {
   }
   if (value == "steady-state" || value == "steady_state") {
     *mode = BenchmarkMode::kSteadyState;
+    return true;
+  }
+  if (value == "cached-head" || value == "cached_head") {
+    *mode = BenchmarkMode::kCachedHead;
+    return true;
+  }
+  if (value == "profile-ready" || value == "profile_ready") {
+    *mode = BenchmarkMode::kProfileReady;
     return true;
   }
   return false;
@@ -423,11 +441,13 @@ void PrintUsage(const char* argv0) {
   std::cout
       << "Usage: " << argv0 << " [options]\n"
       << "  --manifest <path>           Manifest path. Defaults to NEMOTRON_FORWARD_MANIFEST.\n"
-      << "  --mode <phased|steady-state> Benchmark mode. Default: phased\n"
+      << "  --mode <phased|steady-state|cached-head|profile-ready>\n"
+      << "                             Benchmark mode. Default: phased\n"
       << "  --strict-linear            Fail if linear fastpath was requested but reference fallbacks occurred.\n"
       << "  --warmup <count>            Warmup iterations. Default: 1\n"
       << "  --iterations <count>        Timed hot iterations. Default: 3\n"
-      << "  --decode-tokens <count>     Timed ContinueSingleToken steps for --mode=steady-state. Default: 16\n"
+      << "  --decode-tokens <count>     Timed ContinueSingleToken steps for --mode=steady-state\n"
+      << "                             and --mode=cached-head. Default: 16\n"
       << "  --json-output <path>        Write JSON output.\n";
 }
 
@@ -518,6 +538,12 @@ struct TimedPhasedRun {
 struct TimedSteadyStateRun {
   double prefill_ms = 0.0;
   std::vector<double> steady_state_step_ms;
+  std::vector<std::int32_t> generated_token_ids;
+};
+
+struct TimedProfileReadyRun {
+  double prefill_ms = 0.0;
+  double decode_step_ms = 0.0;
   std::vector<std::int32_t> generated_token_ids;
 };
 
@@ -663,7 +689,7 @@ std::optional<TimedSteadyStateRun> RunTimedSteadyStateDecode(
   run.steady_state_step_ms.reserve(decode_token_count);
 
   std::cout << "nano_fused_decode_bench: " << run_label
-            << " steady-state prefill start prompt_tokens=" << prompt_token_ids.size()
+            << " prefill start prompt_tokens=" << prompt_token_ids.size()
             << " decode_tokens=" << decode_token_count << "\n";
   std::cout.flush();
   if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before prefill failed")) {
@@ -694,7 +720,7 @@ std::optional<TimedSteadyStateRun> RunTimedSteadyStateDecode(
   }
 
   std::cout << "nano_fused_decode_bench: " << run_label
-            << " steady-state prefill complete elapsed_ms=" << run.prefill_ms
+            << " prefill complete elapsed_ms=" << run.prefill_ms
             << " seed_token=" << *initial_token << "\n";
   std::cout.flush();
 
@@ -737,6 +763,92 @@ std::optional<TimedSteadyStateRun> RunTimedSteadyStateDecode(
     std::cout.flush();
     token_id = *next_token;
   }
+
+  return run;
+}
+
+std::optional<TimedProfileReadyRun> RunProfileReadyDecode(
+    nemotron::SingleTokenForwardModel& model,
+    const std::vector<std::int32_t>& prompt_token_ids,
+    bool device_token_select_enabled,
+    std::int32_t* device_token_id) {
+  auto request_context = model.CreateRequestContext();
+  if (request_context == nullptr || !request_context->valid()) {
+    std::cerr << "nano_fused_decode_bench: failed to create request context\n";
+    return std::nullopt;
+  }
+  auto prompt_logits =
+      nemotron::DeviceTensorFp32::Create({prompt_token_ids.size(), model.config().vocab_size});
+  if (prompt_logits == nullptr || !prompt_logits->valid()) {
+    std::cerr << "nano_fused_decode_bench: failed to allocate prompt logits\n";
+    return std::nullopt;
+  }
+  auto step_logits = nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
+  if (step_logits == nullptr || !step_logits->valid()) {
+    std::cerr << "nano_fused_decode_bench: failed to allocate step logits\n";
+    return std::nullopt;
+  }
+
+  TimedProfileReadyRun run;
+  run.generated_token_ids.reserve(2);
+
+  if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before prefill failed")) {
+    return std::nullopt;
+  }
+  std::cout << "===PREFILL_START===\n";
+  std::cout.flush();
+  const auto prefill_start = std::chrono::steady_clock::now();
+  if (!model.RunPrefill(
+          prompt_token_ids.data(),
+          prompt_token_ids.size(),
+          *request_context,
+          prompt_logits.get())) {
+    std::cerr << "nano_fused_decode_bench: RunPrefill failed\n";
+    return std::nullopt;
+  }
+  if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after prefill failed")) {
+    return std::nullopt;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+  run.prefill_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
+  std::cout << "===PREFILL_END===\n";
+  std::cout.flush();
+
+  const std::vector<float> prompt_host = CopyTensorToHost(*prompt_logits);
+  const std::vector<float> prompt_final_row =
+      SliceRow(prompt_host, prompt_token_ids.size() - 1, model.config().vocab_size);
+  const auto initial_token = ArgMaxTokenId(prompt_final_row);
+  if (!initial_token.has_value()) {
+    std::cerr << "nano_fused_decode_bench: failed to select profile-ready seed token\n";
+    return std::nullopt;
+  }
+  run.generated_token_ids.push_back(*initial_token);
+
+  if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before decode step failed")) {
+    return std::nullopt;
+  }
+  std::cout << "===DECODE_START===\n";
+  std::cout.flush();
+  const auto decode_start = std::chrono::steady_clock::now();
+  if (!model.ContinueSingleToken(*initial_token, *request_context, step_logits.get())) {
+    std::cerr << "nano_fused_decode_bench: ContinueSingleToken failed at step 1\n";
+    return std::nullopt;
+  }
+  const auto next_token =
+      SelectContinuationTokenId(*step_logits, device_token_select_enabled, device_token_id);
+  if (!next_token.has_value()) {
+    std::cerr << "nano_fused_decode_bench: failed to select token at step 1\n";
+    return std::nullopt;
+  }
+  if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after decode step failed")) {
+    return std::nullopt;
+  }
+  const auto decode_end = std::chrono::steady_clock::now();
+  run.decode_step_ms =
+      std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+  std::cout << "===DECODE_END===\n";
+  std::cout.flush();
+  run.generated_token_ids.push_back(*next_token);
 
   return run;
 }
@@ -953,15 +1065,19 @@ int main(int argc, char** argv) {
   result.model_id = load_result.manifest.runtime.model_id;
   result.manifest_path = options.manifest_path->string();
   result.prompt_token_count = prompt_token_ids.size();
-  result.decode_token_count = options.mode == BenchmarkMode::kSteadyState
-                                  ? options.decode_token_count
-                                  : kDefaultDecodeTokenCount;
+  result.decode_token_count =
+      (options.mode == BenchmarkMode::kSteadyState ||
+       options.mode == BenchmarkMode::kCachedHead)
+          ? options.decode_token_count
+          : (options.mode == BenchmarkMode::kProfileReady ? 1 : kDefaultDecodeTokenCount);
   result.linear_device_fastpath_enabled =
       EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
   result.device_token_select_enabled = device_token_select_enabled;
 
-  if (options.mode == BenchmarkMode::kSteadyState) {
-    std::cout << "nano_fused_decode_bench: starting mode=" << BenchmarkModeCliName(options.mode)
+  if (options.mode == BenchmarkMode::kSteadyState ||
+      options.mode == BenchmarkMode::kCachedHead) {
+    const char* mode_name = BenchmarkModeCliName(options.mode);
+    std::cout << "nano_fused_decode_bench: starting mode=" << mode_name
               << " prompt_tokens=" << prompt_token_ids.size()
               << " decode_tokens=" << options.decode_token_count
               << " device_token_select=" << EnabledStatus(device_token_select_enabled) << "\n";
@@ -970,7 +1086,7 @@ int main(int argc, char** argv) {
         *model,
         prompt_token_ids,
         options.decode_token_count,
-        "steady-state",
+        mode_name,
         device_token_select_enabled,
         device_token_buffer.data);
     if (!steady_state_run.has_value()) {
@@ -992,7 +1108,7 @@ int main(int argc, char** argv) {
           1000.0 / result.hot_steady_state_mean_ms;
     }
 
-    std::cout << "nano_fused_decode_bench: mode=steady-state"
+    std::cout << "nano_fused_decode_bench: mode=" << mode_name
               << " prompt_tokens=" << result.prompt_token_count
               << " decode_tokens=" << result.decode_token_count
               << " prefill_ms=" << std::fixed << std::setprecision(3)
@@ -1004,7 +1120,7 @@ int main(int argc, char** argv) {
               << " decode_tokens_per_second="
               << result.steady_state_generated_tokens_per_second
               << "\n";
-    std::cout << "nano_fused_decode_bench: mode=steady-state per_step_ms=";
+    std::cout << "nano_fused_decode_bench: mode=" << mode_name << " per_step_ms=";
     for (std::size_t i = 0; i < result.steady_state_step_ms.size(); ++i) {
       if (i != 0) {
         std::cout << ",";
@@ -1012,6 +1128,51 @@ int main(int argc, char** argv) {
       std::cout << std::fixed << std::setprecision(3) << result.steady_state_step_ms[i];
     }
     std::cout << "\n";
+  } else if (options.mode == BenchmarkMode::kProfileReady) {
+    std::cout << "nano_fused_decode_bench: starting mode=profile-ready"
+              << " prompt_tokens=" << prompt_token_ids.size()
+              << " decode_tokens=1"
+              << " device_token_select=" << EnabledStatus(device_token_select_enabled) << "\n";
+    std::cout.flush();
+    const auto profile_ready_run = RunProfileReadyDecode(
+        *model,
+        prompt_token_ids,
+        device_token_select_enabled,
+        device_token_buffer.data);
+    if (!profile_ready_run.has_value()) {
+      return 1;
+    }
+
+    result.max_new_tokens = profile_ready_run->generated_token_ids.size();
+    result.warmup_iterations = 0;
+    result.hot_iterations = 0;
+    result.generated_token_count = profile_ready_run->generated_token_ids.size();
+    result.generated_token_ids = profile_ready_run->generated_token_ids;
+    result.steady_state_prefill_ms = profile_ready_run->prefill_ms;
+    result.steady_state_step_ms = {profile_ready_run->decode_step_ms};
+    result.hot_steady_state_mean_ms = profile_ready_run->decode_step_ms;
+    result.hot_steady_state_min_ms = profile_ready_run->decode_step_ms;
+    result.hot_steady_state_max_ms = profile_ready_run->decode_step_ms;
+    if (result.hot_steady_state_mean_ms > 0.0) {
+      result.steady_state_generated_tokens_per_second =
+          1000.0 / result.hot_steady_state_mean_ms;
+    }
+    const double total_profile_ready_ms =
+        profile_ready_run->prefill_ms + profile_ready_run->decode_step_ms;
+    if (total_profile_ready_ms > 0.0) {
+      result.full_decode_tokens_per_second =
+          (static_cast<double>(result.generated_token_count) * 1000.0) /
+          total_profile_ready_ms;
+    }
+
+    std::cout << "nano_fused_decode_bench: mode=profile-ready"
+              << " prompt_tokens=" << result.prompt_token_count
+              << " decode_tokens=" << result.decode_token_count
+              << " prefill_ms=" << std::fixed << std::setprecision(3)
+              << result.steady_state_prefill_ms
+              << " decode_ms=" << result.hot_steady_state_mean_ms
+              << " device_token_select=" << EnabledStatus(result.device_token_select_enabled)
+              << "\n";
   } else {
     std::cout << "nano_fused_decode_bench: starting cold run"
               << " prompt_tokens=" << prompt_token_ids.size()
