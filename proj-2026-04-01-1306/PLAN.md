@@ -18,7 +18,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
   - Gate behind `NEMOTRON_NANO_16_TRACE_EMBEDDING=1` env var to avoid the cost on every run
   Key files: `testing/api/nano_16_token_correctness_test.cpp`
 
-- [ ] **2. Add GEMM plan-build diagnostic logging to linear ops**
+- [x] **2. Add GEMM plan-build diagnostic logging to linear ops**
   When `NEMOTRON_FORWARD_DEBUG=1`, add diagnostic output to `linear_op.cpp` showing why GEMM plan builds fail. In `BuildRuntimeGemmPlan()` and `BuildDescriptorGemmPlan()`, when a plan returns `std::nullopt`, log:
   - The tensor name from the descriptor
   - M, N, K dimensions attempted
@@ -76,8 +76,8 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Embedding and final-norm trace comparison | done | — | nano-prompt-parity (diagnosis) |
-| 2 | GEMM plan-build diagnostic logging | pending | — | nano-linear-fastpath (diagnostics) |
+| 1 | Embedding and final-norm trace comparison | done | 534ba08 | nano-prompt-parity (diagnosis) |
+| 2 | GEMM plan-build diagnostic logging | done | — | nano-linear-fastpath (diagnostics) |
 | 3 | Linear counter breakdown in layer probes | pending | — | nano-linear-fastpath (per-layer) |
 | 4 | Per-operator linear counter tracking | pending | — | nano-linear-fastpath (per-tensor) |
 | 5 | Saved-token oracle for fixed prompt | pending | — | nano-prompt-parity (oracle) |

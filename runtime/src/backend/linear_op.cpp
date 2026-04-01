@@ -55,6 +55,66 @@ std::optional<float> ParsePositiveFloatEnv(const char* env_var) {
   return parsed;
 }
 
+enum class GemmPlanFailureStep {
+  kNone,
+  kBuildGemmLaunchPlan,
+  kBuildRuntimeLaunchPlan,
+  kPrepareGemmExecution,
+  kBuildCublasLtGemmPlan,
+};
+
+const char* GemmPlanFailureStepName(GemmPlanFailureStep step) {
+  switch (step) {
+    case GemmPlanFailureStep::kNone:
+      return "unknown";
+    case GemmPlanFailureStep::kBuildGemmLaunchPlan:
+      return "BuildGemmLaunchPlan";
+    case GemmPlanFailureStep::kBuildRuntimeLaunchPlan:
+      return "BuildRuntimeLaunchPlan";
+    case GemmPlanFailureStep::kPrepareGemmExecution:
+      return "PrepareGemmExecution";
+    case GemmPlanFailureStep::kBuildCublasLtGemmPlan:
+      return "BuildCublasLtGemmPlan";
+  }
+  return "unknown";
+}
+
+void SetGemmPlanFailureStep(
+    GemmPlanFailureStep* failure_step,
+    GemmPlanFailureStep value) {
+  if (failure_step != nullptr) {
+    *failure_step = value;
+  }
+}
+
+void LogGemmPlanBuildFailure(
+    const GemmDescriptor& descriptor,
+    std::size_t rows,
+    const char* plan_source,
+    GemmPlanFailureStep failure_step) {
+  std::cerr << "linear_op: plan build failed for " << descriptor.tensor_name
+            << " M=" << rows
+            << " N=" << descriptor.output_rows
+            << " K=" << descriptor.input_cols
+            << " step=plan_build"
+            << " plan_source=" << plan_source
+            << " sub_step=" << GemmPlanFailureStepName(failure_step)
+            << "\n";
+}
+
+void LogGemmExecuteFailure(
+    const GemmDescriptor& descriptor,
+    std::size_t rows,
+    const char* plan_source) {
+  std::cerr << "linear_op: execute failed for " << descriptor.tensor_name
+            << " M=" << rows
+            << " N=" << descriptor.output_rows
+            << " K=" << descriptor.input_cols
+            << " step=execute"
+            << " plan_source=" << plan_source
+            << "\n";
+}
+
 Nvfp4PackOptions RuntimeNvfp4PackOptions(bool debug, const GemmDescriptor& descriptor) {
   Nvfp4PackOptions options;
   const char* raw_value = std::getenv(kNvfp4ActivationTensorScaleEnvVar);
@@ -82,16 +142,24 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(bool debug, const GemmDescriptor& descr
 std::optional<CublasLtGemmPlan> BuildDescriptorGemmPlan(
     const GemmDescriptor& descriptor,
     std::size_t rows,
-    GemmHeuristicCache* heuristic_cache) {
+    GemmHeuristicCache* heuristic_cache,
+    GemmPlanFailureStep* failure_step = nullptr) {
+  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
   const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
   if (!launch_plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildGemmLaunchPlan);
     return std::nullopt;
   }
   const auto execution = PrepareGemmExecution(*launch_plan, heuristic_cache);
   if (!execution.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  return BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution);
+  if (!plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
+  }
+  return plan;
 }
 
 std::optional<GemmLaunchPlan> BuildRuntimeLaunchPlan(
@@ -99,11 +167,14 @@ std::optional<GemmLaunchPlan> BuildRuntimeLaunchPlan(
     std::size_t rows,
     ByteRangeView packed_bytes,
     std::optional<ByteRangeView> block_scales_bytes = std::nullopt,
-    std::optional<ByteRangeView> tensor_scale_bytes = std::nullopt) {
+    std::optional<ByteRangeView> tensor_scale_bytes = std::nullopt,
+    GemmPlanFailureStep* failure_step = nullptr) {
   const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
   if (!launch_plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildRuntimeLaunchPlan);
     return std::nullopt;
   }
+  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
   GemmLaunchPlan runtime_launch_plan = *launch_plan;
   runtime_launch_plan.packed_bytes = packed_bytes;
   if (block_scales_bytes.has_value()) {
@@ -119,29 +190,41 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     const GemmDescriptor& descriptor,
     const DeviceDenseWeightFp32& weight,
     std::size_t rows,
-    GemmHeuristicCache* heuristic_cache) {
+    GemmHeuristicCache* heuristic_cache,
+    GemmPlanFailureStep* failure_step = nullptr) {
+  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
   const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
       descriptor,
       rows,
       ByteRangeView{
           reinterpret_cast<const std::uint8_t*>(weight.data()),
           weight.numel() * sizeof(float),
-      });
+      },
+      std::nullopt,
+      std::nullopt,
+      failure_step);
   if (!runtime_launch_plan.has_value()) {
     return std::nullopt;
   }
   const auto execution = PrepareGemmExecution(*runtime_launch_plan, heuristic_cache);
   if (!execution.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  return BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution);
+  if (!plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
+  }
+  return plan;
 }
 
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     const GemmDescriptor& descriptor,
     const DeviceNvfp4Weight& weight,
     std::size_t rows,
-    GemmHeuristicCache* heuristic_cache) {
+    GemmHeuristicCache* heuristic_cache,
+    GemmPlanFailureStep* failure_step = nullptr) {
+  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
   const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
       descriptor,
       rows,
@@ -156,15 +239,21 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
       ByteRangeView{
           weight.tensor_scale_data(),
           weight.tensor_scale_nbytes(),
-      });
+      },
+      failure_step);
   if (!runtime_launch_plan.has_value()) {
     return std::nullopt;
   }
   const auto execution = PrepareGemmExecution(*runtime_launch_plan, heuristic_cache);
   if (!execution.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  return BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution);
+  if (!plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
+  }
+  return plan;
 }
 
 bool IsFp32Storage(const std::string& storage_dtype) {
@@ -274,15 +363,18 @@ bool UploadedLinearOp::Run(
     }
     return false;
   }
+  const std::size_t rows = activations.shape().at(0);
   auto& counters = GetLinearOpCounters();
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
       if (LinearDeviceFastpathEnabled()) {
+        GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
         const auto plan = BuildRuntimeGemmPlan(
             impl_->descriptor,
             *impl_->dense_weight,
-            activations.shape().at(0),
-            heuristic_cache);
+            rows,
+            heuristic_cache,
+            &failure_step);
         if (plan.has_value()) {
           counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
           if (const auto stats = RunDenseRowMajorFp32ToDevice(
@@ -297,14 +389,16 @@ bool UploadedLinearOp::Run(
           }
           counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
           if (debug) {
-            std::cerr << "linear_op: dense device path failed for "
-                      << impl_->descriptor.tensor_name << "\n";
+            LogGemmExecuteFailure(impl_->descriptor, rows, "runtime");
           }
         } else {
           counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
           if (debug) {
-            std::cerr << "linear_op: plan build failed for " << impl_->descriptor.tensor_name
-                      << ", falling back to CPU\n";
+            LogGemmPlanBuildFailure(
+                impl_->descriptor,
+                rows,
+                "runtime",
+                failure_step);
           }
         }
       } else if (debug) {
@@ -316,16 +410,36 @@ bool UploadedLinearOp::Run(
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       {
         const Nvfp4PackOptions pack_options = RuntimeNvfp4PackOptions(debug, impl_->descriptor);
+        const char* plan_source = "descriptor";
+        GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
         auto plan = BuildDescriptorGemmPlan(
             impl_->descriptor,
-            activations.shape().at(0),
-            heuristic_cache);
+            rows,
+            heuristic_cache,
+            &failure_step);
+        if (!plan.has_value() && debug) {
+          LogGemmPlanBuildFailure(
+              impl_->descriptor,
+              rows,
+              plan_source,
+              failure_step);
+        }
         if (!plan.has_value() && LinearDeviceFastpathEnabled()) {
+          plan_source = "runtime";
+          failure_step = GemmPlanFailureStep::kNone;
           plan = BuildRuntimeGemmPlan(
               impl_->descriptor,
               *impl_->nvfp4_weight,
-              activations.shape().at(0),
-              heuristic_cache);
+              rows,
+              heuristic_cache,
+              &failure_step);
+          if (!plan.has_value() && debug) {
+            LogGemmPlanBuildFailure(
+                impl_->descriptor,
+                rows,
+                plan_source,
+                failure_step);
+          }
         }
         if (plan.has_value()) {
           counters.nvfp4_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
@@ -347,11 +461,8 @@ bool UploadedLinearOp::Run(
         if (plan.has_value()) {
           counters.nvfp4_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
         }
-        if (debug) {
-          std::cerr << "linear_op: NVFP4 device path failed for "
-                    << impl_->descriptor.tensor_name
-                    << (plan.has_value() ? "" : " (no plan)")
-                    << "\n";
+        if (debug && plan.has_value()) {
+          LogGemmExecuteFailure(impl_->descriptor, rows, plan_source);
         }
         break;
       }

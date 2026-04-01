@@ -41,12 +41,69 @@ float DecodeFp8(std::uint8_t raw_byte) {
   return static_cast<float>(value);
 }
 
+enum class GemmPlanFailureStep {
+  kNone,
+  kBuildGemmLaunchPlan,
+  kPrepareGemmExecution,
+  kBuildCublasLtGemmPlan,
+};
+
+const char* GemmPlanFailureStepName(GemmPlanFailureStep step) {
+  switch (step) {
+    case GemmPlanFailureStep::kNone:
+      return "unknown";
+    case GemmPlanFailureStep::kBuildGemmLaunchPlan:
+      return "BuildGemmLaunchPlan";
+    case GemmPlanFailureStep::kPrepareGemmExecution:
+      return "PrepareGemmExecution";
+    case GemmPlanFailureStep::kBuildCublasLtGemmPlan:
+      return "BuildCublasLtGemmPlan";
+  }
+  return "unknown";
+}
+
+void SetGemmPlanFailureStep(
+    GemmPlanFailureStep* failure_step,
+    GemmPlanFailureStep value) {
+  if (failure_step != nullptr) {
+    *failure_step = value;
+  }
+}
+
+void LogGemmPlanBuildFailure(
+    std::size_t rows,
+    std::size_t output_rows,
+    std::size_t input_cols,
+    GemmPlanFailureStep failure_step) {
+  std::cerr << "scaled_fp8_linear: plan build failed"
+            << " M=" << rows
+            << " N=" << output_rows
+            << " K=" << input_cols
+            << " step=plan_build"
+            << " sub_step=" << GemmPlanFailureStepName(failure_step)
+            << "\n";
+}
+
+void LogGemmExecuteFailure(
+    std::size_t rows,
+    std::size_t output_rows,
+    std::size_t input_cols) {
+  std::cerr << "scaled_fp8_linear: execute failed"
+            << " M=" << rows
+            << " N=" << output_rows
+            << " K=" << input_cols
+            << " step=execute"
+            << "\n";
+}
+
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     std::size_t output_rows,
     std::size_t input_cols,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache,
-    const float* packed_weight_data) {
+    const float* packed_weight_data,
+    GemmPlanFailureStep* failure_step = nullptr) {
+  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
   GemmDescriptor descriptor;
   descriptor.tensor_name = "scaled_fp8_linear";
   descriptor.op_class = "scaled_fp8_linear";
@@ -61,13 +118,19 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
   descriptor.packed_nbytes = output_rows * input_cols * sizeof(float);
   const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
   if (!launch_plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildGemmLaunchPlan);
     return std::nullopt;
   }
   const auto execution = PrepareGemmExecution(*launch_plan, heuristic_cache);
   if (!execution.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  return BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution);
+  if (!plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
+  }
+  return plan;
 }
 
 __global__ void QuantizeFp8RoundTripKernel(
@@ -236,12 +299,15 @@ bool ScaledFp8LinearOp::Run(
 
   auto& counters = GetLinearOpCounters();
   if (LinearDeviceFastpathEnabled()) {
+    const std::size_t rows = activations.shape()[0];
+    GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
     const auto plan = BuildRuntimeGemmPlan(
         impl_->config.output_rows,
         impl_->config.input_cols,
-        activations.shape()[0],
+        rows,
         heuristic_cache,
-        impl_->host_weight_data);
+        impl_->host_weight_data,
+        &failure_step);
     if (plan.has_value()) {
       const auto stats = RunDenseRowMajorFp32ToDevice(
           handle,
@@ -254,10 +320,17 @@ bool ScaledFp8LinearOp::Run(
         return true;
       }
       if (debug) {
-        std::cerr << "scaled_fp8_linear: device GEMM path failed\n";
+        LogGemmExecuteFailure(
+            rows,
+            impl_->config.output_rows,
+            impl_->config.input_cols);
       }
     } else if (debug) {
-      std::cerr << "scaled_fp8_linear: device plan build failed\n";
+      LogGemmPlanBuildFailure(
+          rows,
+          impl_->config.output_rows,
+          impl_->config.input_cols,
+          failure_step);
     }
   } else if (debug) {
     std::cerr << "scaled_fp8_linear: reference path forced\n";
