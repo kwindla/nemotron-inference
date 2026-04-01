@@ -63,7 +63,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
   Mirror what was done for linear counters: add `#include "nemotron/expert_staging_counters.h"` to the correctness test, reset/print expert staging counters around the test, and add a `NEMOTRON_NANO_16_STRICT_EXPERT_STAGING` warning mode that flags if expert staging cost is unexpectedly high (e.g., bytes_uploaded > threshold per token). This completes the counter coverage across both test surfaces.
   Key files: `testing/api/nano_16_token_correctness_test.cpp`
 
-- [ ] **8. Add benchmark regression comparison script**
+- [x] **8. Add benchmark regression comparison script**
   Create `benchmarks/nano_fused_decode/compare_artifacts.py` that:
   - Takes two JSON benchmark artifact paths as arguments
   - Compares key metrics: steady_state_mean_ms, prefill_ms, tokens/sec
@@ -82,8 +82,8 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 | 4 | Per-operator linear counter tracking | done | 241c4be | nano-linear-fastpath (per-tensor) |
 | 5 | Saved-token oracle for fixed prompt | done | 9fdad33 | nano-prompt-parity (oracle) |
 | 6 | Load-and-compare oracle mode | done | 52cf0f5 | nano-prompt-parity (fast compare) |
-| 7 | Expert staging counters in correctness test | done | — | counter coverage |
-| 8 | Benchmark regression comparison script | pending | — | nano-roofline-loop (foundation) |
+| 7 | Expert staging counters in correctness test | done | 87e6ea5 | counter coverage |
+| 8 | Benchmark regression comparison script | done | — | nano-roofline-loop (foundation) |
 
 ## Progress Log
 
