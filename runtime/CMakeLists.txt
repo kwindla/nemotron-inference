@@ -118,6 +118,7 @@ add_library(
   src/backend/attention_layer.cpp
   src/backend/attention_device_fallback.cu
   src/backend/dense_weight.cpp
+  src/backend/device_argmax.cu
   src/backend/device_nvfp4_matrix.cu
   src/backend/device_tensor.cpp
   src/backend/dense_gemm_runner.cpp

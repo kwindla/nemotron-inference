@@ -60,7 +60,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Provide global accessor and reset. Add `PrintExpertStagingCounterSummary()`. Wire into the benchmark from step 3.
   Key files: `runtime/include/nemotron/expert_staging_counters.h` (new), `runtime/src/backend/expert_staging_counters.cpp` (new), `runtime/src/backend/expert_layer.cpp`, `runtime/CMakeLists.txt`
 
-- [ ] **6. Device-side argmax kernel for token selection**
+- [x] **6. Device-side argmax kernel for token selection**
   Add a device-side argmax kernel that eliminates the per-step host logits download for greedy decode. Create:
   - `runtime/include/nemotron/device_argmax.h` with `bool DeviceArgmax(const DeviceTensorFp32& logits_row, std::int32_t* device_token_id)` (operates on a 1-row logits tensor, writes a single int32 token ID to device memory)
   - `runtime/src/backend/device_argmax.cu` implementing a block-reduction argmax kernel (single block, threads cooperate to find max across vocab_size elements)
@@ -111,8 +111,8 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 2 | Linear operator execution counters | done | 9db3589 | preflight-linear-counters |
 | 3 | Steady-state decode benchmark mode | done | 80256a1 | preflight-steady-bench |
 | 4 | cuDNN FE attention feasibility report | done | b13f0e9 | preflight-attention-feasibility; confirmed NOT AVAILABLE (stub build) |
-| 5 | Expert staging cost metrics | done | — | preflight-expert-staging-metrics |
-| 6 | Device-side argmax kernel | pending | — | nano-device-token-select (kernel) |
+| 5 | Expert staging cost metrics | done | f76eaeb | preflight-expert-staging-metrics |
+| 6 | Device-side argmax kernel | done | — | nano-device-token-select (kernel) |
 | 7 | Integrate device argmax into decode loop | pending | — | nano-device-token-select (integration) |
 | 8 | Linear fastpath strict mode | pending | — | nano-linear-fastpath (strict gate) |
 | 9 | Cached-head and profiler-ready benchmark modes | pending | — | nano-hotpath-measure |

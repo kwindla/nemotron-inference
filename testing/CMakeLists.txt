@@ -203,6 +203,16 @@ target_compile_features(device_tensor_test PRIVATE cxx_std_17)
 nemotron_add_test(device_tensor_test)
 
 add_executable(
+  device_argmax_test
+  backend/device_argmax_test.cpp
+)
+
+target_link_libraries(device_argmax_test PRIVATE nemotron_runtime_backend)
+target_compile_features(device_argmax_test PRIVATE cxx_std_17)
+
+nemotron_add_test(device_argmax_test)
+
+add_executable(
   device_nvfp4_matrix_test
   backend/device_nvfp4_matrix_test.cpp
 )
