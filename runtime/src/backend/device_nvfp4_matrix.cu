@@ -85,6 +85,12 @@ __global__ void WriteTensorScaleKernel(
   *tensor_scale_data = tensor_scale;
 }
 
+__global__ void WriteFixedTensorScaleKernel(
+    float* dst,
+    float value) {
+  *dst = value;
+}
+
 __global__ void PackRowMajorFp32ToNvfp4Kernel(
     const float* source,
     std::size_t rows,
@@ -460,10 +466,8 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
   }
 
   if (fixed_tensor_scale.has_value()) {
-    const float host_tensor_scale = *fixed_tensor_scale;
-    if (!CheckCuda(cudaMemcpy(
-            tensor_scale_data, &host_tensor_scale,
-            sizeof(host_tensor_scale), cudaMemcpyHostToDevice))) {
+    WriteFixedTensorScaleKernel<<<1, 1>>>(tensor_scale_data, *fixed_tensor_scale);
+    if (!CheckCuda(cudaGetLastError())) {
       return false;
     }
   } else {
