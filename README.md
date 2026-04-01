@@ -23,6 +23,10 @@ Outputs land in `artifacts/preflight/`.
 Implementation progress is tracked in [PROGRESS.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/PROGRESS.md).
 The v1 cache design note is in [docs/v1_cache_architecture.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/v1_cache_architecture.md).
 The focused sub-plan for the first oracle-checked end-to-end forward path is in [docs/initial_forward_pass_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/initial_forward_pass_plan.md).
+The follow-on sub-plan for removing host roundtrips and CPU fallbacks from the runtime hot path is in [docs/gpu_path_rollout_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gpu_path_rollout_plan.md).
+The current DGX Spark decode-gap note is in [docs/dgx_spark_decode_gap_mini_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/dgx_spark_decode_gap_mini_plan.md).
+The primary MoE backend integration note is in [docs/flashinfer_moe_integration_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/flashinfer_moe_integration_plan.md).
+The active production-aligned MoE target is now FlashInfer CUTLASS fused NVFP4 MoE; the earlier TRT split FlashInfer path is retained only as a rejected reference experiment and interim seam history.
 The GB10 performance-planning note is in [docs/gb10_performance_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_performance_plan.md).
 The GB10 performance history log is in [docs/gb10_performance_progress.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_performance_progress.md).
 The short GB10 operator policy note is in [docs/gb10_execution_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_execution_policy.md).
@@ -77,6 +81,11 @@ Run the first GB10 dense microbenchmark harness:
 ./benchmarks/gb10_mamba_trace_dt_scale_sweep/run_sweep.sh
 ./benchmarks/gb10_mamba_dt_threshold_sweep/run_sweep.sh
 ./benchmarks/gb10_stochastic_rounding_probe/run_probe.sh
+./build/benchmarks/decode_bench/single_token_decode_bench --manifest ./artifacts/manifests/forward_runtime_manifest_unverified.json --iterations 1
+./build/benchmarks/decode_bench/single_token_decode_bench --manifest ./artifacts/manifests/forward_runtime_manifest_unverified.json --warmup 0 --iterations 0
+NEMOTRON_FORWARD_BUILD_DEBUG=1 ./build/benchmarks/decode_bench/single_token_decode_bench --manifest ./artifacts/manifests/forward_runtime_manifest_unverified.json --warmup 0 --iterations 0
+NEMOTRON_FORWARD_BUILD_THREADS=1 ./build/benchmarks/decode_bench/single_token_decode_bench --manifest ./artifacts/manifests/forward_runtime_manifest_unverified.json --warmup 0 --iterations 0
+./benchmarks/decode_bench/run_bench.sh ./artifacts/manifests/forward_runtime_manifest_unverified.json
 ./build/benchmarks/gb10_loader_modes/gb10_loader_modes_bench --manifest /path/to/manifest.json --repeats 3
 ./benchmarks/gb10_loader_modes/run_bench.sh /path/to/manifest.json 3
 ./benchmarks/gb10_gemm_compare/run_compare.sh
@@ -103,12 +112,55 @@ Current runtime config support includes:
 
 - `NEMOTRON_PREFIX_CACHE=0` to force the uncached path and disable prefix-cache lookup/publication
 - `NEMOTRON_FORWARD_DEBUG=1` to emit stage/layer progress from the correctness-first composed forward path
+- `NEMOTRON_FORWARD_BUILD_DEBUG=1` to emit build-time phase and per-layer timing from `SingleTokenForwardModel::Create(...)`
+- `NEMOTRON_FORWARD_BUILD_THREADS=<n>` to override the conservative default layer-construction concurrency used during model build timing / startup
+- `NEMOTRON_BENCH_SAFETY_HEADROOM_GIB=<n>` to override the decode bench bootstrap safety-headroom budget
+- `NEMOTRON_BENCH_WARNING_HOST_BUDGET_GIB=<n>` to set the decode bench low-memory warning threshold based on `MemAvailable + SwapFree`
+- `NEMOTRON_BENCH_ABORT_ON_LOW_HOST_BUDGET=1` to make the decode bench fail fast when the host budget falls below that threshold
+- `NEMOTRON_DISABLE_DENSE_DEVICE_PLAN_SURFACE=1` to disable the dense-native device-plan surface (enabled by default)
+- `NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_FAMILY=attention|expert|other|all` to scope that experiment to one dense family during 16-token decode validation
+- `NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_TENSORS=<comma-separated substrings>` to scope the dense-native experiment to specific tensor-name classes such as `gate.weight`, `fc1_latent_proj.weight`, or `fc2_latent_proj.weight`
+- `NEMOTRON_GROUPED_NVFP4_DEBUG=1` to print grouped routed-expert cuBLASLt failure stage / status on the decode path
+- `NEMOTRON_ROUTED_MOE_BACKEND=auto|custom|flashinfer` to select the routed MoE serving backend (`auto` uses FlashInfer if a compatible plugin is present, otherwise the accepted custom fused backend)
+- `NEMOTRON_ROUTED_MOE_BACKEND_STRICT=1` to fail instead of falling back when `flashinfer` is requested but unavailable
+- `NEMOTRON_FLASHINFER_MOE_LIBRARY=/path/to/libnemotron_flashinfer_moe.so` to override the routed FlashInfer plugin lookup path
+- `NEMOTRON_FLASHINFER_WEIGHT_SURFACE=legacy_trt_prepared|cutlass_raw` to choose which routed expert-weight contract the FlashInfer seam prepares (`legacy_trt_prepared` remains the default until the CUTLASS plugin lands; `cutlass_raw` is the new CUTLASS-aligned raw packed NVFP4 seam)
+- `NEMOTRON_EAGER_ROUTED_NVFP4_LOOKUPS=1` to eagerly prepare all routed-expert NVFP4 lookup tables at model-build time for graph-capture experiments; this is currently experimental and not a recommended Spark default
+- `NEMOTRON_ROUTED_LOOKUP_PREFETCH_TOPN=<n>` to try a bounded routed-expert hot-set prefetch on the first cold MoE miss; this is also experimental and currently not a recommended Spark default
+
+DGX Spark operating rule for heavy decode / startup benches:
+
+- run one heavy model-build or decode benchmark at a time
+- inspect the decode-bench `memory_snapshots` JSON field before trusting a result
+- on Spark, treat `host_budget_bytes = MemAvailable + SwapFree` as the main safety signal and `cudaMemGetInfo()` as advisory only
+- prefer `NEMOTRON_BENCH_ABORT_ON_LOW_HOST_BUDGET=1` with a warning threshold of at least `20 GiB` for unattended or long-running runs
+
+Current startup timing direction on the real manifest-backed build-only path:
+
+- baseline build-only artifact: about `406.2s` model build
+- after device-side BF16 / FP8 materialization: about `133.1s`
+- after conservative concurrent layer construction: about `118.3s`
+- later detailed hotspot baseline with `4` build workers: about `90.6s`
+- current best build-only result with lazy aligned routed-expert NVFP4 materialization: about `15.1s`
+- current first real manifest-backed first-token decode:
+  - environment bootstrap about `2.1s`
+  - model build about `14.0s`
+  - first token about `11.9s`
+  - end-to-end about `27.9s`
+- three follow-up constructor experiments were measured and rejected because they regressed wall time:
+  - pooled expert dense control uploads
+  - async NVFP4 pooled expert upload
+  - pooled Mamba norm/conv/state tensor uploads
+- later startup-policy follow-ups also lost:
+  - plain `mmap` still beat `mmap + prefetch`
+  - `readall` pushed environment build to about `74.1s` and then failed before model creation completed
 
 Current loader/bootstrap support includes:
 
 - verified `manifest.json` decode and file-range/checksum validation
 - manifest-backed runtime bootstrap via `RuntimeEnvironment::BuildFromManifestFile(...)`
 - runtime-owned artifact bytes through `ArtifactLoader`, with explicit `mmap` and eager-read load modes
+- optional benchmark-only `mmap` prefetch hints so startup-policy experiments can be measured without changing the default runtime path
 - optional `/proc/meminfo`-based host-memory clamp during runtime bootstrap for GB10 memory-budget planning
 - typed `TensorCatalog` descriptors for manifest-backed startup, including explicit `block_scales` and `tensor_scale` auxiliary-role resolution
 - aligned `WeightArenaPlan` placement descriptors for future read-only weight upload
@@ -129,6 +181,51 @@ Current loader/bootstrap support includes:
 - a first real layer-1 expert slice that composes outer RMSNorm, dense router logits, correctness-first top-k dispatch, scaled-FP8 latent/shared-up projections, routed/shared NVFP4 expert matmuls under the validated host pack/dequant contract, dense latent projection, and residual merge, and now also supports multi-row prefill replay
 - a registry-backed composed forward scaffold under `runtime/include/nemotron/single_token_forward_model.h` and `runtime/src/api/single_token_forward_model.cpp`, plus a tested `SingleTokenForwardPlan` builder that centralizes ordered layer dispatch, request-local KV sizing, per-layer Mamba state offsets, and a first `RunPrefill(...)` entry point for token matrices
 - a manifest-backed single-request full-forward path that now executes the real `88`-layer checkpoint end to end in correctness-first mode through `full_forward_manifest_smoke_test`, using no-copy manifest bootstrap, lazy per-layer weight materialization, and CPU fallbacks where the current dense BF16 / FP8 execution paths are still shape-fragile
+- the serving-path GPU migration is now mostly implemented:
+  - dense + scaled-FP8 default execution stays on GPU
+  - attention layout/staging stays on GPU
+  - Mamba scan/state math stays on GPU
+  - expert routed/shared large-tensor math stays on GPU
+  - trace/debug downloads still exist behind explicit trace paths
+  - one tiny expert-selection metadata copy still remains in the default path to drive the current host-dispatched expert launch interface
+- the warmed decode harness under [benchmarks/decode_bench](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/benchmarks/decode_bench) now shows:
+  - manifest bootstrap about `2.1s`
+  - build-only model construction about `15.1s` with lazy aligned routed-expert NVFP4 materialization
+  - first real single-token decode about `11.9s`
+  - on the same manifest path, a warmed second token about `0.73s`
+  - the rollout's rough `<30s` end-to-end first-token target is now met on the current benchmark path
+- the bench now also supports real append-only multi-token generation on one request context through `RunDecodeStep(...)`, and the first longer run shows:
+  - [single_token_decode_20260331T090018Z_cuda132.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T090018Z_cuda132.json)
+  - `environment_build_ms ≈ 2.0s`
+  - `model_build_ms ≈ 10.6s`
+  - `16` generated decode steps from a single synthetic seed token
+  - full sequence about `36.3s`
+  - first `4` tokens average about `5.0s/token`
+  - last `8` tokens average about `1.0s/token`
+  - last `4` tokens average about `0.94s/token`
+  - this longer run is the better current steady-state proxy than the earlier one-token microbench
+- the routed-expert decode path now has a working custom packed-NVFP4 fused fast path on the default lazy-resident serving path:
+  - [single_token_decode_20260331T185338Z_fused_moe_custom_routed_retry_16tok.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T185338Z_fused_moe_custom_routed_retry_16tok.json)
+  - output tokens stayed exact: `[5130 x16]`
+  - full 16-token sequence about `26.9s`
+  - `grouped_routed_expert_fastpath_uses = 640`
+  - `expert_selection_metadata_downloads = 395`
+- an eager all-expert routed-lookup graph-prep mode was measured and rejected as a Spark default:
+  - [single_token_decode_20260331T185639Z_fused_moe_custom_routed_eager_16tok.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T185639Z_fused_moe_custom_routed_eager_16tok.json)
+  - output tokens stayed exact, and decode had zero host MoE metadata downloads
+  - but model build rose to about `201.9s`, hot decode to about `59.8s`, and memory pressure became unacceptable
+  - graph-capture work therefore needs a bounded/hybrid expert residency policy, not eager preparation of every routed expert
+- a first bounded-prefetch variant was also measured and rejected as a Spark default:
+  - [single_token_decode_20260331T193926Z_fused_moe_prefetch32_16tok.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T193926Z_fused_moe_prefetch32_16tok.json)
+  - output tokens stayed exact
+  - but `expert_selection_metadata_downloads` only moved from `395` to `389`
+  - while model build rose to about `23.6s` and hot decode to about `49.2s`
+  - so the next graph-prep step needs a smarter hybrid residency policy than simple first-miss top-`N` prefetch
+- the first deterministic model-cache path is now implemented under [model_cache.h](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/include/nemotron/model_cache.h) and [model_cache.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/src/api/model_cache.cpp), with [single_token_forward_model.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/src/api/single_token_forward_model.cpp) now supporting `CreateFromCache(...)`
+- current model-cache status is mixed:
+  - functional cache-backed decode works and still predicts token `5130`
+  - but the current execution-ready cache payload is about `102.1 GB`, and cache-backed startup is about `113.7s`
+  - so the cache subsystem is now real, but the payload format needs redesign before it becomes the next serving-path TTFT win
 - device-resident FP32 dense-weight upload for the first dense GEMM path, plus an uploaded-weight execution path that avoids per-call weight copies
 - device-resident NVFP4 packed-weight upload that preserves logical `block_scales` / `tensor_scale` buffers and now also prepares separate padded-swizzled execution-layout scale buffers for `cuBLASLt`
 - the first real runtime-side NVFP4 GEMM executor for the validated row-major `cuBLASLt` contract, now pointing `A/B_SCALE_POINTER` at padded-swizzled execution scales and folding FP32 per-tensor scales into `alpha`
@@ -214,5 +311,64 @@ Current composed-forward reality:
   - the full all-layer decode oracle now gates on functional decode behavior and a final-logit `rel_l2` tripwire
   - with the real manifest wired in, that all-layer decode oracle now passes
 - verification status after this round:
-  - total tests in tree: `59`
-  - the full suite is now green at `59/59` with `NEMOTRON_FORWARD_MANIFEST` set
+  - total tests in tree: `60`
+  - the full suite is now green at `60/60` with `NEMOTRON_FORWARD_MANIFEST` set
+
+Latest throughput reality on DGX Spark:
+
+- the packed BF16 / FP8 linear pass plus reduced-sync helper work is now in the runtime default path
+- correctness remains green at `60/60`
+- current aligned uncached decode measurement:
+  - bootstrap `≈ 2.1s`
+  - model build `≈ 9.6s`
+  - first token `≈ 5.1s`
+  - warmed decode `≈ 0.73s/token`
+- so TTFT improved materially, but steady-state token throughput is still bottlenecked by the remaining expert-dispatch and deeper fusion work rather than by startup alone
+- latest control-path cleanup kept correctness green and moved warmed decode only slightly:
+  - updated aligned run: warmed decode `≈ 0.729s/token`
+  - that confirms the next meaningful throughput work is deeper MoE / Mamba execution restructuring rather than more small alloc/copy cleanup
+- the first decode-only fused Mamba inner pass is now also in the runtime default path:
+  - aligned fused artifact: [single_token_decode_20260331T_mamba_decode_fused_threads4.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T_mamba_decode_fused_threads4.json)
+  - bootstrap `≈ 2.08s`
+  - model build `≈ 9.86s`
+  - first token `≈ 5.05s`
+  - warmed decode `≈ 0.728s/token`
+  - interpretation: Mamba inner-kernel fusion is correct, but it only moved steady-state decode by about `1 ms/token`
+- grouped / indirect routed-expert dispatch is now in the single-token serving path:
+  - grouped artifact: [single_token_decode_20260331T_grouped_routed_experts_device_lookup_threads4.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T_grouped_routed_experts_device_lookup_threads4.json)
+  - bootstrap `≈ 2.10s`
+  - model build `≈ 8.77s`
+  - warmed decode `≈ 0.711s/token`
+  - predicted token still `5130`
+- interpretation:
+  - grouped routed-expert dispatch is correct and measurably better than the previous `~0.729s/token` path
+  - but it is not the final throughput unlock
+  - the next big throughput wins are now more likely to come from expert residency/cache strategy, a lower-overhead routed-expert backend, and batching/MTP than from more small dispatch cleanup
+- latest fused-MoE graph-prep follow-up:
+  - accepted artifact: [single_token_decode_20260331T200103Z_step_runtime_stats_16tok.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T200103Z_step_runtime_stats_16tok.json)
+  - exact output tokens stayed `[5130 x16]`
+  - `hot_mean_ms ≈ 25557.2`
+  - full selection-metadata downloads are now gone on the default fused routed-MoE path:
+    - `expert_selection_metadata_downloads = 0`
+  - the remaining MoE graph blocker is now the smaller routed lookup repair surface:
+    - `routed_lookup_repair_downloads = 395`
+    - `routed_lookup_repair_experts = 3130`
+  - those repairs decay materially across the sequence, but do not hit zero by token `16`
+  - so the next graph-capture step is not immediate post-first-token capture; it is a smarter hybrid expert-residency policy first
+- latest accepted fused-MoE cleanup result:
+  - artifact: [single_token_decode_20260331T_graph_readiness_cleanup_16tok.json](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/artifacts/benchmarks/single_token_decode_20260331T_graph_readiness_cleanup_16tok.json)
+  - exact output tokens stayed `[5130 x16]`
+  - full `16`-token sequence improved to `≈ 15897.4 ms`
+  - first `4` tokens `≈ 1936.5 ms/token`
+  - last `8` tokens `≈ 614.9 ms/token`
+  - last `4` tokens `≈ 608.6 ms/token`
+  - `expert_selection_metadata_downloads = 0`
+  - `routed_lookup_repair_downloads = 395`
+  - `routed_lookup_repair_experts = 3130`
+  - the improvement came from removing fused-MoE dead weight, not from suppressing lookup repair
+  - the new graph-readiness counters confirm there is still no capture-safe tail in the `16`-token horizon:
+    - `hot_graph_safe_steps = 0`
+    - `hot_max_graph_safe_streak = 0`
+    - `hot_tail_graph_safe_streak = 0`
+    - `hot_first_graph_safe_tail_token_index = -1`
+  - so the next accepted throughput step is still smarter routed-lookup-repair suppression before steady-state CUDA graph capture
