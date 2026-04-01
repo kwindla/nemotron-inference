@@ -32,8 +32,14 @@ RequestExecutionConfig make_config() {
       KvCacheDataType::kBf16,
   };
   config.attention_total_pages = 8;
+  config.mamba_hidden_size = 16;
+  config.mamba_projection_size = 48;
+  config.mamba_intermediate_size = 24;
   config.mamba_conv_state_bytes_fp32 = 32 * sizeof(float);
   config.mamba_state_bytes_fp32 = 64 * sizeof(float);
+  config.expert_selection_capacity = 24;
+  config.expert_intermediate_scratch_numel = 96;
+  config.expert_aux_scratch_numel = 128;
   return config;
 }
 
@@ -56,12 +62,46 @@ bool test_request_context_allocates_buffers_and_kv_pages() {
               "scratch buffer should use the configured scratch-token window")) {
     return false;
   }
+  if (!expect(context->token_ids_device() != nullptr && context->token_ids_device()->count() == 12,
+              "request context should allocate reusable device token-id storage")) {
+    return false;
+  }
   if (!expect(context->mamba_state() != nullptr && context->mamba_state()->numel() == 64,
               "mamba state buffer should allocate the configured fp32 state size")) {
     return false;
   }
   if (!expect(context->mamba_conv_state() != nullptr && context->mamba_conv_state()->numel() == 32,
               "mamba conv-state buffer should allocate the configured fp32 state size")) {
+    return false;
+  }
+  if (!expect(context->mamba_normalized_decode() != nullptr &&
+                  context->mamba_normalized_decode()->shape() == std::vector<std::size_t>({1, 16}),
+              "request context should allocate reusable single-token mamba norm scratch")) {
+    return false;
+  }
+  if (!expect(context->mamba_projected_decode() != nullptr &&
+                  context->mamba_projected_decode()->shape() == std::vector<std::size_t>({1, 48}),
+              "request context should allocate reusable single-token mamba projection scratch")) {
+    return false;
+  }
+  if (!expect(context->mamba_scan_output_decode() != nullptr &&
+                  context->mamba_scan_output_decode()->shape() == std::vector<std::size_t>({1, 24}),
+              "request context should allocate reusable single-token mamba scan scratch")) {
+    return false;
+  }
+  if (!expect(context->mamba_projected_output_decode() != nullptr &&
+                  context->mamba_projected_output_decode()->shape() == std::vector<std::size_t>({1, 16}),
+              "request context should allocate reusable single-token mamba output scratch")) {
+    return false;
+  }
+  if (!expect(context->expert_intermediate_scratch() != nullptr &&
+                  context->expert_intermediate_scratch()->numel() == 96,
+              "request context should allocate reusable expert intermediate scratch when configured")) {
+    return false;
+  }
+  if (!expect(context->expert_aux_scratch() != nullptr &&
+                  context->expert_aux_scratch()->numel() == 128,
+              "request context should allocate reusable expert aux scratch when configured")) {
     return false;
   }
   if (!expect(context->key_cache() != nullptr &&
@@ -83,6 +123,30 @@ bool test_request_context_allocates_buffers_and_kv_pages() {
   }
   if (!expect(context->allocated_kv_pages(0) == 2 && context->allocated_kv_pages(1) == 2,
               "5 tokens at 4 tokens/page should allocate two pages per attention layer")) {
+    return false;
+  }
+  if (!expect(context->kv_page_ids_device(0) != nullptr &&
+                  context->kv_page_ids_device(0)->count() == 2 &&
+                  context->kv_page_ids_device(1) != nullptr &&
+                  context->kv_page_ids_device(1)->count() == 2,
+              "request context should keep per-layer page ids resident on device")) {
+    return false;
+  }
+  if (!expect(context->EnsureAttentionAuxCapacity(1, 2),
+              "request context should allocate reusable attention aux buffers")) {
+    return false;
+  }
+  if (!expect(context->attention_seq_len_q_device() != nullptr &&
+                  context->attention_seq_len_q_device()->count() == 1 &&
+                  context->attention_seq_len_kv_device() != nullptr &&
+                  context->attention_seq_len_kv_device()->count() == 1 &&
+                  context->attention_page_table_device() != nullptr &&
+                  context->attention_page_table_device()->count() == 2,
+              "request context should retain reusable device attention aux storage")) {
+    return false;
+  }
+  if (!expect(context->expert_selection_capacity() == 24,
+              "request context should honor the configured expert-selection scratch capacity")) {
     return false;
   }
   if (!expect(context->AdvanceDecodePosition(3), "advancing decode within bounds should succeed")) {
@@ -117,9 +181,15 @@ bool test_request_context_reset_releases_pages_and_clears_positions() {
     return false;
   }
   std::vector<float> state_values(32, 1.0f);
+  std::vector<float> projected_values(48, 1.0f);
   if (!expect(
           context->mamba_conv_state()->CopyFromHost(state_values.data(), state_values.size()),
           "mamba conv-state upload should succeed")) {
+    return false;
+  }
+  if (!expect(
+          context->mamba_projected_decode()->CopyFromHost(projected_values.data(), projected_values.size()),
+          "mamba decode scratch upload should succeed")) {
     return false;
   }
   if (!expect(context->allocated_kv_pages() == 4, "two pages per layer should be allocated at 7 tokens")) {
@@ -135,6 +205,11 @@ bool test_request_context_reset_releases_pages_and_clears_positions() {
   if (!expect(context->allocated_kv_pages() == 0, "reset should release all request-local kv pages")) {
     return false;
   }
+  if (!expect(context->kv_page_ids_device(0) != nullptr &&
+                  context->kv_page_ids_device(0)->count() == 0,
+              "reset should clear request-local device page-id buffers")) {
+    return false;
+  }
   if (!expect(
           context->mamba_conv_state()->CopyToHost(state_values.data(), state_values.size()),
           "mamba conv-state download should succeed after reset")) {
@@ -143,6 +218,16 @@ bool test_request_context_reset_releases_pages_and_clears_positions() {
   if (!expect(
           std::all_of(state_values.begin(), state_values.end(), [](float value) { return value == 0.0f; }),
           "reset should zero the request-local mamba conv-state")) {
+    return false;
+  }
+  if (!expect(
+          context->mamba_projected_decode()->CopyToHost(projected_values.data(), projected_values.size()),
+          "mamba decode scratch download should succeed after reset")) {
+    return false;
+  }
+  if (!expect(
+          std::all_of(projected_values.begin(), projected_values.end(), [](float value) { return value == 0.0f; }),
+          "reset should zero the request-local mamba decode scratch")) {
     return false;
   }
   return expect(context->kv_pages(0) != nullptr && context->kv_pages(0)->empty(),

@@ -1,13 +1,18 @@
 #include "nemotron/single_token_forward_model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -24,6 +29,7 @@
 #include "nemotron/kernel_catalog.h"
 #include "nemotron/linear_op.h"
 #include "nemotron/mamba_layer.h"
+#include "nemotron/model_cache.h"
 #include "nemotron/model_schedule.h"
 #include "nemotron/paged_kv_cache.h"
 #include "nemotron/primitive_ops.h"
@@ -31,6 +37,15 @@
 
 namespace nemotron {
 namespace {
+
+std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
+  if (descriptor.tensor_scale_data == nullptr || descriptor.tensor_scale_nbytes != sizeof(float)) {
+    return std::nullopt;
+  }
+  float value = 0.0f;
+  std::memcpy(&value, descriptor.tensor_scale_data, sizeof(float));
+  return value;
+}
 
 bool ContainsName(
     const std::vector<GlobalTensorBinding>& bindings,
@@ -74,10 +89,12 @@ std::size_t MaxLayerIndex(const std::vector<LayerScheduleEntry>& layers) {
   return max_index;
 }
 
+std::size_t RequiredMambaConvDim(const SingleTokenForwardConfig& config) {
+  return config.mamba_intermediate_size + (2 * config.mamba_n_groups * config.mamba_state_size);
+}
+
 std::size_t RequiredMambaConvStateElems(const SingleTokenForwardConfig& config) {
-  const std::size_t conv_dim =
-      config.mamba_intermediate_size + (2 * config.mamba_n_groups * config.mamba_state_size);
-  return conv_dim * config.mamba_conv_kernel_size;
+  return RequiredMambaConvDim(config) * config.mamba_conv_kernel_size;
 }
 
 std::size_t RequiredMambaStateElems(const SingleTokenForwardConfig& config) {
@@ -90,6 +107,36 @@ std::vector<float> CopyTensorToHost(const DeviceTensorFp32& tensor) {
     return {};
   }
   return host;
+}
+
+const char* LayerKindName(ForwardLayerKind kind) {
+  switch (kind) {
+    case ForwardLayerKind::kAttention:
+      return "attention";
+    case ForwardLayerKind::kMamba:
+      return "mamba";
+    case ForwardLayerKind::kExpert:
+      return "expert";
+  }
+  return "unknown";
+}
+
+double ToMilliseconds(const std::chrono::steady_clock::duration duration) {
+  return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+std::size_t BuildWorkerCount() {
+  if (const char* override_value = std::getenv("NEMOTRON_FORWARD_BUILD_THREADS");
+      override_value != nullptr) {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(override_value, &end, 10);
+    if (end != override_value && parsed > 0) {
+      return static_cast<std::size_t>(parsed);
+    }
+  }
+  return std::min<std::size_t>(
+      4,
+      std::max<std::size_t>(1, std::thread::hardware_concurrency()));
 }
 
 }  // namespace
@@ -207,8 +254,20 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
   plan.request_config.hidden_size = config.hidden_size;
   plan.request_config.max_tokens = config.max_tokens;
   plan.request_config.scratch_tokens = config.max_tokens;
+  plan.request_config.mamba_hidden_size = config.hidden_size;
+  plan.request_config.mamba_projection_size =
+      config.mamba_intermediate_size + RequiredMambaConvDim(config) + config.mamba_num_heads;
+  plan.request_config.mamba_intermediate_size = config.mamba_intermediate_size;
   plan.request_config.mamba_conv_state_bytes_fp32 = mamba_conv_offset * sizeof(float);
   plan.request_config.mamba_state_bytes_fp32 = mamba_state_offset * sizeof(float);
+  plan.request_config.expert_selection_capacity = config.max_tokens * config.experts_per_token;
+  plan.request_config.expert_intermediate_scratch_numel =
+      config.experts_per_token * config.routed_expert_intermediate_size;
+  plan.request_config.expert_aux_scratch_numel =
+      (4 * config.hidden_size) +
+      (3 * config.moe_latent_size) +
+      config.shared_expert_intermediate_size +
+      config.n_routed_experts;
   if (plan.attention_layer_count != 0) {
     plan.request_config.attention_kv_cache.layer_count = max_layer_index + 1;
     plan.request_config.attention_kv_cache.kv_head_count = config.attention_kv_head_count;
@@ -218,6 +277,8 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
     plan.request_config.attention_total_pages =
         plan.request_config.attention_kv_cache.layer_count *
         RequiredPagesForTokens(plan.request_config.attention_kv_cache, config.max_tokens);
+    plan.request_config.attention_query_head_count = config.attention_head_count;
+    plan.request_config.attention_head_dim = config.attention_head_dim;
   }
 
   plan.valid = !plan.layers.empty();
@@ -246,12 +307,42 @@ struct SingleTokenForwardModel::Impl {
   std::unique_ptr<DeviceEmbeddingTableFp32> embedding_table;
   std::unique_ptr<UploadedLinearOp> lm_head_op;
   std::unique_ptr<DeviceTensorFp32> final_norm_weight;
+  std::unique_ptr<LoadedModelCache> model_cache;
   std::vector<LayerEntry> layers;
+  SingleTokenForwardBuildReport build_report;
 };
 
 std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
     const RuntimeEnvironment& environment,
     const SingleTokenForwardConfig& config) {
+  const bool build_debug = std::getenv("NEMOTRON_FORWARD_BUILD_DEBUG") != nullptr;
+  const auto log_phase = [&](const std::string& name, double ms) {
+    if (build_debug) {
+      std::cerr << std::fixed << std::setprecision(3)
+                << "forward_build_phase[" << name << "]=" << ms << " ms\n"
+                << std::flush;
+    }
+  };
+  const auto log_layer = [&](const SingleTokenForwardLayerBuildTiming& timing) {
+    if (build_debug) {
+      std::cerr << std::fixed << std::setprecision(3)
+                << "forward_build_layer[" << timing.layer_index
+                << "][" << LayerKindName(timing.kind) << "]"
+                << " bindings_ms=" << timing.bindings_ms
+                << " slice_create_ms=" << timing.slice_create_ms
+                << " total_ms=" << timing.total_ms << "\n"
+                << std::flush;
+    }
+  };
+  SingleTokenForwardBuildReport build_report;
+  const auto add_phase =
+      [&](const std::string& name, const std::chrono::steady_clock::time_point& begin,
+          const std::chrono::steady_clock::time_point& end) {
+        const double ms = ToMilliseconds(end - begin);
+        build_report.phases.push_back(SingleTokenForwardBuildPhaseTiming{name, ms});
+        log_phase(name, ms);
+      };
+
   if (!environment.has_model_schedule() ||
       !environment.has_kernel_catalog() ||
       !environment.has_gemm_catalog() ||
@@ -259,11 +350,15 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
     return nullptr;
   }
   const ModelSchedule& schedule = *environment.model_schedule();
+  const auto plan_begin = std::chrono::steady_clock::now();
   const auto plan = BuildSingleTokenForwardPlan(schedule, config);
+  const auto plan_end = std::chrono::steady_clock::now();
+  add_phase("plan_build", plan_begin, plan_end);
   if (!plan.has_value()) {
     return nullptr;
   }
 
+  const auto descriptor_begin = std::chrono::steady_clock::now();
   const KernelCatalog& kernel_catalog = *environment.kernel_catalog();
   const GemmCatalog& gemm_catalog = *environment.gemm_catalog();
   const EmbeddingCatalog& embedding_catalog = *environment.embedding_catalog();
@@ -299,7 +394,10 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
       (final_norm->logical_shape.size() != 1 || final_norm->logical_shape.front() != config.hidden_size)) {
     return nullptr;
   }
+  const auto descriptor_end = std::chrono::steady_clock::now();
+  add_phase("global_descriptor_lookup", descriptor_begin, descriptor_end);
 
+  const auto handles_begin = std::chrono::steady_clock::now();
   auto cublas = CublasLtHandle::Create();
   auto heuristic_cache = std::make_unique<GemmHeuristicCache>();
   if (!cublas || !cublas->valid()) {
@@ -313,6 +411,8 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
       return nullptr;
     }
   }
+  const auto handles_end = std::chrono::steady_clock::now();
+  add_phase("handle_init", handles_begin, handles_end);
 
   auto impl = std::make_unique<Impl>();
   impl->config = config;
@@ -323,33 +423,51 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
   impl->cublas = std::move(cublas);
   impl->cudnn = std::move(cudnn);
   impl->heuristic_cache = std::move(heuristic_cache);
+
+  const auto embedding_begin = std::chrono::steady_clock::now();
   impl->embedding_table = DeviceEmbeddingTableFp32::Upload(*embedding);
+  const auto embedding_end = std::chrono::steady_clock::now();
+  add_phase("embedding_upload", embedding_begin, embedding_end);
+
+  const auto lm_head_begin = std::chrono::steady_clock::now();
   impl->lm_head_op = UploadedLinearOp::Create(*lm_head);
+  const auto lm_head_end = std::chrono::steady_clock::now();
+  add_phase("lm_head_upload", lm_head_begin, lm_head_end);
   if (!impl->embedding_table || !impl->embedding_table->valid() ||
       !impl->lm_head_op || !impl->lm_head_op->valid()) {
     return nullptr;
   }
   if (final_norm != nullptr) {
+    const auto final_norm_begin = std::chrono::steady_clock::now();
     impl->final_norm_weight = UploadVectorWeightToDeviceFp32(*final_norm);
+    const auto final_norm_end = std::chrono::steady_clock::now();
+    add_phase("final_norm_upload", final_norm_begin, final_norm_end);
     if (!impl->final_norm_weight || !impl->final_norm_weight->valid()) {
       return nullptr;
     }
   }
-  impl->layers.reserve(plan->layers.size());
-
-  for (const ForwardLayerPlanEntry& plan_entry : plan->layers) {
+  const auto build_layer = [&](const ForwardLayerPlanEntry& plan_entry,
+                               Impl::LayerEntry* layer_entry_out,
+                               SingleTokenForwardLayerBuildTiming* timing_out) -> bool {
+    const auto layer_begin = std::chrono::steady_clock::now();
     const LayerScheduleEntry* layer = schedule.FindLayer(plan_entry.layer_index);
-    if (layer == nullptr) {
-      return nullptr;
+    if (layer == nullptr || layer_entry_out == nullptr || timing_out == nullptr) {
+      return false;
     }
 
     Impl::LayerEntry layer_entry;
     layer_entry.plan = plan_entry;
+    std::vector<SingleTokenForwardBuildPhaseTiming> detail_timings;
+    const auto add_detail = [&](const char* name, double milliseconds) {
+      detail_timings.push_back(SingleTokenForwardBuildPhaseTiming{name, milliseconds});
+    };
     switch (plan_entry.kind) {
       case ForwardLayerKind::kAttention: {
+        const auto bindings_begin = std::chrono::steady_clock::now();
         const auto bindings = BuildAttentionLayerBindings(*layer, kernel_catalog, gemm_catalog);
+        const auto bindings_end = std::chrono::steady_clock::now();
         if (!bindings.has_value()) {
-          return nullptr;
+          return false;
         }
         AttentionLayerConfig attention_config;
         attention_config.layer_index = plan_entry.layer_index;
@@ -358,16 +476,28 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         attention_config.kv_head_count = config.attention_kv_head_count;
         attention_config.head_dim = config.attention_head_dim;
         attention_config.rms_epsilon = config.layer_norm_epsilon;
+        const auto slice_begin = std::chrono::steady_clock::now();
         layer_entry.attention_slice = AttentionLayerSlice::Create(attention_config, *bindings);
+        const auto slice_end = std::chrono::steady_clock::now();
+        *timing_out = SingleTokenForwardLayerBuildTiming{
+            plan_entry.layer_index,
+            plan_entry.kind,
+            ToMilliseconds(bindings_end - bindings_begin),
+            ToMilliseconds(slice_end - slice_begin),
+            ToMilliseconds(slice_end - layer_begin),
+            std::move(detail_timings),
+        };
         if (!layer_entry.attention_slice || !layer_entry.attention_slice->valid()) {
-          return nullptr;
+          return false;
         }
         break;
       }
       case ForwardLayerKind::kMamba: {
+        const auto bindings_begin = std::chrono::steady_clock::now();
         const auto bindings = BuildMambaLayerBindings(*layer, kernel_catalog, gemm_catalog);
+        const auto bindings_end = std::chrono::steady_clock::now();
         if (!bindings.has_value()) {
-          return nullptr;
+          return false;
         }
         MambaLayerConfig mamba_config;
         mamba_config.layer_index = plan_entry.layer_index;
@@ -383,20 +513,37 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         mamba_config.input_rms_epsilon = config.layer_norm_epsilon;
         mamba_config.mixer_rms_epsilon = config.layer_norm_epsilon;
         mamba_config.time_step_min = config.mamba_time_step_min;
-        layer_entry.mamba_slice = MambaLayerSlice::Create(mamba_config, *bindings);
+        const auto slice_begin = std::chrono::steady_clock::now();
+        layer_entry.mamba_slice = MambaLayerSlice::Create(
+            mamba_config,
+            *bindings,
+            [&](const char* name, double milliseconds) {
+              add_detail(name, milliseconds);
+            });
+        const auto slice_end = std::chrono::steady_clock::now();
+        *timing_out = SingleTokenForwardLayerBuildTiming{
+            plan_entry.layer_index,
+            plan_entry.kind,
+            ToMilliseconds(bindings_end - bindings_begin),
+            ToMilliseconds(slice_end - slice_begin),
+            ToMilliseconds(slice_end - layer_begin),
+            std::move(detail_timings),
+        };
         if (!layer_entry.mamba_slice || !layer_entry.mamba_slice->valid()) {
-          return nullptr;
+          return false;
         }
         break;
       }
       case ForwardLayerKind::kExpert: {
+        const auto bindings_begin = std::chrono::steady_clock::now();
         const auto bindings = BuildExpertLayerBindings(
             *layer,
             kernel_catalog,
             gemm_catalog,
             config.n_routed_experts);
+        const auto bindings_end = std::chrono::steady_clock::now();
         if (!bindings.has_value()) {
-          return nullptr;
+          return false;
         }
         ExpertLayerConfig expert_config;
         expert_config.layer_index = plan_entry.layer_index;
@@ -411,17 +558,416 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         expert_config.rms_epsilon = config.layer_norm_epsilon;
         expert_config.routed_scaling_factor = config.routed_scaling_factor;
         expert_config.norm_topk_prob = config.norm_topk_prob;
-        layer_entry.expert_slice = ExpertLayerSlice::Create(expert_config, *bindings);
+        const auto slice_begin = std::chrono::steady_clock::now();
+        layer_entry.expert_slice = ExpertLayerSlice::Create(
+            expert_config,
+            *bindings,
+            [&](const char* name, double milliseconds) {
+              add_detail(name, milliseconds);
+            });
+        const auto slice_end = std::chrono::steady_clock::now();
+        *timing_out = SingleTokenForwardLayerBuildTiming{
+            plan_entry.layer_index,
+            plan_entry.kind,
+            ToMilliseconds(bindings_end - bindings_begin),
+            ToMilliseconds(slice_end - slice_begin),
+            ToMilliseconds(slice_end - layer_begin),
+            std::move(detail_timings),
+        };
+        if (!layer_entry.expert_slice || !layer_entry.expert_slice->valid()) {
+          return false;
+        }
+        break;
+      }
+    }
+
+    *layer_entry_out = std::move(layer_entry);
+    return true;
+  };
+
+  impl->layers.resize(plan->layers.size());
+  build_report.layers.resize(plan->layers.size());
+
+  const auto layer_loop_begin = std::chrono::steady_clock::now();
+  const std::size_t worker_count =
+      std::min<std::size_t>(BuildWorkerCount(), plan->layers.size());
+  if (worker_count <= 1 || plan->layers.size() <= 1) {
+    for (std::size_t layer_idx = 0; layer_idx < plan->layers.size(); ++layer_idx) {
+      if (!build_layer(
+              plan->layers[layer_idx],
+              &impl->layers[layer_idx],
+              &build_report.layers[layer_idx])) {
+        return nullptr;
+      }
+      log_layer(build_report.layers[layer_idx]);
+    }
+  } else {
+    std::atomic<bool> build_failed = false;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+      workers.emplace_back([&, worker_index]() {
+        for (std::size_t layer_idx = worker_index;
+             layer_idx < plan->layers.size();
+             layer_idx += worker_count) {
+          if (build_failed.load(std::memory_order_relaxed)) {
+            return;
+          }
+          if (!build_layer(
+                  plan->layers[layer_idx],
+                  &impl->layers[layer_idx],
+                  &build_report.layers[layer_idx])) {
+            build_failed.store(true, std::memory_order_relaxed);
+            return;
+          }
+          log_layer(build_report.layers[layer_idx]);
+        }
+      });
+    }
+    for (auto& worker : workers) {
+      worker.join();
+    }
+    if (build_failed.load(std::memory_order_relaxed)) {
+      return nullptr;
+    }
+  }
+  const auto layer_loop_end = std::chrono::steady_clock::now();
+  add_phase("layer_loop_total", layer_loop_begin, layer_loop_end);
+  impl->build_report = std::move(build_report);
+
+  return std::unique_ptr<SingleTokenForwardModel>(new SingleTokenForwardModel(std::move(impl)));
+}
+
+std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCache(
+    const RuntimeEnvironment& environment,
+    const SingleTokenForwardConfig& config,
+    const std::filesystem::path& cache_path) {
+  SingleTokenForwardBuildReport build_report;
+  const auto add_phase =
+      [&](const std::string& name, const std::chrono::steady_clock::time_point& begin,
+          const std::chrono::steady_clock::time_point& end) {
+        build_report.phases.push_back(
+            SingleTokenForwardBuildPhaseTiming{name, ToMilliseconds(end - begin)});
+      };
+
+  if (!environment.has_model_schedule() ||
+      !environment.has_kernel_catalog() ||
+      !environment.has_gemm_catalog() ||
+      !environment.has_embedding_catalog()) {
+    return nullptr;
+  }
+
+  const ModelSchedule& schedule = *environment.model_schedule();
+  const auto plan_begin = std::chrono::steady_clock::now();
+  const auto plan = BuildSingleTokenForwardPlan(schedule, config);
+  const auto plan_end = std::chrono::steady_clock::now();
+  add_phase("plan_build", plan_begin, plan_end);
+  if (!plan.has_value()) {
+    return nullptr;
+  }
+
+  const auto descriptor_begin = std::chrono::steady_clock::now();
+  const KernelCatalog& kernel_catalog = *environment.kernel_catalog();
+  const GemmCatalog& gemm_catalog = *environment.gemm_catalog();
+  const EmbeddingCatalog& embedding_catalog = *environment.embedding_catalog();
+
+  const EmbeddingDescriptor* embedding = FindGlobalDescriptorByCandidates<EmbeddingDescriptor>(
+      schedule.global_bindings(),
+      ModelGlobalRole::kEmbedding,
+      [&](const std::string& name) { return embedding_catalog.FindDescriptor(name); },
+      {"backbone.embeddings.weight", "embeddings.weight"});
+  const GemmDescriptor* lm_head = FindGlobalDescriptorByCandidates<GemmDescriptor>(
+      schedule.global_bindings(),
+      ModelGlobalRole::kLogits,
+      [&](const std::string& name) { return gemm_catalog.FindDescriptor(name); },
+      {"lm_head.weight", "logits.weight", "output.weight"});
+  const KernelTensorDescriptor* final_norm = FindGlobalDescriptorByCandidates<KernelTensorDescriptor>(
+      schedule.global_bindings(),
+      ModelGlobalRole::kFinalNorm,
+      [&](const std::string& name) { return kernel_catalog.FindTensor(name); },
+      {"backbone.norm_f.weight",
+       "norm_f.weight",
+       "backbone.final_norm.weight",
+       "final_norm.weight"});
+  if (embedding == nullptr || lm_head == nullptr) {
+    return nullptr;
+  }
+  const auto descriptor_end = std::chrono::steady_clock::now();
+  add_phase("global_descriptor_lookup", descriptor_begin, descriptor_end);
+
+  const auto handles_begin = std::chrono::steady_clock::now();
+  auto cublas = CublasLtHandle::Create();
+  auto heuristic_cache = std::make_unique<GemmHeuristicCache>();
+  if (!cublas || !cublas->valid()) {
+    return nullptr;
+  }
+  std::unique_ptr<CudnnHandle> cudnn;
+  if (plan->attention_layer_count != 0) {
+    cudnn = CudnnHandle::Create();
+    if (!cudnn || !cudnn->valid()) {
+      return nullptr;
+    }
+  }
+  const auto handles_end = std::chrono::steady_clock::now();
+  add_phase("handle_init", handles_begin, handles_end);
+
+  const auto cache_begin = std::chrono::steady_clock::now();
+  auto cache = LoadedModelCache::Load(cache_path);
+  const auto cache_end = std::chrono::steady_clock::now();
+  add_phase("cache_load", cache_begin, cache_end);
+  if (!cache || !cache->valid()) {
+    return nullptr;
+  }
+  const SingleTokenForwardConfig& cached_config = cache->header().config;
+  if (cached_config.hidden_size != config.hidden_size ||
+      cached_config.total_layer_count != config.total_layer_count ||
+      cached_config.vocab_size != config.vocab_size ||
+      cached_config.n_routed_experts != config.n_routed_experts ||
+      cached_config.experts_per_token != config.experts_per_token) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->config = config;
+  impl->plan = *plan;
+  impl->embedding = embedding;
+  impl->final_norm = final_norm;
+  impl->lm_head = lm_head;
+  impl->cublas = std::move(cublas);
+  impl->cudnn = std::move(cudnn);
+  impl->heuristic_cache = std::move(heuristic_cache);
+  impl->model_cache = std::move(cache);
+
+  const auto embedding_begin = std::chrono::steady_clock::now();
+  impl->embedding_table = impl->model_cache->CreateEmbeddingView(embedding->tensor_name);
+  const auto embedding_end = std::chrono::steady_clock::now();
+  add_phase("embedding_view", embedding_begin, embedding_end);
+
+  const auto lm_head_begin = std::chrono::steady_clock::now();
+  impl->lm_head_op = impl->model_cache->CreateDenseLinearView(*lm_head);
+  const auto lm_head_end = std::chrono::steady_clock::now();
+  add_phase("lm_head_view", lm_head_begin, lm_head_end);
+  if (!impl->embedding_table || !impl->embedding_table->valid() ||
+      !impl->lm_head_op || !impl->lm_head_op->valid()) {
+    return nullptr;
+  }
+  if (final_norm != nullptr) {
+    const auto final_norm_begin = std::chrono::steady_clock::now();
+    impl->final_norm_weight = impl->model_cache->CreateTensorView(final_norm->tensor_name);
+    const auto final_norm_end = std::chrono::steady_clock::now();
+    add_phase("final_norm_view", final_norm_begin, final_norm_end);
+    if (!impl->final_norm_weight || !impl->final_norm_weight->valid()) {
+      return nullptr;
+    }
+  }
+
+  impl->layers.resize(plan->layers.size());
+  build_report.layers.resize(plan->layers.size());
+  const auto layer_loop_begin = std::chrono::steady_clock::now();
+  for (std::size_t layer_idx = 0; layer_idx < plan->layers.size(); ++layer_idx) {
+    const auto layer_begin = std::chrono::steady_clock::now();
+    const ForwardLayerPlanEntry& plan_entry = plan->layers[layer_idx];
+    const LayerScheduleEntry* layer = schedule.FindLayer(plan_entry.layer_index);
+    if (layer == nullptr) {
+      return nullptr;
+    }
+    Impl::LayerEntry layer_entry;
+    layer_entry.plan = plan_entry;
+    const auto bindings_begin = std::chrono::steady_clock::now();
+    switch (plan_entry.kind) {
+      case ForwardLayerKind::kAttention: {
+        const auto bindings = BuildAttentionLayerBindings(*layer, kernel_catalog, gemm_catalog);
+        const auto bindings_end = std::chrono::steady_clock::now();
+        if (!bindings.has_value()) {
+          return nullptr;
+        }
+        AttentionLayerPreparedBindings prepared;
+        prepared.norm_weight = impl->model_cache->CreateTensorView(bindings->norm_weight->tensor_name);
+        prepared.q_proj = impl->model_cache->CreateDenseLinearView(*bindings->q_proj);
+        prepared.k_proj = impl->model_cache->CreateDenseLinearView(*bindings->k_proj);
+        prepared.v_proj = impl->model_cache->CreateDenseLinearView(*bindings->v_proj);
+        prepared.o_proj = impl->model_cache->CreateDenseLinearView(*bindings->o_proj);
+        const auto slice_begin = std::chrono::steady_clock::now();
+        AttentionLayerConfig attention_config;
+        attention_config.layer_index = plan_entry.layer_index;
+        attention_config.hidden_size = config.hidden_size;
+        attention_config.query_head_count = config.attention_head_count;
+        attention_config.kv_head_count = config.attention_kv_head_count;
+        attention_config.head_dim = config.attention_head_dim;
+        attention_config.rms_epsilon = config.layer_norm_epsilon;
+        layer_entry.attention_slice = AttentionLayerSlice::CreatePrepared(
+            attention_config,
+            std::move(prepared));
+        const auto slice_end = std::chrono::steady_clock::now();
+        build_report.layers[layer_idx] = {
+            plan_entry.layer_index,
+            plan_entry.kind,
+            ToMilliseconds(bindings_end - bindings_begin),
+            ToMilliseconds(slice_end - slice_begin),
+            ToMilliseconds(slice_end - layer_begin),
+            {}};
+        if (!layer_entry.attention_slice || !layer_entry.attention_slice->valid()) {
+          return nullptr;
+        }
+        break;
+      }
+      case ForwardLayerKind::kMamba: {
+        const auto bindings = BuildMambaLayerBindings(*layer, kernel_catalog, gemm_catalog);
+        const auto bindings_end = std::chrono::steady_clock::now();
+        if (!bindings.has_value()) {
+          return nullptr;
+        }
+        MambaLayerPreparedBindings prepared;
+        prepared.input_norm_weight = impl->model_cache->CreateTensorView(bindings->input_norm_weight->tensor_name);
+        prepared.mixer_norm_weight = impl->model_cache->CreateTensorView(bindings->mixer_norm_weight->tensor_name);
+        prepared.conv1d_weight = impl->model_cache->CreateTensorView(bindings->conv1d_weight->tensor_name);
+        prepared.conv1d_bias = impl->model_cache->CreateTensorView(bindings->conv1d_bias->tensor_name);
+        prepared.A_log = impl->model_cache->CreateTensorView(bindings->A_log->tensor_name);
+        prepared.D = impl->model_cache->CreateTensorView(bindings->D->tensor_name);
+        prepared.dt_bias = impl->model_cache->CreateTensorView(bindings->dt_bias->tensor_name);
+        if (bindings->in_proj_kernel_weight != nullptr &&
+            bindings->in_proj_weight_scale != nullptr &&
+            bindings->in_proj_input_scale != nullptr) {
+          prepared.in_proj_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->in_proj_gemm_weight->tensor_name,
+              bindings->in_proj_gemm_weight->output_rows,
+              bindings->in_proj_gemm_weight->input_cols);
+        } else {
+          prepared.in_proj_dense = impl->model_cache->CreateDenseLinearView(*bindings->in_proj_gemm_weight);
+        }
+        if (bindings->out_proj_kernel_weight != nullptr &&
+            bindings->out_proj_weight_scale != nullptr &&
+            bindings->out_proj_input_scale != nullptr) {
+          prepared.out_proj_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->out_proj_gemm_weight->tensor_name,
+              bindings->out_proj_gemm_weight->output_rows,
+              bindings->out_proj_gemm_weight->input_cols);
+        } else {
+          prepared.out_proj_dense = impl->model_cache->CreateDenseLinearView(*bindings->out_proj_gemm_weight);
+        }
+        const auto slice_begin = std::chrono::steady_clock::now();
+        MambaLayerConfig mamba_config;
+        mamba_config.layer_index = plan_entry.layer_index;
+        mamba_config.hidden_size = config.hidden_size;
+        mamba_config.intermediate_size = config.mamba_intermediate_size;
+        mamba_config.num_heads = config.mamba_num_heads;
+        mamba_config.head_dim = config.mamba_head_dim;
+        mamba_config.state_size = config.mamba_state_size;
+        mamba_config.n_groups = config.mamba_n_groups;
+        mamba_config.conv_kernel_size = config.mamba_conv_kernel_size;
+        mamba_config.conv_state_offset_elems = plan_entry.mamba_conv_state_offset_elems;
+        mamba_config.ssm_state_offset_elems = plan_entry.mamba_state_offset_elems;
+        mamba_config.input_rms_epsilon = config.layer_norm_epsilon;
+        mamba_config.mixer_rms_epsilon = config.layer_norm_epsilon;
+        mamba_config.time_step_min = config.mamba_time_step_min;
+        layer_entry.mamba_slice = MambaLayerSlice::CreatePrepared(mamba_config, std::move(prepared));
+        const auto slice_end = std::chrono::steady_clock::now();
+        build_report.layers[layer_idx] = {
+            plan_entry.layer_index,
+            plan_entry.kind,
+            ToMilliseconds(bindings_end - bindings_begin),
+            ToMilliseconds(slice_end - slice_begin),
+            ToMilliseconds(slice_end - layer_begin),
+            {}};
+        if (!layer_entry.mamba_slice || !layer_entry.mamba_slice->valid()) {
+          return nullptr;
+        }
+        break;
+      }
+      case ForwardLayerKind::kExpert: {
+        const auto bindings = BuildExpertLayerBindings(*layer, kernel_catalog, gemm_catalog, config.n_routed_experts);
+        const auto bindings_end = std::chrono::steady_clock::now();
+        if (!bindings.has_value()) {
+          return nullptr;
+        }
+        ExpertLayerPreparedBindings prepared;
+        prepared.input_norm_weight = impl->model_cache->CreateTensorView(bindings->input_norm_weight->tensor_name);
+        prepared.gate_score_correction_bias_device =
+            impl->model_cache->CreateTensorView(bindings->gate_score_correction_bias->tensor_name);
+        prepared.gate_weight = impl->model_cache->CreateDenseLinearView(*bindings->gate_weight);
+        prepared.fc2_latent = impl->model_cache->CreateDenseLinearView(*bindings->fc2_latent_weight);
+        if (bindings->fc1_latent_kernel_weight != nullptr &&
+            bindings->fc1_latent_weight_scale != nullptr &&
+            bindings->fc1_latent_input_scale != nullptr) {
+          prepared.fc1_latent_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->fc1_latent_gemm_weight->tensor_name,
+              bindings->fc1_latent_gemm_weight->output_rows,
+              bindings->fc1_latent_gemm_weight->input_cols);
+        } else {
+          prepared.fc1_latent_dense = impl->model_cache->CreateDenseLinearView(*bindings->fc1_latent_gemm_weight);
+        }
+        if (bindings->shared_up_kernel_weight != nullptr &&
+            bindings->shared_up_weight_scale != nullptr &&
+            bindings->shared_up_input_scale != nullptr) {
+          prepared.shared_up_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->shared_up_gemm_weight->tensor_name,
+              bindings->shared_up_gemm_weight->output_rows,
+              bindings->shared_up_gemm_weight->input_cols);
+        } else {
+          prepared.shared_up_dense = impl->model_cache->CreateDenseLinearView(*bindings->shared_up_gemm_weight);
+        }
+        if (bindings->shared_down_gemm_weight->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+          prepared.shared_down_nvfp4 = impl->model_cache->CreateNvfp4LinearView(*bindings->shared_down_gemm_weight);
+        } else if (bindings->shared_down_kernel_weight != nullptr &&
+                   bindings->shared_down_weight_scale != nullptr &&
+                   bindings->shared_down_input_scale != nullptr &&
+                   bindings->shared_down_kernel_weight->storage_dtype == "fp8_e4m3fn") {
+          prepared.shared_down_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->shared_down_gemm_weight->tensor_name,
+              bindings->shared_down_gemm_weight->output_rows,
+              bindings->shared_down_gemm_weight->input_cols);
+        } else {
+          prepared.shared_down_dense = impl->model_cache->CreateDenseLinearView(*bindings->shared_down_gemm_weight);
+        }
+        prepared.routed_experts.resize(bindings->routed_experts.size());
+        for (std::size_t expert_index = 0; expert_index < bindings->routed_experts.size(); ++expert_index) {
+          const ExpertWeightPair& pair = bindings->routed_experts[expert_index];
+          prepared.routed_experts[expert_index].up_descriptor = *pair.up_proj;
+          prepared.routed_experts[expert_index].down_descriptor = *pair.down_proj;
+          prepared.routed_experts[expert_index].up_tensor_scale = ReadTensorScaleHost(*pair.up_proj);
+          prepared.routed_experts[expert_index].down_tensor_scale = ReadTensorScaleHost(*pair.down_proj);
+          if (pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+            prepared.routed_experts[expert_index].up_proj = impl->model_cache->CreateNvfp4LinearView(*pair.up_proj);
+            prepared.routed_experts[expert_index].down_proj = impl->model_cache->CreateNvfp4LinearView(*pair.down_proj);
+          } else {
+            prepared.routed_experts[expert_index].up_proj = impl->model_cache->CreateDenseLinearView(*pair.up_proj);
+            prepared.routed_experts[expert_index].down_proj = impl->model_cache->CreateDenseLinearView(*pair.down_proj);
+          }
+        }
+        const auto slice_begin = std::chrono::steady_clock::now();
+        ExpertLayerConfig expert_config;
+        expert_config.layer_index = plan_entry.layer_index;
+        expert_config.hidden_size = config.hidden_size;
+        expert_config.moe_latent_size = config.moe_latent_size;
+        expert_config.routed_expert_intermediate_size = config.routed_expert_intermediate_size;
+        expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
+        expert_config.n_routed_experts = config.n_routed_experts;
+        expert_config.top_k = config.experts_per_token;
+        expert_config.n_group = config.expert_n_group;
+        expert_config.topk_group = config.expert_topk_group;
+        expert_config.rms_epsilon = config.layer_norm_epsilon;
+        expert_config.routed_scaling_factor = config.routed_scaling_factor;
+        expert_config.norm_topk_prob = config.norm_topk_prob;
+        layer_entry.expert_slice = ExpertLayerSlice::CreatePrepared(expert_config, std::move(prepared));
+        const auto slice_end = std::chrono::steady_clock::now();
+        build_report.layers[layer_idx] = {
+            plan_entry.layer_index,
+            plan_entry.kind,
+            ToMilliseconds(bindings_end - bindings_begin),
+            ToMilliseconds(slice_end - slice_begin),
+            ToMilliseconds(slice_end - layer_begin),
+            {}};
         if (!layer_entry.expert_slice || !layer_entry.expert_slice->valid()) {
           return nullptr;
         }
         break;
       }
     }
-
-    impl->layers.push_back(std::move(layer_entry));
+    impl->layers[layer_idx] = std::move(layer_entry);
   }
-
+  const auto layer_loop_end = std::chrono::steady_clock::now();
+  add_phase("layer_loop_total", layer_loop_begin, layer_loop_end);
+  impl->build_report = std::move(build_report);
   return std::unique_ptr<SingleTokenForwardModel>(new SingleTokenForwardModel(std::move(impl)));
 }
 
@@ -451,6 +997,10 @@ const SingleTokenForwardPlan& SingleTokenForwardModel::plan() const {
   return impl_->plan;
 }
 
+const SingleTokenForwardBuildReport& SingleTokenForwardModel::build_report() const {
+  return impl_->build_report;
+}
+
 std::unique_ptr<RequestExecutionContext> SingleTokenForwardModel::CreateRequestContext() const {
   if (!valid()) {
     return nullptr;
@@ -465,6 +1015,42 @@ bool SingleTokenForwardModel::RunSingleToken(
     const std::vector<std::size_t>& capture_layer_indices,
     SingleTokenForwardTrace* trace,
     std::optional<std::size_t> stop_layer_index) const {
+  return RunPrefill(
+      &token_id,
+      1,
+      request_context,
+      logits,
+      capture_layer_indices,
+      trace,
+      stop_layer_index);
+}
+
+bool SingleTokenForwardModel::RunDecodeStep(
+    std::int32_t token_id,
+    RequestExecutionContext& request_context,
+    DeviceTensorFp32* logits,
+    const std::vector<std::size_t>& capture_layer_indices,
+    SingleTokenForwardTrace* trace,
+    std::optional<std::size_t> stop_layer_index) const {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool model_valid = valid();
+  const bool request_valid = request_context.valid();
+  const bool have_logits = logits != nullptr;
+  const bool logits_valid = have_logits && logits->valid();
+  const std::vector<std::size_t> expected_logits_shape = {1, impl_->config.vocab_size};
+  const bool logits_shape_ok = logits_valid && logits->shape() == expected_logits_shape;
+  if (!model_valid || !request_valid || !have_logits || !logits_valid || !logits_shape_ok) {
+    if (debug) {
+      std::cout << "single_token_forward_model: invalid RunDecodeStep arguments or state\n";
+    }
+    return false;
+  }
+  if (!request_context.AdvanceDecodePosition(1)) {
+    if (debug) {
+      std::cout << "single_token_forward_model: failed to advance decode position\n";
+    }
+    return false;
+  }
   return RunPrefill(
       &token_id,
       1,
@@ -538,18 +1124,37 @@ bool SingleTokenForwardModel::RunPrefill(
     std::cerr << "single_token_forward_model: cuDNN handle unavailable\n";
     return false;
   }
-  if (!request_context.ResetForNewRequest()) {
+  const bool continuing_decode =
+      token_count == 1 &&
+      request_context.sequence_length() != 0 &&
+      request_context.sequence_length() == request_context.decode_position();
+  if (!continuing_decode && !request_context.ResetForNewRequest()) {
     std::cerr << "single_token_forward_model: request context reset failed\n";
     return false;
   }
 
-  DeviceTensorFp32* current = request_context.hidden();
-  DeviceTensorFp32* next = request_context.residual();
-  DeviceTensorFp32* scratch = request_context.scratch();
-  if (current == nullptr || next == nullptr || scratch == nullptr) {
+  DeviceTensorFp32* hidden_storage = request_context.hidden();
+  DeviceTensorFp32* residual_storage = request_context.residual();
+  DeviceTensorFp32* scratch_storage = request_context.scratch();
+  DeviceBuffer<std::int32_t>* token_ids_device = request_context.token_ids_device();
+  if (hidden_storage == nullptr || residual_storage == nullptr || scratch_storage == nullptr) {
     std::cerr << "single_token_forward_model: request context buffers unavailable\n";
     return false;
   }
+  if (token_ids_device == nullptr || token_ids_device->count() < token_count) {
+    std::cerr << "single_token_forward_model: request token-id buffer unavailable\n";
+    return false;
+  }
+  auto current_view = DeviceTensorFp32::CreateView({token_count, impl_->config.hidden_size}, hidden_storage->data());
+  auto next_view = DeviceTensorFp32::CreateView({token_count, impl_->config.hidden_size}, residual_storage->data());
+  auto scratch_view = DeviceTensorFp32::CreateView({token_count, impl_->config.hidden_size}, scratch_storage->data());
+  if (!current_view || !next_view || !scratch_view) {
+    std::cerr << "single_token_forward_model: request context token views unavailable\n";
+    return false;
+  }
+  DeviceTensorFp32* current = current_view.get();
+  DeviceTensorFp32* next = next_view.get();
+  DeviceTensorFp32* scratch = scratch_view.get();
 
   if (!impl_->embedding_table || !impl_->embedding_table->valid() ||
       !impl_->lm_head_op || !impl_->lm_head_op->valid()) {
@@ -562,7 +1167,21 @@ bool SingleTokenForwardModel::RunPrefill(
     return false;
   }
 
-  if (!LookupEmbeddingRowsFp32(*impl_->embedding_table, token_ids, token_count, current).has_value()) {
+  for (std::size_t token_index = 0; token_index < token_count; ++token_index) {
+    if (token_ids[token_index] < 0 ||
+        static_cast<std::size_t>(token_ids[token_index]) >= impl_->config.vocab_size) {
+      std::cerr << "single_token_forward_model: token id out of range at index "
+                << token_index << " token_id=" << token_ids[token_index] << "\n";
+      return false;
+    }
+  }
+  if (!token_ids_device->CopyFromHostAsync(token_ids, token_count) ||
+      !LookupEmbeddingRowsDeviceIdsFp32(
+           *impl_->embedding_table,
+           token_ids_device->data(),
+           token_count,
+           current)
+           .has_value()) {
     std::cerr << "single_token_forward_model: embedding lookup failed\n";
     return false;
   }
@@ -585,11 +1204,22 @@ bool SingleTokenForwardModel::RunPrefill(
       capture_layer_indices.begin(),
       capture_layer_indices.end());
 
+  const bool profile = std::getenv("NEMOTRON_FORWARD_PROFILE") != nullptr;
+  cudaEvent_t profile_start = nullptr;
+  cudaEvent_t profile_end = nullptr;
+  if (profile) {
+    cudaEventCreate(&profile_start);
+    cudaEventCreate(&profile_end);
+  }
+
   for (const Impl::LayerEntry& layer : impl_->layers) {
     if (debug) {
       std::cout << "single_token_forward_model: running layer "
                 << layer.plan.layer_index
                 << " kind=" << static_cast<int>(layer.plan.kind) << "\n";
+    }
+    if (profile) {
+      cudaEventRecord(profile_start);
     }
     bool ok = false;
     switch (layer.plan.kind) {
@@ -639,9 +1269,10 @@ bool SingleTokenForwardModel::RunPrefill(
         const bool valid_slice = created && layer.expert_slice->valid();
         const bool ran =
             valid_slice &&
-            layer.expert_slice->Run(
+            layer.expert_slice->RunWithRequestContext(
                 *impl_->cublas,
                 impl_->heuristic_cache.get(),
+                request_context,
                 *current,
                 next,
                 nullptr);
@@ -655,11 +1286,28 @@ bool SingleTokenForwardModel::RunPrefill(
         break;
       }
     }
+    if (profile) {
+      cudaEventRecord(profile_end);
+      cudaEventSynchronize(profile_end);
+      float layer_ms = 0.0f;
+      cudaEventElapsedTime(&layer_ms, profile_start, profile_end);
+      const char* kind_name =
+          layer.plan.kind == ForwardLayerKind::kAttention ? "attention" :
+          layer.plan.kind == ForwardLayerKind::kMamba ? "mamba" :
+          layer.plan.kind == ForwardLayerKind::kExpert ? "expert" : "unknown";
+      std::cerr << "profile layer=" << layer.plan.layer_index
+                << " kind=" << kind_name
+                << " ms=" << std::fixed << std::setprecision(3) << layer_ms << "\n";
+    }
     if (!ok) {
       std::cerr << "single_token_forward_model: layer "
                 << layer.plan.layer_index
                 << " kind=" << static_cast<int>(layer.plan.kind)
                 << " execution failed\n";
+      if (profile) {
+        cudaEventDestroy(profile_start);
+        cudaEventDestroy(profile_end);
+      }
       return false;
     }
     std::swap(current, next);
@@ -731,6 +1379,10 @@ bool SingleTokenForwardModel::RunPrefill(
       std::cerr << "single_token_forward_model: failed to capture logits\n";
       return false;
     }
+  }
+  if (profile) {
+    cudaEventDestroy(profile_start);
+    cudaEventDestroy(profile_end);
   }
   return true;
 }

@@ -633,17 +633,43 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  auto normalized = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto projected = DeviceTensorFp32::Create({token_count, projection_size});
-  auto scan_output = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
-  auto projected_output = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+  std::unique_ptr<DeviceTensorFp32> normalized_local;
+  std::unique_ptr<DeviceTensorFp32> projected_local;
+  std::unique_ptr<DeviceTensorFp32> scan_output_local;
+  std::unique_ptr<DeviceTensorFp32> projected_output_local;
   std::unique_ptr<DeviceTensorFp32> conv_output;
   std::unique_ptr<DeviceTensorFp32> y_output;
+
+  DeviceTensorFp32* normalized = nullptr;
+  DeviceTensorFp32* projected = nullptr;
+  DeviceTensorFp32* scan_output = nullptr;
+  DeviceTensorFp32* projected_output = nullptr;
+
+  if (token_count == 1 &&
+      request_context.mamba_normalized_decode() != nullptr &&
+      request_context.mamba_projected_decode() != nullptr &&
+      request_context.mamba_scan_output_decode() != nullptr &&
+      request_context.mamba_projected_output_decode() != nullptr) {
+    normalized = request_context.mamba_normalized_decode();
+    projected = request_context.mamba_projected_decode();
+    scan_output = request_context.mamba_scan_output_decode();
+    projected_output = request_context.mamba_projected_output_decode();
+  } else {
+    normalized_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    projected_local = DeviceTensorFp32::Create({token_count, projection_size});
+    scan_output_local = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
+    projected_output_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    normalized = normalized_local.get();
+    projected = projected_local.get();
+    scan_output = scan_output_local.get();
+    projected_output = projected_output_local.get();
+  }
   if (token_count != 1) {
     conv_output = DeviceTensorFp32::Create({token_count, conv_dim});
     y_output = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
   }
-  if (!normalized || !projected || !scan_output || !projected_output ||
+  if (normalized == nullptr || projected == nullptr || scan_output == nullptr ||
+      projected_output == nullptr ||
       (token_count != 1 && (!conv_output || !y_output))) {
     return false;
   }
@@ -655,7 +681,7 @@ bool MambaLayerSlice::Run(
     trace->projected_output.clear();
   }
 
-  if (!RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.input_rms_epsilon, normalized.get())) {
+  if (!RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.input_rms_epsilon, normalized)) {
     return false;
   }
 
@@ -668,9 +694,9 @@ bool MambaLayerSlice::Run(
 
   const bool in_proj_ok =
       (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->in_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, projected.get())) ||
+       impl_->in_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, projected)) ||
       (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected.get()));
+       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected));
   if (!in_proj_ok) {
     return false;
   }
@@ -704,7 +730,7 @@ bool MambaLayerSlice::Run(
             *impl_->mixer_norm_weight,
             request_context.mamba_conv_state(),
             request_context.mamba_state(),
-            scan_output.get())) {
+            scan_output)) {
       return false;
     }
   } else {
@@ -740,7 +766,7 @@ bool MambaLayerSlice::Run(
             *impl_->mixer_norm_weight,
             impl_->config.n_groups,
             impl_->config.mixer_rms_epsilon,
-            scan_output.get())) {
+            scan_output)) {
       return false;
     }
   }
@@ -754,9 +780,9 @@ bool MambaLayerSlice::Run(
 
   const bool out_proj_ok =
       (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->out_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *scan_output, projected_output.get())) ||
+       impl_->out_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *scan_output, projected_output)) ||
       (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->out_proj_dense->Run(cublas_handle, heuristic_cache, *scan_output, projected_output.get()));
+       impl_->out_proj_dense->Run(cublas_handle, heuristic_cache, *scan_output, projected_output));
   if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output)) {
     return false;
   }

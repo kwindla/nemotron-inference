@@ -116,6 +116,8 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
   const std::size_t expected_conv_state_elems = conv_dim * config.mamba_conv_kernel_size;
   const std::size_t expected_ssm_state_elems =
       config.mamba_num_heads * config.mamba_head_dim * config.mamba_state_size;
+  const std::size_t expected_mamba_projection_size =
+      config.mamba_intermediate_size + conv_dim + config.mamba_num_heads;
 
   return expect(plan->valid, "plan should be marked valid") &&
          expect(plan->layers.size() == 3, "plan should contain three ordered layers") &&
@@ -141,6 +143,12 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
                 "forward plan should preserve configured token capacity") &&
          expect(plan->request_config.scratch_tokens == config.max_tokens,
                 "forward plan should size scratch tokens to the configured token capacity") &&
+         expect(plan->request_config.mamba_hidden_size == config.hidden_size,
+                "request config should preserve the mamba decode hidden width") &&
+         expect(plan->request_config.mamba_projection_size == expected_mamba_projection_size,
+                "request config should size reusable mamba projection scratch") &&
+         expect(plan->request_config.mamba_intermediate_size == config.mamba_intermediate_size,
+                "request config should preserve the mamba decode intermediate width") &&
          expect(plan->request_config.attention_kv_cache.layer_count == 8,
                 "KV layer count should span the maximum layer index") &&
          expect(plan->request_config.attention_total_pages == 8,
@@ -150,7 +158,19 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
                 "conv-state bytes should match the single Mamba layer footprint") &&
          expect(plan->request_config.mamba_state_bytes_fp32 ==
                     expected_ssm_state_elems * sizeof(float),
-                "ssm-state bytes should match the single Mamba layer footprint");
+                "ssm-state bytes should match the single Mamba layer footprint") &&
+         expect(plan->request_config.expert_selection_capacity ==
+                    config.max_tokens * config.experts_per_token,
+                "expert scratch capacity should scale with token capacity and top-k routing") &&
+         expect(plan->request_config.expert_intermediate_scratch_numel ==
+                    config.experts_per_token * config.routed_expert_intermediate_size,
+                "forward plan should size expert intermediate scratch for one routed decode step") &&
+         expect(plan->request_config.expert_aux_scratch_numel ==
+                    (4 * config.hidden_size) +
+                    (3 * config.moe_latent_size) +
+                    config.shared_expert_intermediate_size +
+                    config.n_routed_experts,
+                "forward plan should size expert aux scratch for decode-local expert temporaries");
 }
 
 }  // namespace
