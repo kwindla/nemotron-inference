@@ -116,4 +116,4 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 7 | Integrate device argmax into decode loop | done | f4c4996 | nano-device-token-select (integration) |
 | 8 | Linear fastpath strict mode | done | 447882f | nano-linear-fastpath (strict gate) |
 | 9 | Cached-head and profiler-ready benchmark modes | done | dd4f27f | nano-hotpath-measure |
-| 10 | Wire all counters into benchmark JSON artifact | done | — | nano-hotpath-measure (integration) |
+| 10 | Wire all counters into benchmark JSON artifact | done | ddf42f8 | nano-hotpath-measure (integration) |
