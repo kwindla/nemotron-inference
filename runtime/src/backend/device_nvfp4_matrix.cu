@@ -176,6 +176,98 @@ __global__ void SwizzleBlockScalesForMatmulKernel(
   matmul_scales[destination_offset] = row_major_scales[scale_index];
 }
 
+// Fused kernel for M=1 single-row packing. Replaces ComputeGlobalMaxAbsKernel +
+// WriteTensorScaleKernel + PackRowMajorFp32ToNvfp4Kernel +
+// SwizzleBlockScalesForMatmulKernel in a single launch of one thread block.
+__global__ void FusedPackSingleRowFp32ToNvfp4Kernel(
+    const float* source,
+    std::size_t cols,
+    float fixed_tensor_scale,
+    std::uint8_t* packed,
+    std::uint8_t* block_scales,
+    std::size_t matmul_scales_nbytes,
+    std::size_t padded_blocks_per_row,
+    std::uint8_t* matmul_scales,
+    float* tensor_scale_data) {
+  extern __shared__ float smem[];
+  const std::size_t tid = threadIdx.x;
+  const std::size_t blocks_per_row = cols / kBlockWidth;
+
+  float tensor_scale;
+  if (fixed_tensor_scale > 0.0f) {
+    tensor_scale = fixed_tensor_scale;
+    if (tid == 0) {
+      *tensor_scale_data = tensor_scale;
+    }
+  } else {
+    float local_max = 0.0f;
+    for (std::size_t i = tid; i < cols; i += blockDim.x) {
+      const float val = fabsf(source[i]);
+      if (val > local_max) local_max = val;
+    }
+    smem[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+      if (tid < s && smem[tid + s] > smem[tid]) {
+        smem[tid] = smem[tid + s];
+      }
+      __syncthreads();
+    }
+    const float global_max_abs = smem[0];
+    tensor_scale = 1.0f;
+    if (global_max_abs > kFp4MaxFinite * kFp8E4M3MaxFinite) {
+      tensor_scale = ClampScale(global_max_abs / (kFp4MaxFinite * kFp8E4M3MaxFinite));
+    }
+    if (tid == 0) {
+      *tensor_scale_data = tensor_scale;
+      smem[0] = tensor_scale;
+    }
+    __syncthreads();
+    tensor_scale = smem[0];
+  }
+
+  for (std::size_t i = tid; i < matmul_scales_nbytes; i += blockDim.x) {
+    matmul_scales[i] = 0;
+  }
+  __syncthreads();
+
+  for (std::size_t block_index = tid; block_index < blocks_per_row;
+       block_index += blockDim.x) {
+    const std::size_t input_offset = block_index * kBlockWidth;
+    const std::size_t packed_offset = block_index * (kBlockWidth / 2u);
+
+    float block_max_abs = 0.0f;
+    for (std::size_t i = 0; i < kBlockWidth; ++i) {
+      const float abs_value = fabsf(source[input_offset + i]);
+      if (abs_value > block_max_abs) block_max_abs = abs_value;
+    }
+
+    float block_scale = 1.0f;
+    if (block_max_abs > 0.0f) {
+      block_scale = ClampScale(block_max_abs / (kFp4MaxFinite * tensor_scale));
+    }
+    const std::uint8_t block_scale_fp8 = static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
+    block_scales[block_index] = block_scale_fp8;
+
+    const float scale = tensor_scale * block_scale;
+    for (std::size_t i = 0; i < kBlockWidth; i += 2) {
+      const float lhs = source[input_offset + i] / scale;
+      const float rhs = source[input_offset + i + 1] / scale;
+      const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
+                                       __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
+                                   0x0fu;
+      const std::uint8_t rhs_fp4 = static_cast<std::uint8_t>(
+                                       __nv_cvt_float_to_fp4(rhs, __NV_E2M1, cudaRoundNearest)) &
+                                   0x0fu;
+      packed[packed_offset + (i / 2u)] = static_cast<std::uint8_t>(lhs_fp4 | (rhs_fp4 << 4));
+    }
+
+    const std::size_t dest = ExecutionScaleOffset(0, block_index, padded_blocks_per_row);
+    matmul_scales[dest] = block_scale_fp8;
+  }
+}
+
 }  // namespace
 
 struct DeviceNvfp4Matrix::Impl {
@@ -463,6 +555,28 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
   const std::optional<float> fixed_tensor_scale = NormalizeFixedTensorScale(options);
   if (options.fixed_tensor_scale.has_value() && !fixed_tensor_scale.has_value()) {
     return false;
+  }
+
+  // Single-row fast path: one fused kernel replaces 4 separate launches + 2 memsets.
+  if (rows == 1) {
+    const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols);
+    if (!layout.has_value()) {
+      return false;
+    }
+    constexpr std::size_t kFusedThreads = 256;
+    const float fixed_scale = fixed_tensor_scale.has_value() ? *fixed_tensor_scale : -1.0f;
+    FusedPackSingleRowFp32ToNvfp4Kernel<<<1, kFusedThreads,
+                                          kFusedThreads * sizeof(float)>>>(
+        source.data(),
+        cols,
+        fixed_scale,
+        packed_data,
+        block_scales_data,
+        MatmulScaleBytes(rows, cols),
+        layout->padded_blocks_per_row,
+        matmul_block_scales_data,
+        tensor_scale_data);
+    return CheckCuda(cudaGetLastError());
   }
 
   if (fixed_tensor_scale.has_value()) {
