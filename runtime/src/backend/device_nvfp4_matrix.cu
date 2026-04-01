@@ -588,7 +588,7 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
     if (global_max_bits_scratch == nullptr) {
       return false;
     }
-    if (!CheckCuda(cudaMemset(global_max_bits_scratch, 0, sizeof(unsigned int)))) {
+    if (!CheckCuda(cudaMemsetAsync(global_max_bits_scratch, 0, sizeof(unsigned int)))) {
       return false;
     }
 
@@ -629,7 +629,7 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
   if (!layout.has_value()) {
     return false;
   }
-  if (!CheckCuda(cudaMemset(matmul_block_scales_data, 0, MatmulScaleBytes(rows, cols)))) {
+  if (!CheckCuda(cudaMemsetAsync(matmul_block_scales_data, 0, MatmulScaleBytes(rows, cols)))) {
     return false;
   }
   SwizzleBlockScalesForMatmulKernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(

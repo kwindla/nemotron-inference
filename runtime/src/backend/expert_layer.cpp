@@ -2736,8 +2736,8 @@ bool RunExpertLayerImpl(
           impl.scratch_aligned_act_scales.count() >= batch_count * aligned_scale_row &&
           down_output && down_output->valid() && down_output->FillZero()) {
         // Copy activation rows to aligned offsets (D→D, no host).
-        cudaMemset(impl.scratch_aligned_act_packed.data(), 0, batch_count * aligned_packed_row);
-        cudaMemset(impl.scratch_aligned_act_scales.data(), 0, batch_count * aligned_scale_row);
+        cudaMemsetAsync(impl.scratch_aligned_act_packed.data(), 0, batch_count * aligned_packed_row);
+        cudaMemsetAsync(impl.scratch_aligned_act_scales.data(), 0, batch_count * aligned_scale_row);
         for (std::size_t i = 0; i < batch_count; ++i) {
           cudaMemcpy(
               impl.scratch_aligned_act_packed.data() + i * aligned_packed_row,
