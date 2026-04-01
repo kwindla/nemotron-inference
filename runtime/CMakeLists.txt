@@ -34,6 +34,12 @@ add_library(
   src/cache/reusable_state.cpp
 )
 
+target_link_libraries(
+  nemotron_runtime_state
+  PUBLIC
+    CUDA::cudart
+)
+
 target_include_directories(
   nemotron_runtime_state
   PUBLIC
@@ -44,6 +50,7 @@ target_compile_features(nemotron_runtime_state PUBLIC cxx_std_17)
 
 add_library(
   nemotron_runtime_cache
+  src/api/state_snapshot.cpp
   src/cache/prefix_cache.cpp
 )
 
@@ -109,6 +116,7 @@ add_library(
   nemotron_runtime_backend
   src/backend/cublaslt_handle.cpp
   src/backend/attention_layer.cpp
+  src/backend/attention_device_fallback.cu
   src/backend/dense_weight.cpp
   src/backend/device_nvfp4_matrix.cu
   src/backend/device_tensor.cpp
@@ -116,7 +124,11 @@ add_library(
   src/backend/embedding_projection_fragment.cpp
   src/backend/embedding_table.cu
   src/backend/expert_layer.cpp
+  src/backend/fused_mamba_decode.cu
+  src/backend/fused_moe_decode.cu
   src/backend/linear_op.cpp
+  src/backend/linear_op_counters.cpp
+  src/backend/linear_reference_kernels.cu
   src/backend/mamba_layer.cpp
   src/backend/nvfp4_gemm_runner.cpp
   src/backend/nvfp4_packing.cpp
@@ -133,6 +145,13 @@ if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
     PRIVATE
       src/backend/cudnn_handle.cpp
       src/backend/cudnn_paged_attention.cpp
+  )
+else()
+  target_sources(
+    nemotron_runtime_backend
+    PRIVATE
+      src/backend/cudnn_handle_stub.cpp
+      src/backend/cudnn_paged_attention_stub.cpp
   )
 endif()
 
@@ -170,6 +189,12 @@ if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
 endif()
 
 target_compile_features(nemotron_runtime_backend PUBLIC cxx_std_17)
+
+target_link_libraries(
+  nemotron_runtime_cache
+  PUBLIC
+    nemotron_runtime_backend
+)
 
 add_library(
   nemotron_runtime_api

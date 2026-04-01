@@ -1,6 +1,9 @@
 #include "nemotron/linear_op.h"
 
+#include <cerrno>
+#include <cmath>
 #include <cuda_bf16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 #include <cstdlib>
@@ -10,6 +13,9 @@
 #include <optional>
 #include <utility>
 #include <vector>
+
+#include "nemotron/linear_op_counters.h"
+#include "nemotron/linear_reference_kernels.h"
 
 namespace nemotron {
 
@@ -21,15 +27,59 @@ struct UploadedLinearOp::Impl {
 
 namespace {
 
+constexpr const char* kLinearDeviceFastpathEnvVar =
+    "NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH";
+constexpr const char* kNvfp4ActivationTensorScaleEnvVar =
+    "NEMOTRON_FORWARD_NVFP4_ACTIVATION_TENSOR_SCALE";
+
 bool LinearDeviceFastpathEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
+  const char* value = std::getenv(kLinearDeviceFastpathEnvVar);
   if (value == nullptr) {
     return false;
   }
   return std::strcmp(value, "0") != 0;
 }
 
-std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
+std::optional<float> ParsePositiveFloatEnv(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const float parsed = std::strtof(value, &end);
+  if (end == value || (end != nullptr && *end != '\0') || errno == ERANGE ||
+      !std::isfinite(parsed) || parsed <= 0.0f) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
+Nvfp4PackOptions RuntimeNvfp4PackOptions(bool debug, const GemmDescriptor& descriptor) {
+  Nvfp4PackOptions options;
+  const char* raw_value = std::getenv(kNvfp4ActivationTensorScaleEnvVar);
+  if (raw_value == nullptr || raw_value[0] == '\0') {
+    return options;
+  }
+  const auto fixed_tensor_scale = ParsePositiveFloatEnv(kNvfp4ActivationTensorScaleEnvVar);
+  if (!fixed_tensor_scale.has_value()) {
+    if (debug) {
+      std::cerr << "linear_op: ignoring invalid "
+                << kNvfp4ActivationTensorScaleEnvVar
+                << " for " << descriptor.tensor_name << "\n";
+    }
+    return options;
+  }
+  options.fixed_tensor_scale = *fixed_tensor_scale;
+  if (debug) {
+    std::cerr << "linear_op: using fixed NVFP4 activation tensor scale "
+              << *fixed_tensor_scale
+              << " for " << descriptor.tensor_name << "\n";
+  }
+  return options;
+}
+
+std::optional<CublasLtGemmPlan> BuildDescriptorGemmPlan(
     const GemmDescriptor& descriptor,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache) {
@@ -38,6 +88,79 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     return std::nullopt;
   }
   const auto execution = PrepareGemmExecution(*launch_plan, heuristic_cache);
+  if (!execution.has_value()) {
+    return std::nullopt;
+  }
+  return BuildCublasLtGemmPlan(*execution);
+}
+
+std::optional<GemmLaunchPlan> BuildRuntimeLaunchPlan(
+    const GemmDescriptor& descriptor,
+    std::size_t rows,
+    ByteRangeView packed_bytes,
+    std::optional<ByteRangeView> block_scales_bytes = std::nullopt,
+    std::optional<ByteRangeView> tensor_scale_bytes = std::nullopt) {
+  const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
+  if (!launch_plan.has_value()) {
+    return std::nullopt;
+  }
+  GemmLaunchPlan runtime_launch_plan = *launch_plan;
+  runtime_launch_plan.packed_bytes = packed_bytes;
+  if (block_scales_bytes.has_value()) {
+    runtime_launch_plan.block_scales_bytes = *block_scales_bytes;
+  }
+  if (tensor_scale_bytes.has_value()) {
+    runtime_launch_plan.tensor_scale_bytes = *tensor_scale_bytes;
+  }
+  return runtime_launch_plan;
+}
+
+std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
+    const GemmDescriptor& descriptor,
+    const DeviceDenseWeightFp32& weight,
+    std::size_t rows,
+    GemmHeuristicCache* heuristic_cache) {
+  const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
+      descriptor,
+      rows,
+      ByteRangeView{
+          reinterpret_cast<const std::uint8_t*>(weight.data()),
+          weight.numel() * sizeof(float),
+      });
+  if (!runtime_launch_plan.has_value()) {
+    return std::nullopt;
+  }
+  const auto execution = PrepareGemmExecution(*runtime_launch_plan, heuristic_cache);
+  if (!execution.has_value()) {
+    return std::nullopt;
+  }
+  return BuildCublasLtGemmPlan(*execution);
+}
+
+std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
+    const GemmDescriptor& descriptor,
+    const DeviceNvfp4Weight& weight,
+    std::size_t rows,
+    GemmHeuristicCache* heuristic_cache) {
+  const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
+      descriptor,
+      rows,
+      ByteRangeView{
+          weight.packed_data(),
+          weight.packed_nbytes(),
+      },
+      ByteRangeView{
+          weight.matmul_block_scales_data(),
+          weight.matmul_block_scales_nbytes(),
+      },
+      ByteRangeView{
+          weight.tensor_scale_data(),
+          weight.tensor_scale_nbytes(),
+      });
+  if (!runtime_launch_plan.has_value()) {
+    return std::nullopt;
+  }
+  const auto execution = PrepareGemmExecution(*runtime_launch_plan, heuristic_cache);
   if (!execution.has_value()) {
     return std::nullopt;
   }
@@ -56,82 +179,51 @@ bool IsFp8Storage(const std::string& storage_dtype) {
   return storage_dtype == "fp8_e4m3fn" || storage_dtype == "fp8_e4m3";
 }
 
-std::optional<std::vector<float>> ReadDenseWeightToHostFp32(const GemmDescriptor& descriptor) {
-  if (descriptor.packed_data == nullptr ||
-      descriptor.output_rows == 0 ||
-      descriptor.input_cols == 0) {
-    return std::nullopt;
-  }
-  const std::size_t count = descriptor.output_rows * descriptor.input_cols;
-  std::vector<float> values(count, 0.0f);
-  if (IsFp32Storage(descriptor.storage_dtype)) {
-    if (descriptor.packed_nbytes != count * sizeof(float)) {
-      return std::nullopt;
-    }
-    std::memcpy(values.data(), descriptor.packed_data, descriptor.packed_nbytes);
-    return values;
-  }
-  if (IsBf16Storage(descriptor.storage_dtype)) {
-    if (descriptor.packed_nbytes != count * sizeof(__nv_bfloat16)) {
-      return std::nullopt;
-    }
-    const auto* src = reinterpret_cast<const __nv_bfloat16*>(descriptor.packed_data);
-    for (std::size_t i = 0; i < count; ++i) {
-      values[i] = __bfloat162float(src[i]);
-    }
-    return values;
-  }
-  if (IsFp8Storage(descriptor.storage_dtype)) {
-    if (descriptor.packed_nbytes != count * sizeof(__nv_fp8_e4m3)) {
-      return std::nullopt;
-    }
-    const auto* src = reinterpret_cast<const __nv_fp8_e4m3*>(descriptor.packed_data);
-    for (std::size_t i = 0; i < count; ++i) {
-      values[i] = static_cast<float>(src[i]);
-    }
-    return values;
-  }
-  return std::nullopt;
+float DecodeFp4(std::uint8_t raw_nibble) {
+  __nv_fp4_e2m1 value;
+  value.__x = raw_nibble & 0x0F;
+  return static_cast<float>(value);
 }
 
-std::vector<float> CpuMatmulRowMajor(
-    const std::vector<float>& activations,
-    std::size_t rows,
-    const std::vector<float>& weights,
-    std::size_t output_rows,
-    std::size_t input_cols) {
-  std::vector<float> output(rows * output_rows, 0.0f);
-  for (std::size_t row = 0; row < rows; ++row) {
-    for (std::size_t out = 0; out < output_rows; ++out) {
-      // Correctness-first dense fallback: use a higher-accuracy accumulation
-      // surface so offline oracle drift does not get dominated by host
-      // reduction noise before it reaches later mixed-precision layers.
-      double accum = 0.0;
-      for (std::size_t col = 0; col < input_cols; ++col) {
-        accum += static_cast<double>(activations[row * input_cols + col]) *
-                 static_cast<double>(weights[out * input_cols + col]);
-      }
-      output[row * output_rows + out] = static_cast<float>(accum);
-    }
-  }
-  return output;
+float DecodeFp8(std::uint8_t raw_byte) {
+  __nv_fp8_e4m3 value;
+  value.__x = raw_byte;
+  return static_cast<float>(value);
 }
 
 }  // namespace
 
 std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor& descriptor) {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   auto impl = std::make_unique<Impl>();
   impl->descriptor = descriptor;
   switch (descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor:
       impl->dense_weight = DeviceDenseWeightFp32::Upload(descriptor);
       if (!impl->dense_weight || !impl->dense_weight->valid()) {
+        if (debug) {
+          std::cerr << "linear_op_create: dense upload failed for " << descriptor.tensor_name
+                    << " storage=" << descriptor.storage_dtype
+                    << " compute=" << descriptor.compute_dtype
+                    << " layout=" << descriptor.layout_tag << "\n";
+        }
         return nullptr;
       }
       break;
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       impl->nvfp4_weight = DeviceNvfp4Weight::Upload(descriptor);
       if (!impl->nvfp4_weight || !impl->nvfp4_weight->valid()) {
+        if (debug) {
+          std::cerr << "linear_op_create: NVFP4 upload failed for " << descriptor.tensor_name
+                    << " rows=" << descriptor.output_rows
+                    << " cols=" << descriptor.input_cols
+                    << " storage=" << descriptor.storage_dtype
+                    << " compute=" << descriptor.compute_dtype
+                    << " layout=" << descriptor.layout_tag
+                    << " packed_nbytes=" << descriptor.packed_nbytes
+                    << " block_scale_nbytes=" << descriptor.block_scales_nbytes
+                    << " tensor_scale_nbytes=" << descriptor.tensor_scale_nbytes << "\n";
+        }
         return nullptr;
       }
       break;
@@ -182,12 +274,17 @@ bool UploadedLinearOp::Run(
     }
     return false;
   }
+  auto& counters = GetLinearOpCounters();
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
       if (LinearDeviceFastpathEnabled()) {
-        const auto plan =
-            BuildRuntimeGemmPlan(impl_->descriptor, activations.shape().at(0), heuristic_cache);
+        const auto plan = BuildRuntimeGemmPlan(
+            impl_->descriptor,
+            *impl_->dense_weight,
+            activations.shape().at(0),
+            heuristic_cache);
         if (plan.has_value()) {
+          counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
           if (const auto stats = RunDenseRowMajorFp32ToDevice(
                   handle,
                   *plan,
@@ -195,15 +292,20 @@ bool UploadedLinearOp::Run(
                   activations,
                   output);
               stats.has_value()) {
+            counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
             return true;
           }
+          counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
           if (debug) {
             std::cerr << "linear_op: dense device path failed for "
                       << impl_->descriptor.tensor_name << "\n";
           }
-        } else if (debug) {
-          std::cerr << "linear_op: plan build failed for " << impl_->descriptor.tensor_name
-                    << ", falling back to CPU\n";
+        } else {
+          counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
+          if (debug) {
+            std::cerr << "linear_op: plan build failed for " << impl_->descriptor.tensor_name
+                      << ", falling back to CPU\n";
+          }
         }
       } else if (debug) {
         std::cerr << "linear_op: dense reference path forced for "
@@ -213,60 +315,80 @@ bool UploadedLinearOp::Run(
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       {
-        const auto plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape().at(0), heuristic_cache);
-        if (!plan.has_value()) {
-          if (debug) {
-            std::cerr << "linear_op: plan build failed for NVFP4 op "
-                      << impl_->descriptor.tensor_name << "\n";
-          }
-          return false;
+        const Nvfp4PackOptions pack_options = RuntimeNvfp4PackOptions(debug, impl_->descriptor);
+        auto plan = BuildDescriptorGemmPlan(
+            impl_->descriptor,
+            activations.shape().at(0),
+            heuristic_cache);
+        if (!plan.has_value() && LinearDeviceFastpathEnabled()) {
+          plan = BuildRuntimeGemmPlan(
+              impl_->descriptor,
+              *impl_->nvfp4_weight,
+              activations.shape().at(0),
+              heuristic_cache);
         }
-        return RunNvfp4RowMajorFp32SourceToDevice(
-                   handle,
-                   *plan,
-                   activations,
-                   *impl_->nvfp4_weight,
-                   output)
-            .has_value();
+        if (plan.has_value()) {
+          counters.nvfp4_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          counters.nvfp4_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (plan.has_value() &&
+            RunNvfp4RowMajorFp32SourceToDevice(
+                    handle,
+                    *plan,
+                    activations,
+                    *impl_->nvfp4_weight,
+                    output,
+                    pack_options)
+                    .has_value()) {
+          counters.nvfp4_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+          return true;
+        }
+        if (plan.has_value()) {
+          counters.nvfp4_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (debug) {
+          std::cerr << "linear_op: NVFP4 device path failed for "
+                    << impl_->descriptor.tensor_name
+                    << (plan.has_value() ? "" : " (no plan)")
+                    << "\n";
+        }
+        break;
       }
   }
 
-  if (impl_->descriptor.kernel_family != GemmKernelFamily::kDenseRowMajor) {
-    return false;
+  bool device_reference_ok = false;
+  switch (impl_->descriptor.kernel_family) {
+    case GemmKernelFamily::kDenseRowMajor:
+      counters.dense_reference_fallback.fetch_add(1, std::memory_order_relaxed);
+      device_reference_ok =
+          impl_->dense_weight != nullptr &&
+          RunDenseRowMajorHighPrecisionReferenceToDevice(
+              activations,
+              *impl_->dense_weight,
+              output);
+      break;
+    case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
+      counters.nvfp4_reference_fallback.fetch_add(1, std::memory_order_relaxed);
+      device_reference_ok =
+          impl_->nvfp4_weight != nullptr &&
+          RunNvfp4RowMajorReferenceToDevice(
+              activations,
+              *impl_->nvfp4_weight,
+              output,
+              RuntimeNvfp4PackOptions(debug, impl_->descriptor));
+      break;
   }
-
-  const auto host_weights = ReadDenseWeightToHostFp32(impl_->descriptor);
-  if (!host_weights.has_value()) {
+  if (!device_reference_ok) {
     if (debug) {
-      std::cerr << "linear_op: dense fallback weight decode failed for "
-                << impl_->descriptor.tensor_name
-                << " storage=" << impl_->descriptor.storage_dtype << "\n";
-    }
-    return false;
-  }
-  std::vector<float> host_activations(activations.numel(), 0.0f);
-  if (!activations.CopyToHost(host_activations.data(), host_activations.size())) {
-    if (debug) {
-      std::cerr << "linear_op: dense fallback activation copy failed for "
+      std::cerr << "linear_op: device reference fallback failed for "
                 << impl_->descriptor.tensor_name << "\n";
     }
     return false;
   }
-  const std::vector<float> host_output = CpuMatmulRowMajor(
-      host_activations,
-      activations.shape()[0],
-      *host_weights,
-      impl_->descriptor.output_rows,
-      impl_->descriptor.input_cols);
-  if (!output->CopyFromHost(host_output.data(), host_output.size())) {
-    if (debug) {
-      std::cerr << "linear_op: dense fallback output upload failed for "
-                << impl_->descriptor.tensor_name << "\n";
-    }
-    return false;
-  }
-  if (std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
-    std::cerr << "linear_op: dense CPU fallback for " << impl_->descriptor.tensor_name << "\n";
+  if (debug) {
+    std::cerr << "linear_op: device reference fallback for "
+              << impl_->descriptor.tensor_name << "\n";
   }
   return true;
 }

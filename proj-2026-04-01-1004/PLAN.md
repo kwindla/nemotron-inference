@@ -17,7 +17,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Also replace the current binary-search `MaybeTraceFirstDivergentPromptLayer()` with a linear sweep across a configurable set of probe layers (e.g. every 4th layer, then refine). The binary search assumes monotonic divergence which the plan doc says is wrong for residual networks. Add an env var `NEMOTRON_NANO_16_PROBE_STRIDE` to control stride (default 4). Report all divergent layers, not just the "first" one.
   Key files: `testing/api/nano_16_token_correctness_test.cpp`
 
-- [ ] **2. Linear operator execution counters**
+- [x] **2. Linear operator execution counters**
   Add a `LinearOpCounters` struct (header: `runtime/include/nemotron/linear_op_counters.h`) with atomic counters for:
   - `dense_fastpath_plan_success` / `dense_fastpath_plan_fail`
   - `dense_fastpath_execute` / `dense_fastpath_execute_fail`
@@ -107,8 +107,8 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Route-separating prompt comparison matrix | done | — | preflight-prompt-matrix |
-| 2 | Linear operator execution counters | pending | — | preflight-linear-counters |
+| 1 | Route-separating prompt comparison matrix | done | 34eefe4 | preflight-prompt-matrix |
+| 2 | Linear operator execution counters | done | — | preflight-linear-counters |
 | 3 | Steady-state decode benchmark mode | pending | — | preflight-steady-bench |
 | 4 | cuDNN FE attention feasibility report | pending | — | preflight-attention-feasibility |
 | 5 | Expert staging cost metrics | pending | — | preflight-expert-staging-metrics |

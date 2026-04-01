@@ -9,6 +9,9 @@
 #include <iostream>
 #include <utility>
 
+#include "nemotron/linear_op_counters.h"
+#include "nemotron/linear_reference_kernels.h"
+
 namespace nemotron {
 namespace {
 
@@ -36,30 +39,6 @@ float DecodeFp8(std::uint8_t raw_byte) {
   __nv_fp8_e4m3 value;
   value.__x = raw_byte;
   return static_cast<float>(value);
-}
-
-std::vector<float> CpuMatmulRowMajor(
-    const std::vector<float>& activations,
-    std::size_t rows,
-    const float* weights,
-    std::size_t output_rows,
-    std::size_t input_cols) {
-  std::vector<float> output(rows * output_rows, 0.0f);
-  for (std::size_t row = 0; row < rows; ++row) {
-    for (std::size_t out = 0; out < output_rows; ++out) {
-      // This correctness-first path intentionally uses a higher-accuracy
-      // reduction than the generic float32 loop. Small fp8-linear deltas were
-      // large enough to get amplified by later NVFP4 expert projections during
-      // decode-oracle debugging.
-      double accum = 0.0;
-      for (std::size_t col = 0; col < input_cols; ++col) {
-        accum += static_cast<double>(activations[row * input_cols + col]) *
-                 static_cast<double>(weights[out * input_cols + col]);
-      }
-      output[row * output_rows + out] = static_cast<float>(accum);
-    }
-  }
-  return output;
 }
 
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
@@ -101,7 +80,11 @@ __global__ void QuantizeFp8RoundTripKernel(
   const float scale = input_scale > 0.0f ? input_scale : (1.0f / 1024.0f);
   for (std::size_t i = index; i < numel; i += stride) {
     const float normalized = input[i] / scale;
-    output[i] = static_cast<float>(__nv_cvt_float_to_fp8(normalized, __NV_SATFINITE, __NV_E4M3)) * scale;
+    const std::uint8_t quantized =
+        static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(normalized, __NV_SATFINITE, __NV_E4M3));
+    __nv_fp8_e4m3 decoded;
+    decoded.__x = quantized;
+    output[i] = static_cast<float>(decoded) * scale;
   }
 }
 
@@ -224,6 +207,7 @@ bool ScaledFp8LinearOp::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output) const {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
   }
@@ -236,19 +220,22 @@ bool ScaledFp8LinearOp::Run(
     return false;
   }
 
-  std::vector<float> host_activations(activations.numel(), 0.0f);
-  if (!activations.CopyToHost(host_activations.data(), host_activations.size())) {
-    std::cerr << "scaled_fp8_linear: failed to download activations\n";
+  auto quantized_activations = DeviceTensorFp32::Create(activations.shape());
+  if (!quantized_activations || !quantized_activations->valid()) {
     return false;
   }
-  const float input_scale = ClampScale(impl_->config.input_scale);
-  for (float& value : host_activations) {
-    value = DecodeFp8(static_cast<std::uint8_t>(
-                          __nv_cvt_float_to_fp8(value / input_scale, __NV_SATFINITE, __NV_E4M3))) *
-            input_scale;
+  if (!QuantizeFp32ToScaledFp8RoundTrip(
+          activations,
+          impl_->config.input_scale,
+          quantized_activations.get())) {
+    if (debug) {
+      std::cerr << "scaled_fp8_linear: device input quantization failed\n";
+    }
+    return false;
   }
 
-  if (LinearDeviceFastpathEnabled() && activations.shape()[0] == 1) {
+  auto& counters = GetLinearOpCounters();
+  if (LinearDeviceFastpathEnabled()) {
     const auto plan = BuildRuntimeGemmPlan(
         impl_->config.output_rows,
         impl_->config.input_cols,
@@ -256,28 +243,38 @@ bool ScaledFp8LinearOp::Run(
         heuristic_cache,
         impl_->host_weight_data);
     if (plan.has_value()) {
-      const auto result = RunDenseRowMajorFp32(handle, *plan, host_activations.data(), activations.shape()[0]);
-      if (result.has_value()) {
-        if (!output->CopyFromHost(result->output.data(), result->output.size())) {
-          std::cerr << "scaled_fp8_linear: failed to upload output\n";
-          return false;
-        }
+      const auto stats = RunDenseRowMajorFp32ToDevice(
+          handle,
+          *plan,
+          *impl_->weight,
+          *quantized_activations,
+          output);
+      if (stats.has_value()) {
+        counters.scaled_fp8_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
         return true;
       }
+      if (debug) {
+        std::cerr << "scaled_fp8_linear: device GEMM path failed\n";
+      }
+    } else if (debug) {
+      std::cerr << "scaled_fp8_linear: device plan build failed\n";
     }
-  } else if (std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
+  } else if (debug) {
     std::cerr << "scaled_fp8_linear: reference path forced\n";
   }
 
-  const std::vector<float> fallback_output = CpuMatmulRowMajor(
-      host_activations,
-      activations.shape()[0],
-      impl_->host_weight_data,
-      impl_->config.output_rows,
-      impl_->config.input_cols);
-  if (!output->CopyFromHost(fallback_output.data(), fallback_output.size())) {
-    std::cerr << "scaled_fp8_linear: failed to upload CPU fallback output\n";
+  counters.scaled_fp8_reference_fallback.fetch_add(1, std::memory_order_relaxed);
+  if (!RunDenseRowMajorHighPrecisionReferenceToDevice(
+          *quantized_activations,
+          *impl_->weight,
+          output)) {
+    if (debug) {
+      std::cerr << "scaled_fp8_linear: device reference fallback failed\n";
+    }
     return false;
+  }
+  if (debug) {
+    std::cerr << "scaled_fp8_linear: device reference fallback\n";
   }
   return true;
 }
