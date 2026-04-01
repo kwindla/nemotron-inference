@@ -94,7 +94,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Add a script `benchmarks/nano_fused_decode/run_nsight_capture.sh` that invokes `nsys profile` on the benchmark with `--mode=profile-ready` and saves the output to `artifacts/profiles/`.
   Key files: `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`, `benchmarks/nano_fused_decode/run_nsight_capture.sh` (new)
 
-- [ ] **10. Wire all counters into benchmark JSON artifact**
+- [x] **10. Wire all counters into benchmark JSON artifact**
   Final integration step: ensure the benchmark JSON artifact (for all modes) includes:
   - `linear_op_counters`: all fields from `LinearOpCounters`
   - `expert_staging_counters`: all fields from `ExpertStagingCounters`
@@ -115,5 +115,5 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 6 | Device-side argmax kernel | done | 972bdfb | nano-device-token-select (kernel) |
 | 7 | Integrate device argmax into decode loop | done | f4c4996 | nano-device-token-select (integration) |
 | 8 | Linear fastpath strict mode | done | 447882f | nano-linear-fastpath (strict gate) |
-| 9 | Cached-head and profiler-ready benchmark modes | done | — | nano-hotpath-measure |
-| 10 | Wire all counters into benchmark JSON artifact | pending | — | nano-hotpath-measure (integration) |
+| 9 | Cached-head and profiler-ready benchmark modes | done | dd4f27f | nano-hotpath-measure |
+| 10 | Wire all counters into benchmark JSON artifact | done | — | nano-hotpath-measure (integration) |

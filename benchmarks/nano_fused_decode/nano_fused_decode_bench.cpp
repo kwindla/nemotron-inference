@@ -1,5 +1,7 @@
+#include "nemotron/cudnn_handle.h"
 #include "nemotron/device_argmax.h"
 #include "nemotron/device_tensor.h"
+#include "nemotron/expert_staging_counters.h"
 #include "nemotron/linear_op_counters.h"
 #include "nemotron/manifest.h"
 #include "nemotron/runtime_environment.h"
@@ -83,6 +85,7 @@ struct BenchmarkResult {
   bool fused_moe_enabled = true;
   bool linear_device_fastpath_enabled = false;
   bool device_token_select_enabled = true;
+  bool cudnn_fe_available = false;
   double cold_total_ms = 0.0;
   double cold_prefill_ms = 0.0;
   double cold_first_token_ms = 0.0;
@@ -947,6 +950,8 @@ bool WriteJson(
   output << "  \"steady_state_step_ms\": ";
   WriteJsonDoubleArray(output, result.steady_state_step_ms);
   output << ",\n";
+  output << "  \"cudnn_fe_available\": "
+         << (result.cudnn_fe_available ? "true" : "false") << ",\n";
   const auto& counters = nemotron::GetLinearOpCounters();
   output << "  \"linear_op_counters\": {\n";
   output << "    \"dense_fastpath_plan_success\": "
@@ -973,6 +978,17 @@ bool WriteJson(
          << counters.scaled_fp8_fastpath_execute.load(std::memory_order_relaxed) << ",\n";
   output << "    \"scaled_fp8_reference_fallback\": "
          << counters.scaled_fp8_reference_fallback.load(std::memory_order_relaxed) << "\n";
+  output << "  },\n";
+  const auto& expert_staging_counters = nemotron::GetExpertStagingCounters();
+  output << "  \"expert_staging_counters\": {\n";
+  output << "    \"total_bytes_uploaded\": "
+         << expert_staging_counters.total_bytes_uploaded.load(std::memory_order_relaxed) << ",\n";
+  output << "    \"total_experts_staged\": "
+         << expert_staging_counters.total_experts_staged.load(std::memory_order_relaxed) << ",\n";
+  output << "    \"total_staging_calls\": "
+         << expert_staging_counters.total_staging_calls.load(std::memory_order_relaxed) << ",\n";
+  output << "    \"staging_elapsed_us\": "
+         << expert_staging_counters.staging_elapsed_us.load(std::memory_order_relaxed) << "\n";
   output << "  }\n";
   output << "}\n";
   return true;
@@ -994,6 +1010,10 @@ int main(int argc, char** argv) {
   if (!environment_info.has_value()) {
     return 1;
   }
+  const bool cudnn_fe_available = []() {
+    auto cudnn_handle = nemotron::CudnnHandle::Create();
+    return cudnn_handle != nullptr && cudnn_handle->valid();
+  }();
   const bool device_token_select_enabled =
       EnvEnabledOrDefault("NEMOTRON_FORWARD_DEVICE_TOKEN_SELECT", true);
 
@@ -1055,6 +1075,7 @@ int main(int argc, char** argv) {
 
   const std::vector<std::int32_t>& prompt_token_ids = FixedPromptTokenIds();
   nemotron::ResetLinearOpCounters();
+  nemotron::ResetExpertStagingCounters();
   DeviceTokenBuffer device_token_buffer;
   if (device_token_select_enabled && !device_token_buffer.Allocate()) {
     return 1;
@@ -1073,6 +1094,7 @@ int main(int argc, char** argv) {
   result.linear_device_fastpath_enabled =
       EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
   result.device_token_select_enabled = device_token_select_enabled;
+  result.cudnn_fe_available = cudnn_fe_available;
 
   if (options.mode == BenchmarkMode::kSteadyState ||
       options.mode == BenchmarkMode::kCachedHead) {
@@ -1305,6 +1327,7 @@ int main(int argc, char** argv) {
   }
 
   nemotron::PrintLinearOpCounterSummary(std::cout);
+  nemotron::PrintExpertStagingCounterSummary(std::cout);
   std::cout.flush();
 
   if (options.json_output_path.has_value() &&
