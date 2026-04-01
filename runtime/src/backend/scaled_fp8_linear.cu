@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "nemotron/linear_op_counters.h"
+#include "nemotron/linear_op_trace.h"
 #include "nemotron/linear_reference_kernels.h"
 
 namespace nemotron {
@@ -39,6 +40,15 @@ float DecodeFp8(std::uint8_t raw_byte) {
   __nv_fp8_e4m3 value;
   value.__x = raw_byte;
   return static_cast<float>(value);
+}
+
+void AppendLinearOpTraceEntry(const LinearOpTraceEntry& entry) {
+  if (!IsLinearOpTraceEnabled()) {
+    return;
+  }
+  auto& trace = GetLinearOpTrace();
+  std::lock_guard<std::mutex> lock(trace.mutex);
+  trace.entries.push_back(entry);
 }
 
 enum class GemmPlanFailureStep {
@@ -298,6 +308,8 @@ bool ScaledFp8LinearOp::Run(
   }
 
   auto& counters = GetLinearOpCounters();
+  const bool trace_enabled = IsLinearOpTraceEnabled();
+  bool plan_build_ok = false;
   if (LinearDeviceFastpathEnabled()) {
     const std::size_t rows = activations.shape()[0];
     GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
@@ -309,6 +321,7 @@ bool ScaledFp8LinearOp::Run(
         impl_->host_weight_data,
         &failure_step);
     if (plan.has_value()) {
+      plan_build_ok = true;
       const auto stats = RunDenseRowMajorFp32ToDevice(
           handle,
           *plan,
@@ -317,6 +330,15 @@ bool ScaledFp8LinearOp::Run(
           output);
       if (stats.has_value()) {
         counters.scaled_fp8_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+        if (trace_enabled) {
+          AppendLinearOpTraceEntry(LinearOpTraceEntry{
+              "scaled_fp8",
+              GemmKernelFamily::kDenseRowMajor,
+              LinearOpPath::kFastpath,
+              true,
+              true,
+          });
+        }
         return true;
       }
       if (debug) {
@@ -341,10 +363,28 @@ bool ScaledFp8LinearOp::Run(
           *quantized_activations,
           *impl_->weight,
           output)) {
+    if (trace_enabled) {
+      AppendLinearOpTraceEntry(LinearOpTraceEntry{
+          "scaled_fp8",
+          GemmKernelFamily::kDenseRowMajor,
+          LinearOpPath::kReference,
+          plan_build_ok,
+          false,
+      });
+    }
     if (debug) {
       std::cerr << "scaled_fp8_linear: device reference fallback failed\n";
     }
     return false;
+  }
+  if (trace_enabled) {
+    AppendLinearOpTraceEntry(LinearOpTraceEntry{
+        "scaled_fp8",
+        GemmKernelFamily::kDenseRowMajor,
+        LinearOpPath::kReference,
+        plan_build_ok,
+        true,
+    });
   }
   if (debug) {
     std::cerr << "scaled_fp8_linear: device reference fallback\n";

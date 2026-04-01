@@ -33,7 +33,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
   - This localizes fastpath failures to specific layers/operators rather than just a global count
   Key files: `testing/api/nano_16_token_correctness_test.cpp`
 
-- [ ] **4. Add per-operator linear counter tracking to the benchmark**
+- [x] **4. Add per-operator linear counter tracking to the benchmark**
   The current `LinearOpCounters` are global — they don't tell you which tensor/operator fell back. Add a lightweight per-operator tracking mode:
   - Create `runtime/include/nemotron/linear_op_trace.h` with a `LinearOpTrace` struct containing a `std::vector<LinearOpTraceEntry>` where each entry has: `tensor_name`, `kernel_family`, `path_taken` (fastpath/reference), `plan_build_ok`, `execute_ok`
   - Add `GetLinearOpTrace()` / `ResetLinearOpTrace()` / `IsLinearOpTraceEnabled()` gated by `NEMOTRON_FORWARD_LINEAR_TRACE=1`
@@ -78,8 +78,8 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 |---|------|--------|--------|-------|
 | 1 | Embedding and final-norm trace comparison | done | 534ba08 | nano-prompt-parity (diagnosis) |
 | 2 | GEMM plan-build diagnostic logging | done | 5edd6f9 | nano-linear-fastpath (diagnostics) |
-| 3 | Linear counter breakdown in layer probes | done | — | nano-linear-fastpath (per-layer) |
-| 4 | Per-operator linear counter tracking | pending | — | nano-linear-fastpath (per-tensor) |
+| 3 | Linear counter breakdown in layer probes | done | ac16b68 | nano-linear-fastpath (per-layer) |
+| 4 | Per-operator linear counter tracking | done | — | nano-linear-fastpath (per-tensor) |
 | 5 | Saved-token oracle for fixed prompt | pending | — | nano-prompt-parity (oracle) |
 | 6 | Load-and-compare oracle mode | pending | — | nano-prompt-parity (fast compare) |
 | 7 | Expert staging counters in correctness test | pending | — | counter coverage |

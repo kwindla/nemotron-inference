@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "nemotron/linear_op_counters.h"
+#include "nemotron/linear_op_trace.h"
 #include "nemotron/linear_reference_kernels.h"
 
 namespace nemotron {
@@ -268,6 +269,15 @@ bool IsFp8Storage(const std::string& storage_dtype) {
   return storage_dtype == "fp8_e4m3fn" || storage_dtype == "fp8_e4m3";
 }
 
+void AppendLinearOpTraceEntry(const LinearOpTraceEntry& entry) {
+  if (!IsLinearOpTraceEnabled()) {
+    return;
+  }
+  auto& trace = GetLinearOpTrace();
+  std::lock_guard<std::mutex> lock(trace.mutex);
+  trace.entries.push_back(entry);
+}
+
 float DecodeFp4(std::uint8_t raw_nibble) {
   __nv_fp4_e2m1 value;
   value.__x = raw_nibble & 0x0F;
@@ -365,6 +375,8 @@ bool UploadedLinearOp::Run(
   }
   const std::size_t rows = activations.shape().at(0);
   auto& counters = GetLinearOpCounters();
+  const bool trace_enabled = IsLinearOpTraceEnabled();
+  bool plan_build_ok = false;
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
       if (LinearDeviceFastpathEnabled()) {
@@ -376,6 +388,7 @@ bool UploadedLinearOp::Run(
             heuristic_cache,
             &failure_step);
         if (plan.has_value()) {
+          plan_build_ok = true;
           counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
           if (const auto stats = RunDenseRowMajorFp32ToDevice(
                   handle,
@@ -385,6 +398,15 @@ bool UploadedLinearOp::Run(
                   output);
               stats.has_value()) {
             counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+            if (trace_enabled) {
+              AppendLinearOpTraceEntry(LinearOpTraceEntry{
+                  impl_->descriptor.tensor_name,
+                  impl_->descriptor.kernel_family,
+                  LinearOpPath::kFastpath,
+                  true,
+                  true,
+              });
+            }
             return true;
           }
           counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
@@ -442,6 +464,7 @@ bool UploadedLinearOp::Run(
           }
         }
         if (plan.has_value()) {
+          plan_build_ok = true;
           counters.nvfp4_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
         } else {
           counters.nvfp4_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
@@ -456,6 +479,15 @@ bool UploadedLinearOp::Run(
                     pack_options)
                     .has_value()) {
           counters.nvfp4_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+          if (trace_enabled) {
+            AppendLinearOpTraceEntry(LinearOpTraceEntry{
+                impl_->descriptor.tensor_name,
+                impl_->descriptor.kernel_family,
+                LinearOpPath::kFastpath,
+                true,
+                true,
+            });
+          }
           return true;
         }
         if (plan.has_value()) {
@@ -491,11 +523,29 @@ bool UploadedLinearOp::Run(
       break;
   }
   if (!device_reference_ok) {
+    if (trace_enabled) {
+      AppendLinearOpTraceEntry(LinearOpTraceEntry{
+          impl_->descriptor.tensor_name,
+          impl_->descriptor.kernel_family,
+          LinearOpPath::kReference,
+          plan_build_ok,
+          false,
+      });
+    }
     if (debug) {
       std::cerr << "linear_op: device reference fallback failed for "
                 << impl_->descriptor.tensor_name << "\n";
     }
     return false;
+  }
+  if (trace_enabled) {
+    AppendLinearOpTraceEntry(LinearOpTraceEntry{
+        impl_->descriptor.tensor_name,
+        impl_->descriptor.kernel_family,
+        LinearOpPath::kReference,
+        plan_build_ok,
+        true,
+    });
   }
   if (debug) {
     std::cerr << "linear_op: device reference fallback for "

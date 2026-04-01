@@ -3,6 +3,7 @@
 #include "nemotron/device_tensor.h"
 #include "nemotron/expert_staging_counters.h"
 #include "nemotron/linear_op_counters.h"
+#include "nemotron/linear_op_trace.h"
 #include "nemotron/manifest.h"
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
@@ -1075,6 +1076,7 @@ int main(int argc, char** argv) {
 
   const std::vector<std::int32_t>& prompt_token_ids = FixedPromptTokenIds();
   nemotron::ResetLinearOpCounters();
+  nemotron::ResetLinearOpTrace();
   nemotron::ResetExpertStagingCounters();
   DeviceTokenBuffer device_token_buffer;
   if (device_token_select_enabled && !device_token_buffer.Allocate()) {
@@ -1335,12 +1337,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (options.strict_linear && result.linear_device_fastpath_enabled) {
-    const std::vector<LinearFallbackObservation> fallbacks =
-        CollectLinearReferenceFallbacks();
-    if (!fallbacks.empty()) {
-      PrintUnexpectedLinearFallbacks(std::cerr, fallbacks);
-      std::cerr.flush();
+  if (options.strict_linear) {
+    bool strict_linear_failed = false;
+    if (result.linear_device_fastpath_enabled) {
+      const std::vector<LinearFallbackObservation> fallbacks =
+          CollectLinearReferenceFallbacks();
+      if (!fallbacks.empty()) {
+        PrintUnexpectedLinearFallbacks(std::cerr, fallbacks);
+        strict_linear_failed = true;
+      }
+    }
+    nemotron::PrintLinearOpTraceSummary(std::cerr);
+    std::cerr.flush();
+    if (strict_linear_failed) {
       return 1;
     }
   }
