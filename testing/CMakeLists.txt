@@ -258,6 +258,16 @@ target_compile_features(expert_layer_oracle_test PRIVATE cxx_std_17)
 nemotron_add_test(expert_layer_oracle_test)
 
 add_executable(
+  flashinfer_layout_test
+  backend/flashinfer_layout_test.cpp
+)
+
+target_link_libraries(flashinfer_layout_test PRIVATE nemotron_runtime_backend)
+target_compile_features(flashinfer_layout_test PRIVATE cxx_std_17)
+
+nemotron_add_test(flashinfer_layout_test)
+
+add_executable(
   expert_layer3_oracle_test
   backend/expert_layer_oracle_test.cpp
 )
@@ -635,6 +645,16 @@ target_link_libraries(full_forward_manifest_smoke_test PRIVATE nemotron_runtime_
 target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_17)
 
 nemotron_add_test(full_forward_manifest_smoke_test)
+
+add_executable(
+  cache_backed_dense_regression_test
+  api/cache_backed_dense_regression_test.cpp
+)
+
+target_link_libraries(cache_backed_dense_regression_test PRIVATE nemotron_runtime_api)
+target_compile_features(cache_backed_dense_regression_test PRIVATE cxx_std_17)
+
+nemotron_add_test(cache_backed_dense_regression_test)
 
 add_executable(
   prefill_prefix_oracle_test
