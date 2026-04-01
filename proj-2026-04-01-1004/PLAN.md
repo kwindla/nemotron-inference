@@ -49,7 +49,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Add it to `testing/CMakeLists.txt`. This documents the current state and gives a concrete signal if cuDNN FE is ever linked for real.
   Key files: `testing/api/cudnn_feasibility_test.cpp` (new), `testing/CMakeLists.txt`
 
-- [ ] **5. Expert staging cost metrics**
+- [x] **5. Expert staging cost metrics**
   Add counters and logging for routed-expert upload/staging cost in the fused MoE decode path. In `runtime/src/backend/expert_layer.cpp`, around the section that uploads routed expert NVFP4 weights for the fused direct-MoE call (~lines 1019-1044):
   - Time each `DeviceNvfp4Weight::Create(...)` call for routed experts
   - Track total bytes uploaded per `Run()` call
@@ -110,8 +110,8 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 1 | Route-separating prompt comparison matrix | done | 34eefe4 | preflight-prompt-matrix |
 | 2 | Linear operator execution counters | done | 9db3589 | preflight-linear-counters |
 | 3 | Steady-state decode benchmark mode | done | 80256a1 | preflight-steady-bench |
-| 4 | cuDNN FE attention feasibility report | done | — | preflight-attention-feasibility; confirmed NOT AVAILABLE (stub build) |
-| 5 | Expert staging cost metrics | pending | — | preflight-expert-staging-metrics |
+| 4 | cuDNN FE attention feasibility report | done | b13f0e9 | preflight-attention-feasibility; confirmed NOT AVAILABLE (stub build) |
+| 5 | Expert staging cost metrics | done | — | preflight-expert-staging-metrics |
 | 6 | Device-side argmax kernel | pending | — | nano-device-token-select (kernel) |
 | 7 | Integrate device argmax into decode loop | pending | — | nano-device-token-select (integration) |
 | 8 | Linear fastpath strict mode | pending | — | nano-linear-fastpath (strict gate) |

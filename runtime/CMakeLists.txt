@@ -124,6 +124,7 @@ add_library(
   src/backend/embedding_projection_fragment.cpp
   src/backend/embedding_table.cu
   src/backend/expert_layer.cpp
+  src/backend/expert_staging_counters.cpp
   src/backend/fused_mamba_decode.cu
   src/backend/fused_moe_decode.cu
   src/backend/linear_op.cpp
