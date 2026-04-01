@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "nemotron/cublaslt_gemm_plan.h"
@@ -21,8 +22,10 @@ struct ScaledFp8LinearConfig {
   std::size_t input_cols = 0;
   const std::uint8_t* packed_weight_data = nullptr;
   std::size_t packed_weight_nbytes = 0;
+  std::string tensor_name;
   float weight_scale = 0.0f;
   float input_scale = 0.0f;
+  bool allow_dequantized_dense_fastpath = false;
 };
 
 std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
@@ -36,6 +39,9 @@ bool QuantizeFp32ToScaledFp8RoundTrip(
 class ScaledFp8LinearOp {
  public:
   static std::unique_ptr<ScaledFp8LinearOp> Create(const ScaledFp8LinearConfig& config);
+  static std::unique_ptr<ScaledFp8LinearOp> CreateView(
+      const ScaledFp8LinearConfig& config,
+      std::unique_ptr<DeviceDenseWeightFp32> weight_view);
 
   ScaledFp8LinearOp(ScaledFp8LinearOp&&) noexcept;
   ScaledFp8LinearOp& operator=(ScaledFp8LinearOp&&) noexcept;

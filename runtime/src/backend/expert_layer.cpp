@@ -162,6 +162,7 @@ std::optional<ScaledFp8LinearConfig> BuildScaledFp8LinearConfig(
   config.input_cols = weight.logical_shape[1];
   config.packed_weight_data = weight.packed_data;
   config.packed_weight_nbytes = weight.packed_nbytes;
+  config.tensor_name = weight.tensor_name;
   config.weight_scale = *weight_scale_value;
   config.input_scale = *input_scale_value;
   return config;

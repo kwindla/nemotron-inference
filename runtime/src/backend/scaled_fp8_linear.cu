@@ -5,9 +5,14 @@
 
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string_view>
 #include <utility>
+
+#include "nemotron/runtime_stats.h"
+#include "storage_conversion.h"
 
 namespace nemotron {
 namespace {
@@ -16,12 +21,142 @@ bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
 
-bool LinearDeviceFastpathEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
-  if (value == nullptr) {
-    return false;
+bool ExperimentalFp8NativeEnabled() {
+  static const bool enabled = std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE") != nullptr;
+  return enabled;
+}
+
+bool ExperimentalScaledFp8DequantizedDenseEnabled() {
+  static const bool enabled =
+      std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_SCALED_FP8_DEQUANTIZED_DENSE") != nullptr;
+  return enabled;
+}
+
+const char* ExperimentalScaledFp8SurfaceFamilyFilter() {
+  return std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_FAMILY");
+}
+
+const char* ExperimentalScaledFp8SurfaceTensorFilter() {
+  return std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_TENSORS");
+}
+
+std::string_view ResolveScaledFp8TensorName(const ScaledFp8LinearConfig& config) {
+  return config.tensor_name.empty() ? std::string_view("scaled_fp8_linear")
+                                    : std::string_view(config.tensor_name);
+}
+
+std::string ResolveDequantizedTensorName(std::string_view tensor_name) {
+  std::string name(tensor_name);
+  name += "_dequantized";
+  return name;
+}
+
+ScaledFp8RuntimeOpFamily ClassifyScaledFp8RuntimeOpFamily(std::string_view tensor_name) {
+  const auto contains = [](std::string_view haystack, std::string_view needle) {
+    return haystack.find(needle) != std::string_view::npos;
+  };
+  if (contains(tensor_name, "mixer.in_proj.weight") || contains(tensor_name, "in_proj.weight")) {
+    return ScaledFp8RuntimeOpFamily::kMambaInProj;
   }
-  return std::strcmp(value, "0") != 0;
+  if (contains(tensor_name, "mixer.out_proj.weight") || contains(tensor_name, "out_proj.weight")) {
+    return ScaledFp8RuntimeOpFamily::kMambaOutProj;
+  }
+  if (contains(tensor_name, "fc1_latent_proj.weight")) {
+    return ScaledFp8RuntimeOpFamily::kExpertFc1Latent;
+  }
+  if (contains(tensor_name, "shared_experts.up_proj") ||
+      contains(tensor_name, "shared_expert.up_proj")) {
+    return ScaledFp8RuntimeOpFamily::kExpertSharedUp;
+  }
+  if (contains(tensor_name, "shared_experts.down_proj") ||
+      contains(tensor_name, "shared_expert.down_proj")) {
+    return ScaledFp8RuntimeOpFamily::kExpertSharedDown;
+  }
+  return ScaledFp8RuntimeOpFamily::kOther;
+}
+
+bool ExperimentalScaledFp8SurfaceTensorMatches(const GemmDescriptor& descriptor) {
+  const char* filter = ExperimentalScaledFp8SurfaceTensorFilter();
+  if (filter == nullptr || *filter == '\0') {
+    return true;
+  }
+
+  std::stringstream stream(filter);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    const std::size_t begin = token.find_first_not_of(" \t");
+    if (begin == std::string::npos) {
+      continue;
+    }
+    const std::size_t end = token.find_last_not_of(" \t");
+    const std::string_view needle(token.data() + begin, end - begin + 1);
+    if (!needle.empty() &&
+        std::string_view(descriptor.tensor_name).find(needle) != std::string_view::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ScaledFp8FamilyFilterMatchesToken(
+    ScaledFp8RuntimeOpFamily family,
+    std::string_view token) {
+  if (token == "all") {
+    return true;
+  }
+  switch (family) {
+    case ScaledFp8RuntimeOpFamily::kMambaInProj:
+      return token == "mamba" || token == "mamba_in_proj";
+    case ScaledFp8RuntimeOpFamily::kMambaOutProj:
+      return token == "mamba" || token == "mamba_out_proj";
+    case ScaledFp8RuntimeOpFamily::kExpertFc1Latent:
+      return token == "expert" || token == "expert_fc1_latent";
+    case ScaledFp8RuntimeOpFamily::kExpertSharedUp:
+      return token == "expert" || token == "expert_shared_up";
+    case ScaledFp8RuntimeOpFamily::kExpertSharedDown:
+      return token == "expert" || token == "expert_shared_down";
+    case ScaledFp8RuntimeOpFamily::kOther:
+      return token == "other";
+  }
+  return false;
+}
+
+bool ExperimentalScaledFp8SurfaceEnabledForDescriptor(
+    const GemmDescriptor& descriptor,
+    ScaledFp8RuntimeOpFamily family) {
+  const char* filter = ExperimentalScaledFp8SurfaceFamilyFilter();
+  if (filter == nullptr || *filter == '\0') {
+    return ExperimentalScaledFp8SurfaceTensorMatches(descriptor);
+  }
+
+  std::stringstream stream(filter);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    const std::size_t begin = token.find_first_not_of(" \t");
+    if (begin == std::string::npos) {
+      continue;
+    }
+    const std::size_t end = token.find_last_not_of(" \t");
+    const std::string_view family_token(token.data() + begin, end - begin + 1);
+    if (ScaledFp8FamilyFilterMatchesToken(family, family_token)) {
+      return ExperimentalScaledFp8SurfaceTensorMatches(descriptor);
+    }
+  }
+  return false;
+}
+
+bool ExperimentalFp8NativeEnabledForDescriptor(
+    const GemmDescriptor& descriptor,
+    ScaledFp8RuntimeOpFamily family) {
+  return ExperimentalFp8NativeEnabled() &&
+         ExperimentalScaledFp8SurfaceEnabledForDescriptor(descriptor, family);
+}
+
+bool ExperimentalScaledFp8DequantizedDenseEnabledForDescriptor(
+    const GemmDescriptor& descriptor,
+    ScaledFp8RuntimeOpFamily family) {
+  return ExperimentalScaledFp8DequantizedDenseEnabled() &&
+         ExperimentalScaledFp8SurfaceEnabledForDescriptor(descriptor, family);
 }
 
 float ClampScale(float value) {
@@ -38,48 +173,10 @@ float DecodeFp8(std::uint8_t raw_byte) {
   return static_cast<float>(value);
 }
 
-std::vector<float> CpuMatmulRowMajor(
-    const std::vector<float>& activations,
-    std::size_t rows,
-    const float* weights,
-    std::size_t output_rows,
-    std::size_t input_cols) {
-  std::vector<float> output(rows * output_rows, 0.0f);
-  for (std::size_t row = 0; row < rows; ++row) {
-    for (std::size_t out = 0; out < output_rows; ++out) {
-      // This correctness-first path intentionally uses a higher-accuracy
-      // reduction than the generic float32 loop. Small fp8-linear deltas were
-      // large enough to get amplified by later NVFP4 expert projections during
-      // decode-oracle debugging.
-      double accum = 0.0;
-      for (std::size_t col = 0; col < input_cols; ++col) {
-        accum += static_cast<double>(activations[row * input_cols + col]) *
-                 static_cast<double>(weights[out * input_cols + col]);
-      }
-      output[row * output_rows + out] = static_cast<float>(accum);
-    }
-  }
-  return output;
-}
-
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
-    std::size_t output_rows,
-    std::size_t input_cols,
+    const GemmDescriptor& descriptor,
     std::size_t rows,
-    GemmHeuristicCache* heuristic_cache,
-    const float* packed_weight_data) {
-  GemmDescriptor descriptor;
-  descriptor.tensor_name = "scaled_fp8_linear";
-  descriptor.op_class = "scaled_fp8_linear";
-  descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
-  descriptor.output_rows = output_rows;
-  descriptor.input_cols = input_cols;
-  descriptor.storage_dtype = "fp32";
-  descriptor.compute_dtype = "fp32";
-  descriptor.layout_tag = "row_major";
-  descriptor.alignment_bytes = 16;
-  descriptor.packed_data = reinterpret_cast<const std::uint8_t*>(packed_weight_data);
-  descriptor.packed_nbytes = output_rows * input_cols * sizeof(float);
+    GemmHeuristicCache* heuristic_cache) {
   const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
   if (!launch_plan.has_value()) {
     return std::nullopt;
@@ -101,7 +198,11 @@ __global__ void QuantizeFp8RoundTripKernel(
   const float scale = input_scale > 0.0f ? input_scale : (1.0f / 1024.0f);
   for (std::size_t i = index; i < numel; i += stride) {
     const float normalized = input[i] / scale;
-    output[i] = static_cast<float>(__nv_cvt_float_to_fp8(normalized, __NV_SATFINITE, __NV_E4M3)) * scale;
+    const std::uint8_t raw = static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(normalized, __NV_SATFINITE, __NV_E4M3));
+    __nv_fp8_e4m3 quantized;
+    quantized.__x = raw;
+    output[i] = static_cast<float>(quantized) * scale;
   }
 }
 
@@ -109,12 +210,17 @@ __global__ void QuantizeFp8RoundTripKernel(
 
 struct ScaledFp8LinearOp::Impl {
   ScaledFp8LinearConfig config;
+  ScaledFp8RuntimeOpFamily family = ScaledFp8RuntimeOpFamily::kOther;
+  GemmDescriptor descriptor;
+  GemmDescriptor dequantized_descriptor;
   std::unique_ptr<DeviceDenseWeightFp32> weight;
-  float* host_weight_data = nullptr;
-
-  ~Impl() {
-    std::free(host_weight_data);
-  }
+  std::unique_ptr<DeviceTensorFp8E4M3> packed_weight;
+  mutable std::mutex rows1_plan_mutex;
+  mutable bool rows1_plan_attempted = false;
+  mutable std::optional<CublasLtGemmPlan> rows1_plan;
+  mutable std::mutex rows1_dequantized_plan_mutex;
+  mutable bool rows1_dequantized_plan_attempted = false;
+  mutable std::optional<CublasLtGemmPlan> rows1_dequantized_plan;
 };
 
 std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
@@ -154,42 +260,77 @@ bool QuantizeFp32ToScaledFp8RoundTrip(
       numel,
       ClampScale(input_scale),
       output->data());
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::Create(const ScaledFp8LinearConfig& config) {
-  const auto host_weight = DequantizeScaledFp8WeightToHostFp32(config);
-  if (!host_weight.has_value()) {
+  if (config.output_rows == 0 ||
+      config.input_cols == 0 ||
+      config.packed_weight_data == nullptr ||
+      config.packed_weight_nbytes != config.output_rows * config.input_cols ||
+      !std::isfinite(config.weight_scale) ||
+      config.weight_scale <= 0.0f) {
     return nullptr;
   }
 
   GemmDescriptor descriptor;
-  descriptor.tensor_name = "scaled_fp8_linear";
+  descriptor.tensor_name = ResolveScaledFp8TensorName(config);
   descriptor.op_class = "scaled_fp8_linear";
   descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
   descriptor.output_rows = config.output_rows;
   descriptor.input_cols = config.input_cols;
-  descriptor.storage_dtype = "fp32";
+  descriptor.storage_dtype = "fp8_e4m3fn";
   descriptor.compute_dtype = "fp32";
   descriptor.layout_tag = "row_major";
   descriptor.alignment_bytes = 16;
-  descriptor.packed_data = reinterpret_cast<const std::uint8_t*>(host_weight->data());
-  descriptor.packed_nbytes = host_weight->size() * sizeof(float);
-  auto weight = DeviceDenseWeightFp32::Upload(descriptor);
-  if (!weight || !weight->valid()) {
+  descriptor.packed_data = config.packed_weight_data;
+  descriptor.packed_nbytes = config.packed_weight_nbytes;
+
+  auto packed_weight = DeviceTensorFp8E4M3::Create({config.output_rows, config.input_cols});
+  if (!packed_weight ||
+      !packed_weight->CopyFromHost(config.packed_weight_data, config.packed_weight_nbytes)) {
     return nullptr;
   }
 
   auto impl = std::make_unique<Impl>();
   impl->config = config;
-  impl->weight = std::move(weight);
-  impl->host_weight_data = nullptr;
-  void* raw = nullptr;
-  if (posix_memalign(&raw, 16, host_weight->size() * sizeof(float)) != 0 || raw == nullptr) {
+  impl->family = ClassifyScaledFp8RuntimeOpFamily(descriptor.tensor_name);
+  impl->descriptor = descriptor;
+  impl->packed_weight = std::move(packed_weight);
+  return std::unique_ptr<ScaledFp8LinearOp>(new ScaledFp8LinearOp(std::move(impl)));
+}
+
+std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::CreateView(
+    const ScaledFp8LinearConfig& config,
+    std::unique_ptr<DeviceDenseWeightFp32> weight_view) {
+  if (config.output_rows == 0 ||
+      config.input_cols == 0 ||
+      !std::isfinite(config.weight_scale) ||
+      config.weight_scale <= 0.0f ||
+      !weight_view ||
+      !weight_view->valid() ||
+      weight_view->output_rows() != config.output_rows ||
+      weight_view->input_cols() != config.input_cols) {
     return nullptr;
   }
-  impl->host_weight_data = reinterpret_cast<float*>(raw);
-  std::memcpy(impl->host_weight_data, host_weight->data(), host_weight->size() * sizeof(float));
+  auto impl = std::make_unique<Impl>();
+  impl->config = config;
+  impl->descriptor.tensor_name = ResolveScaledFp8TensorName(config);
+  impl->descriptor.op_class = "scaled_fp8_linear";
+  impl->descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
+  impl->descriptor.output_rows = config.output_rows;
+  impl->descriptor.input_cols = config.input_cols;
+  impl->descriptor.storage_dtype = "fp32";
+  impl->descriptor.compute_dtype = "fp32";
+  impl->descriptor.layout_tag = "row_major";
+  impl->descriptor.alignment_bytes = 16;
+  impl->family = ClassifyScaledFp8RuntimeOpFamily(impl->descriptor.tensor_name);
+  impl->weight = std::move(weight_view);
+  impl->dequantized_descriptor = impl->descriptor;
+  impl->dequantized_descriptor.packed_data =
+      reinterpret_cast<const std::uint8_t*>(impl->weight->data());
+  impl->dequantized_descriptor.packed_nbytes =
+      config.output_rows * config.input_cols * sizeof(float);
   return std::unique_ptr<ScaledFp8LinearOp>(new ScaledFp8LinearOp(std::move(impl)));
 }
 
@@ -200,7 +341,9 @@ ScaledFp8LinearOp& ScaledFp8LinearOp::operator=(ScaledFp8LinearOp&&) noexcept = 
 ScaledFp8LinearOp::~ScaledFp8LinearOp() = default;
 
 bool ScaledFp8LinearOp::valid() const {
-  return impl_ != nullptr && impl_->weight != nullptr && impl_->weight->valid();
+  return impl_ != nullptr &&
+         ((impl_->packed_weight != nullptr && impl_->packed_weight->valid()) ||
+          (impl_->weight != nullptr && impl_->weight->valid()));
 }
 
 std::size_t ScaledFp8LinearOp::output_rows() const {
@@ -224,6 +367,7 @@ bool ScaledFp8LinearOp::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output) const {
+  (void)heuristic_cache;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
   }
@@ -236,50 +380,150 @@ bool ScaledFp8LinearOp::Run(
     return false;
   }
 
-  std::vector<float> host_activations(activations.numel(), 0.0f);
-  if (!activations.CopyToHost(host_activations.data(), host_activations.size())) {
-    std::cerr << "scaled_fp8_linear: failed to download activations\n";
-    return false;
-  }
-  const float input_scale = ClampScale(impl_->config.input_scale);
-  for (float& value : host_activations) {
-    value = DecodeFp8(static_cast<std::uint8_t>(
-                          __nv_cvt_float_to_fp8(value / input_scale, __NV_SATFINITE, __NV_E4M3))) *
-            input_scale;
+  const bool native_rollout_enabled =
+      impl_->packed_weight &&
+      impl_->packed_weight->valid() &&
+      ExperimentalFp8NativeEnabledForDescriptor(impl_->descriptor, impl_->family);
+  const bool dequantized_rollout_enabled =
+      ExperimentalScaledFp8DequantizedDenseEnabledForDescriptor(impl_->descriptor, impl_->family);
+  bool rollout_plan_build_failed = false;
+
+  std::optional<CublasLtGemmPlan> plan;
+  if (native_rollout_enabled) {
+    if (activations.shape()[0] == 1) {
+      std::lock_guard<std::mutex> lock(impl_->rows1_plan_mutex);
+      if (!impl_->rows1_plan_attempted) {
+        impl_->rows1_plan =
+            BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
+        impl_->rows1_plan_attempted = true;
+      } else if (impl_->rows1_plan.has_value()) {
+        RecordScaledFp8PlanCacheHit();
+      }
+      if (impl_->rows1_plan.has_value()) {
+        plan = impl_->rows1_plan;
+      } else {
+        rollout_plan_build_failed = true;
+      }
+    } else {
+      plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
+      if (!plan.has_value()) {
+        rollout_plan_build_failed = true;
+      }
+    }
   }
 
-  if (LinearDeviceFastpathEnabled() && activations.shape()[0] == 1) {
-    const auto plan = BuildRuntimeGemmPlan(
-        impl_->config.output_rows,
-        impl_->config.input_cols,
-        activations.shape()[0],
-        heuristic_cache,
-        impl_->host_weight_data);
+  if (native_rollout_enabled &&
+      impl_->packed_weight &&
+      impl_->packed_weight->valid()) {
     if (plan.has_value()) {
-      const auto result = RunDenseRowMajorFp32(handle, *plan, host_activations.data(), activations.shape()[0]);
-      if (result.has_value()) {
-        if (!output->CopyFromHost(result->output.data(), result->output.size())) {
-          std::cerr << "scaled_fp8_linear: failed to upload output\n";
-          return false;
-        }
+      const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
+          handle,
+          *plan,
+          *impl_->packed_weight,
+          ClampScale(impl_->config.input_scale) * impl_->config.weight_scale,
+          activations,
+          impl_->config.input_scale,
+          output);
+      if (native_stats.has_value()) {
+        RecordScaledFp8NativeSuccess(impl_->family);
         return true;
       }
     }
-  } else if (std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
-    std::cerr << "scaled_fp8_linear: reference path forced\n";
   }
 
-  const std::vector<float> fallback_output = CpuMatmulRowMajor(
-      host_activations,
-      activations.shape()[0],
-      impl_->host_weight_data,
-      impl_->config.output_rows,
-      impl_->config.input_cols);
-  if (!output->CopyFromHost(fallback_output.data(), fallback_output.size())) {
-    std::cerr << "scaled_fp8_linear: failed to upload CPU fallback output\n";
+  if ((!impl_->weight || !impl_->weight->valid()) &&
+      impl_->descriptor.packed_data != nullptr &&
+      impl_->descriptor.packed_nbytes != 0) {
+    impl_->weight = DeviceDenseWeightFp32::Upload(impl_->descriptor, impl_->config.weight_scale);
+    if (impl_->weight && impl_->weight->valid()) {
+      impl_->dequantized_descriptor.tensor_name =
+          ResolveDequantizedTensorName(impl_->descriptor.tensor_name);
+      impl_->dequantized_descriptor.op_class = "scaled_fp8_linear_dequantized";
+      impl_->dequantized_descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
+      impl_->dequantized_descriptor.output_rows = impl_->config.output_rows;
+      impl_->dequantized_descriptor.input_cols = impl_->config.input_cols;
+      impl_->dequantized_descriptor.storage_dtype = "fp32";
+      impl_->dequantized_descriptor.compute_dtype = "fp32";
+      impl_->dequantized_descriptor.layout_tag = "row_major";
+      impl_->dequantized_descriptor.alignment_bytes = 16;
+      impl_->dequantized_descriptor.packed_data =
+          reinterpret_cast<const std::uint8_t*>(impl_->weight->data());
+      impl_->dequantized_descriptor.packed_nbytes =
+          impl_->config.output_rows * impl_->config.input_cols * sizeof(float);
+      impl_->rows1_dequantized_plan_attempted = false;
+      impl_->rows1_dequantized_plan.reset();
+    }
+  }
+
+  auto quantized_activations = DeviceTensorFp32::Create(activations.shape());
+  if (!quantized_activations || !quantized_activations->valid()) {
     return false;
   }
-  return true;
+  if (!QuantizeFp32ToScaledFp8RoundTrip(
+          activations,
+          impl_->config.input_scale,
+          quantized_activations.get())) {
+    std::cerr << "scaled_fp8_linear: failed to quantize activations on device\n";
+    return false;
+  }
+
+  std::optional<CublasLtGemmPlan> dequantized_plan;
+  if (dequantized_rollout_enabled &&
+      impl_->weight &&
+      impl_->weight->valid() &&
+      impl_->dequantized_descriptor.packed_data != nullptr) {
+    if (activations.shape()[0] == 1) {
+      std::lock_guard<std::mutex> lock(impl_->rows1_dequantized_plan_mutex);
+      if (!impl_->rows1_dequantized_plan_attempted) {
+        impl_->rows1_dequantized_plan = BuildRuntimeGemmPlan(
+            impl_->dequantized_descriptor, activations.shape()[0], heuristic_cache);
+        impl_->rows1_dequantized_plan_attempted = true;
+      } else if (impl_->rows1_dequantized_plan.has_value()) {
+        RecordScaledFp8PlanCacheHit();
+      }
+      if (impl_->rows1_dequantized_plan.has_value()) {
+        dequantized_plan = impl_->rows1_dequantized_plan;
+      } else {
+        rollout_plan_build_failed = true;
+      }
+    } else {
+      dequantized_plan = BuildRuntimeGemmPlan(
+          impl_->dequantized_descriptor, activations.shape()[0], heuristic_cache);
+      if (!dequantized_plan.has_value()) {
+        rollout_plan_build_failed = true;
+      }
+    }
+  }
+
+  if (dequantized_rollout_enabled &&
+      dequantized_plan.has_value() &&
+      impl_->weight &&
+      impl_->weight->valid() &&
+      RunDenseRowMajorFp32ToDevice(
+          handle,
+          *dequantized_plan,
+          *impl_->weight,
+          *quantized_activations,
+          output)
+          .has_value()) {
+    RecordScaledFp8DequantizedDenseSuccess();
+    return true;
+  }
+
+  // Keep scaled-FP8 on the numerically stable device reference surface for
+  // now. This removes the host roundtrip and CPU fallback while preserving the
+  // current exact-input oracle gates until a native fast path is validated.
+  if (rollout_plan_build_failed) {
+    RecordScaledFp8PlanBuildFailure(impl_->family);
+  }
+  RecordScaledFp8ReferenceFallback(impl_->family);
+  return impl_->weight &&
+         impl_->weight->valid() &&
+         RunDenseRowMajorFp32ReferenceToDevice(
+             *impl_->weight,
+             *quantized_activations,
+             output)
+             .has_value();
 }
 
 }  // namespace nemotron

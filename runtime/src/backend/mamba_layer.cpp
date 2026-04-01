@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,8 @@
 #include <vector>
 
 #include "nemotron/linear_op.h"
+#include "nemotron/mamba_ops.h"
+#include "storage_conversion.h"
 
 namespace nemotron {
 namespace {
@@ -118,32 +121,59 @@ std::optional<ScaledFp8LinearConfig> BuildScaledFp8LinearConfig(
   config.input_cols = weight.logical_shape[1];
   config.packed_weight_data = weight.packed_data;
   config.packed_weight_nbytes = weight.packed_nbytes;
+  config.tensor_name = weight.tensor_name;
   config.weight_scale = *weight_scale_value;
   config.input_scale = *input_scale_value;
   return config;
 }
 
-float Sigmoid(float value) {
-  if (value >= 0.0f) {
-    const float exp_neg = std::exp(-value);
-    return 1.0f / (1.0f + exp_neg);
+std::unique_ptr<DeviceTensorFp32> UploadHostVectorToDevice(const std::vector<float>& values) {
+  if (values.empty()) {
+    return nullptr;
   }
-  const float exp_pos = std::exp(value);
-  return exp_pos / (1.0f + exp_pos);
+  auto device = DeviceTensorFp32::Create({values.size()});
+  if (!device || !device->CopyFromHost(values.data(), values.size())) {
+    return nullptr;
+  }
+  return device;
 }
 
-float SiLU(float value) {
-  return value * Sigmoid(value);
-}
+std::unique_ptr<DeviceTensorFp32> UploadFlatTensorToDeviceFp32(
+    const KernelTensorDescriptor& descriptor) {
+  if (descriptor.packed_data == nullptr) {
+    return nullptr;
+  }
+  const std::size_t count = NumelFromShape(descriptor.logical_shape);
+  if (count == 0) {
+    return nullptr;
+  }
 
-float Softplus(float value) {
-  if (value > 20.0f) {
-    return value;
+  PackedFloatStorage storage;
+  if (IsFp32Storage(descriptor.storage_dtype)) {
+    if (descriptor.packed_nbytes != count * sizeof(float)) {
+      return nullptr;
+    }
+    storage = PackedFloatStorage::kFp32;
+  } else if (IsBf16Storage(descriptor.storage_dtype)) {
+    if (descriptor.packed_nbytes != count * sizeof(__nv_bfloat16)) {
+      return nullptr;
+    }
+    storage = PackedFloatStorage::kBf16;
+  } else {
+    return nullptr;
   }
-  if (value < -20.0f) {
-    return std::exp(value);
+
+  auto device = DeviceTensorFp32::Create({count});
+  if (!device ||
+      !UploadPackedFloatToDeviceFp32(
+          descriptor.packed_data,
+          count,
+          storage,
+          1.0f,
+          device->data())) {
+    return nullptr;
   }
-  return std::log1p(std::exp(value));
+  return device;
 }
 
 }  // namespace
@@ -157,12 +187,12 @@ struct MambaLayerSlice::Impl {
 
   MambaLayerConfig config;
   std::unique_ptr<DeviceTensorFp32> input_norm_weight;
-  std::vector<float> mixer_norm_weight;
-  std::vector<float> conv1d_weight;
-  std::vector<float> conv1d_bias;
-  std::vector<float> A_log;
-  std::vector<float> D;
-  std::vector<float> dt_bias;
+  std::unique_ptr<DeviceTensorFp32> mixer_norm_weight;
+  std::unique_ptr<DeviceTensorFp32> conv1d_weight;
+  std::unique_ptr<DeviceTensorFp32> conv1d_bias;
+  std::unique_ptr<DeviceTensorFp32> A_log;
+  std::unique_ptr<DeviceTensorFp32> D;
+  std::unique_ptr<DeviceTensorFp32> dt_bias;
   ProjectionFamily in_proj_family = ProjectionFamily::kNone;
   ProjectionFamily out_proj_family = ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> in_proj_dense;
@@ -208,7 +238,11 @@ std::optional<MambaLayerBindings> BuildMambaLayerBindings(
 
 std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     const MambaLayerConfig& config,
-    const MambaLayerBindings& bindings) {
+    const MambaLayerBindings& bindings,
+    MambaLayerBuildTimingSink timing_sink) {
+  const auto time_ms = [](const auto begin, const auto end) {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+  };
   const std::size_t conv_dim = config.intermediate_size + (2 * config.n_groups * config.state_size);
   const std::size_t conv_state_elems = conv_dim * config.conv_kernel_size;
   const std::size_t ssm_state_elems = config.num_heads * config.head_dim * config.state_size;
@@ -229,35 +263,48 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     return nullptr;
   }
 
+  if (!bindings.input_norm_weight ||
+      !bindings.mixer_norm_weight ||
+      !bindings.conv1d_weight ||
+      !bindings.conv1d_bias ||
+      !bindings.A_log ||
+      !bindings.D ||
+      !bindings.dt_bias) {
+    return nullptr;
+  }
+  const auto input_norm_begin = std::chrono::steady_clock::now();
   auto input_norm_weight = UploadVectorWeightToDeviceFp32(*bindings.input_norm_weight);
-  auto mixer_norm_weight = ReadTensorToHostFp32(*bindings.mixer_norm_weight);
-  auto conv1d_weight = ReadTensorToHostFp32(*bindings.conv1d_weight);
-  auto conv1d_bias = ReadTensorToHostFp32(*bindings.conv1d_bias);
-  auto A_log = ReadTensorToHostFp32(*bindings.A_log);
-  auto D = ReadTensorToHostFp32(*bindings.D);
-  auto dt_bias = ReadTensorToHostFp32(*bindings.dt_bias);
-  if (!input_norm_weight ||
-      !mixer_norm_weight.has_value() ||
-      !conv1d_weight.has_value() ||
-      !conv1d_bias.has_value() ||
-      !A_log.has_value() ||
-      !D.has_value() ||
-      !dt_bias.has_value()) {
+  const auto input_norm_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("input_norm_upload", time_ms(input_norm_begin, input_norm_end));
+  }
+  if (!input_norm_weight) {
     return nullptr;
   }
 
   Impl::ProjectionFamily in_proj_family = Impl::ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> in_proj_dense;
   std::unique_ptr<ScaledFp8LinearOp> in_proj_scaled_fp8;
+  const auto in_proj_begin = std::chrono::steady_clock::now();
   if (bindings.in_proj_kernel_weight != nullptr &&
       bindings.in_proj_weight_scale != nullptr &&
       bindings.in_proj_input_scale != nullptr) {
+    const auto in_proj_config_begin = std::chrono::steady_clock::now();
     const auto in_proj_config = BuildScaledFp8LinearConfig(
         *bindings.in_proj_kernel_weight,
         *bindings.in_proj_weight_scale,
         *bindings.in_proj_input_scale);
+    const auto in_proj_config_end = std::chrono::steady_clock::now();
+    if (timing_sink) {
+      timing_sink("in_proj_config", time_ms(in_proj_config_begin, in_proj_config_end));
+    }
     if (in_proj_config.has_value()) {
+      const auto in_proj_op_begin = std::chrono::steady_clock::now();
       in_proj_scaled_fp8 = ScaledFp8LinearOp::Create(*in_proj_config);
+      const auto in_proj_op_end = std::chrono::steady_clock::now();
+      if (timing_sink) {
+        timing_sink("in_proj_op_create", time_ms(in_proj_op_begin, in_proj_op_end));
+      }
       if (!in_proj_scaled_fp8 || !in_proj_scaled_fp8->valid()) {
         return nullptr;
       }
@@ -265,25 +312,45 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     }
   }
   if (in_proj_family == Impl::ProjectionFamily::kNone) {
+    const auto in_proj_op_begin = std::chrono::steady_clock::now();
     in_proj_dense = UploadedLinearOp::Create(*bindings.in_proj_gemm_weight);
+    const auto in_proj_op_end = std::chrono::steady_clock::now();
+    if (timing_sink) {
+      timing_sink("in_proj_op_create", time_ms(in_proj_op_begin, in_proj_op_end));
+    }
     if (!in_proj_dense || !in_proj_dense->valid()) {
       return nullptr;
     }
     in_proj_family = Impl::ProjectionFamily::kDense;
   }
+  const auto in_proj_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("in_proj_create", time_ms(in_proj_begin, in_proj_end));
+  }
 
   Impl::ProjectionFamily out_proj_family = Impl::ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> out_proj_dense;
   std::unique_ptr<ScaledFp8LinearOp> out_proj_scaled_fp8;
+  const auto out_proj_begin = std::chrono::steady_clock::now();
   if (bindings.out_proj_kernel_weight != nullptr &&
       bindings.out_proj_weight_scale != nullptr &&
       bindings.out_proj_input_scale != nullptr) {
+    const auto out_proj_config_begin = std::chrono::steady_clock::now();
     const auto out_proj_config = BuildScaledFp8LinearConfig(
         *bindings.out_proj_kernel_weight,
         *bindings.out_proj_weight_scale,
         *bindings.out_proj_input_scale);
+    const auto out_proj_config_end = std::chrono::steady_clock::now();
+    if (timing_sink) {
+      timing_sink("out_proj_config", time_ms(out_proj_config_begin, out_proj_config_end));
+    }
     if (out_proj_config.has_value()) {
+      const auto out_proj_op_begin = std::chrono::steady_clock::now();
       out_proj_scaled_fp8 = ScaledFp8LinearOp::Create(*out_proj_config);
+      const auto out_proj_op_end = std::chrono::steady_clock::now();
+      if (timing_sink) {
+        timing_sink("out_proj_op_create", time_ms(out_proj_op_begin, out_proj_op_end));
+      }
       if (!out_proj_scaled_fp8 || !out_proj_scaled_fp8->valid()) {
         return nullptr;
       }
@@ -291,23 +358,77 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     }
   }
   if (out_proj_family == Impl::ProjectionFamily::kNone) {
+    const auto out_proj_op_begin = std::chrono::steady_clock::now();
     out_proj_dense = UploadedLinearOp::Create(*bindings.out_proj_gemm_weight);
+    const auto out_proj_op_end = std::chrono::steady_clock::now();
+    if (timing_sink) {
+      timing_sink("out_proj_op_create", time_ms(out_proj_op_begin, out_proj_op_end));
+    }
     if (!out_proj_dense || !out_proj_dense->valid()) {
       return nullptr;
     }
     out_proj_family = Impl::ProjectionFamily::kDense;
+  }
+  const auto out_proj_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("out_proj_create", time_ms(out_proj_begin, out_proj_end));
   }
 
   if (bindings.conv1d_weight->logical_shape.size() != 3 ||
       bindings.conv1d_weight->logical_shape[0] != conv_dim ||
       bindings.conv1d_weight->logical_shape[1] != 1 ||
       bindings.conv1d_weight->logical_shape[2] != config.conv_kernel_size ||
-      mixer_norm_weight->size() != config.intermediate_size ||
-      conv1d_weight->size() != conv_state_elems ||
-      conv1d_bias->size() != conv_dim ||
-      A_log->size() != config.num_heads ||
-      D->size() != config.num_heads ||
-      dt_bias->size() != config.num_heads) {
+      NumelFromShape(bindings.mixer_norm_weight->logical_shape) != config.intermediate_size ||
+      NumelFromShape(bindings.conv1d_weight->logical_shape) != conv_state_elems ||
+      NumelFromShape(bindings.conv1d_bias->logical_shape) != conv_dim ||
+      NumelFromShape(bindings.A_log->logical_shape) != config.num_heads ||
+      NumelFromShape(bindings.D->logical_shape) != config.num_heads ||
+      NumelFromShape(bindings.dt_bias->logical_shape) != config.num_heads) {
+    return nullptr;
+  }
+
+  const auto state_upload_begin = std::chrono::steady_clock::now();
+  const auto mixer_norm_begin = std::chrono::steady_clock::now();
+  auto mixer_norm_weight = UploadVectorWeightToDeviceFp32(*bindings.mixer_norm_weight);
+  const auto mixer_norm_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("mixer_norm_upload", time_ms(mixer_norm_begin, mixer_norm_end));
+  }
+  const auto conv1d_weight_begin = std::chrono::steady_clock::now();
+  auto conv1d_weight = UploadFlatTensorToDeviceFp32(*bindings.conv1d_weight);
+  const auto conv1d_weight_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("conv1d_weight_upload", time_ms(conv1d_weight_begin, conv1d_weight_end));
+  }
+  const auto conv1d_bias_begin = std::chrono::steady_clock::now();
+  auto conv1d_bias = UploadVectorWeightToDeviceFp32(*bindings.conv1d_bias);
+  const auto conv1d_bias_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("conv1d_bias_upload", time_ms(conv1d_bias_begin, conv1d_bias_end));
+  }
+  const auto a_log_begin = std::chrono::steady_clock::now();
+  auto A_log = UploadVectorWeightToDeviceFp32(*bindings.A_log);
+  const auto a_log_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("a_log_upload", time_ms(a_log_begin, a_log_end));
+  }
+  const auto d_begin = std::chrono::steady_clock::now();
+  auto D = UploadVectorWeightToDeviceFp32(*bindings.D);
+  const auto d_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("D_upload", time_ms(d_begin, d_end));
+  }
+  const auto dt_bias_begin = std::chrono::steady_clock::now();
+  auto dt_bias = UploadVectorWeightToDeviceFp32(*bindings.dt_bias);
+  const auto dt_bias_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("dt_bias_upload", time_ms(dt_bias_begin, dt_bias_end));
+  }
+  const auto state_upload_end = std::chrono::steady_clock::now();
+  if (timing_sink) {
+    timing_sink("state_tensor_uploads", time_ms(state_upload_begin, state_upload_end));
+  }
+  if (!mixer_norm_weight || !conv1d_weight || !conv1d_bias || !A_log || !D || !dt_bias) {
     return nullptr;
   }
 
@@ -333,22 +454,106 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
       out_proj_input_cols != config.intermediate_size) {
     return nullptr;
   }
+  MambaLayerPreparedBindings prepared;
+  prepared.input_norm_weight = std::move(input_norm_weight);
+  prepared.mixer_norm_weight = std::move(mixer_norm_weight);
+  prepared.conv1d_weight = std::move(conv1d_weight);
+  prepared.conv1d_bias = std::move(conv1d_bias);
+  prepared.A_log = std::move(A_log);
+  prepared.D = std::move(D);
+  prepared.dt_bias = std::move(dt_bias);
+  prepared.in_proj_dense = std::move(in_proj_dense);
+  prepared.out_proj_dense = std::move(out_proj_dense);
+  prepared.in_proj_scaled_fp8 = std::move(in_proj_scaled_fp8);
+  prepared.out_proj_scaled_fp8 = std::move(out_proj_scaled_fp8);
+  return CreatePrepared(config, std::move(prepared));
+}
+
+std::unique_ptr<MambaLayerSlice> MambaLayerSlice::CreatePrepared(
+    const MambaLayerConfig& config,
+    MambaLayerPreparedBindings bindings) {
+  const std::size_t conv_dim = config.intermediate_size + (2 * config.n_groups * config.state_size);
+  const std::size_t conv_state_elems = conv_dim * config.conv_kernel_size;
+  const std::size_t ssm_state_elems = config.num_heads * config.head_dim * config.state_size;
+  if (config.hidden_size == 0 ||
+      config.intermediate_size == 0 ||
+      config.num_heads == 0 ||
+      config.head_dim == 0 ||
+      config.state_size == 0 ||
+      config.n_groups == 0 ||
+      config.conv_kernel_size == 0 ||
+      config.intermediate_size != config.num_heads * config.head_dim ||
+      config.intermediate_size % config.n_groups != 0 ||
+      config.input_rms_epsilon <= 0.0f ||
+      config.mixer_rms_epsilon <= 0.0f ||
+      config.time_step_min <= 0.0f ||
+      conv_state_elems == 0 ||
+      ssm_state_elems == 0 ||
+      !bindings.input_norm_weight || !bindings.input_norm_weight->valid() ||
+      !bindings.mixer_norm_weight || !bindings.mixer_norm_weight->valid() ||
+      !bindings.conv1d_weight || !bindings.conv1d_weight->valid() ||
+      !bindings.conv1d_bias || !bindings.conv1d_bias->valid() ||
+      !bindings.A_log || !bindings.A_log->valid() ||
+      !bindings.D || !bindings.D->valid() ||
+      !bindings.dt_bias || !bindings.dt_bias->valid()) {
+    return nullptr;
+  }
+
+  Impl::ProjectionFamily in_proj_family = Impl::ProjectionFamily::kNone;
+  if (bindings.in_proj_dense && bindings.in_proj_dense->valid()) {
+    in_proj_family = Impl::ProjectionFamily::kDense;
+  } else if (bindings.in_proj_scaled_fp8 && bindings.in_proj_scaled_fp8->valid()) {
+    in_proj_family = Impl::ProjectionFamily::kScaledFp8;
+  }
+  Impl::ProjectionFamily out_proj_family = Impl::ProjectionFamily::kNone;
+  if (bindings.out_proj_dense && bindings.out_proj_dense->valid()) {
+    out_proj_family = Impl::ProjectionFamily::kDense;
+  } else if (bindings.out_proj_scaled_fp8 && bindings.out_proj_scaled_fp8->valid()) {
+    out_proj_family = Impl::ProjectionFamily::kScaledFp8;
+  }
+  if (in_proj_family == Impl::ProjectionFamily::kNone ||
+      out_proj_family == Impl::ProjectionFamily::kNone) {
+    return nullptr;
+  }
+
+  const std::size_t in_proj_output_rows =
+      in_proj_family == Impl::ProjectionFamily::kScaledFp8
+          ? bindings.in_proj_scaled_fp8->output_rows()
+          : bindings.in_proj_dense->output_rows();
+  const std::size_t in_proj_input_cols =
+      in_proj_family == Impl::ProjectionFamily::kScaledFp8
+          ? bindings.in_proj_scaled_fp8->input_cols()
+          : bindings.in_proj_dense->input_cols();
+  const std::size_t out_proj_output_rows =
+      out_proj_family == Impl::ProjectionFamily::kScaledFp8
+          ? bindings.out_proj_scaled_fp8->output_rows()
+          : bindings.out_proj_dense->output_rows();
+  const std::size_t out_proj_input_cols =
+      out_proj_family == Impl::ProjectionFamily::kScaledFp8
+          ? bindings.out_proj_scaled_fp8->input_cols()
+          : bindings.out_proj_dense->input_cols();
+  if (in_proj_output_rows != (config.intermediate_size + conv_dim + config.num_heads) ||
+      in_proj_input_cols != config.hidden_size ||
+      out_proj_output_rows != config.hidden_size ||
+      out_proj_input_cols != config.intermediate_size) {
+    return nullptr;
+  }
 
   auto impl = std::make_unique<Impl>();
   impl->config = config;
-  impl->input_norm_weight = std::move(input_norm_weight);
-  impl->mixer_norm_weight = std::move(*mixer_norm_weight);
-  impl->conv1d_weight = std::move(*conv1d_weight);
-  impl->conv1d_bias = std::move(*conv1d_bias);
-  impl->A_log = std::move(*A_log);
-  impl->D = std::move(*D);
-  impl->dt_bias = std::move(*dt_bias);
+  impl->input_norm_weight = std::move(bindings.input_norm_weight);
+  impl->mixer_norm_weight = std::move(bindings.mixer_norm_weight);
+  impl->conv1d_weight = std::move(bindings.conv1d_weight);
+  impl->conv1d_bias = std::move(bindings.conv1d_bias);
+  impl->A_log = std::move(bindings.A_log);
+  impl->D = std::move(bindings.D);
+  impl->dt_bias = std::move(bindings.dt_bias);
   impl->in_proj_family = in_proj_family;
   impl->out_proj_family = out_proj_family;
-  impl->in_proj_dense = std::move(in_proj_dense);
-  impl->out_proj_dense = std::move(out_proj_dense);
-  impl->in_proj_scaled_fp8 = std::move(in_proj_scaled_fp8);
-  impl->out_proj_scaled_fp8 = std::move(out_proj_scaled_fp8);
+  impl->in_proj_dense = std::move(bindings.in_proj_dense);
+  impl->out_proj_dense = std::move(bindings.out_proj_dense);
+  impl->in_proj_scaled_fp8 = std::move(bindings.in_proj_scaled_fp8);
+  impl->out_proj_scaled_fp8 = std::move(bindings.out_proj_scaled_fp8);
   return std::unique_ptr<MambaLayerSlice>(new MambaLayerSlice(std::move(impl)));
 }
 
@@ -361,12 +566,18 @@ bool MambaLayerSlice::valid() const {
   return impl_ != nullptr &&
          impl_->input_norm_weight != nullptr &&
          impl_->input_norm_weight->valid() &&
-         !impl_->mixer_norm_weight.empty() &&
-         !impl_->conv1d_weight.empty() &&
-         !impl_->conv1d_bias.empty() &&
-         !impl_->A_log.empty() &&
-         !impl_->D.empty() &&
-         !impl_->dt_bias.empty() &&
+         impl_->mixer_norm_weight != nullptr &&
+         impl_->mixer_norm_weight->valid() &&
+         impl_->conv1d_weight != nullptr &&
+         impl_->conv1d_weight->valid() &&
+         impl_->conv1d_bias != nullptr &&
+         impl_->conv1d_bias->valid() &&
+         impl_->A_log != nullptr &&
+         impl_->A_log->valid() &&
+         impl_->D != nullptr &&
+         impl_->D->valid() &&
+         impl_->dt_bias != nullptr &&
+         impl_->dt_bias->valid() &&
          ((impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
            impl_->in_proj_dense != nullptr &&
            impl_->in_proj_dense->valid()) ||
@@ -426,7 +637,14 @@ bool MambaLayerSlice::Run(
   auto projected = DeviceTensorFp32::Create({token_count, projection_size});
   auto scan_output = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
   auto projected_output = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  if (!normalized || !projected || !scan_output || !projected_output) {
+  std::unique_ptr<DeviceTensorFp32> conv_output;
+  std::unique_ptr<DeviceTensorFp32> y_output;
+  if (token_count != 1) {
+    conv_output = DeviceTensorFp32::Create({token_count, conv_dim});
+    y_output = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
+  }
+  if (!normalized || !projected || !scan_output || !projected_output ||
+      (token_count != 1 && (!conv_output || !y_output))) {
     return false;
   }
 
@@ -457,117 +675,81 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  std::vector<float> input_host(input.numel(), 0.0f);
-  std::vector<float> projected_host(projected->numel(), 0.0f);
-  std::vector<float> conv_state_host(request_context.mamba_conv_state()->numel(), 0.0f);
-  std::vector<float> ssm_state_host(request_context.mamba_state()->numel(), 0.0f);
-  if (!input.CopyToHost(input_host.data(), input_host.size()) ||
-      !projected->CopyToHost(projected_host.data(), projected_host.size()) ||
-      !request_context.mamba_conv_state()->CopyToHost(conv_state_host.data(), conv_state_host.size()) ||
-      !request_context.mamba_state()->CopyToHost(ssm_state_host.data(), ssm_state_host.size())) {
-    return false;
+  if (trace != nullptr) {
+    trace->in_proj_output.resize(projected->numel(), 0.0f);
+    if (!projected->CopyToHost(trace->in_proj_output.data(), trace->in_proj_output.size())) {
+      return false;
+    }
+  }
+
+  if (token_count == 1) {
+    if (!MambaDecodeStepFusedFp32(
+            *projected,
+            impl_->config.intermediate_size,
+            conv_dim,
+            impl_->config.num_heads,
+            impl_->config.head_dim,
+            impl_->config.state_size,
+            impl_->config.n_groups,
+            impl_->config.conv_kernel_size,
+            impl_->config.time_step_min,
+            impl_->config.mixer_rms_epsilon,
+            impl_->config.conv_state_offset_elems,
+            impl_->config.ssm_state_offset_elems,
+            *impl_->conv1d_weight,
+            *impl_->conv1d_bias,
+            *impl_->A_log,
+            *impl_->D,
+            *impl_->dt_bias,
+            *impl_->mixer_norm_weight,
+            request_context.mamba_conv_state(),
+            request_context.mamba_state(),
+            scan_output.get())) {
+      return false;
+    }
+  } else {
+    if (!MambaConv1dSiluUpdateFp32(
+            *projected,
+            impl_->config.intermediate_size,
+            conv_dim,
+            impl_->config.conv_kernel_size,
+            impl_->config.conv_state_offset_elems,
+            *impl_->conv1d_weight,
+            *impl_->conv1d_bias,
+            request_context.mamba_conv_state(),
+            conv_output.get()) ||
+        !MambaSsmUpdateFp32(
+            *projected,
+            *conv_output,
+            impl_->config.intermediate_size,
+            conv_dim,
+            impl_->config.num_heads,
+            impl_->config.head_dim,
+            impl_->config.state_size,
+            impl_->config.n_groups,
+            impl_->config.time_step_min,
+            impl_->config.ssm_state_offset_elems,
+            *impl_->A_log,
+            *impl_->D,
+            *impl_->dt_bias,
+            request_context.mamba_state(),
+            y_output.get()) ||
+        !GroupedRmsNormGatedFp32(
+            *y_output,
+            *projected,
+            *impl_->mixer_norm_weight,
+            impl_->config.n_groups,
+            impl_->config.mixer_rms_epsilon,
+            scan_output.get())) {
+      return false;
+    }
   }
 
   if (trace != nullptr) {
-    trace->in_proj_output = projected_host;
-  }
-
-  float* layer_conv_state = conv_state_host.data() + impl_->config.conv_state_offset_elems;
-  float* layer_ssm_state = ssm_state_host.data() + impl_->config.ssm_state_offset_elems;
-  const std::size_t group_width = impl_->config.num_heads / impl_->config.n_groups;
-  const std::size_t mixer_group_size = impl_->config.intermediate_size / impl_->config.n_groups;
-  std::vector<float> conv_output(conv_dim, 0.0f);
-  std::vector<float> B_expanded(impl_->config.num_heads * impl_->config.state_size, 0.0f);
-  std::vector<float> C_expanded(impl_->config.num_heads * impl_->config.state_size, 0.0f);
-  std::vector<float> y(impl_->config.intermediate_size, 0.0f);
-  std::vector<float> scan_output_host(token_count * impl_->config.intermediate_size, 0.0f);
-
-  for (std::size_t token_index = 0; token_index < token_count; ++token_index) {
-    const float* projected_row = projected_host.data() + (token_index * projection_size);
-    const float* gate = projected_row;
-    const float* conv_input = gate + impl_->config.intermediate_size;
-    const float* dt_pre = conv_input + conv_dim;
-
-    for (std::size_t channel = 0; channel < conv_dim; ++channel) {
-      float* state_row = layer_conv_state + (channel * impl_->config.conv_kernel_size);
-      if (impl_->config.conv_kernel_size > 1) {
-        std::memmove(
-            state_row,
-            state_row + 1,
-            (impl_->config.conv_kernel_size - 1) * sizeof(float));
-      }
-      state_row[impl_->config.conv_kernel_size - 1] = conv_input[channel];
-
-      float accum = impl_->conv1d_bias[channel];
-      const float* weight_row = impl_->conv1d_weight.data() + (channel * impl_->config.conv_kernel_size);
-      for (std::size_t tap = 0; tap < impl_->config.conv_kernel_size; ++tap) {
-        accum += state_row[tap] * weight_row[tap];
-      }
-      conv_output[channel] = SiLU(accum);
+    trace->scan_output.resize(scan_output->numel(), 0.0f);
+    if (!scan_output->CopyToHost(trace->scan_output.data(), trace->scan_output.size())) {
+      return false;
     }
-
-    const float* hidden_after_conv = conv_output.data();
-    const float* B_grouped = hidden_after_conv + impl_->config.intermediate_size;
-    const float* C_grouped = B_grouped + (impl_->config.n_groups * impl_->config.state_size);
-    for (std::size_t head = 0; head < impl_->config.num_heads; ++head) {
-      const std::size_t group = head / group_width;
-      std::memcpy(
-          B_expanded.data() + (head * impl_->config.state_size),
-          B_grouped + (group * impl_->config.state_size),
-          impl_->config.state_size * sizeof(float));
-      std::memcpy(
-          C_expanded.data() + (head * impl_->config.state_size),
-          C_grouped + (group * impl_->config.state_size),
-          impl_->config.state_size * sizeof(float));
-    }
-
-    for (std::size_t head = 0; head < impl_->config.num_heads; ++head) {
-      const float A = -std::exp(impl_->A_log[head]);
-      const float D = impl_->D[head];
-      const float dt_base = dt_pre[head] + impl_->dt_bias[head];
-      const float* B_head = B_expanded.data() + (head * impl_->config.state_size);
-      const float* C_head = C_expanded.data() + (head * impl_->config.state_size);
-      for (std::size_t dim = 0; dim < impl_->config.head_dim; ++dim) {
-        const std::size_t hidden_index = (head * impl_->config.head_dim) + dim;
-        const float hidden_value = hidden_after_conv[hidden_index];
-        const float dt = std::max(Softplus(dt_base), impl_->config.time_step_min);
-        const float decay = std::exp(dt * A);
-        float accum = 0.0f;
-        float* state_row = layer_ssm_state + (hidden_index * impl_->config.state_size);
-        for (std::size_t state = 0; state < impl_->config.state_size; ++state) {
-          const float next =
-              state_row[state] * decay + (dt * B_head[state] * hidden_value);
-          state_row[state] = next;
-          accum += next * C_head[state];
-        }
-        y[hidden_index] = accum + (hidden_value * D);
-      }
-    }
-
-    float* scan_row = scan_output_host.data() + (token_index * impl_->config.intermediate_size);
-    for (std::size_t group = 0; group < impl_->config.n_groups; ++group) {
-      const std::size_t begin = group * mixer_group_size;
-      const std::size_t end = begin + mixer_group_size;
-      float variance = 0.0f;
-      for (std::size_t i = begin; i < end; ++i) {
-        const float gated = y[i] * SiLU(gate[i]);
-        variance += gated * gated;
-        scan_row[i] = gated;
-      }
-      variance /= static_cast<float>(mixer_group_size);
-      const float rstd = 1.0f / std::sqrt(variance + impl_->config.mixer_rms_epsilon);
-      for (std::size_t i = begin; i < end; ++i) {
-        scan_row[i] = scan_row[i] * rstd * impl_->mixer_norm_weight[i];
-      }
-    }
-  }
-
-  if (!scan_output->CopyFromHost(scan_output_host.data(), scan_output_host.size())) {
-    return false;
-  }
-
-  if (trace != nullptr) {
-    trace->scan_output = scan_output_host;
   }
 
   const bool out_proj_ok =
@@ -575,10 +757,7 @@ bool MambaLayerSlice::Run(
        impl_->out_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *scan_output, projected_output.get())) ||
       (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
        impl_->out_proj_dense->Run(cublas_handle, heuristic_cache, *scan_output, projected_output.get()));
-  if (!out_proj_ok ||
-      !request_context.mamba_conv_state()->CopyFromHost(conv_state_host.data(), conv_state_host.size()) ||
-      !request_context.mamba_state()->CopyFromHost(ssm_state_host.data(), ssm_state_host.size()) ||
-      !ResidualAddFp32(input, *projected_output, output)) {
+  if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output)) {
     return false;
   }
 
