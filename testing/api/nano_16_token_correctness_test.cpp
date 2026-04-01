@@ -66,6 +66,139 @@ struct LinearFallbackObservation {
   std::uint64_t count = 0;
 };
 
+struct LinearCounterSnapshot {
+  std::uint64_t dense_fastpath_plan_success = 0;
+  std::uint64_t dense_fastpath_plan_fail = 0;
+  std::uint64_t dense_fastpath_execute = 0;
+  std::uint64_t dense_fastpath_execute_fail = 0;
+  std::uint64_t dense_reference_fallback = 0;
+
+  std::uint64_t nvfp4_fastpath_plan_success = 0;
+  std::uint64_t nvfp4_fastpath_plan_fail = 0;
+  std::uint64_t nvfp4_fastpath_execute = 0;
+  std::uint64_t nvfp4_fastpath_execute_fail = 0;
+  std::uint64_t nvfp4_reference_fallback = 0;
+
+  std::uint64_t scaled_fp8_fastpath_execute = 0;
+  std::uint64_t scaled_fp8_reference_fallback = 0;
+};
+
+LinearCounterSnapshot SnapshotLinearOpCounters() {
+  const auto& counters = nemotron::GetLinearOpCounters();
+  LinearCounterSnapshot snapshot;
+  snapshot.dense_fastpath_plan_success =
+      counters.dense_fastpath_plan_success.load(std::memory_order_relaxed);
+  snapshot.dense_fastpath_plan_fail =
+      counters.dense_fastpath_plan_fail.load(std::memory_order_relaxed);
+  snapshot.dense_fastpath_execute =
+      counters.dense_fastpath_execute.load(std::memory_order_relaxed);
+  snapshot.dense_fastpath_execute_fail =
+      counters.dense_fastpath_execute_fail.load(std::memory_order_relaxed);
+  snapshot.dense_reference_fallback =
+      counters.dense_reference_fallback.load(std::memory_order_relaxed);
+
+  snapshot.nvfp4_fastpath_plan_success =
+      counters.nvfp4_fastpath_plan_success.load(std::memory_order_relaxed);
+  snapshot.nvfp4_fastpath_plan_fail =
+      counters.nvfp4_fastpath_plan_fail.load(std::memory_order_relaxed);
+  snapshot.nvfp4_fastpath_execute =
+      counters.nvfp4_fastpath_execute.load(std::memory_order_relaxed);
+  snapshot.nvfp4_fastpath_execute_fail =
+      counters.nvfp4_fastpath_execute_fail.load(std::memory_order_relaxed);
+  snapshot.nvfp4_reference_fallback =
+      counters.nvfp4_reference_fallback.load(std::memory_order_relaxed);
+
+  snapshot.scaled_fp8_fastpath_execute =
+      counters.scaled_fp8_fastpath_execute.load(std::memory_order_relaxed);
+  snapshot.scaled_fp8_reference_fallback =
+      counters.scaled_fp8_reference_fallback.load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+LinearCounterSnapshot AddLinearCounterSnapshots(
+    const LinearCounterSnapshot& lhs,
+    const LinearCounterSnapshot& rhs) {
+  LinearCounterSnapshot sum;
+  sum.dense_fastpath_plan_success =
+      lhs.dense_fastpath_plan_success + rhs.dense_fastpath_plan_success;
+  sum.dense_fastpath_plan_fail =
+      lhs.dense_fastpath_plan_fail + rhs.dense_fastpath_plan_fail;
+  sum.dense_fastpath_execute = lhs.dense_fastpath_execute + rhs.dense_fastpath_execute;
+  sum.dense_fastpath_execute_fail =
+      lhs.dense_fastpath_execute_fail + rhs.dense_fastpath_execute_fail;
+  sum.dense_reference_fallback =
+      lhs.dense_reference_fallback + rhs.dense_reference_fallback;
+
+  sum.nvfp4_fastpath_plan_success =
+      lhs.nvfp4_fastpath_plan_success + rhs.nvfp4_fastpath_plan_success;
+  sum.nvfp4_fastpath_plan_fail =
+      lhs.nvfp4_fastpath_plan_fail + rhs.nvfp4_fastpath_plan_fail;
+  sum.nvfp4_fastpath_execute = lhs.nvfp4_fastpath_execute + rhs.nvfp4_fastpath_execute;
+  sum.nvfp4_fastpath_execute_fail =
+      lhs.nvfp4_fastpath_execute_fail + rhs.nvfp4_fastpath_execute_fail;
+  sum.nvfp4_reference_fallback =
+      lhs.nvfp4_reference_fallback + rhs.nvfp4_reference_fallback;
+
+  sum.scaled_fp8_fastpath_execute =
+      lhs.scaled_fp8_fastpath_execute + rhs.scaled_fp8_fastpath_execute;
+  sum.scaled_fp8_reference_fallback =
+      lhs.scaled_fp8_reference_fallback + rhs.scaled_fp8_reference_fallback;
+  return sum;
+}
+
+void RestoreLinearOpCounters(const LinearCounterSnapshot& snapshot) {
+  auto& counters = nemotron::GetLinearOpCounters();
+  counters.dense_fastpath_plan_success.store(
+      snapshot.dense_fastpath_plan_success,
+      std::memory_order_relaxed);
+  counters.dense_fastpath_plan_fail.store(
+      snapshot.dense_fastpath_plan_fail,
+      std::memory_order_relaxed);
+  counters.dense_fastpath_execute.store(
+      snapshot.dense_fastpath_execute,
+      std::memory_order_relaxed);
+  counters.dense_fastpath_execute_fail.store(
+      snapshot.dense_fastpath_execute_fail,
+      std::memory_order_relaxed);
+  counters.dense_reference_fallback.store(
+      snapshot.dense_reference_fallback,
+      std::memory_order_relaxed);
+
+  counters.nvfp4_fastpath_plan_success.store(
+      snapshot.nvfp4_fastpath_plan_success,
+      std::memory_order_relaxed);
+  counters.nvfp4_fastpath_plan_fail.store(
+      snapshot.nvfp4_fastpath_plan_fail,
+      std::memory_order_relaxed);
+  counters.nvfp4_fastpath_execute.store(
+      snapshot.nvfp4_fastpath_execute,
+      std::memory_order_relaxed);
+  counters.nvfp4_fastpath_execute_fail.store(
+      snapshot.nvfp4_fastpath_execute_fail,
+      std::memory_order_relaxed);
+  counters.nvfp4_reference_fallback.store(
+      snapshot.nvfp4_reference_fallback,
+      std::memory_order_relaxed);
+
+  counters.scaled_fp8_fastpath_execute.store(
+      snapshot.scaled_fp8_fastpath_execute,
+      std::memory_order_relaxed);
+  counters.scaled_fp8_reference_fallback.store(
+      snapshot.scaled_fp8_reference_fallback,
+      std::memory_order_relaxed);
+}
+
+void PrintLayerProbeLinearCounters(
+    std::size_t layer_index,
+    const LinearCounterSnapshot& snapshot) {
+  std::cout << "nano_16_token_correctness_test: layer_probe layer_index="
+            << layer_index
+            << " linear_counters dense_ref=" << snapshot.dense_reference_fallback
+            << " nvfp4_ref=" << snapshot.nvfp4_reference_fallback
+            << " fp8_ref=" << snapshot.scaled_fp8_reference_fallback << "\n";
+  std::cout.flush();
+}
+
 std::vector<LinearFallbackObservation> CollectLinearReferenceFallbacks() {
   const auto& counters = nemotron::GetLinearOpCounters();
   std::vector<LinearFallbackObservation> fallbacks;
@@ -729,6 +862,8 @@ void MaybeTraceDivergentPromptLayers(
     nemotron::SingleTokenForwardModel& model,
     const PrefillRouteConfig& lhs_route,
     const PrefillRouteConfig& rhs_route) {
+  const bool strict_linear_enabled =
+      EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_LINEAR", false);
   const auto explicit_layer = ParseEnvSizeT("NEMOTRON_NANO_16_COMPARE_LAYER");
   if (explicit_layer.has_value()) {
     ComparePromptLayer(model, lhs_route, rhs_route, *explicit_layer);
@@ -750,8 +885,23 @@ void MaybeTraceDivergentPromptLayers(
   std::vector<std::size_t> divergent_layers;
   divergent_layers.reserve(layers.size());
   for (const LayerProbe& probe : probes) {
-    const auto lhs_observation = RunLayerObservation(model, lhs_route, probe.layer_index);
-    const auto rhs_observation = RunLayerObservation(model, rhs_route, probe.layer_index);
+    const auto run_observation = [&](const PrefillRouteConfig& route) {
+      if (!strict_linear_enabled) {
+        return RunLayerObservation(model, route, probe.layer_index);
+      }
+
+      const LinearCounterSnapshot cumulative_before = SnapshotLinearOpCounters();
+      nemotron::ResetLinearOpCounters();
+      std::optional<LayerObservation> observation =
+          RunLayerObservation(model, route, probe.layer_index);
+      const LinearCounterSnapshot layer_delta = SnapshotLinearOpCounters();
+      PrintLayerProbeLinearCounters(probe.layer_index, layer_delta);
+      RestoreLinearOpCounters(AddLinearCounterSnapshots(cumulative_before, layer_delta));
+      return observation;
+    };
+
+    const auto lhs_observation = run_observation(lhs_route);
+    const auto rhs_observation = run_observation(rhs_route);
     if (!lhs_observation.has_value() || !rhs_observation.has_value()) {
       std::cerr << "nano_16_token_correctness_test: layer probe failed pair="
                 << PairId(lhs_route, rhs_route)

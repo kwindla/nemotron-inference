@@ -27,7 +27,7 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
   Also add the same diagnostic to `ScaledFp8LinearOp::Run()` when its plan build fails. This makes the `--strict-linear` output actionable — instead of just "N fallbacks", we'll know exactly which shapes/tensors failed and why.
   Key files: `runtime/src/backend/linear_op.cpp`, `runtime/src/backend/scaled_fp8_linear.cu`
 
-- [ ] **3. Add linear fastpath counter breakdown to correctness test layer probes**
+- [x] **3. Add linear fastpath counter breakdown to correctness test layer probes**
   Extend the layer-probe divergence sweep in `nano_16_token_correctness_test.cpp` to reset and report linear counters around each layer probe. This shows which specific layers trigger reference fallbacks when the fastpath is enabled. After each `RunLayerObservation()` call, if `NEMOTRON_NANO_16_STRICT_LINEAR=1`:
   - Print the linear counter delta for that specific layer probe (which counters incremented)
   - This localizes fastpath failures to specific layers/operators rather than just a global count
@@ -77,8 +77,8 @@ The preflight infrastructure (route-separating test, linear/expert counters, ben
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Embedding and final-norm trace comparison | done | 534ba08 | nano-prompt-parity (diagnosis) |
-| 2 | GEMM plan-build diagnostic logging | done | — | nano-linear-fastpath (diagnostics) |
-| 3 | Linear counter breakdown in layer probes | pending | — | nano-linear-fastpath (per-layer) |
+| 2 | GEMM plan-build diagnostic logging | done | 5edd6f9 | nano-linear-fastpath (diagnostics) |
+| 3 | Linear counter breakdown in layer probes | done | — | nano-linear-fastpath (per-layer) |
 | 4 | Per-operator linear counter tracking | pending | — | nano-linear-fastpath (per-tensor) |
 | 5 | Saved-token oracle for fixed prompt | pending | — | nano-prompt-parity (oracle) |
 | 6 | Load-and-compare oracle mode | pending | — | nano-prompt-parity (fast compare) |
