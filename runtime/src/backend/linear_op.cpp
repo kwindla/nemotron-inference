@@ -64,11 +64,15 @@ bool ExperimentalDenseDevicePlanSurfaceEnabled() {
 }
 
 const char* ExperimentalDenseDevicePlanSurfaceFamilyFilter() {
-  return std::getenv("NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_FAMILY");
+  static const char* const kFilter =
+      std::getenv("NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_FAMILY");
+  return kFilter;
 }
 
 const char* ExperimentalDenseDevicePlanSurfaceTensorFilter() {
-  return std::getenv("NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_TENSORS");
+  static const char* const kFilter =
+      std::getenv("NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_TENSORS");
+  return kFilter;
 }
 
 DenseRuntimeOpFamily ClassifyDenseRuntimeOpFamily(const GemmDescriptor& descriptor) {
@@ -256,7 +260,8 @@ bool UploadedLinearOp::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output) const {
-  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = kDebug;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     if (debug) {
       std::cerr << "linear_op: invalid run state for " << impl_->descriptor.tensor_name << "\n";

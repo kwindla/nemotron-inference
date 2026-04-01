@@ -52,6 +52,26 @@ bool IsFp8E4M3Storage(const std::string& storage_dtype) {
   return storage_dtype == "fp8_e4m3fn" || storage_dtype == "fp8_e4m3";
 }
 
+bool ForwardDebugEnabled() {
+  static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  return kDebug;
+}
+
+const char* RoutedLookupPrefetchTopnEnv() {
+  static const char* const kPrefetchTopn = std::getenv("NEMOTRON_ROUTED_LOOKUP_PREFETCH_TOPN");
+  return kPrefetchTopn;
+}
+
+bool RoutedLookupRepairGroupsEnabled() {
+  static const bool kEnabled = std::getenv("NEMOTRON_ROUTED_LOOKUP_REPAIR_GROUPS") != nullptr;
+  return kEnabled;
+}
+
+bool CutlassMoeEnabled() {
+  static const bool kEnabled = std::getenv("NEMOTRON_CUTLASS_MOE") != nullptr;
+  return kEnabled;
+}
+
 std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
   if (descriptor.tensor_scale_data == nullptr || descriptor.tensor_scale_nbytes != sizeof(float)) {
     return std::nullopt;
@@ -529,7 +549,7 @@ std::unique_ptr<UploadedLinearOp> MaterializeNvfp4AlignedViewOp(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
     bool* buffers_ready) {
-  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = ForwardDebugEnabled();
   if (!EnsureNvfp4AlignedBuffers(descriptor, buffers, buffers_ready)) {
     if (debug) {
       std::cerr << "expert_layer: nvfp4 aligned buffer prep failed for "
@@ -992,7 +1012,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     const ExpertLayerConfig& config,
     const ExpertLayerBindings& bindings,
     ExpertLayerBuildTimingSink timing_sink) {
-  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = ForwardDebugEnabled();
   const auto time_ms = [](const auto begin, const auto end) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
   };
@@ -2047,9 +2067,9 @@ bool RunExpertLayerImpl(
     const DeviceTensorFp32& input,
     DeviceTensorFp32* output,
     ExpertLayerRunTrace* trace) {
-  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = ForwardDebugEnabled();
   const std::size_t routed_prefetch_topn = []() -> std::size_t {
-    const char* env = std::getenv("NEMOTRON_ROUTED_LOOKUP_PREFETCH_TOPN");
+    const char* env = RoutedLookupPrefetchTopnEnv();
     if (env == nullptr || *env == '\0') {
       return 0;
     }
@@ -2523,8 +2543,7 @@ bool RunExpertLayerImpl(
             }),
         missing_indices.end());
     const std::size_t repaired_missing_count = missing_indices.size();
-    const bool expand_to_touched_groups =
-        std::getenv("NEMOTRON_ROUTED_LOOKUP_REPAIR_GROUPS") != nullptr;
+    const bool expand_to_touched_groups = RoutedLookupRepairGroupsEnabled();
     if (expand_to_touched_groups &&
         !missing_indices.empty() &&
         impl.config.n_group != 0 &&
@@ -2860,7 +2879,7 @@ bool RunExpertLayerImpl(
     bool cutlass_up_ok = false;
     if (impl.cutlass_up_plan != nullptr && impl.cutlass_up_plan->valid() &&
         batch_count == static_cast<std::size_t>(impl.cutlass_up_plan->group_count()) &&
-        std::getenv("NEMOTRON_CUTLASS_MOE") != nullptr) {
+        CutlassMoeEnabled()) {
       // A pointers: all groups share the same packed activation (device fill kernel).
       FillDevicePointerArray(
           const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_ptrs.data())),
@@ -2937,7 +2956,7 @@ bool RunExpertLayerImpl(
     bool cutlass_down_ok = false;
     if (impl.cutlass_down_plan != nullptr && impl.cutlass_down_plan->valid() &&
         batch_count == static_cast<std::size_t>(impl.cutlass_down_plan->group_count()) &&
-        std::getenv("NEMOTRON_CUTLASS_MOE") != nullptr) {
+        CutlassMoeEnabled()) {
       constexpr std::size_t kCutlassAlign = 256;
       const std::size_t act_packed_row_bytes = impl.config.routed_expert_intermediate_size / 2;
       const std::size_t act_scale_row_bytes = impl.config.routed_expert_intermediate_size / 16;

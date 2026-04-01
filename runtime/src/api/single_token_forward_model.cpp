@@ -125,6 +125,16 @@ double ToMilliseconds(const std::chrono::steady_clock::duration duration) {
   return std::chrono::duration<double, std::milli>(duration).count();
 }
 
+bool ForwardDebugEnabled() {
+  static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  return kDebug;
+}
+
+bool ForwardProfileEnabled() {
+  static const bool kProfile = std::getenv("NEMOTRON_FORWARD_PROFILE") != nullptr;
+  return kProfile;
+}
+
 std::size_t BuildWorkerCount() {
   if (const char* override_value = std::getenv("NEMOTRON_FORWARD_BUILD_THREADS");
       override_value != nullptr) {
@@ -1032,7 +1042,7 @@ bool SingleTokenForwardModel::RunDecodeStep(
     const std::vector<std::size_t>& capture_layer_indices,
     SingleTokenForwardTrace* trace,
     std::optional<std::size_t> stop_layer_index) const {
-  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = ForwardDebugEnabled();
   const bool model_valid = valid();
   const bool request_valid = request_context.valid();
   const bool have_logits = logits != nullptr;
@@ -1069,7 +1079,7 @@ bool SingleTokenForwardModel::RunPrefill(
     const std::vector<std::size_t>& capture_layer_indices,
     SingleTokenForwardTrace* trace,
     std::optional<std::size_t> stop_layer_index) const {
-  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = ForwardDebugEnabled();
 
   const bool model_valid = valid();
   const bool have_tokens = token_ids != nullptr;
@@ -1204,7 +1214,7 @@ bool SingleTokenForwardModel::RunPrefill(
       capture_layer_indices.begin(),
       capture_layer_indices.end());
 
-  const bool profile = std::getenv("NEMOTRON_FORWARD_PROFILE") != nullptr;
+  const bool profile = ForwardProfileEnabled();
   cudaEvent_t profile_start = nullptr;
   cudaEvent_t profile_end = nullptr;
   if (profile) {

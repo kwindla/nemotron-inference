@@ -22,19 +22,26 @@ bool CheckCuda(cudaError_t status) {
 }
 
 bool ExperimentalFp8NativeEnabled() {
-  return std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE") != nullptr;
+  static const bool kEnabled = std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE") != nullptr;
+  return kEnabled;
 }
 
 bool ExperimentalScaledFp8DequantizedDenseEnabled() {
-  return std::getenv("NEMOTRON_DISABLE_SCALED_FP8_DEQUANTIZED_DENSE") == nullptr;
+  static const bool kEnabled =
+      std::getenv("NEMOTRON_DISABLE_SCALED_FP8_DEQUANTIZED_DENSE") == nullptr;
+  return kEnabled;
 }
 
 const char* ExperimentalScaledFp8SurfaceFamilyFilter() {
-  return std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_FAMILY");
+  static const char* const kFilter =
+      std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_FAMILY");
+  return kFilter;
 }
 
 const char* ExperimentalScaledFp8SurfaceTensorFilter() {
-  return std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_TENSORS");
+  static const char* const kFilter =
+      std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_TENSORS");
+  return kFilter;
 }
 
 std::string_view ResolveScaledFp8TensorName(const ScaledFp8LinearConfig& config) {
