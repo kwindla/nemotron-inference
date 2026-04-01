@@ -729,8 +729,24 @@ struct ExpertLayerSlice::Impl {
   // -- CUTLASS path aligned buffers --
   mutable DeviceBuffer<std::uint8_t> scratch_aligned_act_packed;
   mutable DeviceBuffer<std::uint8_t> scratch_aligned_act_scales;
+  // CUDA graph state for MoE layer (gated by NEMOTRON_CUDA_GRAPH_MOE)
+  mutable bool moe_graph_enabled = false;
+  mutable cudaGraph_t moe_graph = nullptr;
+  mutable cudaGraphExec_t moe_graph_exec = nullptr;
+  mutable bool moe_graph_captured = false;
+  mutable DeviceBuffer<std::int32_t> scratch_graph_indices;
+  mutable DeviceBuffer<float> scratch_graph_weights;
+  mutable DeviceBuffer<float> scratch_graph_latent_in;
+  mutable DeviceBuffer<float> scratch_graph_output;
+  mutable DeviceBuffer<float> scratch_graph_grouped_up;
 
   ~Impl() {
+    if (moe_graph_exec != nullptr) {
+      cudaGraphExecDestroy(moe_graph_exec);
+    }
+    if (moe_graph != nullptr) {
+      cudaGraphDestroy(moe_graph);
+    }
     if (dense_pool != nullptr) {
       cudaFree(dense_pool);
     }
@@ -1502,6 +1518,16 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     const std::size_t aligned_scale_row = round_up(act_scale_row_bytes, kCutlassAlign);
     impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
     impl->scratch_aligned_act_scales.Resize(top_k * aligned_scale_row);
+
+    // CUDA graph scratch buffers (fixed-address copies of variable inputs)
+    impl->moe_graph_enabled = std::getenv("NEMOTRON_CUDA_GRAPH_MOE") != nullptr;
+    if (impl->moe_graph_enabled) {
+      impl->scratch_graph_indices.Resize(top_k);
+      impl->scratch_graph_weights.Resize(top_k);
+      impl->scratch_graph_latent_in.Resize(latent);
+      impl->scratch_graph_output.Resize(latent);
+      impl->scratch_graph_grouped_up.Resize(top_k * intermediate);
+    }
   }
 
   std::string strict_failure_reason;
@@ -2507,6 +2533,105 @@ bool RunExpertLayerImpl(
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPrereqFallback();
       return GroupedRoutedResult::kFallback;
+    }
+
+    // CUDA graph replay fast path: when all experts are warm and graph is
+    // captured, replay the entire MoE compute sequence in one graph launch.
+    if (impl.moe_graph_enabled && impl.all_routed_lookups_ready &&
+        batch_count == static_cast<std::size_t>(impl.config.top_k)) {
+      cudaMemcpyAsync(impl.scratch_graph_indices.data(), selected_indices_device,
+                      batch_count * sizeof(std::int32_t), cudaMemcpyDeviceToDevice);
+      cudaMemcpyAsync(impl.scratch_graph_weights.data(), selected_weights_device,
+                      batch_count * sizeof(float), cudaMemcpyDeviceToDevice);
+      cudaMemcpyAsync(impl.scratch_graph_latent_in.data(), latent_input_row.data(),
+                      impl.config.moe_latent_size * sizeof(float), cudaMemcpyDeviceToDevice);
+
+      bool graph_ok = true;
+      if (!impl.moe_graph_captured) {
+        auto graph_latent_view = DeviceTensorFp32::CreateView(
+            {1, impl.config.moe_latent_size}, impl.scratch_graph_latent_in.data());
+        auto graph_grouped_up = DeviceTensorFp32::CreateView(
+            {batch_count, impl.config.routed_expert_intermediate_size},
+            impl.scratch_graph_grouped_up.data());
+        auto graph_output = DeviceTensorFp32::CreateView(
+            {1, impl.config.moe_latent_size}, impl.scratch_graph_output.data());
+        graph_ok = graph_latent_view && graph_grouped_up && graph_output;
+
+        if (graph_ok) {
+          cudaStream_t stream = nullptr;
+          graph_ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
+
+          if (graph_ok) {
+            GatherExpertSelectionLookupsDualCheckedInPlace(
+                impl.scratch_graph_indices.data(), batch_count, impl.routed_experts.size(),
+                impl.routed_up_packed_lookup_device, impl.routed_up_raw_scale_lookup_device,
+                impl.routed_up_tensor_scale_lookup_device,
+                impl.scratch_up_packed_ptrs, impl.scratch_up_raw_scale_ptrs,
+                impl.scratch_selected_up_tensor_scales,
+                impl.routed_down_packed_lookup_device, impl.routed_down_raw_scale_lookup_device,
+                impl.routed_down_tensor_scale_lookup_device,
+                impl.scratch_down_packed_ptrs, impl.scratch_down_raw_scale_ptrs,
+                impl.scratch_selected_down_tensor_scales,
+                impl.scratch_missing_count, impl.scratch_missing_indices);
+
+            PackDeviceRowMajorFp32ToNvfp4InPlace(
+                *graph_latent_view, {},
+                impl.scratch_latent_packed_data.data(),
+                impl.scratch_latent_block_scales.data(),
+                impl.scratch_latent_matmul_scales.data(),
+                reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                impl.scratch_global_max_bits.data());
+
+            FusedRoutedUpProjPackedNvfp4SingleToken(
+                impl.scratch_latent_packed_data.data(),
+                impl.scratch_latent_block_scales.data(),
+                reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+                impl.config.moe_latent_size,
+                impl.scratch_up_packed_ptrs, impl.scratch_up_raw_scale_ptrs,
+                impl.scratch_selected_up_tensor_scales, graph_grouped_up.get());
+
+            ScaleRelu2PackRowsToNvfp4InPlace(
+                *graph_grouped_up, impl.scratch_row_scales.data(),
+                impl.scratch_down_act_packed, impl.scratch_down_act_block_scales,
+                impl.scratch_down_act_tensor_scales);
+
+            cudaMemsetAsync(impl.scratch_graph_output.data(), 0,
+                            impl.config.moe_latent_size * sizeof(float));
+
+            FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+                impl.scratch_down_act_packed.data(),
+                impl.scratch_down_act_block_scales.data(),
+                impl.scratch_down_act_tensor_scales,
+                impl.scratch_graph_weights.data(),
+                impl.config.routed_expert_intermediate_size,
+                impl.scratch_down_packed_ptrs, impl.scratch_down_raw_scale_ptrs,
+                impl.scratch_selected_down_tensor_scales, graph_output.get());
+
+            graph_ok = cudaStreamEndCapture(stream, &impl.moe_graph) == cudaSuccess &&
+                       impl.moe_graph != nullptr;
+          }
+        }
+        if (graph_ok) {
+          graph_ok = cudaGraphInstantiate(&impl.moe_graph_exec, impl.moe_graph, 0) == cudaSuccess;
+        }
+        if (graph_ok) {
+          impl.moe_graph_captured = true;
+        } else {
+          if (impl.moe_graph != nullptr) {
+            cudaGraphDestroy(impl.moe_graph);
+            impl.moe_graph = nullptr;
+          }
+          impl.moe_graph_enabled = false;
+        }
+      }
+
+      if (impl.moe_graph_captured) {
+        cudaGraphLaunch(impl.moe_graph_exec, nullptr);
+        cudaMemcpyAsync(routed_tensor->data(), impl.scratch_graph_output.data(),
+                        impl.config.moe_latent_size * sizeof(float), cudaMemcpyDeviceToDevice);
+        RecordGroupedRoutedExpertFastpathUse();
+        return GroupedRoutedResult::kUsed;
+      }
     }
 
     // Merged up+down gather: one kernel launch gathers all 6 output arrays.
