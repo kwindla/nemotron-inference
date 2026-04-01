@@ -1,4 +1,5 @@
 #include "nemotron/device_tensor.h"
+#include "nemotron/linear_op_counters.h"
 #include "nemotron/manifest.h"
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -50,6 +52,91 @@ bool has_cuda_device() {
   int device_count = 0;
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
 }
+
+bool EnvEnabledOrDefault(const char* env_var, bool default_enabled) {
+  const char* value = std::getenv(env_var);
+  if (value == nullptr) {
+    return default_enabled;
+  }
+  return value[0] != '\0' && std::string(value) != "0";
+}
+
+struct LinearFallbackObservation {
+  const char* counter_name = "";
+  std::uint64_t count = 0;
+};
+
+std::vector<LinearFallbackObservation> CollectLinearReferenceFallbacks() {
+  const auto& counters = nemotron::GetLinearOpCounters();
+  std::vector<LinearFallbackObservation> fallbacks;
+  fallbacks.reserve(3);
+
+  const auto append_if_nonzero = [&fallbacks](const char* counter_name, const auto& counter) {
+    const std::uint64_t count = counter.load(std::memory_order_relaxed);
+    if (count != 0) {
+      fallbacks.push_back({counter_name, count});
+    }
+  };
+
+  append_if_nonzero("dense_reference_fallback", counters.dense_reference_fallback);
+  append_if_nonzero("nvfp4_reference_fallback", counters.nvfp4_reference_fallback);
+  append_if_nonzero(
+      "scaled_fp8_reference_fallback",
+      counters.scaled_fp8_reference_fallback);
+  return fallbacks;
+}
+
+void PrintUnexpectedLinearFallbackWarning(
+    std::ostream& stream,
+    const std::vector<LinearFallbackObservation>& fallbacks) {
+  if (fallbacks.empty()) {
+    return;
+  }
+
+  stream << "WARNING: nano_16_token_correctness_test: unexpected linear reference fallbacks "
+         << "while NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1\n";
+  for (const LinearFallbackObservation& fallback : fallbacks) {
+    stream << "WARNING: nano_16_token_correctness_test: operator="
+           << fallback.counter_name
+           << " reference_fallback_count=" << fallback.count << "\n";
+  }
+}
+
+class ScopedLinearCounterReport {
+ public:
+  ScopedLinearCounterReport(
+      bool strict_linear_enabled,
+      bool linear_device_fastpath_enabled)
+      : strict_linear_enabled_(strict_linear_enabled),
+        linear_device_fastpath_enabled_(linear_device_fastpath_enabled) {
+    nemotron::ResetLinearOpCounters();
+  }
+
+  ~ScopedLinearCounterReport() {
+    nemotron::PrintLinearOpCounterSummary(std::cout);
+    std::cout.flush();
+
+    if (!strict_linear_enabled_ || !linear_device_fastpath_enabled_) {
+      return;
+    }
+
+    const std::vector<LinearFallbackObservation> fallbacks =
+        CollectLinearReferenceFallbacks();
+    if (fallbacks.empty()) {
+      return;
+    }
+
+    PrintUnexpectedLinearFallbackWarning(std::cerr, fallbacks);
+    std::cerr.flush();
+  }
+
+  ScopedLinearCounterReport(const ScopedLinearCounterReport&) = delete;
+  ScopedLinearCounterReport& operator=(const ScopedLinearCounterReport&) = delete;
+
+ private:
+  bool strict_linear_enabled_ = false;
+  bool linear_device_fastpath_enabled_ = false;
+};
 
 class ScopedEnvOverride {
  public:
@@ -664,6 +751,14 @@ bool run_nano_correctness_gate() {
   if (!expect(model != nullptr && model->valid(), "forward model should build")) {
     return false;
   }
+
+  const bool strict_linear_enabled =
+      EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_LINEAR", false);
+  const bool linear_device_fastpath_enabled =
+      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
+  ScopedLinearCounterReport linear_counter_report(
+      strict_linear_enabled,
+      linear_device_fastpath_enabled);
 
   auto route_a_context = model->CreateRequestContext();
   auto route_b_context = model->CreateRequestContext();

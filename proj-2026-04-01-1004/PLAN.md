@@ -76,7 +76,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
   Update the benchmark and correctness test to respect this gate. The correctness test should keep host logits for comparison; the benchmark should use device argmax by default.
   Key files: `runtime/src/api/single_token_forward_model.cpp`, `runtime/include/nemotron/single_token_forward_model.h`, `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`
 
-- [ ] **8. Linear fastpath strict mode**
+- [x] **8. Linear fastpath strict mode**
   Add a strict mode to the benchmark and correctness test surfaces that fails if the linear device fastpath is requested but any hot operator unexpectedly falls back to the reference kernel.
   In the benchmark (`nano_fused_decode_bench.cpp`):
   - Add `--strict-linear` flag
@@ -113,7 +113,7 @@ The Nemotron fused decode runtime (Mamba + MoE) is landed and passing smoke test
 | 4 | cuDNN FE attention feasibility report | done | b13f0e9 | preflight-attention-feasibility; confirmed NOT AVAILABLE (stub build) |
 | 5 | Expert staging cost metrics | done | f76eaeb | preflight-expert-staging-metrics |
 | 6 | Device-side argmax kernel | done | 972bdfb | nano-device-token-select (kernel) |
-| 7 | Integrate device argmax into decode loop | done | — | nano-device-token-select (integration) |
-| 8 | Linear fastpath strict mode | pending | — | nano-linear-fastpath (strict gate) |
+| 7 | Integrate device argmax into decode loop | done | f4c4996 | nano-device-token-select (integration) |
+| 8 | Linear fastpath strict mode | done | — | nano-linear-fastpath (strict gate) |
 | 9 | Cached-head and profiler-ready benchmark modes | pending | — | nano-hotpath-measure |
 | 10 | Wire all counters into benchmark JSON artifact | pending | — | nano-hotpath-measure (integration) |

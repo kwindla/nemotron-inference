@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -54,6 +55,7 @@ struct BenchmarkOptions {
   std::size_t decode_token_count = kDefaultDecodeTokenCount;
   std::size_t warmup_iterations = 1;
   std::size_t hot_iterations = 3;
+  bool strict_linear = false;
 };
 
 struct EnvironmentInfo {
@@ -100,6 +102,11 @@ struct BenchmarkResult {
   std::vector<std::int32_t> generated_token_ids;
 };
 
+struct LinearFallbackObservation {
+  const char* counter_name = "";
+  std::uint64_t count = 0;
+};
+
 bool CheckCuda(cudaError_t status, const char* message) {
   if (status == cudaSuccess) {
     return true;
@@ -124,6 +131,41 @@ bool EnvEnabledOrDefault(const char* env_var, bool default_enabled) {
 
 const char* EnabledStatus(bool enabled) {
   return enabled ? "enabled" : "disabled";
+}
+
+std::vector<LinearFallbackObservation> CollectLinearReferenceFallbacks() {
+  const auto& counters = nemotron::GetLinearOpCounters();
+  std::vector<LinearFallbackObservation> fallbacks;
+  fallbacks.reserve(3);
+
+  const auto append_if_nonzero = [&fallbacks](const char* counter_name, const auto& counter) {
+    const std::uint64_t count = counter.load(std::memory_order_relaxed);
+    if (count != 0) {
+      fallbacks.push_back({counter_name, count});
+    }
+  };
+
+  append_if_nonzero("dense_reference_fallback", counters.dense_reference_fallback);
+  append_if_nonzero("nvfp4_reference_fallback", counters.nvfp4_reference_fallback);
+  append_if_nonzero(
+      "scaled_fp8_reference_fallback",
+      counters.scaled_fp8_reference_fallback);
+  return fallbacks;
+}
+
+void PrintUnexpectedLinearFallbacks(
+    std::ostream& stream,
+    const std::vector<LinearFallbackObservation>& fallbacks) {
+  if (fallbacks.empty()) {
+    return;
+  }
+
+  stream << "nano_fused_decode_bench: unexpected linear reference fallbacks while "
+         << "NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1\n";
+  for (const LinearFallbackObservation& fallback : fallbacks) {
+    stream << "nano_fused_decode_bench: operator=" << fallback.counter_name
+           << " reference_fallback_count=" << fallback.count << "\n";
+  }
 }
 
 struct DeviceTokenBuffer {
@@ -382,6 +424,7 @@ void PrintUsage(const char* argv0) {
       << "Usage: " << argv0 << " [options]\n"
       << "  --manifest <path>           Manifest path. Defaults to NEMOTRON_FORWARD_MANIFEST.\n"
       << "  --mode <phased|steady-state> Benchmark mode. Default: phased\n"
+      << "  --strict-linear            Fail if linear fastpath was requested but reference fallbacks occurred.\n"
       << "  --warmup <count>            Warmup iterations. Default: 1\n"
       << "  --iterations <count>        Timed hot iterations. Default: 3\n"
       << "  --decode-tokens <count>     Timed ContinueSingleToken steps for --mode=steady-state. Default: 16\n"
@@ -408,6 +451,8 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
       if (i + 1 >= argc || !ParseBenchmarkMode(argv[++i], &options->mode)) {
         return false;
       }
+    } else if (arg == "--strict-linear") {
+      options->strict_linear = true;
     } else if (arg == "--warmup") {
       if (i + 1 >= argc) {
         return false;
@@ -1104,6 +1149,16 @@ int main(int argc, char** argv) {
   if (options.json_output_path.has_value() &&
       !WriteJson(*options.json_output_path, *environment_info, result, prompt_token_ids)) {
     return 1;
+  }
+
+  if (options.strict_linear && result.linear_device_fastpath_enabled) {
+    const std::vector<LinearFallbackObservation> fallbacks =
+        CollectLinearReferenceFallbacks();
+    if (!fallbacks.empty()) {
+      PrintUnexpectedLinearFallbacks(std::cerr, fallbacks);
+      std::cerr.flush();
+      return 1;
+    }
   }
   return 0;
 }
