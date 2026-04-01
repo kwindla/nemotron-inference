@@ -1074,7 +1074,8 @@ bool GatherExpertSelectionLookupsDualCheckedInPlace(
     DeviceBuffer<const void*>& selected_down_matmul_scale_ptrs,
     DeviceBuffer<float>& selected_down_tensor_scales,
     DeviceBuffer<std::uint32_t>& missing_count,
-    DeviceBuffer<std::int32_t>& missing_indices) {
+    DeviceBuffer<std::int32_t>& missing_indices,
+    cudaStream_t stream) {
   if (selected_indices_device == nullptr ||
       selection_count == 0 || lookup_count == 0 ||
       !up_packed_lookup.valid() || !up_matmul_scale_lookup.valid() ||
@@ -1091,12 +1092,12 @@ bool GatherExpertSelectionLookupsDualCheckedInPlace(
       !missing_indices.valid() || missing_indices.count() < selection_count) {
     return false;
   }
-  if (!missing_count.FillZero()) {
+  if (!missing_count.FillZeroAsync(stream)) {
     return false;
   }
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((selection_count + block.x - 1) / block.x));
-  GatherExpertSelectionLookupsDualCheckedKernel<<<grid, block>>>(
+  GatherExpertSelectionLookupsDualCheckedKernel<<<grid, block, 0, stream>>>(
       selected_indices_device,
       selection_count,
       lookup_count,
@@ -1294,7 +1295,8 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
     const float* row_scales_device,
     DeviceBuffer<std::uint8_t>& packed,
     DeviceBuffer<std::uint8_t>& block_scales,
-    DeviceBuffer<float>& tensor_scales) {
+    DeviceBuffer<float>& tensor_scales,
+    cudaStream_t stream) {
   if (!input_rows.valid() ||
       input_rows.shape().size() != 2 ||
       row_scales_device == nullptr) {
@@ -1317,7 +1319,7 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
   }
 
   FusedRelu2PackRowsToNvfp4Kernel<<<static_cast<unsigned int>(rows), kThreadsPerBlock,
-                                    sizeof(float) * kThreadsPerBlock>>>(
+                                    sizeof(float) * kThreadsPerBlock, stream>>>(
       input_rows.data(),
       row_scales_device,
       rows,
@@ -1364,7 +1366,8 @@ bool FusedRoutedUpProjPackedNvfp4SingleToken(
     const DeviceBuffer<const void*>& weight_packed_ptrs,
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
-    DeviceTensorFp32* output_rows) {
+    DeviceTensorFp32* output_rows,
+    cudaStream_t stream) {
   if (activation_packed == nullptr ||
       activation_block_scales == nullptr ||
       activation_tensor_scale == nullptr ||
@@ -1388,7 +1391,7 @@ bool FusedRoutedUpProjPackedNvfp4SingleToken(
       static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x),
       static_cast<unsigned int>(weight_packed_ptrs.count()));
   const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
-  FusedRoutedUpProjPackedNvfp4SingleTokenKernel<<<grid, block, shared_bytes>>>(
+  FusedRoutedUpProjPackedNvfp4SingleTokenKernel<<<grid, block, shared_bytes, stream>>>(
       activation_packed,
       activation_block_scales,
       activation_tensor_scale,
@@ -1410,7 +1413,8 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
     const DeviceBuffer<const void*>& weight_packed_ptrs,
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
-    DeviceTensorFp32* output_row) {
+    DeviceTensorFp32* output_row,
+    cudaStream_t stream) {
   if (activation_rows_packed == nullptr ||
       activation_rows_block_scales == nullptr ||
       selection_weights_device == nullptr ||
@@ -1433,7 +1437,7 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
   const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
-  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<<<grid, block, shared_bytes>>>(
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<<<grid, block, shared_bytes, stream>>>(
       activation_rows_packed,
       activation_rows_block_scales,
       activation_row_tensor_scales.data(),

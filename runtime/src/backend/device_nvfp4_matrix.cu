@@ -539,7 +539,8 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
     std::uint8_t* block_scales_data,
     std::uint8_t* matmul_block_scales_data,
     float* tensor_scale_data,
-    unsigned int* global_max_bits_scratch) {
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream) {
   if (!source.valid() || source.shape().size() != 2 ||
       packed_data == nullptr || block_scales_data == nullptr ||
       matmul_block_scales_data == nullptr || tensor_scale_data == nullptr) {
@@ -566,7 +567,7 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
     constexpr std::size_t kFusedThreads = 256;
     const float fixed_scale = fixed_tensor_scale.has_value() ? *fixed_tensor_scale : -1.0f;
     FusedPackSingleRowFp32ToNvfp4Kernel<<<1, kFusedThreads,
-                                          kFusedThreads * sizeof(float)>>>(
+                                          kFusedThreads * sizeof(float), stream>>>(
         source.data(),
         cols,
         fixed_scale,
@@ -580,7 +581,7 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
   }
 
   if (fixed_tensor_scale.has_value()) {
-    WriteFixedTensorScaleKernel<<<1, 1>>>(tensor_scale_data, *fixed_tensor_scale);
+    WriteFixedTensorScaleKernel<<<1, 1, 0, stream>>>(tensor_scale_data, *fixed_tensor_scale);
     if (!CheckCuda(cudaGetLastError())) {
       return false;
     }
@@ -588,14 +589,15 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
     if (global_max_bits_scratch == nullptr) {
       return false;
     }
-    if (!CheckCuda(cudaMemsetAsync(global_max_bits_scratch, 0, sizeof(unsigned int)))) {
+    if (!CheckCuda(cudaMemsetAsync(global_max_bits_scratch, 0, sizeof(unsigned int), stream))) {
       return false;
     }
 
     const std::size_t numel = rows * cols;
     constexpr std::size_t kThreadsPerBlock = 128;
     const std::size_t reduction_grid_size = (numel + kThreadsPerBlock - 1u) / kThreadsPerBlock;
-    ComputeGlobalMaxAbsKernel<<<static_cast<unsigned int>(reduction_grid_size), kThreadsPerBlock>>>(
+    ComputeGlobalMaxAbsKernel<<<static_cast<unsigned int>(reduction_grid_size),
+                                kThreadsPerBlock, 0, stream>>>(
         source.data(),
         numel,
         global_max_bits_scratch);
@@ -603,7 +605,7 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
       return false;
     }
 
-    WriteTensorScaleKernel<<<1, 1>>>(
+    WriteTensorScaleKernel<<<1, 1, 0, stream>>>(
         global_max_bits_scratch,
         tensor_scale_data);
     if (!CheckCuda(cudaGetLastError())) {
@@ -614,7 +616,8 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
   constexpr std::size_t kThreadsPerBlock = 128;
   const std::size_t total_blocks = rows * (cols / kBlockWidth);
   const std::size_t grid_size = (total_blocks + kThreadsPerBlock - 1u) / kThreadsPerBlock;
-  PackRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+  PackRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size),
+                                  kThreadsPerBlock, 0, stream>>>(
       source.data(),
       rows,
       cols,
@@ -629,10 +632,12 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
   if (!layout.has_value()) {
     return false;
   }
-  if (!CheckCuda(cudaMemsetAsync(matmul_block_scales_data, 0, MatmulScaleBytes(rows, cols)))) {
+  if (!CheckCuda(cudaMemsetAsync(
+          matmul_block_scales_data, 0, MatmulScaleBytes(rows, cols), stream))) {
     return false;
   }
-  SwizzleBlockScalesForMatmulKernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+  SwizzleBlockScalesForMatmulKernel<<<static_cast<unsigned int>(grid_size),
+                                      kThreadsPerBlock, 0, stream>>>(
       block_scales_data,
       rows,
       layout->logical_blocks_per_row,

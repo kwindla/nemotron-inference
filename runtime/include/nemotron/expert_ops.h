@@ -101,7 +101,8 @@ bool GatherExpertSelectionLookupsDualCheckedInPlace(
     DeviceBuffer<const void*>& selected_down_matmul_scale_ptrs,
     DeviceBuffer<float>& selected_down_tensor_scales,
     DeviceBuffer<std::uint32_t>& missing_count,
-    DeviceBuffer<std::int32_t>& missing_indices);
+    DeviceBuffer<std::int32_t>& missing_indices,
+    cudaStream_t stream = nullptr);
 
 bool FillDevicePointerArray(
     const void* value,
@@ -147,7 +148,8 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
     const float* row_scales_device,
     DeviceBuffer<std::uint8_t>& packed,
     DeviceBuffer<std::uint8_t>& block_scales,
-    DeviceBuffer<float>& tensor_scales);
+    DeviceBuffer<float>& tensor_scales,
+    cudaStream_t stream = nullptr);
 
 bool WeightedSumRowsFp32(
     const DeviceTensorFp32& input_rows,
@@ -162,7 +164,8 @@ bool FusedRoutedUpProjPackedNvfp4SingleToken(
     const DeviceBuffer<const void*>& weight_packed_ptrs,
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
-    DeviceTensorFp32* output_rows);
+    DeviceTensorFp32* output_rows,
+    cudaStream_t stream = nullptr);
 
 bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
     const std::uint8_t* activation_rows_packed,
@@ -173,7 +176,8 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
     const DeviceBuffer<const void*>& weight_packed_ptrs,
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
-    DeviceTensorFp32* output_row);
+    DeviceTensorFp32* output_row,
+    cudaStream_t stream = nullptr);
 
 // Fill a device array with the same pointer value. Used to build CUTLASS A pointer arrays
 // where all groups share the same activation buffer.

@@ -5,6 +5,8 @@
 #include <memory>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/device_tensor.h"
 #include "nemotron/nvfp4_packing.h"
 
@@ -60,6 +62,7 @@ bool PackDeviceRowMajorFp32ToNvfp4InPlace(
     std::uint8_t* block_scales_data,
     std::uint8_t* matmul_block_scales_data,
     float* tensor_scale_data,
-    unsigned int* global_max_bits_scratch);
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream = nullptr);
 
 }  // namespace nemotron
