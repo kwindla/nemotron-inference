@@ -1829,6 +1829,125 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       entry.grouped_lookup_ready = true;
     }
   }
+  // Eagerly populate lookup tables from cache-loaded expert ops.
+  // When loaded from model cache, experts already have valid up_proj/down_proj
+  // with DeviceNvfp4Weight. Populate the device lookup tables directly so the
+  // fast path works from the first token without lazy materialization.
+  if (impl->grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
+    std::size_t populated_count = 0;
+    for (std::size_t expert_index = 0; expert_index < impl->routed_experts.size(); ++expert_index) {
+      auto& entry = impl->routed_experts[expert_index];
+      if (entry.grouped_lookup_ready) {
+        ++populated_count;
+        continue;
+      }
+      if (entry.up_proj == nullptr || entry.down_proj == nullptr ||
+          entry.up_proj->kernel_family() != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
+          entry.down_proj->kernel_family() != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
+          entry.up_proj->nvfp4_weight() == nullptr ||
+          entry.down_proj->nvfp4_weight() == nullptr ||
+          !entry.up_tensor_scale.has_value() ||
+          !entry.down_tensor_scale.has_value()) {
+        continue;
+      }
+      const void* up_packed = entry.up_proj->nvfp4_weight()->packed_data();
+      const void* up_raw_scales = entry.up_proj->nvfp4_weight()->block_scales_data();
+      const float up_tensor_scale = *entry.up_tensor_scale;
+      const void* down_packed = entry.down_proj->nvfp4_weight()->packed_data();
+      const void* down_raw_scales = entry.down_proj->nvfp4_weight()->block_scales_data();
+      const float down_tensor_scale = *entry.down_tensor_scale;
+      if (up_packed == nullptr || up_raw_scales == nullptr ||
+          down_packed == nullptr || down_raw_scales == nullptr) {
+        continue;
+      }
+      const bool copied =
+          cudaMemcpy(
+              impl->routed_up_packed_lookup_device.data() + expert_index,
+              &up_packed, sizeof(up_packed), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_up_raw_scale_lookup_device.data() + expert_index,
+              &up_raw_scales, sizeof(up_raw_scales), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_up_tensor_scale_lookup_device.data() + expert_index,
+              &up_tensor_scale, sizeof(up_tensor_scale), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_down_packed_lookup_device.data() + expert_index,
+              &down_packed, sizeof(down_packed), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_down_raw_scale_lookup_device.data() + expert_index,
+              &down_raw_scales, sizeof(down_raw_scales), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_down_tensor_scale_lookup_device.data() + expert_index,
+              &down_tensor_scale, sizeof(down_tensor_scale), cudaMemcpyHostToDevice) == cudaSuccess;
+      if (!copied) {
+        break;
+      }
+      entry.grouped_lookup_ready = true;
+      ++populated_count;
+    }
+    if (populated_count == impl->routed_experts.size()) {
+      impl->routed_lookups_materialized_count.store(populated_count, std::memory_order_relaxed);
+      impl->all_routed_lookups_ready = true;
+    }
+  }
+  // Pre-allocate scratch buffers for try_grouped_routed_single_token.
+  // (Mirrors the allocation in Create(); must also be done here in
+  // CreatePrepared so the model-cache path has usable scratch buffers.)
+  {
+    constexpr std::size_t kNvfp4BlockWidth = 16;
+    constexpr std::size_t kScaleRowTile = 128;
+    constexpr std::size_t kScaleBlockTile = 4;
+    constexpr std::size_t kCutlassAlign = 256;
+    const auto round_up = [](std::size_t value, std::size_t alignment) -> std::size_t {
+      return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
+    };
+
+    const std::size_t top_k = config.top_k;
+    const std::size_t latent = config.moe_latent_size;
+    const std::size_t intermediate = config.routed_expert_intermediate_size;
+
+    impl->scratch_up_packed_ptrs.Resize(top_k);
+    impl->scratch_up_raw_scale_ptrs.Resize(top_k);
+    impl->scratch_down_packed_ptrs.Resize(top_k);
+    impl->scratch_down_raw_scale_ptrs.Resize(top_k);
+    impl->scratch_missing_count.Resize(1);
+    impl->scratch_missing_indices.Resize(top_k);
+    impl->scratch_selected_up_tensor_scales.Resize(top_k);
+    impl->scratch_selected_down_tensor_scales.Resize(top_k);
+
+    impl->scratch_latent_packed_data.Resize((1 * latent + 1u) / 2u);
+    impl->scratch_latent_block_scales.Resize(latent / kNvfp4BlockWidth);
+    impl->scratch_latent_matmul_scales.Resize(
+        round_up(1, kScaleRowTile) * round_up(latent / kNvfp4BlockWidth, kScaleBlockTile));
+    impl->scratch_latent_tensor_scale.Resize(sizeof(float));
+    impl->scratch_global_max_bits.Resize(1);
+
+    impl->scratch_down_act_packed.Resize((top_k * intermediate + 1u) / 2u);
+    impl->scratch_down_act_block_scales.Resize(top_k * (intermediate / kNvfp4BlockWidth));
+    impl->scratch_down_act_tensor_scales.Resize(top_k);
+
+    if (impl->scratch_row_scales.Resize(top_k)) {
+      std::vector<float> ones(top_k, 1.0f);
+      impl->scratch_row_scales.CopyFromHost(ones);
+    }
+
+    const std::size_t act_packed_row_bytes = intermediate / 2;
+    const std::size_t act_scale_row_bytes = intermediate / kNvfp4BlockWidth;
+    const std::size_t aligned_packed_row = round_up(act_packed_row_bytes, kCutlassAlign);
+    const std::size_t aligned_scale_row = round_up(act_scale_row_bytes, kCutlassAlign);
+    impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
+    impl->scratch_aligned_act_scales.Resize(top_k * aligned_scale_row);
+
+    impl->moe_graph_enabled = std::getenv("NEMOTRON_CUDA_GRAPH_MOE") != nullptr;
+    if (impl->moe_graph_enabled) {
+      impl->scratch_graph_indices.Resize(top_k);
+      impl->scratch_graph_weights.Resize(top_k);
+      impl->scratch_graph_latent_in.Resize(latent);
+      impl->scratch_graph_output.Resize(latent);
+      impl->scratch_graph_grouped_up.Resize(top_k * intermediate);
+    }
+  }
+
   std::string strict_failure_reason;
   if (!ConfigureRoutedMoEBackend(
           impl.get(),
