@@ -2509,7 +2509,8 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
-    if (!GatherExpertSelectionLookupsCheckedInPlace(
+    // Merged up+down gather: one kernel launch gathers all 6 output arrays.
+    if (!GatherExpertSelectionLookupsDualCheckedInPlace(
             selected_indices_device,
             batch_count,
             impl.routed_experts.size(),
@@ -2519,6 +2520,12 @@ bool RunExpertLayerImpl(
             impl.scratch_up_packed_ptrs,
             impl.scratch_up_raw_scale_ptrs,
             impl.scratch_selected_up_tensor_scales,
+            impl.routed_down_packed_lookup_device,
+            impl.routed_down_raw_scale_lookup_device,
+            impl.routed_down_tensor_scale_lookup_device,
+            impl.scratch_down_packed_ptrs,
+            impl.scratch_down_raw_scale_ptrs,
+            impl.scratch_selected_down_tensor_scales,
             impl.scratch_missing_count,
             impl.scratch_missing_indices)) {
       RecordGroupedRoutedExpertFastpathFallback();
@@ -2536,7 +2543,7 @@ bool RunExpertLayerImpl(
     }
     if (missing_lookup_count != 0) {
       if ((!maybe_prefetch_routed_lookups(token_index) && routed_prefetch_topn != 0) ||
-          !GatherExpertSelectionLookupsCheckedInPlace(
+          !GatherExpertSelectionLookupsDualCheckedInPlace(
               selected_indices_device,
               batch_count,
               impl.routed_experts.size(),
@@ -2546,6 +2553,12 @@ bool RunExpertLayerImpl(
               impl.scratch_up_packed_ptrs,
               impl.scratch_up_raw_scale_ptrs,
               impl.scratch_selected_up_tensor_scales,
+              impl.routed_down_packed_lookup_device,
+              impl.routed_down_raw_scale_lookup_device,
+              impl.routed_down_tensor_scale_lookup_device,
+              impl.scratch_down_packed_ptrs,
+              impl.scratch_down_raw_scale_ptrs,
+              impl.scratch_selected_down_tensor_scales,
               impl.scratch_missing_count,
               impl.scratch_missing_indices) ||
           !repair_missing_routed_lookups(
@@ -2674,59 +2687,7 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
-    if (!GatherExpertSelectionLookupsCheckedInPlace(
-            selected_indices_device,
-            batch_count,
-            impl.routed_experts.size(),
-            impl.routed_down_packed_lookup_device,
-            impl.routed_down_raw_scale_lookup_device,
-            impl.routed_down_tensor_scale_lookup_device,
-            impl.scratch_down_packed_ptrs,
-            impl.scratch_down_raw_scale_ptrs,
-            impl.scratch_selected_down_tensor_scales,
-            impl.scratch_missing_count,
-            impl.scratch_missing_indices)) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertPackFallback();
-      return GroupedRoutedResult::kFallback;
-    }
-    if (!repair_missing_routed_lookups(
-            impl.scratch_missing_count,
-            impl.scratch_missing_indices,
-            &missing_lookup_count)) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertLookupFallback();
-      return GroupedRoutedResult::kFallback;
-    }
-    if (missing_lookup_count != 0) {
-      if ((!maybe_prefetch_routed_lookups(token_index) && routed_prefetch_topn != 0) ||
-          !GatherExpertSelectionLookupsCheckedInPlace(
-              selected_indices_device,
-              batch_count,
-              impl.routed_experts.size(),
-              impl.routed_down_packed_lookup_device,
-              impl.routed_down_raw_scale_lookup_device,
-              impl.routed_down_tensor_scale_lookup_device,
-              impl.scratch_down_packed_ptrs,
-              impl.scratch_down_raw_scale_ptrs,
-              impl.scratch_selected_down_tensor_scales,
-              impl.scratch_missing_count,
-              impl.scratch_missing_indices) ||
-          !repair_missing_routed_lookups(
-              impl.scratch_missing_count,
-              impl.scratch_missing_indices,
-              &missing_lookup_count) ||
-          missing_lookup_count != 0) {
-        if (debug) {
-          std::cerr << "expert_layer: layer " << impl.config.layer_index
-                    << " routed fastpath missing " << missing_lookup_count
-                    << " down lookup entries after lazy materialization\n";
-        }
-        RecordGroupedRoutedExpertFastpathFallback();
-        RecordGroupedRoutedExpertLookupFallback();
-        return GroupedRoutedResult::kFallback;
-      }
-    }
+    // Down lookups already gathered in the merged dual gather above.
     // CUTLASS down_proj: fully device-resident dispatch.
     bool cutlass_down_ok = false;
     if (impl.cutlass_down_plan != nullptr && impl.cutlass_down_plan->valid() &&

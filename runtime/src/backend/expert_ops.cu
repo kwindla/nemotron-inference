@@ -552,6 +552,69 @@ __global__ void GatherExpertSelectionLookupsCheckedKernel(
   }
 }
 
+// Merged up+down gather in a single kernel launch. Both use the same
+// selected_indices but index different lookup tables.
+__global__ void GatherExpertSelectionLookupsDualCheckedKernel(
+    const std::int32_t* selected_indices,
+    std::size_t selection_count,
+    std::size_t lookup_count,
+    const void* const* up_packed_lookup,
+    const void* const* up_matmul_scale_lookup,
+    const float* up_tensor_scale_lookup,
+    const void** selected_up_packed,
+    const void** selected_up_matmul_scales,
+    float* selected_up_tensor_scales,
+    const void* const* down_packed_lookup,
+    const void* const* down_matmul_scale_lookup,
+    const float* down_tensor_scale_lookup,
+    const void** selected_down_packed,
+    const void** selected_down_matmul_scales,
+    float* selected_down_tensor_scales,
+    std::uint32_t* missing_count,
+    std::int32_t* missing_indices) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (index >= selection_count) {
+    return;
+  }
+  const std::int32_t expert_index = selected_indices[index];
+  if (expert_index < 0 || static_cast<std::size_t>(expert_index) >= lookup_count) {
+    selected_up_packed[index] = nullptr;
+    selected_up_matmul_scales[index] = nullptr;
+    selected_up_tensor_scales[index] = 0.0f;
+    selected_down_packed[index] = nullptr;
+    selected_down_matmul_scales[index] = nullptr;
+    selected_down_tensor_scales[index] = 0.0f;
+    const std::uint32_t missing_index = atomicAdd(missing_count, 1u);
+    if (missing_indices != nullptr) {
+      missing_indices[missing_index] = expert_index;
+    }
+    return;
+  }
+
+  const std::size_t li = static_cast<std::size_t>(expert_index);
+  const void* up_p = up_packed_lookup[li];
+  const void* up_ms = up_matmul_scale_lookup[li];
+  const float up_ts = up_tensor_scale_lookup[li];
+  selected_up_packed[index] = up_p;
+  selected_up_matmul_scales[index] = up_ms;
+  selected_up_tensor_scales[index] = up_ts;
+
+  const void* down_p = down_packed_lookup[li];
+  const void* down_ms = down_matmul_scale_lookup[li];
+  const float down_ts = down_tensor_scale_lookup[li];
+  selected_down_packed[index] = down_p;
+  selected_down_matmul_scales[index] = down_ms;
+  selected_down_tensor_scales[index] = down_ts;
+
+  if (up_p == nullptr || up_ms == nullptr || up_ts == 0.0f ||
+      down_p == nullptr || down_ms == nullptr || down_ts == 0.0f) {
+    const std::uint32_t missing_index = atomicAdd(missing_count, 1u);
+    if (missing_indices != nullptr) {
+      missing_indices[missing_index] = expert_index;
+    }
+  }
+}
+
 __global__ void FillPointerArrayKernel(
     const void* value,
     std::size_t count,
@@ -989,6 +1052,66 @@ bool GatherExpertSelectionLookupsCheckedInPlace(
       selected_packed_ptrs.data(),
       selected_matmul_scale_ptrs.data(),
       selected_tensor_scales.data(),
+      missing_count.data(),
+      missing_indices.data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool GatherExpertSelectionLookupsDualCheckedInPlace(
+    const std::int32_t* selected_indices_device,
+    std::size_t selection_count,
+    std::size_t lookup_count,
+    const DeviceBuffer<const void*>& up_packed_lookup,
+    const DeviceBuffer<const void*>& up_matmul_scale_lookup,
+    const DeviceBuffer<float>& up_tensor_scale_lookup,
+    DeviceBuffer<const void*>& selected_up_packed_ptrs,
+    DeviceBuffer<const void*>& selected_up_matmul_scale_ptrs,
+    DeviceBuffer<float>& selected_up_tensor_scales,
+    const DeviceBuffer<const void*>& down_packed_lookup,
+    const DeviceBuffer<const void*>& down_matmul_scale_lookup,
+    const DeviceBuffer<float>& down_tensor_scale_lookup,
+    DeviceBuffer<const void*>& selected_down_packed_ptrs,
+    DeviceBuffer<const void*>& selected_down_matmul_scale_ptrs,
+    DeviceBuffer<float>& selected_down_tensor_scales,
+    DeviceBuffer<std::uint32_t>& missing_count,
+    DeviceBuffer<std::int32_t>& missing_indices) {
+  if (selected_indices_device == nullptr ||
+      selection_count == 0 || lookup_count == 0 ||
+      !up_packed_lookup.valid() || !up_matmul_scale_lookup.valid() ||
+      !up_tensor_scale_lookup.valid() ||
+      !selected_up_packed_ptrs.valid() || selected_up_packed_ptrs.count() < selection_count ||
+      !selected_up_matmul_scale_ptrs.valid() || selected_up_matmul_scale_ptrs.count() < selection_count ||
+      !selected_up_tensor_scales.valid() || selected_up_tensor_scales.count() < selection_count ||
+      !down_packed_lookup.valid() || !down_matmul_scale_lookup.valid() ||
+      !down_tensor_scale_lookup.valid() ||
+      !selected_down_packed_ptrs.valid() || selected_down_packed_ptrs.count() < selection_count ||
+      !selected_down_matmul_scale_ptrs.valid() || selected_down_matmul_scale_ptrs.count() < selection_count ||
+      !selected_down_tensor_scales.valid() || selected_down_tensor_scales.count() < selection_count ||
+      !missing_count.valid() || missing_count.count() < 1 ||
+      !missing_indices.valid() || missing_indices.count() < selection_count) {
+    return false;
+  }
+  if (!missing_count.FillZero()) {
+    return false;
+  }
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((selection_count + block.x - 1) / block.x));
+  GatherExpertSelectionLookupsDualCheckedKernel<<<grid, block>>>(
+      selected_indices_device,
+      selection_count,
+      lookup_count,
+      up_packed_lookup.data(),
+      up_matmul_scale_lookup.data(),
+      up_tensor_scale_lookup.data(),
+      selected_up_packed_ptrs.data(),
+      selected_up_matmul_scale_ptrs.data(),
+      selected_up_tensor_scales.data(),
+      down_packed_lookup.data(),
+      down_matmul_scale_lookup.data(),
+      down_tensor_scale_lookup.data(),
+      selected_down_packed_ptrs.data(),
+      selected_down_matmul_scale_ptrs.data(),
+      selected_down_tensor_scales.data(),
       missing_count.data(),
       missing_indices.data());
   return CheckCuda(cudaGetLastError());
