@@ -1,4 +1,5 @@
 #include "nemotron/device_tensor.h"
+#include "nemotron/expert_staging_counters.h"
 #include "nemotron/linear_op_counters.h"
 #include "nemotron/manifest.h"
 #include "nemotron/runtime_environment.h"
@@ -236,6 +237,74 @@ void PrintUnexpectedLinearFallbackWarning(
            << " reference_fallback_count=" << fallback.count << "\n";
   }
 }
+
+struct ExpertStagingSnapshot {
+  std::uint64_t total_bytes_uploaded = 0;
+  std::uint64_t total_experts_staged = 0;
+  std::uint64_t total_staging_calls = 0;
+  std::uint64_t staging_elapsed_us = 0;
+};
+
+ExpertStagingSnapshot SnapshotExpertStagingCounters() {
+  const auto& counters = nemotron::GetExpertStagingCounters();
+  ExpertStagingSnapshot snapshot;
+  snapshot.total_bytes_uploaded =
+      counters.total_bytes_uploaded.load(std::memory_order_relaxed);
+  snapshot.total_experts_staged =
+      counters.total_experts_staged.load(std::memory_order_relaxed);
+  snapshot.total_staging_calls =
+      counters.total_staging_calls.load(std::memory_order_relaxed);
+  snapshot.staging_elapsed_us =
+      counters.staging_elapsed_us.load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+void PrintUnexpectedExpertStagingWarning(
+    std::ostream& stream,
+    const ExpertStagingSnapshot& snapshot) {
+  if (snapshot.total_bytes_uploaded == 0) {
+    return;
+  }
+
+  stream
+      << "WARNING: nano_16_token_correctness_test: unexpected expert staging cost while "
+      << "NEMOTRON_NANO_16_STRICT_EXPERT_STAGING=1"
+      << " total_bytes_uploaded=" << snapshot.total_bytes_uploaded
+      << " total_experts_staged=" << snapshot.total_experts_staged
+      << " staging_elapsed_us=" << snapshot.staging_elapsed_us << "\n";
+}
+
+class ScopedExpertStagingCounterReport {
+ public:
+  explicit ScopedExpertStagingCounterReport(bool strict_expert_staging_enabled)
+      : strict_expert_staging_enabled_(strict_expert_staging_enabled) {
+    nemotron::ResetExpertStagingCounters();
+  }
+
+  ~ScopedExpertStagingCounterReport() {
+    nemotron::PrintExpertStagingCounterSummary(std::cout);
+    std::cout.flush();
+
+    if (!strict_expert_staging_enabled_) {
+      return;
+    }
+
+    const ExpertStagingSnapshot snapshot = SnapshotExpertStagingCounters();
+    if (snapshot.total_bytes_uploaded == 0) {
+      return;
+    }
+
+    PrintUnexpectedExpertStagingWarning(std::cerr, snapshot);
+    std::cerr.flush();
+  }
+
+  ScopedExpertStagingCounterReport(const ScopedExpertStagingCounterReport&) = delete;
+  ScopedExpertStagingCounterReport& operator=(const ScopedExpertStagingCounterReport&) =
+      delete;
+
+ private:
+  bool strict_expert_staging_enabled_ = false;
+};
 
 class ScopedLinearCounterReport {
  public:
@@ -1366,10 +1435,14 @@ bool run_nano_correctness_gate() {
 
   const bool strict_linear_enabled =
       EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_LINEAR", false);
+  const bool strict_expert_staging_enabled =
+      EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_EXPERT_STAGING", false);
   const bool linear_device_fastpath_enabled =
       EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
   const bool capture_embedding_trace =
       EnvEnabledOrDefault("NEMOTRON_NANO_16_TRACE_EMBEDDING", false);
+  ScopedExpertStagingCounterReport expert_staging_counter_report(
+      strict_expert_staging_enabled);
   ScopedLinearCounterReport linear_counter_report(
       strict_linear_enabled,
       linear_device_fastpath_enabled);
