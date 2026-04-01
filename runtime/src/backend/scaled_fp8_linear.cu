@@ -218,6 +218,7 @@ struct ScaledFp8LinearOp::Impl {
   mutable std::mutex rows1_dequantized_plan_mutex;
   mutable bool rows1_dequantized_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_dequantized_plan;
+  mutable std::unique_ptr<DeviceTensorFp32> quantized_scratch_;
 };
 
 std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
@@ -452,14 +453,18 @@ bool ScaledFp8LinearOp::Run(
     }
   }
 
-  auto quantized_activations = DeviceTensorFp32::Create(activations.shape());
-  if (!quantized_activations || !quantized_activations->valid()) {
+  if (!impl_->quantized_scratch_ ||
+      impl_->quantized_scratch_->shape() != activations.shape()) {
+    impl_->quantized_scratch_ = DeviceTensorFp32::Create(activations.shape());
+  }
+  DeviceTensorFp32* const quantized_activations = impl_->quantized_scratch_.get();
+  if (quantized_activations == nullptr || !quantized_activations->valid()) {
     return false;
   }
   if (!QuantizeFp32ToScaledFp8RoundTrip(
           activations,
           impl_->config.input_scale,
-          quantized_activations.get())) {
+          quantized_activations)) {
     std::cerr << "scaled_fp8_linear: failed to quantize activations on device\n";
     return false;
   }
