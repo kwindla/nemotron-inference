@@ -246,6 +246,7 @@ bool AttentionLayerSlice::Run(
   std::unique_ptr<DeviceTensorFp32> attn_output_fp32_local;
   std::unique_ptr<DeviceTensorFp32> projected_local;
   std::unique_ptr<DeviceTensorBf16> query_bf16_local;
+  std::unique_ptr<DeviceTensorFp8E4M3> query_fp8_local;
   std::unique_ptr<DeviceTensorBf16> output_bf16_local;
 
   DeviceTensorFp32* normed = nullptr;
@@ -255,7 +256,11 @@ bool AttentionLayerSlice::Run(
   DeviceTensorFp32* attn_output_fp32 = nullptr;
   DeviceTensorFp32* projected = nullptr;
   DeviceTensorBf16* query_bf16 = nullptr;
+  DeviceTensorFp8E4M3* query_fp8 = nullptr;
   DeviceTensorBf16* output_bf16 = nullptr;
+  const bool use_fp8_kv_cache =
+      request_context.config().attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3;
+  const bool use_fp8_decode_attention = use_fp8_kv_cache && token_count == 1;
 
   if (token_count == 1 &&
       request_context.attention_normed_decode() != nullptr &&
@@ -265,6 +270,7 @@ bool AttentionLayerSlice::Run(
       request_context.attention_output_fp32_decode() != nullptr &&
       request_context.attention_projected_decode() != nullptr &&
       request_context.attention_query_bf16_decode() != nullptr &&
+      (!use_fp8_decode_attention || request_context.attention_query_fp8_decode() != nullptr) &&
       request_context.attention_output_bf16_decode() != nullptr) {
     normed = request_context.attention_normed_decode();
     q = request_context.attention_q_decode();
@@ -273,6 +279,9 @@ bool AttentionLayerSlice::Run(
     attn_output_fp32 = request_context.attention_output_fp32_decode();
     projected = request_context.attention_projected_decode();
     query_bf16 = request_context.attention_query_bf16_decode();
+    if (use_fp8_decode_attention) {
+      query_fp8 = request_context.attention_query_fp8_decode();
+    }
     output_bf16 = request_context.attention_output_bf16_decode();
   } else {
     normed_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
@@ -286,6 +295,10 @@ bool AttentionLayerSlice::Run(
     projected_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
     query_bf16_local = DeviceTensorBf16::Create(
         {1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
+    if (use_fp8_decode_attention) {
+      query_fp8_local = DeviceTensorFp8E4M3::Create(
+          {1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
+    }
     output_bf16_local = DeviceTensorBf16::Create(
         {1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
     normed = normed_local.get();
@@ -295,11 +308,14 @@ bool AttentionLayerSlice::Run(
     attn_output_fp32 = attn_output_fp32_local.get();
     projected = projected_local.get();
     query_bf16 = query_bf16_local.get();
+    query_fp8 = query_fp8_local.get();
     output_bf16 = output_bf16_local.get();
   }
   if (normed == nullptr || q == nullptr || k == nullptr || v == nullptr ||
       attn_output_fp32 == nullptr || projected == nullptr ||
-      query_bf16 == nullptr || output_bf16 == nullptr) {
+      query_bf16 == nullptr ||
+      (use_fp8_decode_attention && query_fp8 == nullptr) ||
+      output_bf16 == nullptr) {
     if (debug) {
       std::cout << "attention_layer: scratch allocation failed\n";
     }
@@ -350,13 +366,21 @@ bool AttentionLayerSlice::Run(
       layer_page_ids_device = fixed_decode_page_table;
     }
   }
-  const bool query_layout_ok = ConvertRowMajorMatrixToAttentionBf16(
+  const bool query_bf16_ok = ConvertRowMajorMatrixToAttentionBf16(
       *q,
       token_count,
       impl_->config.query_head_count,
       impl_->config.head_dim,
       query_bf16);
-  const bool scatter_kv_ok = query_layout_ok && ScatterKvRowMajorMatricesToPagedCacheBf16(
+  const bool query_fp8_ok = !use_fp8_decode_attention ||
+      ConvertRowMajorMatrixToAttentionFp8E4M3(
+          *q,
+          token_count,
+          impl_->config.query_head_count,
+          impl_->config.head_dim,
+          request_context.config().attention_kv_cache.q_scale,
+          query_fp8);
+  const bool scatter_bf16_ok = ScatterKvRowMajorMatricesToPagedCacheBf16(
       *k,
       *v,
       token_count,
@@ -368,11 +392,30 @@ bool AttentionLayerSlice::Run(
       layer_page_id_count,
       request_context.key_cache(),
       request_context.value_cache());
-  if (!query_layout_ok || !scatter_kv_ok || !output_bf16->FillZero()) {
+  const bool scatter_fp8_ok = !use_fp8_kv_cache ||
+      ScatterKvRowMajorMatricesToPagedCacheFp8E4M3(
+          *k,
+          *v,
+          token_count,
+          cache_start_token,
+          impl_->config.kv_head_count,
+          impl_->config.head_dim,
+          request_context.config().attention_kv_cache.tokens_per_page,
+          request_context.config().attention_kv_cache.k_scale,
+          request_context.config().attention_kv_cache.v_scale,
+          layer_page_ids_device->data(),
+          layer_page_id_count,
+          request_context.key_cache_fp8(),
+          request_context.value_cache_fp8());
+  if (!query_bf16_ok || !query_fp8_ok ||
+      !scatter_bf16_ok || !scatter_fp8_ok ||
+      !output_bf16->FillZero()) {
     if (debug) {
       std::cout << "attention_layer: failed to prepare device attention inputs"
-                << " query_layout_ok=" << query_layout_ok
-                << " scatter_kv_ok=" << scatter_kv_ok << "\n";
+                << " query_bf16_ok=" << query_bf16_ok
+                << " query_fp8_ok=" << query_fp8_ok
+                << " scatter_bf16_ok=" << scatter_bf16_ok
+                << " scatter_fp8_ok=" << scatter_fp8_ok << "\n";
     }
     return false;
   }
@@ -384,9 +427,22 @@ bool AttentionLayerSlice::Run(
     const CudnnPagedAttentionPlan* decode_plan = nullptr;
     {
       std::lock_guard<std::mutex> lock(impl_->decode_plan_mutex);
+      const auto decode_plan_matches_request = [&]() {
+        if (!impl_->decode_plan || !impl_->decode_plan->valid()) {
+          return false;
+        }
+        const auto& plan_cache_config = impl_->decode_plan->config().cache_config;
+        const auto& request_cache_config = request_context.config().attention_kv_cache;
+        return plan_cache_config.dtype == request_cache_config.dtype &&
+               plan_cache_config.q_scale == request_cache_config.q_scale &&
+               plan_cache_config.k_scale == request_cache_config.k_scale &&
+               plan_cache_config.v_scale == request_cache_config.v_scale &&
+               plan_cache_config.prob_scale == request_cache_config.prob_scale;
+      };
       if (!impl_->decode_plan_attempted ||
           impl_->decode_plan_max_kv_tokens != decode_max_kv_tokens ||
-          impl_->decode_plan_page_table_entries != decode_page_table_entries) {
+          impl_->decode_plan_page_table_entries != decode_page_table_entries ||
+          !decode_plan_matches_request()) {
         CudnnPagedAttentionConfig decode_config;
         decode_config.cache_config = request_context.config().attention_kv_cache;
         decode_config.batch_size = 1;
@@ -436,9 +492,10 @@ bool AttentionLayerSlice::Run(
       }
 
       const CudnnPagedAttentionExecution execution{
-          query_bf16->data(),
-          request_context.key_cache()->data(),
-          request_context.value_cache()->data(),
+          use_fp8_decode_attention ? static_cast<const void*>(query_fp8->data())
+                                   : static_cast<const void*>(query_bf16->data()),
+          request_context.key_cache_data(),
+          request_context.value_cache_data(),
           seq_len_q->data(),
           seq_len_kv->data(),
           decode_page_table_device->data(),
@@ -493,8 +550,10 @@ bool AttentionLayerSlice::Run(
           }(),
       },
   };
+  AttentionKvCacheConfig generic_cache_config = request_context.config().attention_kv_cache;
+  generic_cache_config.dtype = KvCacheDataType::kBf16;
   const auto batch_plan = BuildPagedAttentionBatchPlan(
-      request_context.config().attention_kv_cache,
+      generic_cache_config,
       impl_->config.layer_index,
       sequences,
       nullptr);
@@ -551,9 +610,9 @@ bool AttentionLayerSlice::Run(
   }
 
   const CudnnPagedAttentionExecution execution{
-      query_bf16->data(),
-      request_context.key_cache()->data(),
-      request_context.value_cache()->data(),
+      static_cast<const void*>(query_bf16->data()),
+      static_cast<const void*>(request_context.key_cache()->data()),
+      static_cast<const void*>(request_context.value_cache()->data()),
       seq_len_q->data(),
       seq_len_kv->data(),
       page_table->data(),

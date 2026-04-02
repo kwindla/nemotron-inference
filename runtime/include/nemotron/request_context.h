@@ -72,8 +72,16 @@ class RequestExecutionContext {
   const DeviceTensorFp32* mamba_projected_output_decode() const;
   DeviceTensorBf16* key_cache();
   const DeviceTensorBf16* key_cache() const;
+  DeviceTensorFp8E4M3* key_cache_fp8();
+  const DeviceTensorFp8E4M3* key_cache_fp8() const;
   DeviceTensorBf16* value_cache();
   const DeviceTensorBf16* value_cache() const;
+  DeviceTensorFp8E4M3* value_cache_fp8();
+  const DeviceTensorFp8E4M3* value_cache_fp8() const;
+  void* key_cache_data();
+  const void* key_cache_data() const;
+  void* value_cache_data();
+  const void* value_cache_data() const;
   DeviceBuffer<std::int32_t>* token_ids_device();
   const DeviceBuffer<std::int32_t>* token_ids_device() const;
 
@@ -110,6 +118,8 @@ class RequestExecutionContext {
   const DeviceTensorFp32* attention_projected_decode() const;
   DeviceTensorBf16* attention_query_bf16_decode();
   const DeviceTensorBf16* attention_query_bf16_decode() const;
+  DeviceTensorFp8E4M3* attention_query_fp8_decode();
+  const DeviceTensorFp8E4M3* attention_query_fp8_decode() const;
   DeviceTensorBf16* attention_output_bf16_decode();
   const DeviceTensorBf16* attention_output_bf16_decode() const;
 
@@ -154,11 +164,14 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorFp32> attention_output_fp32_decode,
       std::unique_ptr<DeviceTensorFp32> attention_projected_decode,
       std::unique_ptr<DeviceTensorBf16> attention_query_bf16_decode,
+      std::unique_ptr<DeviceTensorFp8E4M3> attention_query_fp8_decode,
       std::unique_ptr<DeviceTensorBf16> attention_output_bf16_decode,
       std::unique_ptr<DeviceTensorFp32> expert_intermediate_scratch,
       std::unique_ptr<DeviceTensorFp32> expert_aux_scratch,
       std::unique_ptr<DeviceTensorBf16> key_cache,
       std::unique_ptr<DeviceTensorBf16> value_cache,
+      std::unique_ptr<DeviceTensorFp8E4M3> key_cache_fp8,
+      std::unique_ptr<DeviceTensorFp8E4M3> value_cache_fp8,
       std::optional<PagedKvCacheArena> kv_arena);
 
   bool InitializeAttentionDecodeMetadata();
@@ -185,11 +198,14 @@ class RequestExecutionContext {
   std::unique_ptr<DeviceTensorFp32> attention_output_fp32_decode_;
   std::unique_ptr<DeviceTensorFp32> attention_projected_decode_;
   std::unique_ptr<DeviceTensorBf16> attention_query_bf16_decode_;
+  std::unique_ptr<DeviceTensorFp8E4M3> attention_query_fp8_decode_;
   std::unique_ptr<DeviceTensorBf16> attention_output_bf16_decode_;
   std::unique_ptr<DeviceTensorFp32> expert_intermediate_scratch_;
   std::unique_ptr<DeviceTensorFp32> expert_aux_scratch_;
   std::unique_ptr<DeviceTensorBf16> key_cache_;
   std::unique_ptr<DeviceTensorBf16> value_cache_;
+  std::unique_ptr<DeviceTensorFp8E4M3> key_cache_fp8_;
+  std::unique_ptr<DeviceTensorFp8E4M3> value_cache_fp8_;
   DeviceBuffer<std::int32_t> token_ids_device_;
   std::optional<PagedKvCacheArena> kv_arena_;
   std::vector<std::vector<KvPageHandle>> kv_pages_by_layer_;

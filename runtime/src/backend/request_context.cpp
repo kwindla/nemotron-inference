@@ -68,6 +68,7 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   std::unique_ptr<DeviceTensorFp32> attention_output_fp32_decode;
   std::unique_ptr<DeviceTensorFp32> attention_projected_decode;
   std::unique_ptr<DeviceTensorBf16> attention_query_bf16_decode;
+  std::unique_ptr<DeviceTensorFp8E4M3> attention_query_fp8_decode;
   std::unique_ptr<DeviceTensorBf16> attention_output_bf16_decode;
   std::unique_ptr<DeviceTensorFp32> expert_intermediate_scratch;
   std::unique_ptr<DeviceTensorFp32> expert_aux_scratch;
@@ -121,26 +122,32 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
 
   std::unique_ptr<DeviceTensorBf16> key_cache;
   std::unique_ptr<DeviceTensorBf16> value_cache;
+  std::unique_ptr<DeviceTensorFp8E4M3> key_cache_fp8;
+  std::unique_ptr<DeviceTensorFp8E4M3> value_cache_fp8;
   std::optional<PagedKvCacheArena> kv_arena;
   if (config.attention_kv_cache.layer_count != 0) {
     kv_arena = PagedKvCacheArena::Create(config.attention_kv_cache, config.attention_total_pages);
     if (!kv_arena.has_value()) {
       return nullptr;
     }
-    key_cache = DeviceTensorBf16::Create({
+    const std::vector<std::size_t> cache_shape = {
         config.attention_total_pages,
         config.attention_kv_cache.kv_head_count,
         config.attention_kv_cache.tokens_per_page,
         config.attention_kv_cache.head_dim,
-    });
-    value_cache = DeviceTensorBf16::Create({
-        config.attention_total_pages,
-        config.attention_kv_cache.kv_head_count,
-        config.attention_kv_cache.tokens_per_page,
-        config.attention_kv_cache.head_dim,
-    });
+    };
+    key_cache = DeviceTensorBf16::Create(cache_shape);
+    value_cache = DeviceTensorBf16::Create(cache_shape);
     if (!key_cache || !value_cache || !key_cache->FillZero() || !value_cache->FillZero()) {
       return nullptr;
+    }
+    if (config.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3) {
+      key_cache_fp8 = DeviceTensorFp8E4M3::Create(cache_shape);
+      value_cache_fp8 = DeviceTensorFp8E4M3::Create(cache_shape);
+      if (!key_cache_fp8 || !value_cache_fp8 ||
+          !key_cache_fp8->FillZero() || !value_cache_fp8->FillZero()) {
+        return nullptr;
+      }
     }
     if (config.attention_query_head_count != 0 && config.attention_head_dim != 0) {
       attention_normed_decode = DeviceTensorFp32::Create({1, config.hidden_size});
@@ -154,16 +161,25 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
       attention_projected_decode = DeviceTensorFp32::Create({1, config.hidden_size});
       attention_query_bf16_decode = DeviceTensorBf16::Create(
           {1, config.attention_query_head_count, 1, config.attention_head_dim});
+      if (config.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3) {
+        attention_query_fp8_decode = DeviceTensorFp8E4M3::Create(
+            {1, config.attention_query_head_count, 1, config.attention_head_dim});
+      }
       attention_output_bf16_decode = DeviceTensorBf16::Create(
           {1, config.attention_query_head_count, 1, config.attention_head_dim});
       if (!attention_normed_decode || !attention_q_decode || !attention_k_decode ||
           !attention_v_decode || !attention_output_fp32_decode ||
           !attention_projected_decode || !attention_query_bf16_decode ||
+          (config.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3 &&
+           (!attention_query_fp8_decode || !attention_query_fp8_decode->valid())) ||
           !attention_output_bf16_decode ||
           !attention_normed_decode->FillZero() || !attention_q_decode->FillZero() ||
           !attention_k_decode->FillZero() || !attention_v_decode->FillZero() ||
           !attention_output_fp32_decode->FillZero() || !attention_projected_decode->FillZero() ||
           !attention_query_bf16_decode->FillZero() || !attention_output_bf16_decode->FillZero()) {
+        return nullptr;
+      }
+      if (attention_query_fp8_decode && !attention_query_fp8_decode->FillZero()) {
         return nullptr;
       }
     }
@@ -190,11 +206,14 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
       std::move(attention_output_fp32_decode),
       std::move(attention_projected_decode),
       std::move(attention_query_bf16_decode),
+      std::move(attention_query_fp8_decode),
       std::move(attention_output_bf16_decode),
       std::move(expert_intermediate_scratch),
       std::move(expert_aux_scratch),
       std::move(key_cache),
       std::move(value_cache),
+      std::move(key_cache_fp8),
+      std::move(value_cache_fp8),
       std::move(kv_arena)));
   if (!context->token_ids_device_.Resize(config.max_tokens)) {
     return nullptr;
@@ -229,11 +248,14 @@ RequestExecutionContext::RequestExecutionContext(
     std::unique_ptr<DeviceTensorFp32> attention_output_fp32_decode,
     std::unique_ptr<DeviceTensorFp32> attention_projected_decode,
     std::unique_ptr<DeviceTensorBf16> attention_query_bf16_decode,
+    std::unique_ptr<DeviceTensorFp8E4M3> attention_query_fp8_decode,
     std::unique_ptr<DeviceTensorBf16> attention_output_bf16_decode,
     std::unique_ptr<DeviceTensorFp32> expert_intermediate_scratch,
     std::unique_ptr<DeviceTensorFp32> expert_aux_scratch,
     std::unique_ptr<DeviceTensorBf16> key_cache,
     std::unique_ptr<DeviceTensorBf16> value_cache,
+    std::unique_ptr<DeviceTensorFp8E4M3> key_cache_fp8,
+    std::unique_ptr<DeviceTensorFp8E4M3> value_cache_fp8,
     std::optional<PagedKvCacheArena> kv_arena)
     : config_(std::move(config)),
       hidden_(std::move(hidden)),
@@ -255,11 +277,14 @@ RequestExecutionContext::RequestExecutionContext(
       attention_output_fp32_decode_(std::move(attention_output_fp32_decode)),
       attention_projected_decode_(std::move(attention_projected_decode)),
       attention_query_bf16_decode_(std::move(attention_query_bf16_decode)),
+      attention_query_fp8_decode_(std::move(attention_query_fp8_decode)),
       attention_output_bf16_decode_(std::move(attention_output_bf16_decode)),
       expert_intermediate_scratch_(std::move(expert_intermediate_scratch)),
       expert_aux_scratch_(std::move(expert_aux_scratch)),
       key_cache_(std::move(key_cache)),
       value_cache_(std::move(value_cache)),
+      key_cache_fp8_(std::move(key_cache_fp8)),
+      value_cache_fp8_(std::move(value_cache_fp8)),
       kv_arena_(std::move(kv_arena)),
       kv_pages_by_layer_(config_.attention_kv_cache.layer_count),
       kv_page_ids_device_by_layer_(config_.attention_kv_cache.layer_count),
@@ -306,9 +331,17 @@ bool RequestExecutionContext::valid() const {
   if (config_.attention_kv_cache.layer_count != 0 && !kv_arena_.has_value()) {
     return false;
   }
-  if (config_.attention_kv_cache.layer_count != 0 &&
-      (!key_cache_ || !key_cache_->valid() || !value_cache_ || !value_cache_->valid())) {
-    return false;
+  if (config_.attention_kv_cache.layer_count != 0) {
+    if (config_.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3) {
+      if (!key_cache_ || !key_cache_->valid() ||
+          !value_cache_ || !value_cache_->valid() ||
+          !key_cache_fp8_ || !key_cache_fp8_->valid() ||
+          !value_cache_fp8_ || !value_cache_fp8_->valid()) {
+        return false;
+      }
+    } else if (!key_cache_ || !key_cache_->valid() || !value_cache_ || !value_cache_->valid()) {
+      return false;
+    }
   }
   if (config_.attention_kv_cache.layer_count != 0) {
     const std::size_t decode_page_table_entries =
@@ -336,6 +369,7 @@ bool RequestExecutionContext::valid() const {
       (attention_output_fp32_decode_ && !attention_output_fp32_decode_->valid()) ||
       (attention_projected_decode_ && !attention_projected_decode_->valid()) ||
       (attention_query_bf16_decode_ && !attention_query_bf16_decode_->valid()) ||
+      (attention_query_fp8_decode_ && !attention_query_fp8_decode_->valid()) ||
       (attention_output_bf16_decode_ && !attention_output_bf16_decode_->valid())) {
     return false;
   }
@@ -474,12 +508,52 @@ const DeviceTensorBf16* RequestExecutionContext::key_cache() const {
   return key_cache_.get();
 }
 
+DeviceTensorFp8E4M3* RequestExecutionContext::key_cache_fp8() {
+  return key_cache_fp8_.get();
+}
+
+const DeviceTensorFp8E4M3* RequestExecutionContext::key_cache_fp8() const {
+  return key_cache_fp8_.get();
+}
+
 DeviceTensorBf16* RequestExecutionContext::value_cache() {
   return value_cache_.get();
 }
 
 const DeviceTensorBf16* RequestExecutionContext::value_cache() const {
   return value_cache_.get();
+}
+
+DeviceTensorFp8E4M3* RequestExecutionContext::value_cache_fp8() {
+  return value_cache_fp8_.get();
+}
+
+const DeviceTensorFp8E4M3* RequestExecutionContext::value_cache_fp8() const {
+  return value_cache_fp8_.get();
+}
+
+void* RequestExecutionContext::key_cache_data() {
+  return config_.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3
+      ? static_cast<void*>(key_cache_fp8_ ? key_cache_fp8_->data() : nullptr)
+      : static_cast<void*>(key_cache_ ? key_cache_->data() : nullptr);
+}
+
+const void* RequestExecutionContext::key_cache_data() const {
+  return config_.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3
+      ? static_cast<const void*>(key_cache_fp8_ ? key_cache_fp8_->data() : nullptr)
+      : static_cast<const void*>(key_cache_ ? key_cache_->data() : nullptr);
+}
+
+void* RequestExecutionContext::value_cache_data() {
+  return config_.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3
+      ? static_cast<void*>(value_cache_fp8_ ? value_cache_fp8_->data() : nullptr)
+      : static_cast<void*>(value_cache_ ? value_cache_->data() : nullptr);
+}
+
+const void* RequestExecutionContext::value_cache_data() const {
+  return config_.attention_kv_cache.dtype == KvCacheDataType::kFp8E4M3
+      ? static_cast<const void*>(value_cache_fp8_ ? value_cache_fp8_->data() : nullptr)
+      : static_cast<const void*>(value_cache_ ? value_cache_->data() : nullptr);
 }
 
 DeviceBuffer<std::int32_t>* RequestExecutionContext::token_ids_device() {
@@ -724,6 +798,14 @@ const DeviceTensorBf16* RequestExecutionContext::attention_query_bf16_decode() c
   return attention_query_bf16_decode_.get();
 }
 
+DeviceTensorFp8E4M3* RequestExecutionContext::attention_query_fp8_decode() {
+  return attention_query_fp8_decode_.get();
+}
+
+const DeviceTensorFp8E4M3* RequestExecutionContext::attention_query_fp8_decode() const {
+  return attention_query_fp8_decode_.get();
+}
+
 DeviceTensorBf16* RequestExecutionContext::attention_output_bf16_decode() {
   return attention_output_bf16_decode_.get();
 }
@@ -850,6 +932,12 @@ bool RequestExecutionContext::ResetForNewRequest() {
   if (value_cache_) {
     ok = ok && value_cache_->FillZero();
   }
+  if (key_cache_fp8_) {
+    ok = ok && key_cache_fp8_->FillZero();
+  }
+  if (value_cache_fp8_) {
+    ok = ok && value_cache_fp8_->FillZero();
+  }
   if (attention_normed_decode_) {
     ok = ok && attention_normed_decode_->FillZero();
   }
@@ -870,6 +958,9 @@ bool RequestExecutionContext::ResetForNewRequest() {
   }
   if (attention_query_bf16_decode_) {
     ok = ok && attention_query_bf16_decode_->FillZero();
+  }
+  if (attention_query_fp8_decode_) {
+    ok = ok && attention_query_fp8_decode_->FillZero();
   }
   if (attention_output_bf16_decode_) {
     ok = ok && attention_output_bf16_decode_->FillZero();

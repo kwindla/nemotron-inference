@@ -4,8 +4,10 @@
 #include <cudnn.h>
 #include <cudnn_frontend.h>
 
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <unordered_map>
@@ -26,6 +28,8 @@ constexpr std::int64_t kSeqLenQUid = 6;
 constexpr std::int64_t kSeqLenKvUid = 7;
 constexpr std::int64_t kPageTableKUid = 8;
 constexpr std::int64_t kPageTableVUid = 9;
+constexpr std::int64_t kAmaxSUid = 10;
+constexpr std::int64_t kAmaxOUid = 11;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -37,8 +41,43 @@ std::optional<fe::DataType_t> ToCudnnFrontendDataType(KvCacheDataType dtype) {
       return fe::DataType_t::HALF;
     case KvCacheDataType::kBf16:
       return fe::DataType_t::BFLOAT16;
+    case KvCacheDataType::kFp8E4M3:
+      return fe::DataType_t::FP8_E4M3;
   }
   return std::nullopt;
+}
+
+float SanitizeFp8Scale(float scale) {
+  constexpr float kMinScale = 1.0f / 1024.0f;
+  return (!std::isfinite(scale) || scale < kMinScale) ? kMinScale : scale;
+}
+
+bool UseFp8Attention(const CudnnPagedAttentionConfig& config) {
+  return config.cache_config.dtype == KvCacheDataType::kFp8E4M3;
+}
+
+bool DebugAttentionEnabled() {
+  return std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+}
+
+void LogGraphStageFailure(
+    const char* stage,
+    fe::error_t status,
+    const CudnnPagedAttentionConfig& config) {
+  if (!DebugAttentionEnabled()) {
+    return;
+  }
+  std::cout << "cudnn_paged_attention: " << stage << " failed: " << status.get_message()
+            << " dtype=" << static_cast<int>(config.cache_config.dtype)
+            << " batch_size=" << config.batch_size
+            << " query_heads=" << config.query_head_count
+            << " kv_heads=" << config.cache_config.kv_head_count
+            << " max_query_tokens=" << config.max_query_tokens
+            << " max_kv_tokens=" << config.max_kv_tokens
+            << " head_dim=" << config.cache_config.head_dim
+            << " tokens_per_page=" << config.cache_config.tokens_per_page
+            << " page_table_entries=" << config.page_table_entries
+            << "\n";
 }
 
 bool FitsInt64(std::size_t value) {
@@ -72,7 +111,12 @@ bool CudnnPagedAttentionConfig::valid() const {
          FitsInt64(cache_config.head_dim) &&
          FitsInt64(cache_config.tokens_per_page) &&
          FitsInt64(container_page_count) &&
-         FitsInt64(page_table_entries);
+         FitsInt64(page_table_entries) &&
+         (!UseFp8Attention(*this) ||
+          (std::isfinite(cache_config.q_scale) && cache_config.q_scale > 0.0f &&
+           std::isfinite(cache_config.k_scale) && cache_config.k_scale > 0.0f &&
+           std::isfinite(cache_config.v_scale) && cache_config.v_scale > 0.0f &&
+           std::isfinite(cache_config.prob_scale) && cache_config.prob_scale > 0.0f));
 }
 
 std::optional<CudnnPagedAttentionConfig> BuildCudnnPagedAttentionConfig(
@@ -127,6 +171,8 @@ struct CudnnPagedAttentionPlan::Impl {
   std::shared_ptr<fe::graph::Graph> graph;
   void* workspace = nullptr;
   std::size_t workspace_bytes = 0;
+  void* amax_s = nullptr;
+  void* amax_o = nullptr;
   bool valid = false;
 };
 
@@ -141,11 +187,13 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
   if (!io_data_type.has_value()) {
     return nullptr;
   }
+  const fe::DataType_t query_data_type =
+      UseFp8Attention(config) ? fe::DataType_t::FP8_E4M3 : fe::DataType_t::BFLOAT16;
 
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->graph = std::make_shared<fe::graph::Graph>();
-  impl->graph->set_io_data_type(*io_data_type)
+  impl->graph->set_io_data_type(query_data_type)
       .set_intermediate_data_type(fe::DataType_t::FLOAT)
       .set_compute_data_type(fe::DataType_t::FLOAT);
 
@@ -163,7 +211,8 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
                                        config.max_query_tokens * config.cache_config.head_dim,
                                        config.cache_config.head_dim,
                                        1,
-                                   })));
+                                   }))
+                                   .set_data_type(query_data_type));
 
   auto k = impl->graph->tensor(fe::graph::Tensor_attributes()
                                    .set_name("K_container")
@@ -180,7 +229,8 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
                                        config.cache_config.tokens_per_page * config.cache_config.head_dim,
                                        config.cache_config.head_dim,
                                        1,
-                                   })));
+                                   }))
+                                   .set_data_type(*io_data_type));
 
   auto v = impl->graph->tensor(fe::graph::Tensor_attributes()
                                    .set_name("V_container")
@@ -197,7 +247,8 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
                                        config.cache_config.tokens_per_page * config.cache_config.head_dim,
                                        config.cache_config.head_dim,
                                        1,
-                                   })));
+                                   }))
+                                   .set_data_type(*io_data_type));
 
   auto seq_q = impl->graph->tensor(fe::graph::Tensor_attributes()
                                        .set_name("seq_q")
@@ -255,9 +306,41 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
         .set_diagonal_band_right_bound(0);
   }
 
-  auto outputs = impl->graph->sdpa(q, k, v, std::move(sdpa_options));
-  auto& o = outputs[0];
-  auto& stats = outputs[1];
+  std::shared_ptr<fe::graph::Tensor_attributes> o;
+  std::shared_ptr<fe::graph::Tensor_attributes> stats;
+  std::shared_ptr<fe::graph::Tensor_attributes> amax_s;
+  std::shared_ptr<fe::graph::Tensor_attributes> amax_o;
+  if (UseFp8Attention(config)) {
+    const float q_scale = SanitizeFp8Scale(config.cache_config.q_scale);
+    const float k_scale = SanitizeFp8Scale(config.cache_config.k_scale);
+    const float v_scale = SanitizeFp8Scale(config.cache_config.v_scale);
+    const float prob_scale = SanitizeFp8Scale(config.cache_config.prob_scale);
+    auto descale_q = impl->graph->tensor(q_scale);
+    auto descale_k = impl->graph->tensor(k_scale);
+    auto descale_v = impl->graph->tensor(v_scale);
+    auto descale_s = impl->graph->tensor(prob_scale);
+    auto scale_s = impl->graph->tensor(1.0f / prob_scale);
+    auto scale_o = impl->graph->tensor(1.0f);
+    auto outputs = impl->graph->sdpa_fp8(
+        q,
+        k,
+        v,
+        descale_q,
+        descale_k,
+        descale_v,
+        descale_s,
+        scale_s,
+        scale_o,
+        std::move(sdpa_options));
+    o = outputs[0];
+    stats = outputs[1];
+    amax_s = outputs[2];
+    amax_o = outputs[3];
+  } else {
+    auto outputs = impl->graph->sdpa(q, k, v, std::move(sdpa_options));
+    o = outputs[0];
+    stats = outputs[1];
+  }
   o->set_output(true)
       .set_uid(kOutputUid)
       .set_dim(MakeDims({
@@ -271,7 +354,24 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
           config.max_query_tokens * config.cache_config.head_dim,
           config.cache_config.head_dim,
           1,
-      }));
+      }))
+      .set_data_type(fe::DataType_t::BFLOAT16);
+
+  if (UseFp8Attention(config)) {
+    if (amax_s == nullptr || amax_o == nullptr) {
+      return nullptr;
+    }
+    amax_s->set_output(true)
+        .set_uid(kAmaxSUid)
+        .set_dim({1, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::FLOAT);
+    amax_o->set_output(true)
+        .set_uid(kAmaxOUid)
+        .set_dim({1, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::FLOAT);
+  }
 
   if (config.generate_stats) {
     if (stats == nullptr) {
@@ -280,9 +380,35 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
     stats->set_output(true).set_uid(kStatsUid).set_data_type(fe::DataType_t::FLOAT);
   }
 
-  if (!impl->graph->build(
-          reinterpret_cast<cudnnHandle_t>(handle.handle()),
-          {fe::HeurMode_t::A}).is_good()) {
+  auto validate_status = impl->graph->validate();
+  if (!validate_status.is_good()) {
+    LogGraphStageFailure("validate", validate_status, config);
+    return nullptr;
+  }
+  auto op_graph_status = impl->graph->build_operation_graph(
+      reinterpret_cast<cudnnHandle_t>(handle.handle()));
+  if (!op_graph_status.is_good()) {
+    LogGraphStageFailure("build_operation_graph", op_graph_status, config);
+    return nullptr;
+  }
+  const auto heur_modes = UseFp8Attention(config)
+      ? std::vector<fe::HeurMode_t>{fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}
+      : std::vector<fe::HeurMode_t>{fe::HeurMode_t::A};
+  auto create_plans_status = impl->graph->create_execution_plans(heur_modes);
+  if (!create_plans_status.is_good()) {
+    LogGraphStageFailure("create_execution_plans", create_plans_status, config);
+    return nullptr;
+  }
+  auto check_support_status = impl->graph->check_support(
+      reinterpret_cast<cudnnHandle_t>(handle.handle()));
+  if (!check_support_status.is_good()) {
+    LogGraphStageFailure("check_support", check_support_status, config);
+    return nullptr;
+  }
+  auto build_plans_status = impl->graph->build_plans(
+      reinterpret_cast<cudnnHandle_t>(handle.handle()));
+  if (!build_plans_status.is_good()) {
+    LogGraphStageFailure("build_plans", build_plans_status, config);
     return nullptr;
   }
 
@@ -294,6 +420,24 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
   impl->workspace_bytes = static_cast<std::size_t>(workspace_bytes);
   if (impl->workspace_bytes > 0) {
     if (!CheckCuda(cudaMalloc(&impl->workspace, impl->workspace_bytes))) {
+      return nullptr;
+    }
+  }
+  if (UseFp8Attention(config)) {
+    if (!CheckCuda(cudaMalloc(&impl->amax_s, sizeof(float))) ||
+        !CheckCuda(cudaMalloc(&impl->amax_o, sizeof(float)))) {
+      if (impl->amax_s != nullptr) {
+        cudaFree(impl->amax_s);
+        impl->amax_s = nullptr;
+      }
+      if (impl->amax_o != nullptr) {
+        cudaFree(impl->amax_o);
+        impl->amax_o = nullptr;
+      }
+      if (impl->workspace != nullptr) {
+        cudaFree(impl->workspace);
+        impl->workspace = nullptr;
+      }
       return nullptr;
     }
   }
@@ -310,6 +454,12 @@ CudnnPagedAttentionPlan& CudnnPagedAttentionPlan::operator=(CudnnPagedAttentionP
 CudnnPagedAttentionPlan::~CudnnPagedAttentionPlan() {
   if (impl_ && impl_->workspace != nullptr) {
     cudaFree(impl_->workspace);
+  }
+  if (impl_ && impl_->amax_s != nullptr) {
+    cudaFree(impl_->amax_s);
+  }
+  if (impl_ && impl_->amax_o != nullptr) {
+    cudaFree(impl_->amax_o);
   }
 }
 
@@ -354,6 +504,10 @@ bool CudnnPagedAttentionPlan::Execute(
   };
   if (impl_->config.generate_stats) {
     variant_pack[kStatsUid] = execution.stats;
+  }
+  if (UseFp8Attention(impl_->config)) {
+    variant_pack[kAmaxSUid] = impl_->amax_s;
+    variant_pack[kAmaxOUid] = impl_->amax_o;
   }
 
   return impl_->graph->execute(

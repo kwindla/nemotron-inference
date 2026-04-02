@@ -10,6 +10,7 @@ namespace nemotron {
 enum class KvCacheDataType {
   kFp16,
   kBf16,
+  kFp8E4M3,
 };
 
 std::size_t KvCacheDataTypeBytes(KvCacheDataType dtype);
@@ -20,6 +21,10 @@ struct AttentionKvCacheConfig {
   std::size_t head_dim = 0;
   std::size_t tokens_per_page = 0;
   KvCacheDataType dtype = KvCacheDataType::kBf16;
+  float q_scale = 1.0f;
+  float k_scale = 1.0f;
+  float v_scale = 1.0f;
+  float prob_scale = 1.0f;
 };
 
 struct AttentionKvPageGeometry {

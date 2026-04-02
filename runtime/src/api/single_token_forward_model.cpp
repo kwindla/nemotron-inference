@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
@@ -163,6 +164,33 @@ bool ForwardProfileEnabled() {
   return kProfile;
 }
 
+bool ParseEnabledEnvVar(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) {
+    return false;
+  }
+  if (value[0] == '\0') {
+    return true;
+  }
+  if (value[0] == '0' && value[1] == '\0') {
+    return false;
+  }
+  return true;
+}
+
+float ParsePositiveEnvFloat(const char* name, float fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const float parsed = std::strtof(value, &end);
+  if (end == value || !std::isfinite(parsed) || parsed <= 0.0f) {
+    return fallback;
+  }
+  return parsed;
+}
+
 std::size_t BuildWorkerCount() {
   if (const char* override_value = std::getenv("NEMOTRON_FORWARD_BUILD_THREADS");
       override_value != nullptr) {
@@ -307,11 +335,21 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
       config.shared_expert_intermediate_size +
       config.n_routed_experts;
   if (plan.attention_layer_count != 0) {
+    const bool fp8_kv_cache_enabled = ParseEnabledEnvVar("NEMOTRON_FP8_KV_CACHE");
     plan.request_config.attention_kv_cache.layer_count = max_layer_index + 1;
     plan.request_config.attention_kv_cache.kv_head_count = config.attention_kv_head_count;
     plan.request_config.attention_kv_cache.head_dim = config.attention_head_dim;
     plan.request_config.attention_kv_cache.tokens_per_page = config.attention_tokens_per_page;
-    plan.request_config.attention_kv_cache.dtype = KvCacheDataType::kBf16;
+    plan.request_config.attention_kv_cache.dtype =
+        fp8_kv_cache_enabled ? KvCacheDataType::kFp8E4M3 : KvCacheDataType::kBf16;
+    plan.request_config.attention_kv_cache.q_scale =
+        ParsePositiveEnvFloat("NEMOTRON_FP8_KV_CACHE_Q_SCALE", 1.0f);
+    plan.request_config.attention_kv_cache.k_scale =
+        ParsePositiveEnvFloat("NEMOTRON_FP8_KV_CACHE_K_SCALE", 1.0f);
+    plan.request_config.attention_kv_cache.v_scale =
+        ParsePositiveEnvFloat("NEMOTRON_FP8_KV_CACHE_V_SCALE", 1.0f);
+    plan.request_config.attention_kv_cache.prob_scale =
+        ParsePositiveEnvFloat("NEMOTRON_FP8_KV_CACHE_PROB_SCALE", 1.0f);
     plan.request_config.attention_total_pages =
         plan.request_config.attention_kv_cache.layer_count *
         RequiredPagesForTokens(plan.request_config.attention_kv_cache, config.max_tokens);
