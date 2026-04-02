@@ -210,7 +210,7 @@ bool QuantizeFp32ToScaledFp8RoundTrip(
       numel,
       ClampScale(input_scale),
       output->data());
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::Create(const ScaledFp8LinearConfig& config) {

@@ -322,7 +322,6 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
             handle.workspace_bytes(),
             nullptr),
         "cublasLtMatmul");
-    ok &= check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   }
 
   if (preference != nullptr) {

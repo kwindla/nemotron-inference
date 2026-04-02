@@ -394,7 +394,6 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
             handle.workspace_bytes(),
             nullptr),
         "cublasLtMatmul");
-    ok &= check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
   }
 
   if (preference != nullptr) {

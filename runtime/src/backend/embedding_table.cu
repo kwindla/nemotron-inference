@@ -215,12 +215,6 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsFp32(
       std::cerr << "embedding_table: kernel launch failed ("
                 << CudaErrorName(launch_status) << ")\n";
     }
-    const cudaError_t sync_status = ok ? cudaDeviceSynchronize() : cudaSuccess;
-    ok &= CheckCuda(sync_status);
-    if (!CheckCuda(sync_status)) {
-      std::cerr << "embedding_table: kernel sync failed ("
-                << CudaErrorName(sync_status) << ")\n";
-    }
   }
 
   if (token_ids_dev != nullptr) {

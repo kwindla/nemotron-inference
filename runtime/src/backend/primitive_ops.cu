@@ -109,7 +109,7 @@ bool ResidualAddFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   ResidualAddKernel<<<grid, block>>>(lhs.data(), rhs.data(), output->data(), count);
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 bool Relu2InPlaceFp32(DeviceTensorFp32* tensor) {
@@ -121,7 +121,7 @@ bool Relu2InPlaceFp32(DeviceTensorFp32* tensor) {
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   Relu2InPlaceKernel<<<grid, block>>>(tensor->data(), count);
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 bool AccumulateScaledFp32(
@@ -136,7 +136,7 @@ bool AccumulateScaledFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   AccumulateScaledKernel<<<grid, block>>>(input.data(), scale, output->data(), count);
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 bool RmsNormFp32(
@@ -154,7 +154,7 @@ bool RmsNormFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>(rows));
   RmsNormKernel<<<grid, block>>>(input.data(), weight.data(), output->data(), rows, hidden_size, epsilon);
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 }  // namespace nemotron

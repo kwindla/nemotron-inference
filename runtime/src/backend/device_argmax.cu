@@ -87,7 +87,7 @@ bool DeviceArgmax(const DeviceTensorFp32& logits_row, std::int32_t* device_token
   }
 
   DeviceArgmaxKernel<<<1, kThreadsPerBlock>>>(logits_row.data(), vocab_size, device_token_id);
-  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+  return CheckCuda(cudaGetLastError());
 }
 
 }  // namespace nemotron

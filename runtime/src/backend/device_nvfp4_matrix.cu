@@ -22,6 +22,14 @@ bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
 
+bool HasCudaDevice() {
+  static const bool kHasCudaDevice = []() {
+    int device_count = 0;
+    return CheckCuda(cudaGetDeviceCount(&device_count)) && device_count > 0;
+  }();
+  return kHasCudaDevice;
+}
+
 std::size_t PackedBytes(std::size_t rows, std::size_t cols) {
   return (rows * cols + 1u) / 2u;
 }
@@ -218,12 +226,7 @@ std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
     std::size_t rows,
     std::size_t cols,
     Nvfp4ScaleLayout scale_layout) {
-  if (rows == 0 || cols == 0 || cols % kBlockWidth != 0) {
-    return nullptr;
-  }
-
-  int device_count = 0;
-  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+  if (rows == 0 || cols == 0 || cols % kBlockWidth != 0 || !HasCudaDevice()) {
     return nullptr;
   }
 
@@ -405,15 +408,12 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
       return nullptr;
     }
   } else {
-    unsigned int* global_max_bits = nullptr;
-    if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&global_max_bits), sizeof(unsigned int)))) {
+    auto* tensor_scale_data =
+        reinterpret_cast<float*>(const_cast<std::uint8_t*>(packed->tensor_scale_data()));
+    auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
+    if (!CheckCuda(cudaMemset(global_max_bits, 0, packed->tensor_scale_nbytes()))) {
       return nullptr;
     }
-    if (!CheckCuda(cudaMemset(global_max_bits, 0, sizeof(unsigned int)))) {
-      cudaFree(global_max_bits);
-      return nullptr;
-    }
-
     const std::size_t numel = rows * cols;
     constexpr std::size_t kThreadsPerBlock = 128;
     const std::size_t reduction_grid_size = (numel + kThreadsPerBlock - 1u) / kThreadsPerBlock;
@@ -421,19 +421,16 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
         source.data(),
         numel,
         global_max_bits);
-    if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
-      cudaFree(global_max_bits);
+    if (!CheckCuda(cudaGetLastError())) {
       return nullptr;
     }
 
     WriteTensorScaleKernel<<<1, 1>>>(
         global_max_bits,
-        reinterpret_cast<float*>(const_cast<std::uint8_t*>(packed->tensor_scale_data())));
-    if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
-      cudaFree(global_max_bits);
+        tensor_scale_data);
+    if (!CheckCuda(cudaGetLastError())) {
       return nullptr;
     }
-    cudaFree(global_max_bits);
   }
 
   constexpr std::size_t kThreadsPerBlock = 128;
@@ -446,7 +443,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
       reinterpret_cast<const float*>(packed->tensor_scale_data()),
       const_cast<std::uint8_t*>(packed->packed_data()),
       const_cast<std::uint8_t*>(packed->block_scales_data()));
-  if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
+  if (!CheckCuda(cudaGetLastError())) {
     return nullptr;
   }
 
@@ -467,7 +464,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
       layout->padded_blocks_per_row,
       scale_layout,
       const_cast<std::uint8_t*>(packed->matmul_block_scales_data()));
-  if (!CheckCuda(cudaGetLastError()) || !CheckCuda(cudaDeviceSynchronize())) {
+  if (!CheckCuda(cudaGetLastError())) {
     return nullptr;
   }
 

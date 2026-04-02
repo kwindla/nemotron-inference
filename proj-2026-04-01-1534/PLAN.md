@@ -151,7 +151,7 @@ Translate from these upstream designs, not from generic intuition:
   - post-cleanup artifact and profile saved
   - next target chosen from evidence
 
-- [ ] **8a. Remove explicit cudaDeviceSynchronize from hot-path ops**
+- [x] **8a. Remove explicit cudaDeviceSynchronize from hot-path ops**
   Goal:
   - remove unconditional `cudaDeviceSynchronize()` from all hot-path operators
   - partial win expected — cudaFree implicit barriers limit the benefit until alloc reuse lands in 8b
@@ -225,7 +225,7 @@ Translate from these upstream designs, not from generic intuition:
 | 5 | Profile next bottleneck | done | — | FusedMoeDirectDecode = 98.4% of GPU time (77ms/call × 23 layers = 1771ms/token) |
 | 6 | Replace MoE scalar matmuls with cuBLASLt | done | — | 57.2 ms/token (was 1805ms); 400x total speedup from baseline; smoke PASS |
 | 7 | Re-measure and decide | done | — | Mamba=66% GPU, sync/alloc=42% wall; both need fixing for 20ms |
-| 8a | Remove explicit syncs + dead allocs | pending | — | partial win; cudaFree still barriers |
+| 8a | Remove explicit syncs + dead allocs | done | — | hot-path syncs removed; per-alloc device checks cached; cudaFree still barriers |
 | 8b | Decode scratch buffer reuse | pending | — | bulk of host overhead improvement |
 | 8c | Attention activation pre-alloc | pending | — | attention-specific alloc cleanup |
 | 9 | Re-profile after cleanup | pending | — | kernel floor ~33ms; host should be near-zero |
@@ -240,3 +240,10 @@ Translate from these upstream designs, not from generic intuition:
 - What was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4` passed. `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test -j1` passed after rerunning sequentially; the first attempt failed because two concurrent target builds raced on `libnemotron_runtime_backend.a`.
 - What risk remains: correctness against the existing host/fused reference is not yet revalidated with `full_forward_manifest_smoke_test` execution or the Nano correctness tests, and decode performance is still unknown. The new path currently preserves the existing per-op synchronize behavior in NVFP4 packing/GEMM/primitive ops, so kernel compute should drop sharply, but host-side sequencing overhead may still be visible until the next measurement pass.
 - What the next step is: run the real smoke/correctness checks with `NEMOTRON_FORWARD_MOE_CUBLASLT=1`, then benchmark/profile to confirm the fused MoE kernel disappears from the hot path and quantify the new dominant cost for step 7.
+
+### 2026-04-01 Step 8a Checkpoint
+
+- What changed: removed unconditional hot-path `cudaDeviceSynchronize()` calls from the primitive device ops (`ResidualAddFp32`, `Relu2InPlaceFp32`, `AccumulateScaledFp32`, `RmsNormFp32`), dense cuBLASLt GEMM execution, NVFP4 cuBLASLt GEMM execution, embedding lookup, device argmax, and the FP8 quantize round-trip path. In `runtime/src/backend/device_nvfp4_matrix.cu`, replaced the temporary `global_max_bits` device allocation with the existing tensor-scale buffer, removed the pack-path synchronizations, and cached the CUDA-device availability check instead of calling `cudaGetDeviceCount()` on each matrix create. In `runtime/src/backend/device_tensor.cpp`, converted the FP32/BF16 tensor create paths to a one-time static CUDA availability check instead of per-allocation `cudaGetDeviceCount()`.
+- What was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4` passed. `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test -j4` passed. Confirmed that the targeted hot-path files no longer contain unconditional `cudaDeviceSynchronize()` calls.
+- What risk remains: several hot paths still allocate/free temporaries per token, and `cudaFree` remains an implicit barrier until step 8b lands. The expert-layer dead scratch-allocation move called out in review was already satisfied in the current tree, so there was no functional change required there. This checkpoint only covers build verification; it does not yet execute the smoke test binary or re-profile decode.
+- What the next step is: implement step 8b to replace per-token temp allocations with reusable decode scratch buffers, then re-profile wall time once the implicit `cudaFree` barriers are gone.

@@ -27,6 +27,14 @@ bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
 
+bool HasCudaDevice() {
+  static const bool kHasCudaDevice = []() {
+    int device_count = 0;
+    return CheckCuda(cudaGetDeviceCount(&device_count)) && device_count > 0;
+  }();
+  return kHasCudaDevice;
+}
+
 std::size_t NumelFromShape(const std::vector<std::size_t>& shape) {
   if (shape.empty()) {
     return 0;
@@ -42,12 +50,7 @@ std::size_t NumelFromShape(const std::vector<std::size_t>& shape) {
 
 std::unique_ptr<DeviceTensorFp32> DeviceTensorFp32::Create(std::vector<std::size_t> shape) {
   const std::size_t numel = NumelFromShape(shape);
-  if (numel == 0) {
-    return nullptr;
-  }
-
-  int device_count = 0;
-  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+  if (numel == 0 || !HasCudaDevice()) {
     return nullptr;
   }
 
@@ -117,12 +120,7 @@ bool DeviceTensorFp32::FillZero() {
 
 std::unique_ptr<DeviceTensorBf16> DeviceTensorBf16::Create(std::vector<std::size_t> shape) {
   const std::size_t numel = NumelFromShape(shape);
-  if (numel == 0) {
-    return nullptr;
-  }
-
-  int device_count = 0;
-  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+  if (numel == 0 || !HasCudaDevice()) {
     return nullptr;
   }
 
