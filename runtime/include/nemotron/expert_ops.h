@@ -82,22 +82,26 @@ bool GatherExpertSelectionLookupsCheckedInPlace(
     DeviceBuffer<std::uint32_t>& missing_count,
     DeviceBuffer<std::int32_t>& missing_indices);
 
-// Merged up+down gather: gathers all 6 output arrays (up packed, up scales,
-// up tensor_scales, down packed, down scales, down tensor_scales) in one pass.
+// Merged up+down gather: gathers packed pointers, raw scale pointers, swizzled
+// scale pointers, and tensor scales for both up/down in one pass.
 bool GatherExpertSelectionLookupsDualCheckedInPlace(
     const std::int32_t* selected_indices_device,
     std::size_t selection_count,
     std::size_t lookup_count,
     const DeviceBuffer<const void*>& up_packed_lookup,
+    const DeviceBuffer<const void*>& up_raw_scale_lookup,
     const DeviceBuffer<const void*>& up_matmul_scale_lookup,
     const DeviceBuffer<float>& up_tensor_scale_lookup,
     DeviceBuffer<const void*>& selected_up_packed_ptrs,
+    DeviceBuffer<const void*>& selected_up_raw_scale_ptrs,
     DeviceBuffer<const void*>& selected_up_matmul_scale_ptrs,
     DeviceBuffer<float>& selected_up_tensor_scales,
     const DeviceBuffer<const void*>& down_packed_lookup,
+    const DeviceBuffer<const void*>& down_raw_scale_lookup,
     const DeviceBuffer<const void*>& down_matmul_scale_lookup,
     const DeviceBuffer<float>& down_tensor_scale_lookup,
     DeviceBuffer<const void*>& selected_down_packed_ptrs,
+    DeviceBuffer<const void*>& selected_down_raw_scale_ptrs,
     DeviceBuffer<const void*>& selected_down_matmul_scale_ptrs,
     DeviceBuffer<float>& selected_down_tensor_scales,
     DeviceBuffer<std::uint32_t>& missing_count,
@@ -127,7 +131,6 @@ bool ComputeGroupedUpPackScales(
     DeviceBuffer<float>* output_row_scales);
 
 bool ComputeWeightedMergeScales(
-    const float* selection_weights_device,
     const DeviceBuffer<float>& activation_tensor_scales,
     const DeviceBuffer<float>& weight_tensor_scales,
     DeviceBuffer<float>* output_row_scales);
@@ -141,13 +144,14 @@ bool ScaleRelu2PackRowsToNvfp4(
     DeviceBuffer<float>* tensor_scales);
 
 // Same as ScaleRelu2PackRowsToNvfp4 but writes into pre-allocated buffers.
-// No matmul_block_scales (not needed on the single-token hot path).
+// Optionally emits swizzled execution-layout block scales for CUTLASS.
 // Zero cudaMalloc on the hot path.
 bool ScaleRelu2PackRowsToNvfp4InPlace(
     const DeviceTensorFp32& input_rows,
     const float* row_scales_device,
     DeviceBuffer<std::uint8_t>& packed,
     DeviceBuffer<std::uint8_t>& block_scales,
+    DeviceBuffer<std::uint8_t>* matmul_block_scales,
     DeviceBuffer<float>& tensor_scales,
     cudaStream_t stream = nullptr);
 

@@ -559,15 +559,19 @@ __global__ void GatherExpertSelectionLookupsDualCheckedKernel(
     std::size_t selection_count,
     std::size_t lookup_count,
     const void* const* up_packed_lookup,
+    const void* const* up_raw_scale_lookup,
     const void* const* up_matmul_scale_lookup,
     const float* up_tensor_scale_lookup,
     const void** selected_up_packed,
+    const void** selected_up_raw_scales,
     const void** selected_up_matmul_scales,
     float* selected_up_tensor_scales,
     const void* const* down_packed_lookup,
+    const void* const* down_raw_scale_lookup,
     const void* const* down_matmul_scale_lookup,
     const float* down_tensor_scale_lookup,
     const void** selected_down_packed,
+    const void** selected_down_raw_scales,
     const void** selected_down_matmul_scales,
     float* selected_down_tensor_scales,
     std::uint32_t* missing_count,
@@ -579,9 +583,11 @@ __global__ void GatherExpertSelectionLookupsDualCheckedKernel(
   const std::int32_t expert_index = selected_indices[index];
   if (expert_index < 0 || static_cast<std::size_t>(expert_index) >= lookup_count) {
     selected_up_packed[index] = nullptr;
+    selected_up_raw_scales[index] = nullptr;
     selected_up_matmul_scales[index] = nullptr;
     selected_up_tensor_scales[index] = 0.0f;
     selected_down_packed[index] = nullptr;
+    selected_down_raw_scales[index] = nullptr;
     selected_down_matmul_scales[index] = nullptr;
     selected_down_tensor_scales[index] = 0.0f;
     const std::uint32_t missing_index = atomicAdd(missing_count, 1u);
@@ -593,21 +599,25 @@ __global__ void GatherExpertSelectionLookupsDualCheckedKernel(
 
   const std::size_t li = static_cast<std::size_t>(expert_index);
   const void* up_p = up_packed_lookup[li];
+  const void* up_rs = up_raw_scale_lookup[li];
   const void* up_ms = up_matmul_scale_lookup[li];
   const float up_ts = up_tensor_scale_lookup[li];
   selected_up_packed[index] = up_p;
+  selected_up_raw_scales[index] = up_rs;
   selected_up_matmul_scales[index] = up_ms;
   selected_up_tensor_scales[index] = up_ts;
 
   const void* down_p = down_packed_lookup[li];
+  const void* down_rs = down_raw_scale_lookup[li];
   const void* down_ms = down_matmul_scale_lookup[li];
   const float down_ts = down_tensor_scale_lookup[li];
   selected_down_packed[index] = down_p;
+  selected_down_raw_scales[index] = down_rs;
   selected_down_matmul_scales[index] = down_ms;
   selected_down_tensor_scales[index] = down_ts;
 
-  if (up_p == nullptr || up_ms == nullptr || up_ts == 0.0f ||
-      down_p == nullptr || down_ms == nullptr || down_ts == 0.0f) {
+  if (up_p == nullptr || up_rs == nullptr || up_ms == nullptr || up_ts == 0.0f ||
+      down_p == nullptr || down_rs == nullptr || down_ms == nullptr || down_ts == 0.0f) {
     const std::uint32_t missing_index = atomicAdd(missing_count, 1u);
     if (missing_indices != nullptr) {
       missing_indices[missing_index] = expert_index;
@@ -659,12 +669,10 @@ __global__ void ComputeGroupedUpPackScalesKernel(
   if (index >= count) {
     return;
   }
-  const float scale = (*activation_tensor_scale) * weight_tensor_scales[index];
-  output_row_scales[index] = scale * scale;
+  output_row_scales[index] = (*activation_tensor_scale) * weight_tensor_scales[index];
 }
 
 __global__ void ComputeWeightedMergeScalesKernel(
-    const float* selection_weights,
     const float* activation_tensor_scales,
     const float* weight_tensor_scales,
     std::size_t count,
@@ -674,7 +682,7 @@ __global__ void ComputeWeightedMergeScalesKernel(
     return;
   }
   output_row_scales[index] =
-      selection_weights[index] * activation_tensor_scales[index] * weight_tensor_scales[index];
+      activation_tensor_scales[index] * weight_tensor_scales[index];
 }
 
 __global__ void FusedRoutedUpProjPackedNvfp4SingleTokenKernel(
@@ -1062,15 +1070,19 @@ bool GatherExpertSelectionLookupsDualCheckedInPlace(
     std::size_t selection_count,
     std::size_t lookup_count,
     const DeviceBuffer<const void*>& up_packed_lookup,
+    const DeviceBuffer<const void*>& up_raw_scale_lookup,
     const DeviceBuffer<const void*>& up_matmul_scale_lookup,
     const DeviceBuffer<float>& up_tensor_scale_lookup,
     DeviceBuffer<const void*>& selected_up_packed_ptrs,
+    DeviceBuffer<const void*>& selected_up_raw_scale_ptrs,
     DeviceBuffer<const void*>& selected_up_matmul_scale_ptrs,
     DeviceBuffer<float>& selected_up_tensor_scales,
     const DeviceBuffer<const void*>& down_packed_lookup,
+    const DeviceBuffer<const void*>& down_raw_scale_lookup,
     const DeviceBuffer<const void*>& down_matmul_scale_lookup,
     const DeviceBuffer<float>& down_tensor_scale_lookup,
     DeviceBuffer<const void*>& selected_down_packed_ptrs,
+    DeviceBuffer<const void*>& selected_down_raw_scale_ptrs,
     DeviceBuffer<const void*>& selected_down_matmul_scale_ptrs,
     DeviceBuffer<float>& selected_down_tensor_scales,
     DeviceBuffer<std::uint32_t>& missing_count,
@@ -1078,14 +1090,18 @@ bool GatherExpertSelectionLookupsDualCheckedInPlace(
     cudaStream_t stream) {
   if (selected_indices_device == nullptr ||
       selection_count == 0 || lookup_count == 0 ||
-      !up_packed_lookup.valid() || !up_matmul_scale_lookup.valid() ||
+      !up_packed_lookup.valid() || !up_raw_scale_lookup.valid() ||
+      !up_matmul_scale_lookup.valid() ||
       !up_tensor_scale_lookup.valid() ||
       !selected_up_packed_ptrs.valid() || selected_up_packed_ptrs.count() < selection_count ||
+      !selected_up_raw_scale_ptrs.valid() || selected_up_raw_scale_ptrs.count() < selection_count ||
       !selected_up_matmul_scale_ptrs.valid() || selected_up_matmul_scale_ptrs.count() < selection_count ||
       !selected_up_tensor_scales.valid() || selected_up_tensor_scales.count() < selection_count ||
-      !down_packed_lookup.valid() || !down_matmul_scale_lookup.valid() ||
+      !down_packed_lookup.valid() || !down_raw_scale_lookup.valid() ||
+      !down_matmul_scale_lookup.valid() ||
       !down_tensor_scale_lookup.valid() ||
       !selected_down_packed_ptrs.valid() || selected_down_packed_ptrs.count() < selection_count ||
+      !selected_down_raw_scale_ptrs.valid() || selected_down_raw_scale_ptrs.count() < selection_count ||
       !selected_down_matmul_scale_ptrs.valid() || selected_down_matmul_scale_ptrs.count() < selection_count ||
       !selected_down_tensor_scales.valid() || selected_down_tensor_scales.count() < selection_count ||
       !missing_count.valid() || missing_count.count() < 1 ||
@@ -1102,15 +1118,19 @@ bool GatherExpertSelectionLookupsDualCheckedInPlace(
       selection_count,
       lookup_count,
       up_packed_lookup.data(),
+      up_raw_scale_lookup.data(),
       up_matmul_scale_lookup.data(),
       up_tensor_scale_lookup.data(),
       selected_up_packed_ptrs.data(),
+      selected_up_raw_scale_ptrs.data(),
       selected_up_matmul_scale_ptrs.data(),
       selected_up_tensor_scales.data(),
       down_packed_lookup.data(),
+      down_raw_scale_lookup.data(),
       down_matmul_scale_lookup.data(),
       down_tensor_scale_lookup.data(),
       selected_down_packed_ptrs.data(),
+      selected_down_raw_scale_ptrs.data(),
       selected_down_matmul_scale_ptrs.data(),
       selected_down_tensor_scales.data(),
       missing_count.data(),
@@ -1203,12 +1223,10 @@ bool ComputeGroupedUpPackScales(
 }
 
 bool ComputeWeightedMergeScales(
-    const float* selection_weights_device,
     const DeviceBuffer<float>& activation_tensor_scales,
     const DeviceBuffer<float>& weight_tensor_scales,
     DeviceBuffer<float>* output_row_scales) {
-  if (selection_weights_device == nullptr ||
-      !activation_tensor_scales.valid() ||
+  if (!activation_tensor_scales.valid() ||
       !weight_tensor_scales.valid() ||
       activation_tensor_scales.count() != weight_tensor_scales.count() ||
       output_row_scales == nullptr ||
@@ -1219,7 +1237,6 @@ bool ComputeWeightedMergeScales(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   ComputeWeightedMergeScalesKernel<<<grid, block>>>(
-      selection_weights_device,
       activation_tensor_scales.data(),
       weight_tensor_scales.data(),
       count,
@@ -1295,6 +1312,7 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
     const float* row_scales_device,
     DeviceBuffer<std::uint8_t>& packed,
     DeviceBuffer<std::uint8_t>& block_scales,
+    DeviceBuffer<std::uint8_t>* matmul_block_scales,
     DeviceBuffer<float>& tensor_scales,
     cudaStream_t stream) {
   if (!input_rows.valid() ||
@@ -1311,10 +1329,28 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
   const std::size_t blocks_per_row = cols / kNvfp4BlockWidth;
   const std::size_t packed_bytes = rows * (cols / 2u);
   const std::size_t block_scale_bytes = rows * blocks_per_row;
+  std::size_t matmul_bytes_per_row = 0;
+  std::optional<Nvfp4ExecutionScaleLayout> layout;
+  if (matmul_block_scales != nullptr) {
+    matmul_bytes_per_row = ExecutionNvfp4ScaleBytes(1, cols);
+    if (matmul_bytes_per_row == 0) {
+      return false;
+    }
+    layout = BuildNvfp4ExecutionScaleLayout(1, cols);
+    if (!layout.has_value()) {
+      return false;
+    }
+  }
 
   if (!packed.valid() || packed.count() < packed_bytes ||
       !block_scales.valid() || block_scales.count() < block_scale_bytes ||
       !tensor_scales.valid() || tensor_scales.count() < rows) {
+    return false;
+  }
+  if (matmul_block_scales != nullptr &&
+      (!matmul_block_scales->valid() ||
+       matmul_block_scales->count() < rows * matmul_bytes_per_row ||
+       !matmul_block_scales->FillZeroAsync(stream))) {
     return false;
   }
 
@@ -1327,9 +1363,9 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
       tensor_scales.data(),
       packed.data(),
       block_scales.data(),
-      0,
-      0,
-      nullptr);
+      layout.has_value() ? layout->padded_blocks_per_row : 0,
+      matmul_bytes_per_row,
+      matmul_block_scales != nullptr ? matmul_block_scales->data() : nullptr);
   return CheckCuda(cudaGetLastError());
 }
 
