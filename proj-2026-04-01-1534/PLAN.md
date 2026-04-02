@@ -135,7 +135,7 @@ Translate from these upstream designs, not from generic intuition:
   - benchmark shows MoE per-layer time drops from ~77ms to sub-ms
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/nvfp4_gemm_runner.cpp`
 
-- [ ] **7. Re-measure and decide: production attention or next structural fix**
+- [x] **7. Re-measure and decide: production attention or next structural fix**
   Goal:
   - after sync/alloc cleanup, re-profile to see the new bottleneck ranking
   Scope:
@@ -188,7 +188,7 @@ Translate from these upstream designs, not from generic intuition:
 | 4 | Monolithic expert residency | done | 5a624e1 | 23/23 resident, 0 uploads, 1805 ms/token |
 | 5 | Profile next bottleneck | done | — | FusedMoeDirectDecode = 98.4% of GPU time (77ms/call × 23 layers = 1771ms/token) |
 | 6 | Replace MoE scalar matmuls with cuBLASLt | done | — | 57.2 ms/token (was 1805ms); 400x total speedup from baseline; smoke PASS |
-| 7 | Re-measure and decide | pending | — | attention or kernel optimization next? |
+| 7 | Re-measure and decide | done | — | Mamba=66% GPU, sync/alloc=42% wall; both need fixing for 20ms |
 | 8 | Production decode attention | pending | — | contingent on step 7 evidence |
 | 9 | Evidence-driven loop | pending | — | |
 
