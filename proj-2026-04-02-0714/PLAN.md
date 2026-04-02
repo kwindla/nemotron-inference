@@ -19,7 +19,7 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
 
 - [ ] **1. Fix expert selection kernel — `<<<1,1>>>` → `<<<1,128>>>`**
   The `DeviceExpertSelectionKernel` in `fused_moe_decode.cu` launches with grid=1, block=1. A single thread does sigmoid on 128 values + serial top-k insertion sort. This takes 0.054ms/call × 23 layers = 1.3ms/token.
-  Fix: rewrite as `<<<1, 128>>>` (one thread per expert). Each thread computes sigmoid + correction bias for its expert. Then use warp-level parallel reduction for top-k selection. For Nano (n_group=1, topk_group=1), skip the group ranking entirely.
+  Fix: rewrite as `<<<1, 32>>>` with 4 experts per thread (warp-only, no cross-warp merge needed). Each thread computes sigmoid + correction bias for its 4 experts. Then use warp shuffle for parallel top-k selection across all 128 scores. For Nano (n_group=1, topk_group=1), skip the group ranking entirely. Preserve both `scores[]` (for routing weights) and `choice_scores[]` (for ranking).
   Expected: 0.054ms → ~0.005ms per call, saving ~1.1ms/token.
   Keep the original as fallback behind `NEMOTRON_FORWARD_EXPERT_SELECT_LEGACY=1`.
   Key files: `runtime/src/backend/fused_moe_decode.cu`
@@ -28,8 +28,9 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
   `DeviceNvfp4Matrix::PackInto()` does a `cudaMemcpy(D2H, 4 bytes)` after computing the activation tensor scale on device. This happens 184 times per token (8 packs × 23 MoE layers). Each forces a pipeline stall.
   Fix: keep the tensor scale on device. Modify the NVFP4 GEMM runner to accept a device pointer for alpha instead of a host float. Use cuBLASLt's `CUBLASLT_POINTER_MODE_DEVICE` to pass the alpha as a device pointer. Compute `alpha = act_tensor_scale * weight_tensor_scale` on device via a tiny multiply kernel that writes to a pre-allocated device float.
   Alternative simpler fix: since we already cache the weight tensor scale on host, and the activation tensor scale is computed on device, compute alpha on device as `act_scale_device * weight_scale_host_constant` via a single-element device kernel, then pass the device alpha pointer to cuBLASLt.
+  NOTE from review: POINTER_MODE_DEVICE support is algorithm-specific for cuBLASLt. Need to check `CUBLASLT_ALGO_CAP_POINTER_MODE_MASK` for the selected NVFP4 algo. If not supported, the simpler approach is to just remove the PackInto D2H and instead do a single batched D2H of all 8 tensor scales per MoE layer after all packs complete (1 cudaMemcpy of 32 bytes instead of 8 separate 4-byte copies).
   Expected: eliminate 184 D2H copies/token, saving ~0.6ms/token.
-  Key files: `runtime/src/backend/device_nvfp4_matrix.cu`, `runtime/src/backend/nvfp4_gemm_runner.cpp`, `runtime/src/backend/expert_layer.cpp`
+  Key files: `runtime/src/backend/device_nvfp4_matrix.cu`, `runtime/src/backend/nvfp4_gemm_runner.cpp`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/linear_op.cpp`
 
 - [ ] **3. Benchmark and profile**
   Run steady-state benchmark. Target: ≤20ms/token mean.
