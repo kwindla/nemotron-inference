@@ -534,4 +534,46 @@ bool ScaledFp8LinearOp::Run(
              .has_value();
 }
 
+bool ScaledFp8LinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorFp32* output) const {
+  if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
+    return false;
+  }
+  if (activations.shape().size() != 2 || activations.shape()[1] != impl_->config.input_cols) {
+    return false;
+  }
+  auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
+  if (!activations_fp32 ||
+      !ConvertDeviceBf16ToFp32(activations.data(), activations.numel(), activations_fp32->data())) {
+    return false;
+  }
+  return Run(handle, heuristic_cache, *activations_fp32, output);
+}
+
+bool ScaledFp8LinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output) const {
+  if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
+    return false;
+  }
+  if (output->shape().size() != 2 ||
+      output->shape()[0] != activations.shape()[0] ||
+      output->shape()[1] != impl_->config.output_rows) {
+    return false;
+  }
+  auto output_fp32 = DeviceTensorFp32::Create(output->shape());
+  if (!output_fp32) {
+    return false;
+  }
+  if (!Run(handle, heuristic_cache, activations, output_fp32.get())) {
+    return false;
+  }
+  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+}
+
 }  // namespace nemotron

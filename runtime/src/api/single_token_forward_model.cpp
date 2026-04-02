@@ -1263,7 +1263,10 @@ bool SingleTokenForwardModel::RunPrefill(
   if (use_bf16_decode_storage) {
     DeviceTensorBf16* hidden_decode_storage = request_context.hidden_decode_bf16();
     DeviceTensorBf16* residual_decode_storage = request_context.residual_decode_bf16();
-    if (hidden_decode_storage == nullptr || residual_decode_storage == nullptr) {
+    DeviceTensorBf16* scratch_decode_storage = request_context.scratch_decode_bf16();
+    if (hidden_decode_storage == nullptr ||
+        residual_decode_storage == nullptr ||
+        scratch_decode_storage == nullptr) {
       std::cerr << "single_token_forward_model: BF16 decode storage unavailable\n";
       destroy_profile_events();
       return false;
@@ -1275,33 +1278,25 @@ bool SingleTokenForwardModel::RunPrefill(
     auto next_view_bf16 = DeviceTensorBf16::CreateView(
         {token_count, impl_->config.hidden_size},
         residual_decode_storage->data());
-    auto current_view_fp32 = DeviceTensorFp32::CreateView(
+    auto scratch_view_bf16 = DeviceTensorBf16::CreateView(
         {token_count, impl_->config.hidden_size},
-        hidden_storage->data());
-    auto scratch_view_fp32 = DeviceTensorFp32::CreateView(
-        {token_count, impl_->config.hidden_size},
-        scratch_storage->data());
-    if (!current_view_bf16 || !next_view_bf16 || !current_view_fp32 || !scratch_view_fp32) {
+        scratch_decode_storage->data());
+    if (!current_view_bf16 || !next_view_bf16 || !scratch_view_bf16) {
       std::cerr << "single_token_forward_model: BF16 decode views unavailable\n";
       destroy_profile_events();
       return false;
     }
     DeviceTensorBf16* current = current_view_bf16.get();
     DeviceTensorBf16* next = next_view_bf16.get();
-    DeviceTensorFp32* current_fp32 = current_view_fp32.get();
-    DeviceTensorFp32* scratch_fp32 = scratch_view_fp32.get();
+    DeviceTensorBf16* scratch_bf16 = scratch_view_bf16.get();
 
     if (!token_ids_device->CopyFromHostAsync(token_ids, token_count) ||
-        !LookupEmbeddingRowsDeviceIdsFp32(
+        !LookupEmbeddingRowsDeviceIdsBf16(
              *impl_->embedding_table,
              token_ids_device->data(),
              token_count,
-             current_fp32)
-             .has_value() ||
-        !ConvertDeviceFp32ToBf16(
-             current_fp32->data(),
-             current_fp32->numel(),
-             current->data())) {
+             current)
+             .has_value()) {
       std::cerr << "single_token_forward_model: embedding lookup failed\n";
       destroy_profile_events();
       return false;
@@ -1450,24 +1445,18 @@ bool SingleTokenForwardModel::RunPrefill(
       }
     }
 
-    if (!ConvertDeviceBf16ToFp32(current->data(), current->numel(), current_fp32->data())) {
-      std::cerr << "single_token_forward_model: failed to upcast final hidden state\n";
-      destroy_profile_events();
-      return false;
-    }
-
-    const DeviceTensorFp32* logits_input = current_fp32;
+    const DeviceTensorBf16* logits_input = current;
     if (impl_->final_norm_weight != nullptr) {
-      if (!RmsNormFp32(
-              *current_fp32,
+      if (!RmsNormBf16(
+              *current,
               *impl_->final_norm_weight,
               impl_->config.layer_norm_epsilon,
-              scratch_fp32)) {
+              scratch_bf16)) {
         std::cerr << "single_token_forward_model: final RMSNorm failed\n";
         destroy_profile_events();
         return false;
       }
-      logits_input = scratch_fp32;
+      logits_input = scratch_bf16;
     }
 
     if (trace != nullptr) {

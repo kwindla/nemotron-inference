@@ -19,6 +19,12 @@ namespace nemotron {
 class UploadedLinearOp {
  public:
   static std::unique_ptr<UploadedLinearOp> Create(const GemmDescriptor& descriptor);
+  static std::unique_ptr<UploadedLinearOp> CreateDenseView(
+      const GemmDescriptor& descriptor,
+      std::unique_ptr<DeviceDenseWeightFp32> weight_view);
+  static std::unique_ptr<UploadedLinearOp> CreateNvfp4View(
+      const GemmDescriptor& descriptor,
+      std::unique_ptr<DeviceNvfp4Weight> weight_view);
 
   UploadedLinearOp(UploadedLinearOp&&) noexcept;
   UploadedLinearOp& operator=(UploadedLinearOp&&) noexcept;
@@ -31,12 +37,25 @@ class UploadedLinearOp {
   std::size_t output_rows() const;
   std::size_t input_cols() const;
   GemmKernelFamily kernel_family() const;
+  const DeviceNvfp4Weight* nvfp4_weight() const;
 
   bool Run(
       CublasLtHandle& handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorFp32& activations,
       DeviceTensorFp32* output) const;
+
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& activations,
+      DeviceTensorFp32* output) const;
+
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& activations,
+      DeviceTensorBf16* output) const;
 
  private:
   struct Impl;

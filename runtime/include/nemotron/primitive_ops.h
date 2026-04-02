@@ -15,4 +15,10 @@ bool RmsNormFp32(
     float epsilon,
     DeviceTensorFp32* output);
 
+bool RmsNormBf16(
+    const DeviceTensorBf16& input,
+    const DeviceTensorFp32& weight,
+    float epsilon,
+    DeviceTensorBf16* output);
+
 }  // namespace nemotron

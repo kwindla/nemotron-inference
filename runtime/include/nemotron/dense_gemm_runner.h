@@ -36,6 +36,55 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
+    const DeviceDenseWeightFp32& weights,
+    const DeviceTensorBf16& activations,
+    DeviceTensorFp32* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceDenseWeightFp32& weights,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorBf16& weights,
+    const DeviceTensorFp32& activations,
+    DeviceTensorFp32* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorBf16& weights,
+    const DeviceTensorBf16& activations,
+    DeviceTensorFp32* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorBf16& weights,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp8E4M3& weights,
+    float alpha_scale,
+    const DeviceTensorFp32& activations,
+    float input_scale,
+    DeviceTensorFp32* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ReferenceToDevice(
+    const DeviceDenseWeightFp32& weights,
+    const DeviceTensorFp32& activations,
+    DeviceTensorFp32* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output);
 

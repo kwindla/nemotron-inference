@@ -10,6 +10,7 @@
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -164,6 +165,225 @@ std::unique_ptr<DeviceTensorBf16> UploadDenseWeightToDeviceBf16(const GemmDescri
   return weight;
 }
 
+GemmDescriptor BuildDenseRuntimeDescriptor(
+    const GemmDescriptor& descriptor,
+    const DeviceDenseWeightFp32* dense_weight,
+    const DeviceTensorBf16* dense_weight_bf16,
+    DenseRuntimeOpFamily dense_family) {
+  GemmDescriptor runtime_descriptor = descriptor;
+  if (ExperimentalDenseDevicePlanSurfaceEnabledForDescriptor(descriptor, dense_family)) {
+    if (dense_weight_bf16 != nullptr && dense_weight_bf16->valid()) {
+      runtime_descriptor.storage_dtype = "bf16";
+      runtime_descriptor.packed_data =
+          reinterpret_cast<const std::uint8_t*>(dense_weight_bf16->data());
+      runtime_descriptor.packed_nbytes =
+          descriptor.output_rows * descriptor.input_cols * sizeof(__nv_bfloat16);
+    } else if (dense_weight != nullptr && dense_weight->valid()) {
+      runtime_descriptor.storage_dtype = "fp32";
+      runtime_descriptor.packed_data =
+          reinterpret_cast<const std::uint8_t*>(dense_weight->data());
+      runtime_descriptor.packed_nbytes =
+          descriptor.output_rows * descriptor.input_cols * sizeof(float);
+    }
+  }
+  return runtime_descriptor;
+}
+
+template <typename ActivationTensorT>
+std::optional<CublasLtGemmPlan> ResolveDensePlan(
+    std::mutex& dense_rows1_plan_mutex,
+    bool* dense_rows1_plan_attempted,
+    std::optional<CublasLtGemmPlan>* dense_rows1_plan,
+    const GemmDescriptor& descriptor,
+    const DeviceDenseWeightFp32* dense_weight,
+    const DeviceTensorBf16* dense_weight_bf16,
+    const ActivationTensorT& activations,
+    GemmHeuristicCache* heuristic_cache,
+    DenseRuntimeOpFamily dense_family) {
+  const GemmDescriptor runtime_descriptor =
+      BuildDenseRuntimeDescriptor(descriptor, dense_weight, dense_weight_bf16, dense_family);
+  std::optional<CublasLtGemmPlan> plan;
+  if (activations.shape().at(0) == 1) {
+    std::lock_guard<std::mutex> lock(dense_rows1_plan_mutex);
+    if (!*dense_rows1_plan_attempted) {
+      *dense_rows1_plan =
+          BuildRuntimeGemmPlan(runtime_descriptor, activations.shape().at(0), heuristic_cache);
+      *dense_rows1_plan_attempted = true;
+      if (!dense_rows1_plan->has_value()) {
+        RecordDensePlanBuildFailure(dense_family);
+      }
+    } else if (dense_rows1_plan->has_value()) {
+      RecordDensePlanCacheHit();
+    }
+    if (dense_rows1_plan->has_value()) {
+      plan = *dense_rows1_plan;
+    }
+  } else {
+    plan = BuildRuntimeGemmPlan(runtime_descriptor, activations.shape().at(0), heuristic_cache);
+    if (!plan.has_value()) {
+      RecordDensePlanBuildFailure(dense_family);
+    }
+  }
+  return plan;
+}
+
+bool EnsureDenseWeightFp32(
+    const GemmDescriptor& descriptor,
+    std::unique_ptr<DeviceDenseWeightFp32>* dense_weight) {
+  if (*dense_weight && (*dense_weight)->valid()) {
+    return true;
+  }
+  if (!IsBf16DenseDescriptor(descriptor)) {
+    return false;
+  }
+  *dense_weight = DeviceDenseWeightFp32::Upload(descriptor);
+  return *dense_weight && (*dense_weight)->valid();
+}
+
+bool EnsureDenseWeightBf16(
+    const GemmDescriptor& descriptor,
+    const DeviceDenseWeightFp32* dense_weight,
+    std::unique_ptr<DeviceTensorBf16>* dense_weight_bf16,
+    bool* dense_rows1_plan_attempted,
+    std::optional<CublasLtGemmPlan>* dense_rows1_plan) {
+  if (*dense_weight_bf16 && (*dense_weight_bf16)->valid()) {
+    return true;
+  }
+  if (dense_weight == nullptr || !dense_weight->valid()) {
+    return false;
+  }
+  auto converted = DeviceTensorBf16::Create({descriptor.output_rows, descriptor.input_cols});
+  if (!converted ||
+      !ConvertDeviceFp32ToBf16(
+          dense_weight->data(),
+          descriptor.output_rows * descriptor.input_cols,
+          converted->data())) {
+    return false;
+  }
+  *dense_weight_bf16 = std::move(converted);
+  *dense_rows1_plan_attempted = false;
+  dense_rows1_plan->reset();
+  return true;
+}
+
+template <typename ActivationTensorT, typename OutputTensorT>
+std::optional<DenseRowMajorDeviceStats> RunDenseNativeDispatch(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorBf16& weights,
+    const ActivationTensorT& activations,
+    OutputTensorT* output) {
+  if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32> &&
+                std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
+    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output);
+  } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
+                       std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
+    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output);
+  } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
+                       std::is_same_v<OutputTensorT, DeviceTensorBf16>) {
+    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output);
+  } else {
+    return std::nullopt;
+  }
+}
+
+template <typename ActivationTensorT, typename OutputTensorT>
+std::optional<DenseRowMajorDeviceStats> RunDenseNativeDispatch(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceDenseWeightFp32& weights,
+    const ActivationTensorT& activations,
+    OutputTensorT* output) {
+  if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32> &&
+                std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
+    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output);
+  } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
+                       std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
+    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output);
+  } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
+                       std::is_same_v<OutputTensorT, DeviceTensorBf16>) {
+    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output);
+  } else {
+    return std::nullopt;
+  }
+}
+
+template <typename ActivationTensorT, typename OutputTensorT>
+bool TryRunDenseNative(
+    const GemmDescriptor& descriptor,
+    const DeviceDenseWeightFp32* dense_weight,
+    const DeviceTensorBf16* dense_weight_bf16,
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const ActivationTensorT& activations,
+    OutputTensorT* output,
+    DenseRuntimeOpFamily dense_family,
+    bool debug) {
+  if (dense_weight_bf16 != nullptr && dense_weight_bf16->valid()) {
+    if (const auto stats = RunDenseNativeDispatch(handle, plan, *dense_weight_bf16, activations, output);
+        stats.has_value()) {
+      RecordDenseNativeSuccess(dense_family);
+      return true;
+    }
+    RecordDenseBf16NativeFailure();
+    if (debug) {
+      std::cerr << "linear_op: dense BF16 cuBLASLt path failed for "
+                << descriptor.tensor_name << "\n";
+    }
+    return false;
+  }
+  if (dense_weight != nullptr && dense_weight->valid()) {
+    if (const auto stats = RunDenseNativeDispatch(handle, plan, *dense_weight, activations, output);
+        stats.has_value()) {
+      RecordDenseNativeSuccess(dense_family);
+      return true;
+    }
+    RecordDenseFp32NativeFailure();
+    if (debug) {
+      std::cerr << "linear_op: dense FP32-weight cuBLASLt path failed for "
+                << descriptor.tensor_name << "\n";
+    }
+  }
+  return false;
+}
+
+template <typename OutputTensorT>
+bool RunDenseReferenceFallback(
+    const GemmDescriptor& descriptor,
+    std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
+    const DeviceTensorFp32& activations,
+    OutputTensorT* output) {
+  if (!EnsureDenseWeightFp32(descriptor, dense_weight)) {
+    return false;
+  }
+  if constexpr (std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
+    return RunDenseRowMajorFp32ReferenceToDevice(**dense_weight, activations, output).has_value();
+  } else {
+    auto output_fp32 = DeviceTensorFp32::Create(output->shape());
+    return output_fp32 &&
+           RunDenseRowMajorFp32ReferenceToDevice(
+               **dense_weight,
+               activations,
+               output_fp32.get())
+               .has_value() &&
+           ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+  }
+}
+
+template <typename OutputTensorT>
+bool RunDenseReferenceFallback(
+    const GemmDescriptor& descriptor,
+    std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
+    const DeviceTensorBf16& activations,
+    OutputTensorT* output) {
+  auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
+  if (!activations_fp32 ||
+      !ConvertDeviceBf16ToFp32(activations.data(), activations.numel(), activations_fp32->data())) {
+    return false;
+  }
+  return RunDenseReferenceFallback(descriptor, dense_weight, *activations_fp32, output);
+}
+
 }  // namespace
 
 std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor& descriptor) {
@@ -271,91 +491,39 @@ bool UploadedLinearOp::Run(
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
       const DenseRuntimeOpFamily dense_family = ClassifyDenseRuntimeOpFamily(impl_->descriptor);
-      GemmDescriptor runtime_descriptor = impl_->descriptor;
-      if (ExperimentalDenseDevicePlanSurfaceEnabledForDescriptor(impl_->descriptor, dense_family)) {
-        if (impl_->dense_weight_bf16 && impl_->dense_weight_bf16->valid()) {
-          runtime_descriptor.storage_dtype = "bf16";
-          runtime_descriptor.packed_data =
-              reinterpret_cast<const std::uint8_t*>(impl_->dense_weight_bf16->data());
-          runtime_descriptor.packed_nbytes =
-              impl_->descriptor.output_rows * impl_->descriptor.input_cols * sizeof(__nv_bfloat16);
-        } else if (impl_->dense_weight && impl_->dense_weight->valid()) {
-          runtime_descriptor.storage_dtype = "fp32";
-          runtime_descriptor.packed_data =
-              reinterpret_cast<const std::uint8_t*>(impl_->dense_weight->data());
-          runtime_descriptor.packed_nbytes =
-              impl_->descriptor.output_rows * impl_->descriptor.input_cols * sizeof(float);
-        }
+      const auto plan = ResolveDensePlan(
+          impl_->dense_rows1_plan_mutex,
+          &impl_->dense_rows1_plan_attempted,
+          &impl_->dense_rows1_plan,
+          impl_->descriptor,
+          impl_->dense_weight.get(),
+          impl_->dense_weight_bf16.get(),
+          activations,
+          heuristic_cache,
+          dense_family);
+      if (plan.has_value() &&
+          TryRunDenseNative(
+              impl_->descriptor,
+              impl_->dense_weight.get(),
+              impl_->dense_weight_bf16.get(),
+              handle,
+              *plan,
+              activations,
+              output,
+              dense_family,
+              debug)) {
+        return true;
       }
-      std::optional<CublasLtGemmPlan> plan;
-      if (activations.shape().at(0) == 1) {
-        std::lock_guard<std::mutex> lock(impl_->dense_rows1_plan_mutex);
-        if (!impl_->dense_rows1_plan_attempted) {
-          impl_->dense_rows1_plan =
-              BuildRuntimeGemmPlan(runtime_descriptor, activations.shape().at(0), heuristic_cache);
-          impl_->dense_rows1_plan_attempted = true;
-          if (!impl_->dense_rows1_plan.has_value()) {
-            RecordDensePlanBuildFailure(dense_family);
-          }
-        } else if (impl_->dense_rows1_plan.has_value()) {
-          RecordDensePlanCacheHit();
-        }
-        if (impl_->dense_rows1_plan.has_value()) {
-          plan = impl_->dense_rows1_plan;
-        }
-      } else {
-        plan = BuildRuntimeGemmPlan(runtime_descriptor, activations.shape().at(0), heuristic_cache);
-        if (!plan.has_value()) {
-          RecordDensePlanBuildFailure(dense_family);
-        }
-      }
-        if (plan.has_value()) {
-          if (impl_->dense_weight_bf16 && impl_->dense_weight_bf16->valid()) {
-            if (const auto stats = RunDenseRowMajorBf16ToDevice(
-                    handle,
-                    *plan,
-                    *impl_->dense_weight_bf16,
-                  activations,
-                  output);
-              stats.has_value()) {
-              RecordDenseNativeSuccess(dense_family);
-              return true;
-            }
-            RecordDenseBf16NativeFailure();
-            if (debug) {
-              std::cerr << "linear_op: dense BF16 cuBLASLt path failed for "
-                        << impl_->descriptor.tensor_name
-                        << ", falling back to FP32 reference surface\n";
-            }
-        } else if (const auto stats = RunDenseRowMajorFp32ToDevice(
-                       handle,
-                       *plan,
-                       *impl_->dense_weight,
-                       activations,
-                       output);
-                   stats.has_value()) {
-          RecordDenseNativeSuccess(dense_family);
-          return true;
-        } else {
-          RecordDenseFp32NativeFailure();
-        }
-        if (debug) {
-          std::cerr << "linear_op: dense cuBLASLt path failed for "
-                    << impl_->descriptor.tensor_name
-                    << ", falling back to device reference\n";
-        }
-      } else if (debug) {
+      if (!plan.has_value() && debug) {
         std::cerr << "linear_op: dense plan build failed for " << impl_->descriptor.tensor_name
                   << ", falling back to device reference\n";
-      }
-      if ((!impl_->dense_weight || !impl_->dense_weight->valid()) &&
-          IsBf16DenseDescriptor(impl_->descriptor)) {
-        impl_->dense_weight = DeviceDenseWeightFp32::Upload(impl_->descriptor);
+      } else if (debug) {
+        std::cerr << "linear_op: dense cuBLASLt path failed for "
+                  << impl_->descriptor.tensor_name
+                  << ", falling back to device reference\n";
       }
       RecordDenseReferenceFallback(dense_family);
-      return impl_->dense_weight && impl_->dense_weight->valid() &&
-             RunDenseRowMajorFp32ReferenceToDevice(*impl_->dense_weight, activations, output)
-                 .has_value();
+      return RunDenseReferenceFallback(impl_->descriptor, &impl_->dense_weight, activations, output);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       {
@@ -375,6 +543,173 @@ bool UploadedLinearOp::Run(
                    output)
             .has_value();
       }
+  }
+  return false;
+}
+
+bool UploadedLinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorFp32* output) const {
+  static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = kDebug;
+  if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
+    if (debug) {
+      std::cerr << "linear_op: invalid BF16->FP32 run state for "
+                << impl_->descriptor.tensor_name << "\n";
+    }
+    return false;
+  }
+  switch (impl_->descriptor.kernel_family) {
+    case GemmKernelFamily::kDenseRowMajor: {
+      if ((!impl_->dense_weight_bf16 || !impl_->dense_weight_bf16->valid()) &&
+          impl_->dense_weight != nullptr &&
+          impl_->dense_weight->valid()) {
+        auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
+        if (!activations_fp32 ||
+            !ConvertDeviceBf16ToFp32(
+                activations.data(),
+                activations.numel(),
+                activations_fp32->data())) {
+          return false;
+        }
+        return Run(handle, heuristic_cache, *activations_fp32, output);
+      }
+      const DenseRuntimeOpFamily dense_family = ClassifyDenseRuntimeOpFamily(impl_->descriptor);
+      const auto plan = ResolveDensePlan(
+          impl_->dense_rows1_plan_mutex,
+          &impl_->dense_rows1_plan_attempted,
+          &impl_->dense_rows1_plan,
+          impl_->descriptor,
+          impl_->dense_weight.get(),
+          impl_->dense_weight_bf16.get(),
+          activations,
+          heuristic_cache,
+          dense_family);
+      if (plan.has_value() &&
+          TryRunDenseNative(
+              impl_->descriptor,
+              impl_->dense_weight.get(),
+              impl_->dense_weight_bf16.get(),
+              handle,
+              *plan,
+              activations,
+              output,
+              dense_family,
+              debug)) {
+        return true;
+      }
+      if (!plan.has_value() && debug) {
+        std::cerr << "linear_op: dense BF16-input plan build failed for "
+                  << impl_->descriptor.tensor_name << "\n";
+      } else if (debug) {
+        std::cerr << "linear_op: dense BF16-input cuBLASLt path failed for "
+                  << impl_->descriptor.tensor_name
+                  << ", falling back to device reference\n";
+      }
+      RecordDenseReferenceFallback(dense_family);
+      return RunDenseReferenceFallback(impl_->descriptor, &impl_->dense_weight, activations, output);
+    }
+    case GemmKernelFamily::kCublasLtNvfp4BlockScaled: {
+      auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
+      if (!activations_fp32 ||
+          !ConvertDeviceBf16ToFp32(activations.data(), activations.numel(), activations_fp32->data())) {
+        return false;
+      }
+      const auto plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape().at(0), heuristic_cache);
+      if (!plan.has_value()) {
+        if (debug) {
+          std::cerr << "linear_op: plan build failed for BF16-input NVFP4 op "
+                    << impl_->descriptor.tensor_name << "\n";
+        }
+        return false;
+      }
+      return RunNvfp4RowMajorFp32SourceToDevice(
+                 handle,
+                 *plan,
+                 *activations_fp32,
+                 *impl_->nvfp4_weight,
+                 output)
+          .has_value();
+    }
+  }
+  return false;
+}
+
+bool UploadedLinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output) const {
+  static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool debug = kDebug;
+  if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
+    if (debug) {
+      std::cerr << "linear_op: invalid BF16->BF16 run state for "
+                << impl_->descriptor.tensor_name << "\n";
+    }
+    return false;
+  }
+  switch (impl_->descriptor.kernel_family) {
+    case GemmKernelFamily::kDenseRowMajor: {
+      if (!EnsureDenseWeightBf16(
+              impl_->descriptor,
+              impl_->dense_weight.get(),
+              &impl_->dense_weight_bf16,
+              &impl_->dense_rows1_plan_attempted,
+              &impl_->dense_rows1_plan) &&
+          debug &&
+          impl_->dense_weight != nullptr &&
+          impl_->dense_weight->valid()) {
+        std::cerr << "linear_op: failed to materialize BF16 dense weight for "
+                  << impl_->descriptor.tensor_name << "\n";
+      }
+      const DenseRuntimeOpFamily dense_family = ClassifyDenseRuntimeOpFamily(impl_->descriptor);
+      const auto plan = ResolveDensePlan(
+          impl_->dense_rows1_plan_mutex,
+          &impl_->dense_rows1_plan_attempted,
+          &impl_->dense_rows1_plan,
+          impl_->descriptor,
+          impl_->dense_weight.get(),
+          impl_->dense_weight_bf16.get(),
+          activations,
+          heuristic_cache,
+          dense_family);
+      if (plan.has_value() &&
+          TryRunDenseNative(
+              impl_->descriptor,
+              impl_->dense_weight.get(),
+              impl_->dense_weight_bf16.get(),
+              handle,
+              *plan,
+              activations,
+              output,
+              dense_family,
+              debug)) {
+        return true;
+      }
+      if (!plan.has_value() && debug) {
+        std::cerr << "linear_op: dense BF16 surface plan build failed for "
+                  << impl_->descriptor.tensor_name << "\n";
+      } else if (debug) {
+        std::cerr << "linear_op: dense BF16 surface cuBLASLt path failed for "
+                  << impl_->descriptor.tensor_name
+                  << ", falling back to device reference\n";
+      }
+      RecordDenseReferenceFallback(dense_family);
+      return RunDenseReferenceFallback(impl_->descriptor, &impl_->dense_weight, activations, output);
+    }
+    case GemmKernelFamily::kCublasLtNvfp4BlockScaled: {
+      auto output_fp32 = DeviceTensorFp32::Create(output->shape());
+      if (!output_fp32) {
+        return false;
+      }
+      if (!Run(handle, heuristic_cache, activations, output_fp32.get())) {
+        return false;
+      }
+      return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+    }
   }
   return false;
 }

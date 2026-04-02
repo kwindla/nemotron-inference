@@ -4,7 +4,9 @@
 #include <cuda_runtime.h>
 
 #include <iostream>
-#include <vector>
+#include <type_traits>
+
+#include "storage_conversion.h"
 
 namespace nemotron {
 
@@ -24,10 +26,24 @@ const char* CudaErrorName(cudaError_t status) {
   return cudaGetErrorString(status);
 }
 
+template <typename OutputT>
+__device__ OutputT ConvertEmbeddingValue(float value);
+
+template <>
+__device__ float ConvertEmbeddingValue<float>(float value) {
+  return value;
+}
+
+template <>
+__device__ __nv_bfloat16 ConvertEmbeddingValue<__nv_bfloat16>(float value) {
+  return __float2bfloat16(value);
+}
+
+template <typename OutputT>
 __global__ void EmbeddingLookupKernel(
     const float* table,
     const std::int32_t* token_ids,
-    float* output,
+    OutputT* output,
     std::size_t token_count,
     std::size_t embedding_dim) {
   const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -38,7 +54,94 @@ __global__ void EmbeddingLookupKernel(
   const std::size_t token_index = index / embedding_dim;
   const std::size_t dim_index = index % embedding_dim;
   const std::int32_t token_id = token_ids[token_index];
-  output[index] = table[static_cast<std::size_t>(token_id) * embedding_dim + dim_index];
+  output[index] = ConvertEmbeddingValue<OutputT>(
+      table[static_cast<std::size_t>(token_id) * embedding_dim + dim_index]);
+}
+
+template <typename TensorT>
+bool ValidateLookupRequest(
+    const DeviceEmbeddingTableFp32& table,
+    const void* token_ids,
+    std::size_t token_count,
+    const TensorT* output) {
+  const bool table_valid = table.valid();
+  const bool have_token_ids = token_ids != nullptr;
+  const bool nonzero_token_count = token_count != 0;
+  const bool have_output = output != nullptr;
+  const bool output_valid = have_output && output->valid();
+  const bool output_rank_ok = output_valid && output->shape().size() == 2;
+  const bool output_rows_ok = output_rank_ok && output->shape()[0] == token_count;
+  const bool output_cols_ok = output_rank_ok && output->shape()[1] == table.embedding_dim();
+  if (table_valid &&
+      have_token_ids &&
+      nonzero_token_count &&
+      have_output &&
+      output_valid &&
+      output_rank_ok &&
+      output_rows_ok &&
+      output_cols_ok) {
+    return true;
+  }
+
+  std::cerr << "embedding_table: invalid lookup request"
+            << " table_valid=" << table_valid
+            << " have_token_ids=" << have_token_ids
+            << " nonzero_token_count=" << nonzero_token_count
+            << " have_output=" << have_output
+            << " output_valid=" << output_valid
+            << " output_rank_ok=" << output_rank_ok
+            << " output_rows_ok=" << output_rows_ok
+            << " output_cols_ok=" << output_cols_ok;
+  if (output_valid) {
+    std::cerr << " output_shape=[";
+    for (std::size_t i = 0; i < output->shape().size(); ++i) {
+      if (i != 0) {
+        std::cerr << ",";
+      }
+      std::cerr << output->shape()[i];
+    }
+    std::cerr << "]";
+  }
+  std::cerr << " token_count=" << token_count
+            << " embedding_dim=" << table.embedding_dim()
+            << "\n";
+  return false;
+}
+
+template <typename TensorT>
+std::optional<EmbeddingLookupStats> LaunchEmbeddingLookup(
+    const DeviceEmbeddingTableFp32& table,
+    const std::int32_t* device_token_ids,
+    std::size_t token_count,
+    TensorT* output,
+    bool synchronize) {
+  if (!ValidateLookupRequest(table, device_token_ids, token_count, output)) {
+    return std::nullopt;
+  }
+  const std::size_t total = token_count * table.embedding_dim();
+  const int block_size = 256;
+  const int grid_size = static_cast<int>((total + block_size - 1) / block_size);
+  EmbeddingLookupKernel<<<grid_size, block_size>>>(
+      table.data(),
+      device_token_ids,
+      output->data(),
+      token_count,
+      table.embedding_dim());
+  const cudaError_t launch_status = cudaPeekAtLastError();
+  if (!CheckCuda(launch_status)) {
+    std::cerr << "embedding_table: kernel launch failed ("
+              << CudaErrorName(launch_status) << ")\n";
+    return std::nullopt;
+  }
+  if (synchronize) {
+    const cudaError_t sync_status = cudaDeviceSynchronize();
+    if (!CheckCuda(sync_status)) {
+      std::cerr << "embedding_table: kernel sync failed ("
+                << CudaErrorName(sync_status) << ")\n";
+      return std::nullopt;
+    }
+  }
+  return EmbeddingLookupStats{token_count, table.embedding_dim()};
 }
 
 }  // namespace
@@ -97,29 +200,34 @@ std::unique_ptr<DeviceEmbeddingTableFp32> DeviceEmbeddingTableFp32::Upload(
     return nullptr;
   }
 
-  std::vector<float> bf16_converted;
-  const void* upload_source = descriptor.packed_data;
-  if (is_bf16) {
-    bf16_converted.assign(element_count, 0.0f);
-    const auto* src = reinterpret_cast<const __nv_bfloat16*>(descriptor.packed_data);
-    for (std::size_t i = 0; i < element_count; ++i) {
-      bf16_converted[i] = __bfloat162float(src[i]);
-    }
-    upload_source = bf16_converted.data();
-  }
-
-  const cudaError_t memcpy_status = cudaMemcpy(
-      impl->data,
-      upload_source,
-      upload_bytes,
-      cudaMemcpyHostToDevice);
-  if (!CheckCuda(memcpy_status)) {
-    std::cerr << "embedding_table: cudaMemcpy upload failed ("
-              << CudaErrorName(memcpy_status) << ")\n";
+  const PackedFloatStorage storage =
+      is_bf16 ? PackedFloatStorage::kBf16 : PackedFloatStorage::kFp32;
+  if (!UploadPackedFloatToDeviceFp32(
+          descriptor.packed_data,
+          element_count,
+          storage,
+          1.0f,
+          impl->data)) {
+    std::cerr << "embedding_table: device conversion upload failed ("
+              << CudaErrorName(cudaGetLastError()) << ")\n";
     cudaFree(impl->data);
     return nullptr;
   }
 
+  return std::unique_ptr<DeviceEmbeddingTableFp32>(new DeviceEmbeddingTableFp32(std::move(impl)));
+}
+
+std::unique_ptr<DeviceEmbeddingTableFp32> DeviceEmbeddingTableFp32::CreateView(
+    std::size_t vocab_size,
+    std::size_t embedding_dim,
+    float* data) {
+  if (vocab_size == 0 || embedding_dim == 0 || data == nullptr) {
+    return nullptr;
+  }
+  auto impl = std::make_unique<Impl>();
+  impl->vocab_size = vocab_size;
+  impl->embedding_dim = embedding_dim;
+  impl->data = data;
   return std::unique_ptr<DeviceEmbeddingTableFp32>(new DeviceEmbeddingTableFp32(std::move(impl)));
 }
 
@@ -156,15 +264,7 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsFp32(
     const std::int32_t* host_token_ids,
     std::size_t token_count,
     DeviceTensorFp32* output) {
-  if (!table.valid() ||
-      host_token_ids == nullptr ||
-      token_count == 0 ||
-      output == nullptr ||
-      !output->valid() ||
-      output->shape().size() != 2 ||
-      output->shape()[0] != token_count ||
-      output->shape()[1] != table.embedding_dim()) {
-    std::cerr << "embedding_table: invalid lookup request\n";
+  if (!ValidateLookupRequest(table, host_token_ids, token_count, output)) {
     return std::nullopt;
   }
 
@@ -199,28 +299,10 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsFp32(
               << CudaErrorName(token_copy_status) << ")\n";
   }
 
+  std::optional<EmbeddingLookupStats> stats;
   if (ok) {
-    const std::size_t total = token_count * table.embedding_dim();
-    const int block_size = 256;
-    const int grid_size = static_cast<int>((total + block_size - 1) / block_size);
-    EmbeddingLookupKernel<<<grid_size, block_size>>>(
-        table.data(),
-        token_ids_dev,
-        output->data(),
-        token_count,
-        table.embedding_dim());
-    const cudaError_t launch_status = cudaPeekAtLastError();
-    ok &= CheckCuda(launch_status);
-    if (!CheckCuda(launch_status)) {
-      std::cerr << "embedding_table: kernel launch failed ("
-                << CudaErrorName(launch_status) << ")\n";
-    }
-    const cudaError_t sync_status = ok ? cudaDeviceSynchronize() : cudaSuccess;
-    ok &= CheckCuda(sync_status);
-    if (!CheckCuda(sync_status)) {
-      std::cerr << "embedding_table: kernel sync failed ("
-                << CudaErrorName(sync_status) << ")\n";
-    }
+    stats = LaunchEmbeddingLookup(table, token_ids_dev, token_count, output, true);
+    ok &= stats.has_value();
   }
 
   if (token_ids_dev != nullptr) {
@@ -231,10 +313,80 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsFp32(
     return std::nullopt;
   }
 
-  return EmbeddingLookupStats{
-      token_count,
-      table.embedding_dim(),
-  };
+  return stats;
+}
+
+std::optional<EmbeddingLookupStats> LookupEmbeddingRowsBf16(
+    const DeviceEmbeddingTableFp32& table,
+    const std::int32_t* host_token_ids,
+    std::size_t token_count,
+    DeviceTensorBf16* output) {
+  if (!ValidateLookupRequest(table, host_token_ids, token_count, output)) {
+    return std::nullopt;
+  }
+
+  for (std::size_t i = 0; i < token_count; ++i) {
+    if (host_token_ids[i] < 0 || static_cast<std::size_t>(host_token_ids[i]) >= table.vocab_size()) {
+      std::cerr << "embedding_table: token id out of range at index " << i
+                << " token_id=" << host_token_ids[i]
+                << " vocab_size=" << table.vocab_size() << "\n";
+      return std::nullopt;
+    }
+  }
+
+  std::int32_t* token_ids_dev = nullptr;
+  bool ok = true;
+  const cudaError_t token_alloc_status =
+      cudaMalloc(reinterpret_cast<void**>(&token_ids_dev), token_count * sizeof(std::int32_t));
+  ok &= CheckCuda(token_alloc_status);
+  if (!ok) {
+    std::cerr << "embedding_table: token-id cudaMalloc failed ("
+              << CudaErrorName(token_alloc_status) << ")\n";
+  }
+  const cudaError_t token_copy_status = ok
+      ? cudaMemcpy(
+            token_ids_dev,
+            host_token_ids,
+            token_count * sizeof(std::int32_t),
+            cudaMemcpyHostToDevice)
+      : cudaSuccess;
+  ok &= CheckCuda(token_copy_status);
+  if (!CheckCuda(token_copy_status)) {
+    std::cerr << "embedding_table: token-id cudaMemcpy failed ("
+              << CudaErrorName(token_copy_status) << ")\n";
+  }
+
+  std::optional<EmbeddingLookupStats> stats;
+  if (ok) {
+    stats = LaunchEmbeddingLookup(table, token_ids_dev, token_count, output, true);
+    ok &= stats.has_value();
+  }
+
+  if (token_ids_dev != nullptr) {
+    cudaFree(token_ids_dev);
+  }
+
+  if (!ok) {
+    return std::nullopt;
+  }
+
+  return stats;
+}
+
+std::optional<EmbeddingLookupStats> LookupEmbeddingRowsDeviceIdsFp32(
+    const DeviceEmbeddingTableFp32& table,
+    const std::int32_t* device_token_ids,
+    std::size_t token_count,
+    DeviceTensorFp32* output) {
+  return LaunchEmbeddingLookup(table, device_token_ids, token_count, output, false);
+}
+
+std::optional<EmbeddingLookupStats> LookupEmbeddingRowsDeviceIdsBf16(
+    const DeviceEmbeddingTableFp32& table,
+    const std::int32_t* device_token_ids,
+    std::size_t token_count,
+    DeviceTensorBf16* output) {
+  return LaunchEmbeddingLookup(table, device_token_ids, token_count, output, false);
 }
 
 }  // namespace nemotron

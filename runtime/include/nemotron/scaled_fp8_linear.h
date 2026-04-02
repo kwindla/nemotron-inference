@@ -62,6 +62,18 @@ class ScaledFp8LinearOp {
       const DeviceTensorFp32& activations,
       DeviceTensorFp32* output) const;
 
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& activations,
+      DeviceTensorFp32* output) const;
+
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& activations,
+      DeviceTensorBf16* output) const;
+
  private:
   struct Impl;
 
