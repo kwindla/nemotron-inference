@@ -149,13 +149,15 @@ add_library(
   src/api/runtime_stats.cpp
   src/backend/scaled_fp8_linear.cu
   src/backend/storage_conversion.cu
+  src/backend/cutlass_fp8_gemm.cu
   src/backend/cutlass_nvfp4_grouped_gemm.cu
 )
 
-# The CUTLASS grouped GEMM file needs special compile flags:
+# The CUTLASS GEMM files need special compile flags:
 # - sm_121a for conditional MMA arch features
 # - CUTLASS include paths (heavy headers, isolated to this one file)
 set_source_files_properties(
+  src/backend/cutlass_fp8_gemm.cu
   src/backend/cutlass_nvfp4_grouped_gemm.cu
   PROPERTIES
     COMPILE_OPTIONS "--expt-relaxed-constexpr;-DCUTLASS_SM100_FAMILY_ARCHS_ENABLED"
