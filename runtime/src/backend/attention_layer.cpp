@@ -393,6 +393,8 @@ struct AttentionLayerSlice::Impl {
   std::unique_ptr<DeviceTensorFp32> k_scratch;
   std::unique_ptr<DeviceTensorFp32> v_scratch;
   std::unique_ptr<DeviceTensorFp32> attn_output_scratch;
+  std::unique_ptr<DeviceTensorBf16> query_bf16_scratch;
+  std::unique_ptr<DeviceTensorBf16> attn_output_bf16_scratch;
   std::array<std::int32_t, 1> query_sequence_lengths_host{0};
   std::array<std::int32_t, 1> query_sequence_starts_host{0};
   PagedAttentionBatchPlan batch_plan;
@@ -474,6 +476,10 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   auto k_scratch = DeviceTensorFp32::Create({1, kv_width});
   auto v_scratch = DeviceTensorFp32::Create({1, kv_width});
   auto attn_output_scratch = DeviceTensorFp32::Create({1, query_width});
+  auto query_bf16_scratch =
+      DeviceTensorBf16::Create({1, config.query_head_count, 1, config.head_dim});
+  auto attn_output_bf16_scratch =
+      DeviceTensorBf16::Create({1, config.query_head_count, 1, config.head_dim});
   if (!norm_weight ||
       !q_proj ||
       !k_proj ||
@@ -483,7 +489,9 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
       !q_scratch ||
       !k_scratch ||
       !v_scratch ||
-      !attn_output_scratch) {
+      !attn_output_scratch ||
+      !query_bf16_scratch ||
+      !attn_output_bf16_scratch) {
     return debug_fail("weight materialization failed");
   }
 
@@ -499,6 +507,8 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   impl->k_scratch = std::move(k_scratch);
   impl->v_scratch = std::move(v_scratch);
   impl->attn_output_scratch = std::move(attn_output_scratch);
+  impl->query_bf16_scratch = std::move(query_bf16_scratch);
+  impl->attn_output_bf16_scratch = std::move(attn_output_bf16_scratch);
   impl->seq_len_q = DeviceBuffer<std::int32_t>::Create(1);
   impl->seq_len_kv = DeviceBuffer<std::int32_t>::Create(1);
   impl->query_starts = DeviceBuffer<std::int32_t>::Create(1);
@@ -544,6 +554,10 @@ bool AttentionLayerSlice::valid() const {
          impl_->v_scratch->valid() &&
          impl_->attn_output_scratch != nullptr &&
          impl_->attn_output_scratch->valid() &&
+         impl_->query_bf16_scratch != nullptr &&
+         impl_->query_bf16_scratch->valid() &&
+         impl_->attn_output_bf16_scratch != nullptr &&
+         impl_->attn_output_bf16_scratch->valid() &&
          impl_->seq_len_q.has_value() &&
          impl_->seq_len_kv.has_value() &&
          impl_->query_starts.has_value() &&
@@ -599,12 +613,16 @@ bool AttentionLayerSlice::Run(
   std::unique_ptr<DeviceTensorFp32> v_owned;
   std::unique_ptr<DeviceTensorFp32> attn_output_owned;
   std::unique_ptr<DeviceTensorFp32> projected_owned;
+  std::unique_ptr<DeviceTensorBf16> query_bf16_owned;
+  std::unique_ptr<DeviceTensorBf16> output_bf16_owned;
   DeviceTensorFp32* normed = nullptr;
   DeviceTensorFp32* q = nullptr;
   DeviceTensorFp32* k = nullptr;
   DeviceTensorFp32* v = nullptr;
   DeviceTensorFp32* attn_output_fp32 = nullptr;
   DeviceTensorFp32* projected = nullptr;
+  DeviceTensorBf16* query_bf16 = nullptr;
+  DeviceTensorBf16* output_bf16 = nullptr;
   const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
   if (use_decode_scratch) {
     normed = impl_->normed_scratch.get();
@@ -613,6 +631,8 @@ bool AttentionLayerSlice::Run(
     v = impl_->v_scratch.get();
     attn_output_fp32 = impl_->attn_output_scratch.get();
     projected = output;
+    query_bf16 = impl_->query_bf16_scratch.get();
+    output_bf16 = impl_->attn_output_bf16_scratch.get();
   } else {
     normed_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
     q_owned = DeviceTensorFp32::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
@@ -621,14 +641,28 @@ bool AttentionLayerSlice::Run(
     attn_output_owned = DeviceTensorFp32::Create(
         {token_count, impl_->config.query_head_count * impl_->config.head_dim});
     projected_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    query_bf16_owned =
+        DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
+    output_bf16_owned =
+        DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
     normed = normed_owned.get();
     q = q_owned.get();
     k = k_owned.get();
     v = v_owned.get();
     attn_output_fp32 = attn_output_owned.get();
     projected = projected_owned.get();
+    query_bf16 = query_bf16_owned.get();
+    output_bf16 = output_bf16_owned.get();
   }
-  if (!normed || !q || !k || !v || !attn_output_fp32 || !projected) {
+  if (!normed ||
+      !q ||
+      !k ||
+      !v ||
+      !attn_output_fp32 ||
+      !projected ||
+      !query_bf16 ||
+      !output_bf16 ||
+      !output_bf16->FillZero()) {
     if (debug) {
       std::cout << "attention_layer: scratch allocation failed\n";
     }
@@ -728,22 +762,12 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  auto query_bf16 =
-      DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
-  auto output_bf16 =
-      DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
-  if (!query_bf16 || !output_bf16 || !output_bf16->FillZero()) {
-    if (debug) {
-      std::cout << "attention_layer: failed to allocate query or output buffers\n";
-    }
-    return false;
-  }
   if (!ConvertRowMajorFp32ToAttentionQueryBf16(
           *q,
           token_count,
           impl_->config.query_head_count,
           impl_->config.head_dim,
-          query_bf16.get())) {
+          query_bf16)) {
     if (debug) {
       std::cout << "attention_layer: failed to convert query to BF16 layout\n";
     }
@@ -853,7 +877,7 @@ bool AttentionLayerSlice::Run(
             token_count,
             1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
             true,
-            output_bf16.get())) {
+            output_bf16)) {
       if (debug) {
         std::cout << "attention_layer: device paged attention fallback failed\n";
       }

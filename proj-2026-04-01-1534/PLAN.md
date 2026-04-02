@@ -183,7 +183,7 @@ Translate from these upstream designs, not from generic intuition:
   - gate the reuse path behind `NEMOTRON_FORWARD_DECODE_SCRATCH=1` (default enabled)
   Key files: `device_tensor.cpp`, `single_token_forward_model.cpp`, `mamba_layer.cpp`, `expert_layer.cpp`, `attention_layer.cpp`
 
-- [ ] **8c. Pre-allocate attention activation buffers**
+- [x] **8c. Pre-allocate attention activation buffers**
   Goal:
   - eliminate the remaining per-call BF16 attention activation allocations
   Sites: `attention_layer.cpp:664-667` (BF16 query/output buffers)
@@ -226,7 +226,7 @@ Translate from these upstream designs, not from generic intuition:
 | 7 | Re-measure and decide | done | — | Mamba=66% GPU, sync/alloc=42% wall; both need fixing for 20ms |
 | 8a | Remove explicit syncs + dead allocs | done | — | hot-path syncs removed; per-alloc device checks cached; cudaFree still barriers |
 | 8b | Decode scratch buffer reuse | done | — | request-context decode views + layer-local FP32 scratch landed; BF16 attention and NVFP4 pack buffers remain |
-| 8c | Attention activation pre-alloc | pending | — | remaining BF16 attention alloc cleanup |
+| 8c | Attention activation pre-alloc | done | — | BF16 query/output pre-allocated in Impl; smoke PASS |
 | 9 | Re-profile after cleanup | pending | — | kernel floor ~33ms; host should be near-zero |
 | 10 | Optimize Mamba decode kernel | pending | — | 0.94ms × 23 = 22ms/token; hard blocker for 20ms |
 | 11 | Evidence-driven loop to 20ms | pending | — | |
