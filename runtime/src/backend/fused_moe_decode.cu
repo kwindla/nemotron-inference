@@ -16,6 +16,11 @@ namespace {
 constexpr int kMaxSelectedExperts = 32;
 constexpr int kMaxExpertGroups = 64;
 constexpr int kMaxRoutedExperts = 1024;
+constexpr int kWarpExpertSelectionThreads = 32;
+constexpr int kExpertsPerWarpSelectionThread = 4;
+constexpr int kWarpExpertSelectionCapacity =
+    kWarpExpertSelectionThreads * kExpertsPerWarpSelectionThread;
+constexpr unsigned int kFullWarpMask = 0xffffffffu;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -24,6 +29,29 @@ bool CheckCuda(cudaError_t status) {
 bool EnvEnabled(const char* env_var) {
   const char* value = std::getenv(env_var);
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+__device__ __forceinline__ bool ExpertSelectionCandidateIsBetter(
+    float candidate_value,
+    int candidate_expert,
+    float current_value,
+    int current_expert) {
+  if (candidate_expert < 0) {
+    return false;
+  }
+  if (candidate_value > current_value) {
+    return true;
+  }
+  if (candidate_value < current_value) {
+    return false;
+  }
+  if (!(candidate_value == current_value)) {
+    return false;
+  }
+  if (current_expert < 0) {
+    return false;
+  }
+  return candidate_expert < current_expert;
 }
 
 __device__ void SelectTopExpertsOneToken(
@@ -257,7 +285,7 @@ __global__ void FusedMoeDirectDecodeKernel(
   }
 }
 
-__global__ void DeviceExpertSelectionKernel(
+__global__ void DeviceExpertSelectionLegacyKernel(
     FusedMoeDirectLayerParams params,
     const float* router_logits,
     int* selected_indices,
@@ -266,6 +294,112 @@ __global__ void DeviceExpertSelectionKernel(
     return;
   }
   SelectTopExpertsOneToken(params, router_logits, selected_indices, selected_weights);
+}
+
+__global__ void DeviceExpertSelectionKernel(
+    FusedMoeDirectLayerParams params,
+    const float* router_logits,
+    int* selected_indices,
+    float* selected_weights) {
+  if (blockIdx.x != 0 || threadIdx.x >= kWarpExpertSelectionThreads) {
+    return;
+  }
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int n_routed_experts = static_cast<int>(params.n_routed_experts);
+  float raw_scores[kExpertsPerWarpSelectionThread];
+  float choice_scores[kExpertsPerWarpSelectionThread];
+  int expert_indices[kExpertsPerWarpSelectionThread];
+
+#pragma unroll
+  for (int local_slot = 0; local_slot < kExpertsPerWarpSelectionThread; ++local_slot) {
+    const int expert = lane * kExpertsPerWarpSelectionThread + local_slot;
+    if (expert < n_routed_experts) {
+      expert_indices[local_slot] = expert;
+      const float raw_score = fused_decode::Sigmoid(router_logits[expert]);
+      raw_scores[local_slot] = raw_score;
+      choice_scores[local_slot] = raw_score + params.correction_bias[expert];
+    } else {
+      expert_indices[local_slot] = -1;
+      raw_scores[local_slot] = 0.0f;
+      choice_scores[local_slot] = -INFINITY;
+    }
+  }
+
+  for (int selected_slot = 0; selected_slot < static_cast<int>(params.top_k);
+       ++selected_slot) {
+    float local_best_choice = -INFINITY;
+    float local_best_raw = 0.0f;
+    int local_best_expert = -1;
+    int local_best_lane = lane;
+    int local_best_slot = -1;
+
+#pragma unroll
+    for (int local_slot = 0; local_slot < kExpertsPerWarpSelectionThread; ++local_slot) {
+      if (ExpertSelectionCandidateIsBetter(
+              choice_scores[local_slot],
+              expert_indices[local_slot],
+              local_best_choice,
+              local_best_expert)) {
+        local_best_choice = choice_scores[local_slot];
+        local_best_raw = raw_scores[local_slot];
+        local_best_expert = expert_indices[local_slot];
+        local_best_slot = local_slot;
+      }
+    }
+
+    for (int offset = kWarpExpertSelectionThreads / 2; offset > 0; offset >>= 1) {
+      const float other_choice =
+          __shfl_down_sync(kFullWarpMask, local_best_choice, offset);
+      const float other_raw = __shfl_down_sync(kFullWarpMask, local_best_raw, offset);
+      const int other_expert = __shfl_down_sync(kFullWarpMask, local_best_expert, offset);
+      const int other_lane = __shfl_down_sync(kFullWarpMask, local_best_lane, offset);
+      const int other_slot = __shfl_down_sync(kFullWarpMask, local_best_slot, offset);
+      if (ExpertSelectionCandidateIsBetter(
+              other_choice,
+              other_expert,
+              local_best_choice,
+              local_best_expert)) {
+        local_best_choice = other_choice;
+        local_best_raw = other_raw;
+        local_best_expert = other_expert;
+        local_best_lane = other_lane;
+        local_best_slot = other_slot;
+      }
+    }
+
+    const int winning_expert = __shfl_sync(kFullWarpMask, local_best_expert, 0);
+    const float winning_raw = __shfl_sync(kFullWarpMask, local_best_raw, 0);
+    const int winning_lane = __shfl_sync(kFullWarpMask, local_best_lane, 0);
+    const int winning_local_slot = __shfl_sync(kFullWarpMask, local_best_slot, 0);
+
+    if (lane == winning_lane && winning_local_slot >= 0) {
+      expert_indices[winning_local_slot] = -1;
+      choice_scores[winning_local_slot] = -INFINITY;
+    }
+
+    if (lane == 0) {
+      selected_indices[selected_slot] = winning_expert;
+      selected_weights[selected_slot] = winning_expert >= 0 ? winning_raw : 0.0f;
+    }
+  }
+
+  if (lane == 0) {
+    float weight_sum = 0.0f;
+    for (int slot = 0; slot < static_cast<int>(params.top_k); ++slot) {
+      weight_sum += selected_weights[slot];
+    }
+    if (params.norm_topk_prob) {
+      const float denominator = weight_sum + 1.0e-20f;
+      for (int slot = 0; slot < static_cast<int>(params.top_k); ++slot) {
+        selected_weights[slot] /= denominator;
+      }
+    }
+    for (int slot = 0; slot < static_cast<int>(params.top_k); ++slot) {
+      selected_weights[slot] =
+          selected_weights[slot] * params.routed_scaling_factor;
+    }
+  }
 }
 
 __global__ void AccumulateScaledByDeviceWeightKernel(
@@ -329,11 +463,26 @@ bool RunDeviceExpertSelection(
   params.norm_topk_prob = norm_topk_prob;
   params.correction_bias = correction_bias.data();
 
-  DeviceExpertSelectionKernel<<<1, 1>>>(
-      params,
-      router_logits.data(),
-      selected_indices,
-      selected_weights);
+  const bool force_legacy = EnvEnabled("NEMOTRON_FORWARD_EXPERT_SELECT_LEGACY");
+  const bool use_warp_selection =
+      !force_legacy &&
+      n_group == 1 &&
+      topk_group == 1 &&
+      n_routed_experts <= static_cast<std::size_t>(kWarpExpertSelectionCapacity);
+
+  if (use_warp_selection) {
+    DeviceExpertSelectionKernel<<<1, kWarpExpertSelectionThreads>>>(
+        params,
+        router_logits.data(),
+        selected_indices,
+        selected_weights);
+  } else {
+    DeviceExpertSelectionLegacyKernel<<<1, 1>>>(
+        params,
+        router_logits.data(),
+        selected_indices,
+        selected_weights);
+  }
   return CheckCuda(cudaGetLastError());
 }
 

@@ -17,7 +17,7 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
 
 ## Steps
 
-- [ ] **1. Fix expert selection kernel — `<<<1,1>>>` → `<<<1,128>>>`**
+- [x] **1. Fix expert selection kernel — `<<<1,1>>>` → `<<<1,32>>>`**
   The `DeviceExpertSelectionKernel` in `fused_moe_decode.cu` launches with grid=1, block=1. A single thread does sigmoid on 128 values + serial top-k insertion sort. This takes 0.054ms/call × 23 layers = 1.3ms/token.
   Fix: rewrite as `<<<1, 32>>>` with 4 experts per thread (warp-only, no cross-warp merge needed). Each thread computes sigmoid + correction bias for its 4 experts. Then use warp shuffle for parallel top-k selection across all 128 scores. For Nano (n_group=1, topk_group=1), skip the group ranking entirely. Preserve both `scores[]` (for routing weights) and `choice_scores[]` (for ranking).
   Expected: 0.054ms → ~0.005ms per call, saving ~1.1ms/token.
@@ -40,6 +40,6 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Fix expert selection <<<1,1>>> → <<<1,128>>> | pending | — | -1.1ms/token expected |
+| 1 | Fix expert selection <<<1,1>>> → <<<1,32>>> | done | — | warp-parallel iterated top-1; smoke PASS |
 | 2 | Eliminate PackInto D2H tensor scale | pending | — | -0.6ms/token expected |
 | 3 | Benchmark and profile | pending | — | target ≤20ms |
