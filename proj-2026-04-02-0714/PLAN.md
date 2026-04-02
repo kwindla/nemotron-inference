@@ -32,7 +32,7 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
   Expected: eliminate 184 D2H copies/token, saving ~0.6ms/token.
   Key files: `runtime/src/backend/device_nvfp4_matrix.cu`, `runtime/src/backend/nvfp4_gemm_runner.cpp`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/linear_op.cpp`
 
-- [ ] **3. Benchmark and profile**
+- [x] **3. Benchmark and profile**
   Run steady-state benchmark. Target: ≤20ms/token mean.
   Save benchmark artifact and Nsight profile.
   Key files: benchmark scripts
@@ -42,4 +42,4 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
 |---|------|--------|--------|-------|
 | 1 | Fix expert selection <<<1,1>>> → <<<1,32>>> | done | — | warp-parallel iterated top-1; smoke PASS |
 | 2 | Eliminate PackInto D2H tensor scale | done | — | device-alpha via POINTER_MODE_DEVICE + device multiply; smoke PASS |
-| 3 | Benchmark and profile | pending | — | target ≤20ms |
+| 3 | Benchmark and profile | done | — | 21.9ms mean (min 19.4ms); 45.6 tok/sec; 1044x; early steps hit 20ms target |
