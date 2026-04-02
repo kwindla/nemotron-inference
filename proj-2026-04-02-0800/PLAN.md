@@ -28,7 +28,7 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
 
 ## Steps
 
-- [ ] **1. Add production paged decode attention kernel**
+- [x] **1. Add production paged decode attention kernel**
   Add `RunPagedAttentionDecodeProduction()` alongside the existing fallback. Design based on Codex review corrections:
   - **One block per KV head** with multiple warps handling the query group (16 query heads per KV head for Nano)
   - Grid: `batch_size * kv_head_count` blocks (for Nano decode: 1 × 2 = 2 blocks)
@@ -62,6 +62,6 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Warp-cooperative decode attention kernel | pending | — | 32 threads/head, online softmax, no KV-scaling smem |
+| 1 | Warp-cooperative decode attention kernel | done | — | 2 blocks × 256 threads, GQA-aware, online softmax, lane-sharded; compile PASS |
 | 2 | Wire into attention layer dispatcher | pending | — | decode vs prefill routing |
 | 3 | Verify and benchmark | pending | — | target ≤20ms mean |
