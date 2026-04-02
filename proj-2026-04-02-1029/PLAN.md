@@ -29,4 +29,4 @@ Minimize time-to-first-token (TTFT) for multi-turn conversations by caching atte
 | 1 | Remove prompt heads from multi-turn runtime path | done | 836c0d4 | |
 | 2 | Fix Nano manifest runtime_profile and validate budget | done | f3b3cd9 | |
 | 3 | Add global-root integration test | done | e904711 | |
-| 4 | TTFT benchmark | done | — | |
+| 4 | TTFT benchmark | done | eac560e | |
