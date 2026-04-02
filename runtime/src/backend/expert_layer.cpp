@@ -404,20 +404,28 @@ std::unique_ptr<DeviceTensorFp32> UploadHostVectorToDevice(const std::vector<flo
 template <typename T>
 class DeviceArray {
  public:
-  static std::unique_ptr<DeviceArray<T>> CopyFromHost(const std::vector<T>& values) {
-    if (values.empty()) {
+  static std::unique_ptr<DeviceArray<T>> Create(std::size_t count) {
+    if (count == 0) {
       return nullptr;
     }
     T* data = nullptr;
-    const std::size_t bytes = values.size() * sizeof(T);
+    const std::size_t bytes = count * sizeof(T);
     if (cudaMalloc(reinterpret_cast<void**>(&data), bytes) != cudaSuccess) {
       return nullptr;
     }
-    if (cudaMemcpy(data, values.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-      cudaFree(data);
+    return std::unique_ptr<DeviceArray<T>>(new DeviceArray<T>(data, count));
+  }
+
+  static std::unique_ptr<DeviceArray<T>> CopyFromHost(const std::vector<T>& values) {
+    auto output = Create(values.size());
+    if (!output) {
       return nullptr;
     }
-    return std::unique_ptr<DeviceArray<T>>(new DeviceArray<T>(data, values.size()));
+    const std::size_t bytes = values.size() * sizeof(T);
+    if (cudaMemcpy(output->data_, values.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+      return nullptr;
+    }
+    return output;
   }
 
   ~DeviceArray() {
@@ -431,6 +439,19 @@ class DeviceArray {
   DeviceArray(DeviceArray&&) = delete;
   DeviceArray& operator=(DeviceArray&&) = delete;
 
+  bool CopyToHost(std::vector<T>* output) const {
+    if (output == nullptr || data_ == nullptr) {
+      return false;
+    }
+    output->assign(size_, T{});
+    return cudaMemcpy(
+               output->data(),
+               data_,
+               size_ * sizeof(T),
+               cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
+
+  T* data() { return data_; }
   const T* data() const { return data_; }
   std::size_t size() const { return size_; }
 
@@ -794,7 +815,7 @@ bool RunMoeDirectDecodeViaCublaslt(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
-    const std::vector<ExpertSelection>& selected_experts,
+    const float* selected_weights_device,
     const std::vector<float>& routed_up_tensor_scales_host,
     const std::vector<float>& routed_down_tensor_scales_host,
     const std::vector<FusedNvfp4WeightView>& routed_up_views,
@@ -822,17 +843,16 @@ bool RunMoeDirectDecodeViaCublaslt(
       input.shape()[1] != config.hidden_size ||
       routed_up_descriptors.empty() ||
       routed_down_descriptors.empty() ||
-      routed_up_descriptors.size() != selected_experts.size() ||
-      routed_down_descriptors.size() != selected_experts.size() ||
+      routed_up_descriptors.size() != routed_down_descriptors.size() ||
       routed_up_descriptors.front() == nullptr ||
       routed_down_descriptors.front() == nullptr ||
       !shared_up_weight.valid() ||
       !shared_down_weight.valid() ||
-      selected_experts.empty() ||
-      selected_experts.size() != routed_up_tensor_scales_host.size() ||
-      selected_experts.size() != routed_down_tensor_scales_host.size() ||
-      selected_experts.size() != routed_up_views.size() ||
-      selected_experts.size() != routed_down_views.size() ||
+      selected_weights_device == nullptr ||
+      routed_up_descriptors.size() != routed_up_tensor_scales_host.size() ||
+      routed_up_descriptors.size() != routed_down_tensor_scales_host.size() ||
+      routed_up_descriptors.size() != routed_up_views.size() ||
+      routed_up_descriptors.size() != routed_down_views.size() ||
       (scratch != nullptr &&
        (scratch->output_accum == nullptr ||
         scratch->routed_up == nullptr ||
@@ -918,7 +938,7 @@ bool RunMoeDirectDecodeViaCublaslt(
     return false;
   }
 
-  for (std::size_t slot = 0; slot < selected_experts.size(); ++slot) {
+  for (std::size_t slot = 0; slot < routed_up_descriptors.size(); ++slot) {
     const Nvfp4PackedMatrixDeviceView expert_up_view =
         MakeNvfp4PackedMatrixDeviceView(routed_up_views[slot]);
     const Nvfp4PackedMatrixDeviceView expert_down_view =
@@ -948,9 +968,10 @@ bool RunMoeDirectDecodeViaCublaslt(
              routed_down_tensor_scales_host[slot],
              output)
              .has_value() ||
-        !AccumulateScaledFp32(
+        !AccumulateScaledFp32ByDeviceWeight(
              *output,
-             selected_experts[slot].weight,
+             selected_weights_device,
+             slot,
              routed_output)) {
       return false;
     }
@@ -1848,18 +1869,40 @@ bool ExpertLayerSlice::Run(
         FusedMoeDecodeEnabled() &&
         MoeCublasLtEnabled();
     if (use_moe_cublaslt) {
-      std::vector<float> router_logits_host;
-      if (!CopyToHost(*router_logits, &router_logits_host) ||
-          router_logits_host.size() != impl_->config.n_routed_experts) {
+      auto selected_indices_device = DeviceArray<int>::Create(impl_->config.top_k);
+      auto selected_weights_device = DeviceArray<float>::Create(impl_->config.top_k);
+      if (!selected_indices_device ||
+          !selected_weights_device ||
+          !RunDeviceExpertSelection(
+              *router_logits,
+              *impl_->gate_score_correction_bias_device,
+              impl_->config.n_routed_experts,
+              impl_->config.top_k,
+              impl_->config.n_group,
+              impl_->config.topk_group,
+              impl_->config.routed_scaling_factor,
+              impl_->config.norm_topk_prob,
+              selected_indices_device->data(),
+              selected_weights_device->data())) {
         return false;
       }
 
-      std::vector<ExpertSelection> selected_experts = SelectTopExperts(
-          impl_->config,
-          router_logits_host,
-          impl_->gate_score_correction_bias);
-      if (selected_experts.size() != impl_->config.top_k) {
+      std::vector<int> selected_indices_host;
+      if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
+          selected_indices_host.size() != impl_->config.top_k) {
         return false;
+      }
+      std::vector<std::size_t> selected_expert_indices;
+      selected_expert_indices.reserve(selected_indices_host.size());
+      for (int selected_index : selected_indices_host) {
+        if (selected_index < 0) {
+          return false;
+        }
+        const std::size_t expert_index = static_cast<std::size_t>(selected_index);
+        if (expert_index >= impl_->routed_experts.size()) {
+          return false;
+        }
+        selected_expert_indices.push_back(expert_index);
       }
 
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_up_weights;
@@ -1870,12 +1913,12 @@ bool ExpertLayerSlice::Run(
       std::vector<float> routed_down_tensor_scales_host;
       std::vector<FusedNvfp4WeightView> routed_up_views;
       std::vector<FusedNvfp4WeightView> routed_down_views;
-      routed_up_descriptors.reserve(selected_experts.size());
-      routed_down_descriptors.reserve(selected_experts.size());
-      routed_up_tensor_scales_host.reserve(selected_experts.size());
-      routed_down_tensor_scales_host.reserve(selected_experts.size());
-      routed_up_views.reserve(selected_experts.size());
-      routed_down_views.reserve(selected_experts.size());
+      routed_up_descriptors.reserve(selected_expert_indices.size());
+      routed_down_descriptors.reserve(selected_expert_indices.size());
+      routed_up_tensor_scales_host.reserve(selected_expert_indices.size());
+      routed_down_tensor_scales_host.reserve(selected_expert_indices.size());
+      routed_up_views.reserve(selected_expert_indices.size());
+      routed_down_views.reserve(selected_expert_indices.size());
 
       auto& staging_counters = GetExpertStagingCounters();
       if (impl_->monolithic_resident) {
@@ -1884,31 +1927,29 @@ bool ExpertLayerSlice::Run(
         if (impl_->monolithic_up == nullptr || impl_->monolithic_down == nullptr) {
           return false;
         }
-        for (const ExpertSelection& selection : selected_experts) {
-          if (selection.expert_index >= impl_->routed_experts.size()) {
+        for (std::size_t expert_index : selected_expert_indices) {
+          if (expert_index >= impl_->routed_experts.size()) {
             return false;
           }
-          const Impl::RoutedExpertRuntime& runtime_pair =
-              impl_->routed_experts[selection.expert_index];
+          const Impl::RoutedExpertRuntime& runtime_pair = impl_->routed_experts[expert_index];
           if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
             return false;
           }
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
           routed_up_tensor_scales_host.push_back(
-              impl_->monolithic_up->host_tensor_scale(selection.expert_index));
+              impl_->monolithic_up->host_tensor_scale(expert_index));
           routed_down_tensor_scales_host.push_back(
-              impl_->monolithic_down->host_tensor_scale(selection.expert_index));
-          routed_up_views.push_back(impl_->monolithic_up->GetView(selection.expert_index));
-          routed_down_views.push_back(impl_->monolithic_down->GetView(selection.expert_index));
+              impl_->monolithic_down->host_tensor_scale(expert_index));
+          routed_up_views.push_back(impl_->monolithic_up->GetView(expert_index));
+          routed_down_views.push_back(impl_->monolithic_down->GetView(expert_index));
         }
       } else if (impl_->full_residency_enabled) {
-        for (const ExpertSelection& selection : selected_experts) {
-          if (selection.expert_index >= impl_->routed_experts.size()) {
+        for (std::size_t expert_index : selected_expert_indices) {
+          if (expert_index >= impl_->routed_experts.size()) {
             return false;
           }
-          const Impl::RoutedExpertRuntime& runtime_pair =
-              impl_->routed_experts[selection.expert_index];
+          const Impl::RoutedExpertRuntime& runtime_pair = impl_->routed_experts[expert_index];
           if (runtime_pair.up_proj == nullptr ||
               runtime_pair.down_proj == nullptr ||
               runtime_pair.up_proj_device == nullptr ||
@@ -1926,14 +1967,13 @@ bool ExpertLayerSlice::Run(
         }
       } else {
         staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-        staged_up_weights.reserve(selected_experts.size());
-        staged_down_weights.reserve(selected_experts.size());
-        for (const ExpertSelection& selection : selected_experts) {
-          if (selection.expert_index >= impl_->routed_experts.size()) {
+        staged_up_weights.reserve(selected_expert_indices.size());
+        staged_down_weights.reserve(selected_expert_indices.size());
+        for (std::size_t expert_index : selected_expert_indices) {
+          if (expert_index >= impl_->routed_experts.size()) {
             return false;
           }
-          const Impl::RoutedExpertRuntime& runtime_pair =
-              impl_->routed_experts[selection.expert_index];
+          const Impl::RoutedExpertRuntime& runtime_pair = impl_->routed_experts[expert_index];
           if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
             return false;
           }
@@ -1989,7 +2029,7 @@ bool ExpertLayerSlice::Run(
               heuristic_cache,
               input,
               *normalized,
-              selected_experts,
+              selected_weights_device->data(),
               routed_up_tensor_scales_host,
               routed_down_tensor_scales_host,
               routed_up_views,

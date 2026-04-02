@@ -42,7 +42,7 @@ The host overhead comes from four categories:
   Accept when: zero cudaMalloc/cudaFree in the NVFP4 pack path during decode.
   Key files: `device_nvfp4_matrix.cu`, `device_nvfp4_matrix.h`, `expert_layer.cpp`, `linear_op.cpp`
 
-- [ ] **3. Move MoE expert selection to device**
+- [x] **3. Move MoE expert selection to device**
   Goal: eliminate D2H copy of router_logits for host-side expert selection.
   Current: `expert_layer.cpp:1800-1809` copies router_logits to host, runs `SelectTopExperts()` on CPU, copies selected indices/weights back to device.
   Fix: implement device-side top-k selection (the fused kernel already does this on device — `SelectTopExpertsOneToken` in `fused_moe_decode.cu`). Call the device-side selection from the cuBLASLt path.
@@ -59,5 +59,5 @@ The host overhead comes from four categories:
 |---|------|--------|--------|-------|
 | 1 | Cache tensor scales + cuBLASLt plans | done | — | host tensor scales + cuBLASLt cache + FillZero removed; smoke PASS |
 | 2 | Pre-allocate NVFP4 pack buffers | done | — | PackInto + expert/linear pre-alloc; smoke PASS |
-| 3 | Device-side expert selection | pending | — | eliminate router_logits D2H |
+| 3 | Device-side expert selection | done | — | RunDeviceExpertSelection kernel; only 24B indices D2H; smoke PASS |
 | 4 | Benchmark and profile | pending | — | target ≤20ms |

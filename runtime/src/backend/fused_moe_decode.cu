@@ -257,10 +257,109 @@ __global__ void FusedMoeDirectDecodeKernel(
   }
 }
 
+__global__ void DeviceExpertSelectionKernel(
+    FusedMoeDirectLayerParams params,
+    const float* router_logits,
+    int* selected_indices,
+    float* selected_weights) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  SelectTopExpertsOneToken(params, router_logits, selected_indices, selected_weights);
+}
+
+__global__ void AccumulateScaledByDeviceWeightKernel(
+    const float* input,
+    const float* scales_device,
+    std::size_t scale_index,
+    float* output,
+    std::size_t count) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  output[index] = __fadd_rn(output[index], __fmul_rn(input[index], scales_device[scale_index]));
+}
+
 }  // namespace
 
 bool FusedMoeDecodeEnabled() {
   return EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_DECODE");
+}
+
+bool RunDeviceExpertSelection(
+    const DeviceTensorFp32& router_logits,
+    const DeviceTensorFp32& correction_bias,
+    std::size_t n_routed_experts,
+    std::size_t top_k,
+    std::size_t n_group,
+    std::size_t topk_group,
+    float routed_scaling_factor,
+    bool norm_topk_prob,
+    int* selected_indices,
+    float* selected_weights) {
+  if (!router_logits.valid() ||
+      !correction_bias.valid() ||
+      selected_indices == nullptr ||
+      selected_weights == nullptr ||
+      router_logits.shape().size() != 2 ||
+      router_logits.shape()[0] != 1 ||
+      router_logits.shape()[1] != n_routed_experts ||
+      correction_bias.shape().size() != 1 ||
+      correction_bias.shape()[0] != n_routed_experts ||
+      n_routed_experts == 0 ||
+      n_routed_experts > kMaxRoutedExperts ||
+      top_k == 0 ||
+      top_k > n_routed_experts ||
+      top_k > kMaxSelectedExperts ||
+      n_group == 0 ||
+      n_group > n_routed_experts ||
+      n_group > kMaxExpertGroups ||
+      topk_group == 0 ||
+      (n_routed_experts % n_group) != 0) {
+    return false;
+  }
+
+  FusedMoeDirectLayerParams params;
+  params.n_routed_experts = n_routed_experts;
+  params.top_k = top_k;
+  params.n_group = n_group;
+  params.topk_group = topk_group;
+  params.routed_scaling_factor = routed_scaling_factor;
+  params.norm_topk_prob = norm_topk_prob;
+  params.correction_bias = correction_bias.data();
+
+  DeviceExpertSelectionKernel<<<1, 1>>>(
+      params,
+      router_logits.data(),
+      selected_indices,
+      selected_weights);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool AccumulateScaledFp32ByDeviceWeight(
+    const DeviceTensorFp32& input,
+    const float* scales_device,
+    std::size_t scale_index,
+    DeviceTensorFp32* output) {
+  if (output == nullptr ||
+      !input.valid() ||
+      !output->valid() ||
+      scales_device == nullptr ||
+      input.shape() != output->shape()) {
+    return false;
+  }
+
+  const std::size_t count = input.numel();
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  AccumulateScaledByDeviceWeightKernel<<<grid, block>>>(
+      input.data(),
+      scales_device,
+      scale_index,
+      output->data(),
+      count);
+  return CheckCuda(cudaGetLastError());
 }
 
 bool RunFusedMoeDirectDecode(
