@@ -677,6 +677,16 @@ target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_17)
 nemotron_add_test(full_forward_manifest_smoke_test)
 
 add_executable(
+  nano_global_root_prefix_cache_test
+  api/nano_global_root_prefix_cache_test.cpp
+)
+
+target_link_libraries(nano_global_root_prefix_cache_test PRIVATE nemotron_runtime_api)
+target_compile_features(nano_global_root_prefix_cache_test PRIVATE cxx_std_17)
+
+nemotron_add_test(nano_global_root_prefix_cache_test)
+
+add_executable(
   nano_loader_budget_test
   api/nano_loader_budget_test.cpp
 )
