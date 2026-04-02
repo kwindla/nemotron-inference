@@ -1,4 +1,6 @@
 build/
+build_cutlass/
+plugins/
 artifacts/
 testing/oracle/**/*.bin
 claude-todo.md
