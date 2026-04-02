@@ -9,5 +9,5 @@ claude-todo.md
 .playwright-mcp/
 .codex/active_plan.json
 .codex/runtime/
-codex-jobs/
-proj-*/
+/codex-jobs/
+proj-*/codex-jobs/*.log
