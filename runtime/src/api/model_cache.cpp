@@ -1211,9 +1211,17 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
     if (!weight || !weight->valid()) {
       return nullptr;
     }
+    // v1 caches store dequantized FP32 weights. CreateView now re-materializes
+    // the native packed FP8 representation once so the cache-backed path can
+    // use native FP8 without requiring a cache rewrite.
     return ScaledFp8LinearOp::CreateView(config, std::move(weight));
   }
 
+  // v2 caches store native packed FP8 bytes. CreateView eagerly materializes a
+  // dequantized FP32 view for fallback/profiling so both cache formats behave
+  // the same after construction.
+  config.packed_weight_data = PayloadPtr(entry);
+  config.packed_weight_nbytes = entry->payload_nbytes;
   auto packed_weight = DeviceTensorFp8E4M3::CreateView(
       {entry->output_rows, entry->input_cols},
       PayloadPtr(entry));

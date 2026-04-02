@@ -141,6 +141,25 @@ std::vector<std::uint8_t> read_u8_file(const std::filesystem::path& path) {
   return values;
 }
 
+std::unique_ptr<nemotron::DeviceDenseWeightFp32> upload_dense_weight_fp32(
+    std::size_t output_rows,
+    std::size_t input_cols,
+    const std::vector<float>& values) {
+  nemotron::GemmDescriptor descriptor;
+  descriptor.tensor_name = "scaled_fp8_linear_test_cache_view_weight";
+  descriptor.op_class = "dense_linear";
+  descriptor.kernel_family = nemotron::GemmKernelFamily::kDenseRowMajor;
+  descriptor.output_rows = output_rows;
+  descriptor.input_cols = input_cols;
+  descriptor.storage_dtype = "fp32";
+  descriptor.compute_dtype = "fp32";
+  descriptor.layout_tag = "row_major";
+  descriptor.alignment_bytes = 16;
+  descriptor.packed_data = reinterpret_cast<const std::uint8_t*>(values.data());
+  descriptor.packed_nbytes = values.size() * sizeof(float);
+  return nemotron::DeviceDenseWeightFp32::Upload(descriptor);
+}
+
 float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
   if (lhs.size() != rhs.size()) {
     return std::numeric_limits<float>::infinity();
@@ -152,8 +171,83 @@ float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs)
   return max_value;
 }
 
+bool run_scaled_fp8_cache_view_case_and_check_stats(
+    const std::string& tensor_name,
+    std::size_t rows,
+    std::size_t input_cols,
+    std::size_t output_rows,
+    const std::vector<float>& activations,
+    const std::vector<std::uint8_t>& weight_fp8,
+    float weight_scale,
+    float input_scale,
+    const std::vector<float>& expected_output) {
+  ScaledFp8LinearConfig config;
+  config.output_rows = output_rows;
+  config.input_cols = input_cols;
+  config.packed_weight_data = weight_fp8.data();
+  config.packed_weight_nbytes = weight_fp8.size();
+  config.tensor_name = tensor_name;
+  config.weight_scale = weight_scale;
+  config.input_scale = input_scale;
+  const auto host_weight_dequant = DequantizeScaledFp8WeightToHostFp32(config);
+  if (!expect(host_weight_dequant.has_value(), "cache-view dequantized weight should build")) {
+    return false;
+  }
+  auto weight_view = upload_dense_weight_fp32(output_rows, input_cols, *host_weight_dequant);
+  if (!expect(weight_view != nullptr && weight_view->valid(), "cache-view dense weight should upload")) {
+    return false;
+  }
+  auto op = ScaledFp8LinearOp::CreateView(config, std::move(weight_view));
+  if (!expect(op != nullptr && op->valid(), "cache-view scaled-fp8 op should build")) {
+    return false;
+  }
+
+  const auto handle = CublasLtHandle::Create();
+  if (!expect(handle != nullptr && handle->valid(), "cache-view cublas handle should create")) {
+    return false;
+  }
+  auto input = DeviceTensorFp32::Create({rows, input_cols});
+  auto output = DeviceTensorFp32::Create({rows, output_rows});
+  if (!expect(input != nullptr && input->valid(), "cache-view input tensor should create") ||
+      !expect(output != nullptr && output->valid(), "cache-view output tensor should create") ||
+      !expect(input->CopyFromHost(activations.data(), activations.size()), "cache-view input should upload")) {
+    return false;
+  }
+
+  ResetRuntimeExecutionStats();
+  GemmHeuristicCache heuristic_cache;
+  if (!expect(op->Run(*handle, &heuristic_cache, *input, output.get()), "cache-view op should execute")) {
+    return false;
+  }
+
+  std::vector<float> actual(expected_output.size(), 0.0f);
+  if (!expect(output->CopyToHost(actual.data(), actual.size()), "cache-view output should download")) {
+    return false;
+  }
+  const float output_diff = max_abs_diff(actual, expected_output);
+  if (output_diff > 1.0e-3f) {
+    std::cerr << "scaled_fp8_linear_test: cache-view tensor=" << tensor_name
+              << " max_diff=" << output_diff << "\n";
+  }
+  const auto stats = GetRuntimeExecutionStatsSnapshot();
+  return expect(
+             nearly_equal(actual, expected_output, 1.0e-3f),
+             "cache-view output should match oracle") &&
+         expect(
+             stats.scaled_fp8_native_success == 1,
+             "cache-view run should record one native success") &&
+         expect(
+             stats.scaled_fp8_dequantized_dense_success == 0,
+             "cache-view run should not use dequantized dense") &&
+         expect(
+             stats.scaled_fp8_reference_fallbacks == 0,
+             "cache-view run should not use reference fallback");
+}
+
 bool run_small_scaled_fp8_case_and_check_stats(
+    bool disable_native_fp8,
     bool disable_dequantized_dense,
+    std::uint64_t expected_native_success,
     std::uint64_t expected_dequantized_dense_success,
     std::uint64_t expected_reference_fallbacks,
     std::uint64_t expected_reference_fallbacks_expert_shared_up) {
@@ -163,14 +257,17 @@ bool run_small_scaled_fp8_case_and_check_stats(
     return true;
   }
 
-  ScopedEnvVar native_fp8("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE");
+  ScopedEnvVar disable_native("NEMOTRON_DISABLE_FP8_NATIVE");
   ScopedEnvVar disable_dequantized("NEMOTRON_DISABLE_SCALED_FP8_DEQUANTIZED_DENSE");
   ScopedEnvVar family_filter("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_FAMILY");
   ScopedEnvVar tensor_filter("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_TENSORS");
-  native_fp8.Unset();
+  disable_native.Unset();
   disable_dequantized.Unset();
   family_filter.Unset();
   tensor_filter.Unset();
+  if (disable_native_fp8) {
+    disable_native.Set("1");
+  }
   if (disable_dequantized_dense) {
     disable_dequantized.Set("1");
   }
@@ -234,7 +331,21 @@ bool run_small_scaled_fp8_case_and_check_stats(
   }
 
   const auto stats = GetRuntimeExecutionStatsSnapshot();
+  if (stats.scaled_fp8_native_success != expected_native_success ||
+      stats.scaled_fp8_dequantized_dense_success != expected_dequantized_dense_success ||
+      stats.scaled_fp8_reference_fallbacks != expected_reference_fallbacks ||
+      stats.scaled_fp8_reference_fallbacks_expert_shared_up !=
+          expected_reference_fallbacks_expert_shared_up) {
+    std::cerr << "scaled_fp8_linear_test: native_success=" << stats.scaled_fp8_native_success
+              << " dequantized_success=" << stats.scaled_fp8_dequantized_dense_success
+              << " reference_fallbacks=" << stats.scaled_fp8_reference_fallbacks
+              << " reference_fallbacks_expert_shared_up="
+              << stats.scaled_fp8_reference_fallbacks_expert_shared_up << "\n";
+  }
   return expect(
+             stats.scaled_fp8_native_success == expected_native_success,
+             "scaled-fp8 native success count should match") &&
+         expect(
              stats.scaled_fp8_dequantized_dense_success == expected_dequantized_dense_success,
              "scaled-fp8 dequantized dense success count should match") &&
          expect(
@@ -305,15 +416,28 @@ bool test_scaled_fp8_linear_matches_cpu_reference() {
   return expect(nearly_equal(actual, expected, 1.0e-4f), "scaled fp8 linear output should match CPU reference");
 }
 
-bool test_scaled_fp8_linear_defaults_to_dequantized_dense_single_token() {
-  return run_small_scaled_fp8_case_and_check_stats(/*disable_dequantized_dense=*/false,
+bool test_scaled_fp8_linear_defaults_to_native_fp8_single_token() {
+  return run_small_scaled_fp8_case_and_check_stats(/*disable_native_fp8=*/false,
+                                                   /*disable_dequantized_dense=*/false,
+                                                   /*expected_native_success=*/1,
+                                                   /*expected_dequantized_dense_success=*/0,
+                                                   /*expected_reference_fallbacks=*/0,
+                                                   /*expected_reference_fallbacks_expert_shared_up=*/0);
+}
+
+bool test_scaled_fp8_linear_disable_native_uses_dequantized_dense() {
+  return run_small_scaled_fp8_case_and_check_stats(/*disable_native_fp8=*/true,
+                                                   /*disable_dequantized_dense=*/false,
+                                                   /*expected_native_success=*/0,
                                                    /*expected_dequantized_dense_success=*/1,
                                                    /*expected_reference_fallbacks=*/0,
                                                    /*expected_reference_fallbacks_expert_shared_up=*/0);
 }
 
-bool test_scaled_fp8_linear_disable_dequantized_dense_uses_reference_fallback() {
-  return run_small_scaled_fp8_case_and_check_stats(/*disable_dequantized_dense=*/true,
+bool test_scaled_fp8_linear_disable_native_and_dequantized_uses_reference_fallback() {
+  return run_small_scaled_fp8_case_and_check_stats(/*disable_native_fp8=*/true,
+                                                   /*disable_dequantized_dense=*/true,
+                                                   /*expected_native_success=*/0,
                                                    /*expected_dequantized_dense_success=*/0,
                                                    /*expected_reference_fallbacks=*/1,
                                                    /*expected_reference_fallbacks_expert_shared_up=*/1);
@@ -426,13 +550,108 @@ bool test_scaled_fp8_linear_matches_oracle_fixture() {
          expect(output_diff <= 1.0e-3f, "fixture scaled-fp8 output should match oracle");
 }
 
+bool test_scaled_fp8_linear_cache_view_matches_expert_oracle_fixture() {
+  const std::filesystem::path fixture_root =
+      "/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/oracle/expert_layer3_prefix_input_block_cuda";
+  if (!std::filesystem::exists(fixture_root)) {
+    std::cout << "scaled_fp8_linear_test: SKIP cache-view expert fixture (missing oracle fixture)\n";
+    return true;
+  }
+  const auto activations = read_f32_file(fixture_root / "expected_norm_output_fp32.bin");
+  const auto expected_output = read_f32_file(fixture_root / "expected_fc1_latent_output_fp32.bin");
+  const auto weight_fp8 = read_u8_file(fixture_root / "fc1_latent_weight_fp8.bin");
+  const auto weight_scale = read_f32_file(fixture_root / "fc1_latent_weight_scale_fp32.bin");
+  const auto input_scale = read_f32_file(fixture_root / "fc1_latent_input_scale_fp32.bin");
+  if (!expect(activations.size() == 4 * 4096, "cache-view expert activations should match shape") ||
+      !expect(expected_output.size() == 4 * 1024, "cache-view expert output should match shape") ||
+      !expect(weight_fp8.size() == 1024 * 4096, "cache-view expert weights should match shape") ||
+      !expect(weight_scale.size() == 1, "cache-view expert weight scale should load") ||
+      !expect(input_scale.size() == 1, "cache-view expert input scale should load")) {
+    return false;
+  }
+  return run_scaled_fp8_cache_view_case_and_check_stats(
+      "backbone.layers.3.mixer.fc1_latent_proj.weight",
+      4,
+      4096,
+      1024,
+      activations,
+      weight_fp8,
+      weight_scale[0],
+      input_scale[0],
+      expected_output);
+}
+
+bool test_scaled_fp8_linear_cache_view_matches_mamba_in_proj_fixture() {
+  const std::filesystem::path fixture_root =
+      "/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/oracle/mamba_layer9_runtime_input_block_cuda";
+  if (!std::filesystem::exists(fixture_root)) {
+    std::cout << "scaled_fp8_linear_test: SKIP cache-view mamba fixture (missing oracle fixture)\n";
+    return true;
+  }
+  const auto activations = read_f32_file(fixture_root / "expected_norm_output_fp32.bin");
+  const auto expected_output = read_f32_file(fixture_root / "expected_in_proj_output_fp32.bin");
+  const auto weight_fp8 = read_u8_file(fixture_root / "in_proj_weight_fp8.bin");
+  const auto weight_scale = read_f32_file(fixture_root / "in_proj_weight_scale_fp32.bin");
+  const auto input_scale = read_f32_file(fixture_root / "in_proj_input_scale_fp32.bin");
+  if (!expect(!activations.empty(), "cache-view mamba in-proj activations should load") ||
+      !expect(!expected_output.empty(), "cache-view mamba in-proj output should load") ||
+      !expect(weight_scale.size() == 1, "cache-view mamba in-proj weight scale should load") ||
+      !expect(input_scale.size() == 1, "cache-view mamba in-proj input scale should load")) {
+    return false;
+  }
+  return run_scaled_fp8_cache_view_case_and_check_stats(
+      "backbone.layers.9.mixer.in_proj.weight",
+      1,
+      activations.size(),
+      expected_output.size(),
+      activations,
+      weight_fp8,
+      weight_scale[0],
+      input_scale[0],
+      expected_output);
+}
+
+bool test_scaled_fp8_linear_cache_view_matches_mamba_out_proj_fixture() {
+  const std::filesystem::path fixture_root =
+      "/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/oracle/mamba_layer9_runtime_input_block_cuda";
+  if (!std::filesystem::exists(fixture_root)) {
+    std::cout << "scaled_fp8_linear_test: SKIP cache-view mamba fixture (missing oracle fixture)\n";
+    return true;
+  }
+  const auto activations = read_f32_file(fixture_root / "expected_scan_output_fp32.bin");
+  const auto expected_output = read_f32_file(fixture_root / "expected_projected_output_fp32.bin");
+  const auto weight_fp8 = read_u8_file(fixture_root / "out_proj_weight_fp8.bin");
+  const auto weight_scale = read_f32_file(fixture_root / "out_proj_weight_scale_fp32.bin");
+  const auto input_scale = read_f32_file(fixture_root / "out_proj_input_scale_fp32.bin");
+  if (!expect(!activations.empty(), "cache-view mamba out-proj activations should load") ||
+      !expect(!expected_output.empty(), "cache-view mamba out-proj output should load") ||
+      !expect(weight_scale.size() == 1, "cache-view mamba out-proj weight scale should load") ||
+      !expect(input_scale.size() == 1, "cache-view mamba out-proj input scale should load")) {
+    return false;
+  }
+  return run_scaled_fp8_cache_view_case_and_check_stats(
+      "backbone.layers.9.mixer.out_proj.weight",
+      1,
+      activations.size(),
+      expected_output.size(),
+      activations,
+      weight_fp8,
+      weight_scale[0],
+      input_scale[0],
+      expected_output);
+}
+
 }  // namespace
 
 int main() {
-  return (test_scaled_fp8_linear_defaults_to_dequantized_dense_single_token() &&
-          test_scaled_fp8_linear_disable_dequantized_dense_uses_reference_fallback() &&
+  return (test_scaled_fp8_linear_defaults_to_native_fp8_single_token() &&
+          test_scaled_fp8_linear_disable_native_uses_dequantized_dense() &&
+          test_scaled_fp8_linear_disable_native_and_dequantized_uses_reference_fallback() &&
           test_scaled_fp8_linear_matches_cpu_reference() &&
-          test_scaled_fp8_linear_matches_oracle_fixture())
+          test_scaled_fp8_linear_matches_oracle_fixture() &&
+          test_scaled_fp8_linear_cache_view_matches_expert_oracle_fixture() &&
+          test_scaled_fp8_linear_cache_view_matches_mamba_in_proj_fixture() &&
+          test_scaled_fp8_linear_cache_view_matches_mamba_out_proj_fixture())
              ? 0
              : 1;
 }

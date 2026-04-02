@@ -9,6 +9,7 @@
 #include <mutex>
 #include <sstream>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include "nemotron/runtime_stats.h"
@@ -22,26 +23,24 @@ bool CheckCuda(cudaError_t status) {
 }
 
 bool ExperimentalFp8NativeEnabled() {
-  static const bool kEnabled = std::getenv("NEMOTRON_ENABLE_EXPERIMENTAL_FP8_NATIVE") != nullptr;
-  return kEnabled;
+  return std::getenv("NEMOTRON_DISABLE_FP8_NATIVE") == nullptr;
 }
 
 bool ExperimentalScaledFp8DequantizedDenseEnabled() {
-  static const bool kEnabled =
-      std::getenv("NEMOTRON_DISABLE_SCALED_FP8_DEQUANTIZED_DENSE") == nullptr;
-  return kEnabled;
+  return std::getenv("NEMOTRON_DISABLE_SCALED_FP8_DEQUANTIZED_DENSE") == nullptr;
+}
+
+bool ExperimentalScaledFp8NativeDebugEnabled() {
+  const char* value = std::getenv("NEMOTRON_DEBUG_SCALED_FP8_NATIVE");
+  return value != nullptr && !(value[0] == '0' && value[1] == '\0');
 }
 
 const char* ExperimentalScaledFp8SurfaceFamilyFilter() {
-  static const char* const kFilter =
-      std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_FAMILY");
-  return kFilter;
+  return std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_FAMILY");
 }
 
 const char* ExperimentalScaledFp8SurfaceTensorFilter() {
-  static const char* const kFilter =
-      std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_TENSORS");
-  return kFilter;
+  return std::getenv("NEMOTRON_EXPERIMENTAL_SCALED_FP8_SURFACE_TENSORS");
 }
 
 std::string_view ResolveScaledFp8TensorName(const ScaledFp8LinearConfig& config) {
@@ -177,6 +176,36 @@ float DecodeFp8(std::uint8_t raw_byte) {
   return static_cast<float>(value);
 }
 
+const char* ScaledFp8FamilyName(ScaledFp8RuntimeOpFamily family) {
+  switch (family) {
+    case ScaledFp8RuntimeOpFamily::kMambaInProj:
+      return "mamba_in_proj";
+    case ScaledFp8RuntimeOpFamily::kMambaOutProj:
+      return "mamba_out_proj";
+    case ScaledFp8RuntimeOpFamily::kExpertFc1Latent:
+      return "expert_fc1_latent";
+    case ScaledFp8RuntimeOpFamily::kExpertSharedUp:
+      return "expert_shared_up";
+    case ScaledFp8RuntimeOpFamily::kExpertSharedDown:
+      return "expert_shared_down";
+    case ScaledFp8RuntimeOpFamily::kOther:
+      return "other";
+  }
+  return "unknown";
+}
+
+void LogScaledFp8NativeDiagnosticOnce(const std::string& key, const std::string& message) {
+  if (!ExperimentalScaledFp8NativeDebugEnabled()) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (seen.insert(key).second) {
+    std::cerr << message << "\n";
+  }
+}
+
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     const GemmDescriptor& descriptor,
     std::size_t rows,
@@ -210,6 +239,20 @@ __global__ void QuantizeFp8RoundTripKernel(
   }
 }
 
+__global__ void QuantizePackedFp8WeightKernel(
+    const float* input,
+    std::size_t numel,
+    float weight_scale,
+    std::uint8_t* output) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const float scale = weight_scale > 0.0f ? weight_scale : (1.0f / 1024.0f);
+  for (std::size_t i = index; i < numel; i += stride) {
+    output[i] = static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(input[i] / scale, __NV_SATFINITE, __NV_E4M3));
+  }
+}
+
 __global__ void DequantizePackedFp8WeightKernel(
     const std::uint8_t* input,
     std::size_t numel,
@@ -237,6 +280,31 @@ bool DequantizePackedFp8WeightToDeviceFp32(
   const int grid_size = static_cast<int>(
       (numel + static_cast<std::size_t>(kBlockSize) - 1u) / static_cast<std::size_t>(kBlockSize));
   DequantizePackedFp8WeightKernel<<<grid_size, kBlockSize, 0, stream>>>(
+      input.data(),
+      numel,
+      weight_scale,
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool QuantizeDeviceFp32ToPackedFp8Weight(
+    const DeviceDenseWeightFp32& input,
+    float weight_scale,
+    DeviceTensorFp8E4M3* output,
+    cudaStream_t stream) {
+  if (!input.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      !std::isfinite(weight_scale) ||
+      weight_scale <= 0.0f ||
+      output->shape() != std::vector<std::size_t>{input.output_rows(), input.input_cols()}) {
+    return false;
+  }
+  constexpr int kBlockSize = 256;
+  const std::size_t numel = input.numel();
+  const int grid_size = static_cast<int>(
+      (numel + static_cast<std::size_t>(kBlockSize) - 1u) / static_cast<std::size_t>(kBlockSize));
+  QuantizePackedFp8WeightKernel<<<grid_size, kBlockSize, 0, stream>>>(
       input.data(),
       numel,
       weight_scale,
@@ -282,6 +350,9 @@ struct ScaledFp8LinearOp::Impl {
   mutable bool rows1_dequantized_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_dequantized_plan;
   mutable std::unique_ptr<DeviceTensorFp32> quantized_scratch_;
+  mutable std::unique_ptr<DeviceTensorFp32> native_input_scale_;
+  mutable std::unique_ptr<DeviceTensorFp32> native_weight_scale_;
+  mutable bool native_scale_tensors_initialized = false;
 };
 
 std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
@@ -392,6 +463,65 @@ std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::CreateView(
     return nullptr;
   }
 
+  std::unique_ptr<DeviceTensorFp8E4M3> synthesized_packed_weight;
+  if (weight_view && weight_view->valid() && !packed_weight_view) {
+    synthesized_packed_weight = DeviceTensorFp8E4M3::Create({config.output_rows, config.input_cols});
+    if (synthesized_packed_weight &&
+        synthesized_packed_weight->valid() &&
+        QuantizeDeviceFp32ToPackedFp8Weight(
+            *weight_view,
+            config.weight_scale,
+            synthesized_packed_weight.get(),
+            nullptr) &&
+        CheckCuda(cudaStreamSynchronize(nullptr))) {
+      packed_weight_view = std::move(synthesized_packed_weight);
+      LogScaledFp8NativeDiagnosticOnce(
+          "create_view_quantized:" + std::string(ResolveScaledFp8TensorName(config)),
+          "scaled_fp8_linear: synthesized packed FP8 weight from FP32 cache tensor=" +
+              std::string(ResolveScaledFp8TensorName(config)));
+    } else {
+      synthesized_packed_weight.reset();
+      LogScaledFp8NativeDiagnosticOnce(
+          "create_view_quantize_failed:" + std::string(ResolveScaledFp8TensorName(config)),
+          "scaled_fp8_linear: failed to synthesize packed FP8 weight tensor=" +
+              std::string(ResolveScaledFp8TensorName(config)));
+    }
+  }
+
+  std::unique_ptr<DeviceTensorFp32> dequantized_weight_storage;
+  if ((!weight_view || !weight_view->valid()) &&
+      packed_weight_view &&
+      packed_weight_view->valid()) {
+    dequantized_weight_storage = DeviceTensorFp32::Create({config.output_rows, config.input_cols});
+    if (dequantized_weight_storage &&
+        dequantized_weight_storage->valid() &&
+        DequantizePackedFp8WeightToDeviceFp32(
+            *packed_weight_view,
+            config.weight_scale,
+            dequantized_weight_storage.get(),
+            nullptr) &&
+        CheckCuda(cudaStreamSynchronize(nullptr))) {
+      weight_view = DeviceDenseWeightFp32::CreateView(
+          config.output_rows,
+          config.input_cols,
+          dequantized_weight_storage->data());
+      if (!weight_view || !weight_view->valid()) {
+        dequantized_weight_storage.reset();
+      } else {
+        LogScaledFp8NativeDiagnosticOnce(
+            "create_view_dequantized:" + std::string(ResolveScaledFp8TensorName(config)),
+            "scaled_fp8_linear: synthesized dequantized FP32 weight from native FP8 cache tensor=" +
+                std::string(ResolveScaledFp8TensorName(config)));
+      }
+    } else {
+      dequantized_weight_storage.reset();
+      LogScaledFp8NativeDiagnosticOnce(
+          "create_view_dequantize_failed:" + std::string(ResolveScaledFp8TensorName(config)),
+          "scaled_fp8_linear: failed to synthesize dequantized FP32 weight tensor=" +
+              std::string(ResolveScaledFp8TensorName(config)));
+    }
+  }
+
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->descriptor.tensor_name = ResolveScaledFp8TensorName(config);
@@ -405,6 +535,7 @@ std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::CreateView(
   impl->family = ClassifyScaledFp8RuntimeOpFamily(impl->descriptor.tensor_name);
   impl->weight = std::move(weight_view);
   impl->packed_weight = std::move(packed_weight_view);
+  impl->dequantized_weight_storage = std::move(dequantized_weight_storage);
   if (impl->packed_weight && impl->packed_weight->valid()) {
     impl->descriptor.storage_dtype = "fp8_e4m3fn";
     impl->descriptor.packed_data = impl->packed_weight->data();
@@ -469,13 +600,32 @@ bool ScaledFp8LinearOp::Run(
     return false;
   }
 
-  const bool native_rollout_enabled =
-      impl_->packed_weight &&
-      impl_->packed_weight->valid() &&
+  const bool packed_weight_present = impl_->packed_weight != nullptr;
+  const bool packed_weight_valid = packed_weight_present && impl_->packed_weight->valid();
+  const bool native_default_enabled = ExperimentalFp8NativeEnabled();
+  const bool native_surface_enabled =
+      ExperimentalScaledFp8SurfaceEnabledForDescriptor(impl_->descriptor, impl_->family);
+  const bool native_descriptor_enabled =
       ExperimentalFp8NativeEnabledForDescriptor(impl_->descriptor, impl_->family);
+  const bool native_rollout_enabled =
+      packed_weight_present && packed_weight_valid && native_descriptor_enabled;
   const bool dequantized_rollout_enabled =
       ExperimentalScaledFp8DequantizedDenseEnabledForDescriptor(impl_->descriptor, impl_->family);
   bool rollout_plan_build_failed = false;
+
+  if (!native_rollout_enabled) {
+    std::ostringstream message;
+    message << "scaled_fp8_linear: native FP8 guard blocked"
+            << " tensor=" << impl_->descriptor.tensor_name
+            << " family=" << ScaledFp8FamilyName(impl_->family)
+            << " packed_weight_present=" << packed_weight_present
+            << " packed_weight_valid=" << packed_weight_valid
+            << " native_default_enabled=" << native_default_enabled
+            << " native_surface_enabled=" << native_surface_enabled;
+    LogScaledFp8NativeDiagnosticOnce(
+        "guard:" + impl_->descriptor.tensor_name,
+        message.str());
+  }
 
   std::optional<CublasLtGemmPlan> plan;
   if (native_rollout_enabled) {
@@ -492,11 +642,21 @@ bool ScaledFp8LinearOp::Run(
         plan = impl_->rows1_plan;
       } else {
         rollout_plan_build_failed = true;
+        LogScaledFp8NativeDiagnosticOnce(
+            "plan_build_failed:" + impl_->descriptor.tensor_name,
+            "scaled_fp8_linear: native FP8 plan build failed tensor=" +
+                impl_->descriptor.tensor_name +
+                " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
       }
     } else {
       plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
       if (!plan.has_value()) {
         rollout_plan_build_failed = true;
+        LogScaledFp8NativeDiagnosticOnce(
+            "plan_build_failed:" + impl_->descriptor.tensor_name,
+            "scaled_fp8_linear: native FP8 plan build failed tensor=" +
+                impl_->descriptor.tensor_name +
+                " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
       }
     }
   }
@@ -505,18 +665,55 @@ bool ScaledFp8LinearOp::Run(
       impl_->packed_weight &&
       impl_->packed_weight->valid()) {
     if (plan.has_value()) {
-      const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
-          handle,
-          *plan,
-          *impl_->packed_weight,
-          ClampScale(impl_->config.input_scale) * impl_->config.weight_scale,
-          activations,
-          impl_->config.input_scale,
-          output,
-          stream);
-      if (native_stats.has_value()) {
-        RecordScaledFp8NativeSuccess(impl_->family);
-        return true;
+      if (!impl_->native_input_scale_ ||
+          impl_->native_input_scale_->shape() != std::vector<std::size_t>{1}) {
+        impl_->native_input_scale_ = DeviceTensorFp32::Create({1});
+      }
+      if (!impl_->native_weight_scale_ ||
+          impl_->native_weight_scale_->shape() != std::vector<std::size_t>{1}) {
+        impl_->native_weight_scale_ = DeviceTensorFp32::Create({1});
+      }
+      const float input_scale = ClampScale(impl_->config.input_scale);
+      const float weight_scale = impl_->config.weight_scale;
+      bool native_scales_ready =
+          impl_->native_input_scale_ &&
+          impl_->native_input_scale_->valid() &&
+          impl_->native_weight_scale_ &&
+          impl_->native_weight_scale_->valid();
+      if (native_scales_ready && !impl_->native_scale_tensors_initialized) {
+        native_scales_ready =
+            impl_->native_input_scale_->CopyFromHost(&input_scale, 1) &&
+            impl_->native_weight_scale_->CopyFromHost(&weight_scale, 1);
+        if (native_scales_ready) {
+          impl_->native_scale_tensors_initialized = true;
+        }
+      }
+      if (!native_scales_ready) {
+        LogScaledFp8NativeDiagnosticOnce(
+            "scale_init_failed:" + impl_->descriptor.tensor_name,
+            "scaled_fp8_linear: native FP8 scale initialization failed tensor=" +
+                impl_->descriptor.tensor_name +
+                " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
+      } else {
+        const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
+            handle,
+            *plan,
+            *impl_->packed_weight,
+            impl_->native_weight_scale_->data(),
+            activations,
+            input_scale,
+            impl_->native_input_scale_->data(),
+            output,
+            stream);
+        if (native_stats.has_value()) {
+          RecordScaledFp8NativeSuccess(impl_->family);
+          return true;
+        }
+        LogScaledFp8NativeDiagnosticOnce(
+            "execution_failed:" + impl_->descriptor.tensor_name,
+            "scaled_fp8_linear: native FP8 execution failed tensor=" +
+                impl_->descriptor.tensor_name +
+                " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
       }
     }
   }

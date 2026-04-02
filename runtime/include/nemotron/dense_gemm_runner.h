@@ -80,9 +80,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp8E4M3& weights,
-    float alpha_scale,
+    const float* weight_scale_device,
     const DeviceTensorFp32& activations,
     float input_scale,
+    const float* input_scale_device,
     DeviceTensorFp32* output,
     cudaStream_t stream = nullptr);
 

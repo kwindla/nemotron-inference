@@ -3,7 +3,9 @@
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -37,6 +39,100 @@ bool CheckCublas(cublasStatus_t status) {
   return status == CUBLAS_STATUS_SUCCESS;
 }
 
+bool DenseGemmDebugEnabled() {
+  static const bool kEnabled = []() {
+    const char* dense = std::getenv("NEMOTRON_DEBUG_DENSE_GEMM_RUNNER");
+    if (dense != nullptr && !(dense[0] == '0' && dense[1] == '\0')) {
+      return true;
+    }
+    const char* fp8 = std::getenv("NEMOTRON_DEBUG_SCALED_FP8_NATIVE");
+    return fp8 != nullptr && !(fp8[0] == '0' && fp8[1] == '\0');
+  }();
+  return kEnabled;
+}
+
+bool Fp8FastAccumSupported() {
+  static const bool kSupported = []() {
+    int device = 0;
+    cudaDeviceProp prop{};
+    return cudaGetDevice(&device) == cudaSuccess &&
+           cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
+           ((prop.major == 8 && prop.minor == 9) || prop.major == 9);
+  }();
+  return kSupported;
+}
+
+const char* CublasStatusName(cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+      return "CUBLAS_STATUS_NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR:
+      return "CUBLAS_STATUS_LICENSE_ERROR";
+  }
+  return "CUBLAS_STATUS_UNKNOWN";
+}
+
+void LogDenseGemmCublasFailure(
+    const char* step,
+    cublasStatus_t status,
+    cudaDataType_t activations_type,
+    cudaDataType_t weights_type,
+    float alpha_scale,
+    bool fast_accum,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k,
+    const CublasLtGemmPlan& plan) {
+  if (!DenseGemmDebugEnabled()) {
+    return;
+  }
+  std::cerr << "dense_gemm_runner: " << step
+            << " status=" << CublasStatusName(status)
+            << " code=" << static_cast<int>(status)
+            << " activations_type=" << static_cast<int>(activations_type)
+            << " weights_type=" << static_cast<int>(weights_type)
+            << " alpha_scale=" << alpha_scale
+            << " fast_accum=" << fast_accum
+            << " m=" << m
+            << " n=" << n
+            << " k=" << k
+            << " lda=" << plan.lda
+            << " ldb=" << plan.ldb
+            << " ldc=" << plan.ldc
+            << " trans_a=" << static_cast<int>(plan.transform_a)
+            << " trans_b=" << static_cast<int>(plan.transform_b)
+            << " order_a=" << static_cast<int>(plan.order_a)
+            << " order_b=" << static_cast<int>(plan.order_b)
+            << " order_c=" << static_cast<int>(plan.order_c)
+            << "\n";
+}
+
+void LogDenseGemmCudaFailure(const char* step, cudaError_t status) {
+  if (!DenseGemmDebugEnabled()) {
+    return;
+  }
+  std::cerr << "dense_gemm_runner: " << step
+            << " cuda_status=" << cudaGetErrorString(status)
+            << " code=" << static_cast<int>(status)
+            << "\n";
+}
+
 cudaDataType_t OutputDataType(const DeviceTensorFp32&) {
   return CUDA_R_32F;
 }
@@ -65,14 +161,82 @@ cublasLtOrder_t ToCublasOrder(CublasLtMatrixOrder order) {
   return CUBLASLT_ORDER_ROW;
 }
 
+struct MatrixLayoutShape {
+  std::uint64_t rows = 0;
+  std::uint64_t cols = 0;
+  std::int64_t ld = 0;
+};
+
+MatrixLayoutShape ActivationLayoutShape(
+    const CublasLtGemmPlan& plan,
+    std::size_t m,
+    std::size_t k) {
+  switch (plan.contract) {
+    case CublasLtContract::kRowMajorA_N_RowMajorB_T:
+      return MatrixLayoutShape{
+          static_cast<std::uint64_t>(m),
+          static_cast<std::uint64_t>(k),
+          static_cast<std::int64_t>(plan.lda)};
+    case CublasLtContract::kColumnMajorA_T_ColumnMajorB_N:
+      return MatrixLayoutShape{
+          static_cast<std::uint64_t>(k),
+          static_cast<std::uint64_t>(m),
+          static_cast<std::int64_t>(plan.lda)};
+  }
+  return {};
+}
+
+MatrixLayoutShape WeightLayoutShape(
+    const CublasLtGemmPlan& plan,
+    std::size_t n,
+    std::size_t k) {
+  switch (plan.contract) {
+    case CublasLtContract::kRowMajorA_N_RowMajorB_T:
+      return MatrixLayoutShape{
+          static_cast<std::uint64_t>(n),
+          static_cast<std::uint64_t>(k),
+          static_cast<std::int64_t>(plan.ldb)};
+    case CublasLtContract::kColumnMajorA_T_ColumnMajorB_N:
+      return MatrixLayoutShape{
+          static_cast<std::uint64_t>(k),
+          static_cast<std::uint64_t>(n),
+          static_cast<std::int64_t>(plan.ldb)};
+  }
+  return {};
+}
+
+template <typename OutputTensorT>
+MatrixLayoutShape OutputLayoutShape(
+    const CublasLtGemmPlan& plan,
+    const OutputTensorT& output,
+    std::size_t m,
+    std::size_t n) {
+  (void)output;
+  switch (plan.contract) {
+    case CublasLtContract::kRowMajorA_N_RowMajorB_T:
+      return MatrixLayoutShape{
+          static_cast<std::uint64_t>(m),
+          static_cast<std::uint64_t>(n),
+          static_cast<std::int64_t>(plan.ldc)};
+    case CublasLtContract::kColumnMajorA_T_ColumnMajorB_N:
+      return MatrixLayoutShape{
+          static_cast<std::uint64_t>(n),
+          static_cast<std::uint64_t>(m),
+          static_cast<std::int64_t>(plan.ldc)};
+  }
+  return {};
+}
+
 template <typename OutputTensorT>
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const void* activations_data,
     cudaDataType_t activations_type,
+    const void* activations_scale_data,
     const void* weights_data,
     cudaDataType_t weights_type,
+    const void* weights_scale_data,
     float alpha_scale,
     bool fast_accum,
     std::size_t m,
@@ -100,77 +264,150 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
   cublasLtMatmulHeuristicResult_t heuristic{};
   int returned_results = 0;
   bool ok = output->FillZero(stream);
+  if (!ok) {
+    LogDenseGemmCudaFailure("memset_output", cudaGetLastError());
+  }
+  const MatrixLayoutShape a_shape = ActivationLayoutShape(plan, m, k);
+  const MatrixLayoutShape b_shape = WeightLayoutShape(plan, n, k);
+  const MatrixLayoutShape c_shape = OutputLayoutShape(plan, *output, m, n);
 
-  ok &= CheckCublas(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  const auto apply_cublas = [&](const char* step, cublasStatus_t status) {
+    if (!CheckCublas(status)) {
+      LogDenseGemmCublasFailure(
+          step,
+          status,
+          activations_type,
+          weights_type,
+          alpha_scale,
+          fast_accum,
+          m,
+          n,
+          k,
+          plan);
+      ok = false;
+      return false;
+    }
+    return true;
+  };
+  const auto apply_cuda = [&](const char* step, cudaError_t status) {
+    if (!CheckCuda(status)) {
+      LogDenseGemmCudaFailure(step, status);
+      ok = false;
+      return false;
+    }
+    return true;
+  };
+
+  apply_cublas("matmul_desc_create", cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
   const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
   const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
-  ok &= CheckCublas(cublasLtMatmulDescSetAttribute(
+  if (ok) {
+    apply_cublas("set_transa", cublasLtMatmulDescSetAttribute(
       op_desc,
       CUBLASLT_MATMUL_DESC_TRANSA,
       &trans_a,
       sizeof(trans_a)));
-  ok &= CheckCublas(cublasLtMatmulDescSetAttribute(
+  }
+  if (ok) {
+    apply_cublas("set_transb", cublasLtMatmulDescSetAttribute(
       op_desc,
       CUBLASLT_MATMUL_DESC_TRANSB,
       &trans_b,
       sizeof(trans_b)));
+  }
+  if (activations_scale_data != nullptr) {
+    if (ok) {
+      apply_cublas("set_a_scale_ptr", cublasLtMatmulDescSetAttribute(
+        op_desc,
+        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        &activations_scale_data,
+        sizeof(activations_scale_data)));
+    }
+  }
+  if (weights_scale_data != nullptr) {
+    if (ok) {
+      apply_cublas("set_b_scale_ptr", cublasLtMatmulDescSetAttribute(
+        op_desc,
+        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        &weights_scale_data,
+        sizeof(weights_scale_data)));
+    }
+  }
   if (fast_accum) {
     const int fast_accum_attr = 1;
-    ok &= CheckCublas(cublasLtMatmulDescSetAttribute(
+    if (ok) {
+      apply_cublas("set_fast_accum", cublasLtMatmulDescSetAttribute(
         op_desc,
         CUBLASLT_MATMUL_DESC_FAST_ACCUM,
         &fast_accum_attr,
         sizeof(fast_accum_attr)));
+    }
   }
 
-  ok &= CheckCublas(cublasLtMatrixLayoutCreate(
+  if (ok) {
+    apply_cublas("layout_a_create", cublasLtMatrixLayoutCreate(
       &a_desc,
       activations_type,
-      static_cast<std::uint64_t>(m),
-      static_cast<std::uint64_t>(k),
-      static_cast<std::int64_t>(plan.lda)));
-  ok &= CheckCublas(cublasLtMatrixLayoutCreate(
+      a_shape.rows,
+      a_shape.cols,
+      a_shape.ld));
+  }
+  if (ok) {
+    apply_cublas("layout_b_create", cublasLtMatrixLayoutCreate(
       &b_desc,
       weights_type,
-      static_cast<std::uint64_t>(n),
-      static_cast<std::uint64_t>(k),
-      static_cast<std::int64_t>(plan.ldb)));
-  ok &= CheckCublas(cublasLtMatrixLayoutCreate(
+      b_shape.rows,
+      b_shape.cols,
+      b_shape.ld));
+  }
+  if (ok) {
+    apply_cublas("layout_c_create", cublasLtMatrixLayoutCreate(
       &c_desc,
       OutputDataType(*output),
-      static_cast<std::uint64_t>(m),
-      static_cast<std::uint64_t>(n),
-      static_cast<std::int64_t>(plan.ldc)));
+      c_shape.rows,
+      c_shape.cols,
+      c_shape.ld));
+  }
 
   const cublasLtOrder_t order_a = ToCublasOrder(plan.order_a);
   const cublasLtOrder_t order_b = ToCublasOrder(plan.order_b);
   const cublasLtOrder_t order_c = ToCublasOrder(plan.order_c);
-  ok &= CheckCublas(cublasLtMatrixLayoutSetAttribute(
+  if (ok) {
+    apply_cublas("layout_a_set_order", cublasLtMatrixLayoutSetAttribute(
       a_desc,
       CUBLASLT_MATRIX_LAYOUT_ORDER,
       &order_a,
       sizeof(order_a)));
-  ok &= CheckCublas(cublasLtMatrixLayoutSetAttribute(
+  }
+  if (ok) {
+    apply_cublas("layout_b_set_order", cublasLtMatrixLayoutSetAttribute(
       b_desc,
       CUBLASLT_MATRIX_LAYOUT_ORDER,
       &order_b,
       sizeof(order_b)));
-  ok &= CheckCublas(cublasLtMatrixLayoutSetAttribute(
+  }
+  if (ok) {
+    apply_cublas("layout_c_set_order", cublasLtMatrixLayoutSetAttribute(
       c_desc,
       CUBLASLT_MATRIX_LAYOUT_ORDER,
       &order_c,
       sizeof(order_c)));
+  }
 
-  ok &= CheckCublas(cublasLtMatmulPreferenceCreate(&preference));
+  if (ok) {
+    apply_cublas("preference_create", cublasLtMatmulPreferenceCreate(&preference));
+  }
   const std::size_t max_workspace = handle.workspace_bytes();
-  ok &= CheckCublas(cublasLtMatmulPreferenceSetAttribute(
+  if (ok) {
+    apply_cublas("preference_set_workspace", cublasLtMatmulPreferenceSetAttribute(
       preference,
       CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
       &max_workspace,
       sizeof(max_workspace)));
+  }
 
   if (ok) {
-    ok &= CheckCublas(cublasLtMatmulAlgoGetHeuristic(
+    apply_cublas("algo_get_heuristic", cublasLtMatmulAlgoGetHeuristic(
         handle.handle(),
         op_desc,
         a_desc,
@@ -181,13 +418,26 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
         1,
         &heuristic,
         &returned_results));
-    ok &= returned_results > 0;
+    if (ok && returned_results <= 0) {
+      if (DenseGemmDebugEnabled()) {
+        std::cerr << "dense_gemm_runner: algo_get_heuristic returned no results"
+                  << " activations_type=" << static_cast<int>(activations_type)
+                  << " weights_type=" << static_cast<int>(weights_type)
+                  << " alpha_scale=" << alpha_scale
+                  << " fast_accum=" << fast_accum
+                  << " m=" << m
+                  << " n=" << n
+                  << " k=" << k
+                  << "\n";
+      }
+      ok = false;
+    }
   }
 
   if (ok) {
     const float alpha = alpha_scale;
     const float beta = 0.0f;
-    ok &= CheckCublas(cublasLtMatmul(
+    apply_cublas("matmul", cublasLtMatmul(
         handle.handle(),
         op_desc,
         &alpha,
@@ -204,7 +454,9 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
         handle.workspace(),
         handle.workspace_bytes(),
         stream));
-    ok &= CheckCuda(cudaGetLastError());
+    if (ok) {
+      apply_cuda("matmul_cuda", cudaGetLastError());
+    }
   }
 
   if (preference != nullptr) {
@@ -274,8 +526,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       plan,
       activations.data(),
       CUDA_R_32F,
+      nullptr,
       weights.data(),
       CUDA_R_32F,
+      nullptr,
       1.0f,
       false,
       m,
@@ -322,8 +576,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       plan,
       activations.data(),
       CUDA_R_16BF,
+      nullptr,
       weights.data(),
       CUDA_R_32F,
+      nullptr,
       1.0f,
       false,
       m,
@@ -370,8 +626,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       plan,
       activations.data(),
       CUDA_R_16BF,
+      nullptr,
       weights.data(),
       CUDA_R_32F,
+      nullptr,
       1.0f,
       false,
       m,
@@ -427,8 +685,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       plan,
       converted_activations->data(),
       CUDA_R_16BF,
+      nullptr,
       weights.data(),
       CUDA_R_16BF,
+      nullptr,
       1.0f,
       false,
       m,
@@ -474,8 +734,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       plan,
       activations.data(),
       CUDA_R_16BF,
+      nullptr,
       weights.data(),
       CUDA_R_16BF,
+      nullptr,
       1.0f,
       false,
       m,
@@ -521,8 +783,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       plan,
       activations.data(),
       CUDA_R_16BF,
+      nullptr,
       weights.data(),
       CUDA_R_16BF,
+      nullptr,
       1.0f,
       false,
       m,
@@ -536,9 +800,10 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp8E4M3& weights,
-    float alpha_scale,
+    const float* weight_scale_device,
     const DeviceTensorFp32& activations,
     float input_scale,
+    const float* input_scale_device,
     DeviceTensorFp32* output,
     cudaStream_t stream) {
   if (!handle.valid() ||
@@ -580,10 +845,12 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
       plan,
       quantized_activations->data(),
       CUDA_R_8F_E4M3,
+      input_scale_device,
       weights.data(),
       CUDA_R_8F_E4M3,
-      alpha_scale,
-      true,
+      weight_scale_device,
+      1.0f,
+      Fp8FastAccumSupported(),
       m,
       n,
       k,
