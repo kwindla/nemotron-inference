@@ -69,7 +69,7 @@ Current per-expert path adds matmul_block_scales (~634 KB/pair), making each pai
   When disabled, fall back to the current per-expert or selected-only upload path.
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/include/nemotron/expert_staging_counters.h`, `runtime/src/backend/expert_staging_counters.cpp`
 
-- [ ] **4. Verify full residency, correctness, and benchmark**
+- [x] **4. Verify full residency, correctness, and benchmark**
   Pre-test: `nvidia-smi` clean GPU check, kill stale processes.
   Run:
   - Smoke test with `NEMOTRON_FORWARD_BUILD_MODEL=1 NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_FUSED_MAMBA_DECODE=1 NEMOTRON_FORWARD_FUSED_MOE_DECODE=1 NEMOTRON_FORWARD_DEBUG=1` — verify all 23 expert layers report `monolithic` residency
@@ -83,4 +83,4 @@ Current per-expert path adds matmul_block_scales (~634 KB/pair), making each pai
 | 1 | MonolithicNvfp4ExpertWeights data structure | done | 5531d00 | 3 cudaMalloc per projection vs 512 current |
 | 2 | Wire into ExpertLayerSlice::Create() | done | c13f438 | 6 allocs per layer vs 1,024 current |
 | 3 | Zero per-token uploads in Run() | done | — | monolithic path skips staging loop entirely |
-| 4 | Full residency verification + benchmark | pending | — | target: 23/23 resident, 0 bytes uploaded |
+| 4 | Full residency verification + benchmark | done | — | 23/23 monolithic, 0 bytes uploaded, 1805 ms/token (12.7x from baseline) |
