@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -56,6 +58,219 @@ bool ForwardDebugEnabled() {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   return kDebug;
 }
+
+bool ExpertSubLayerProfileEnabled() {
+  static const bool kEnabled = []() {
+    const char* value = std::getenv("NEMOTRON_FORWARD_PROFILE");
+    return value != nullptr && std::strcmp(value, "2") == 0;
+  }();
+  return kEnabled;
+}
+
+void LogSubLayerProfileCudaFailure(const char* caller, cudaError_t error) {
+  std::cerr << caller << ": " << cudaGetErrorString(error) << "\n";
+}
+
+enum class ExpertSubLayerStage : std::size_t {
+  kRmsNorm = 0,
+  kRouterGemm,
+  kTopKSelection,
+  kLatentFc1Projection,
+  kLatentNvfp4Packing,
+  kRoutedUpProj,
+  kRelu2Pack,
+  kRoutedDownProj,
+  kWeightedMerge,
+  kSharedExpertUp,
+  kSharedExpertRelu2,
+  kSharedExpertDown,
+  kFc2LatentProjection,
+  kResidualAdd,
+  kCount,
+};
+
+constexpr std::size_t kExpertSubLayerStageCount =
+    static_cast<std::size_t>(ExpertSubLayerStage::kCount);
+
+const char* ExpertSubLayerStageName(ExpertSubLayerStage stage) {
+  switch (stage) {
+    case ExpertSubLayerStage::kRmsNorm:
+      return "rms_norm";
+    case ExpertSubLayerStage::kRouterGemm:
+      return "router_gemm";
+    case ExpertSubLayerStage::kTopKSelection:
+      return "topk_selection";
+    case ExpertSubLayerStage::kLatentFc1Projection:
+      return "latent_fc1_projection";
+    case ExpertSubLayerStage::kLatentNvfp4Packing:
+      return "latent_nvfp4_packing";
+    case ExpertSubLayerStage::kRoutedUpProj:
+      return "routed_up_proj";
+    case ExpertSubLayerStage::kRelu2Pack:
+      return "relu2_pack";
+    case ExpertSubLayerStage::kRoutedDownProj:
+      return "routed_down_proj";
+    case ExpertSubLayerStage::kWeightedMerge:
+      return "weighted_merge";
+    case ExpertSubLayerStage::kSharedExpertUp:
+      return "shared_expert_up";
+    case ExpertSubLayerStage::kSharedExpertRelu2:
+      return "shared_expert_relu2";
+    case ExpertSubLayerStage::kSharedExpertDown:
+      return "shared_expert_down";
+    case ExpertSubLayerStage::kFc2LatentProjection:
+      return "fc2_latent_projection";
+    case ExpertSubLayerStage::kResidualAdd:
+      return "residual_add";
+    case ExpertSubLayerStage::kCount:
+      break;
+  }
+  return "unknown";
+}
+
+struct RecordedSubLayerSpan {
+  ExpertSubLayerStage stage = ExpertSubLayerStage::kRmsNorm;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+};
+
+class ExpertSubLayerProfileTotals {
+ public:
+  void Add(ExpertSubLayerStage stage, double elapsed_ms) {
+    if (!ExpertSubLayerProfileEnabled()) {
+      return;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::size_t index = static_cast<std::size_t>(stage);
+    totals_ms_[index] += elapsed_ms;
+    sample_counts_[index] += 1;
+    has_samples_ = true;
+  }
+
+  ~ExpertSubLayerProfileTotals() {
+    if (!ExpertSubLayerProfileEnabled()) {
+      return;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_samples_) {
+      return;
+    }
+    double total_ms = 0.0;
+    std::cerr << std::fixed << std::setprecision(3);
+    for (std::size_t i = 0; i < kExpertSubLayerStageCount; ++i) {
+      if (sample_counts_[i] == 0) {
+        continue;
+      }
+      total_ms += totals_ms_[i];
+      std::cerr << "forward_profile: expert_sublayer_"
+                << ExpertSubLayerStageName(static_cast<ExpertSubLayerStage>(i))
+                << "_ms=" << totals_ms_[i] << "\n";
+    }
+    std::cerr << "forward_profile: expert_sublayer_total_ms=" << total_ms << "\n"
+              << std::flush;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::array<double, kExpertSubLayerStageCount> totals_ms_{};
+  std::array<std::size_t, kExpertSubLayerStageCount> sample_counts_{};
+  bool has_samples_ = false;
+};
+
+ExpertSubLayerProfileTotals& GetExpertSubLayerProfileTotals() {
+  static ExpertSubLayerProfileTotals totals;
+  return totals;
+}
+
+class ExpertSubLayerProfiler {
+ public:
+  explicit ExpertSubLayerProfiler(bool enabled)
+      : enabled_(enabled) {}
+
+  ~ExpertSubLayerProfiler() {
+    for (RecordedSubLayerSpan& span : spans_) {
+      if (span.start != nullptr) {
+        cudaEventDestroy(span.start);
+      }
+      if (span.stop != nullptr) {
+        cudaEventDestroy(span.stop);
+      }
+    }
+  }
+
+  template <typename Fn>
+  bool Measure(ExpertSubLayerStage stage, cudaStream_t stream, bool* ok_out, Fn&& fn) {
+    if (ok_out == nullptr) {
+      return false;
+    }
+    if (!enabled_) {
+      *ok_out = fn();
+      return true;
+    }
+
+    RecordedSubLayerSpan span;
+    span.stage = stage;
+    cudaError_t status =
+        cudaEventCreateWithFlags(&span.start, cudaEventBlockingSync);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("expert_layer: create sublayer profile start", status);
+      return false;
+    }
+    status = cudaEventCreateWithFlags(&span.stop, cudaEventBlockingSync);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("expert_layer: create sublayer profile stop", status);
+      cudaEventDestroy(span.start);
+      return false;
+    }
+    status = cudaEventRecord(span.start, stream);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("expert_layer: record sublayer profile start", status);
+      cudaEventDestroy(span.start);
+      cudaEventDestroy(span.stop);
+      return false;
+    }
+
+    *ok_out = fn();
+
+    status = cudaEventRecord(span.stop, stream);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("expert_layer: record sublayer profile stop", status);
+      cudaEventDestroy(span.start);
+      cudaEventDestroy(span.stop);
+      return false;
+    }
+
+    spans_.push_back(span);
+    return true;
+  }
+
+  bool Commit() {
+    if (!enabled_ || committed_) {
+      return true;
+    }
+    for (RecordedSubLayerSpan& span : spans_) {
+      cudaError_t status = cudaEventSynchronize(span.stop);
+      if (status != cudaSuccess) {
+        LogSubLayerProfileCudaFailure("expert_layer: sync sublayer profile stop", status);
+        return false;
+      }
+      float elapsed_ms = 0.0f;
+      status = cudaEventElapsedTime(&elapsed_ms, span.start, span.stop);
+      if (status != cudaSuccess) {
+        LogSubLayerProfileCudaFailure("expert_layer: sublayer profile elapsed", status);
+        return false;
+      }
+      GetExpertSubLayerProfileTotals().Add(span.stage, elapsed_ms);
+    }
+    committed_ = true;
+    return true;
+  }
+
+ private:
+  bool enabled_ = false;
+  bool committed_ = false;
+  std::vector<RecordedSubLayerSpan> spans_;
+};
 
 const char* RoutedLookupPrefetchTopnEnv() {
   static const char* const kPrefetchTopn = std::getenv("NEMOTRON_ROUTED_LOOKUP_PREFETCH_TOPN");
@@ -2705,6 +2920,16 @@ bool RunExpertLayerImpl(
           std::is_same_v<ActivationTensorT, DeviceTensorBf16>,
       "unsupported expert activation tensor type");
   const bool debug = ForwardDebugEnabled();
+  const bool expert_sublayer_profile_enabled = ExpertSubLayerProfileEnabled();
+  ExpertSubLayerProfiler sublayer_profiler(expert_sublayer_profile_enabled);
+  const auto measure_stage =
+      [&](ExpertSubLayerStage stage, bool* ok_out, auto&& fn) -> bool {
+        return sublayer_profiler.Measure(
+            stage,
+            stream,
+            ok_out,
+            std::forward<decltype(fn)>(fn));
+      };
   const std::size_t routed_prefetch_topn = []() -> std::size_t {
     const char* env = RoutedLookupPrefetchTopnEnv();
     if (env == nullptr || *env == '\0') {
@@ -2837,17 +3062,35 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  const bool norm_ok =
-      RunExpertRmsNorm(
-          input,
-          *impl.input_norm_weight,
-          impl.config.rms_epsilon,
-          normalized.get(),
-          stream);
-  const bool gate_ok =
-      norm_ok &&
-      impl.gate_weight->Run(
-          cublas_handle, heuristic_cache, *normalized, router_logits.get(), stream);
+  bool norm_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kRmsNorm,
+          &norm_ok,
+          [&]() {
+            return RunExpertRmsNorm(
+                input,
+                *impl.input_norm_weight,
+                impl.config.rms_epsilon,
+                normalized.get(),
+                stream);
+          })) {
+    return false;
+  }
+  bool gate_ok = false;
+  if (norm_ok &&
+      !measure_stage(
+          ExpertSubLayerStage::kRouterGemm,
+          &gate_ok,
+          [&]() {
+            return impl.gate_weight->Run(
+                cublas_handle,
+                heuristic_cache,
+                *normalized,
+                router_logits.get(),
+                stream);
+          })) {
+    return false;
+  }
   if (!norm_ok || !gate_ok) {
     if (debug) {
       std::cout << "expert_layer: norm or gate projection failed"
@@ -2857,20 +3100,34 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  const bool fc1_ok =
-      (impl.fc1_latent_scaled_fp8 != nullptr &&
-       impl.fc1_latent_scaled_fp8->Run(
-           cublas_handle, heuristic_cache, *normalized, latent.get(), stream)) ||
-      (impl.fc1_latent_dense != nullptr &&
-       impl.fc1_latent_dense->Run(
-           cublas_handle, heuristic_cache, *normalized, latent.get(), stream));
-  const bool shared_up_ok =
-      (impl.shared_up_scaled_fp8 != nullptr &&
-       impl.shared_up_scaled_fp8->Run(
-           cublas_handle, heuristic_cache, *normalized, shared_up.get(), stream)) ||
-      (impl.shared_up_dense != nullptr &&
-       impl.shared_up_dense->Run(
-           cublas_handle, heuristic_cache, *normalized, shared_up.get(), stream));
+  bool fc1_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kLatentFc1Projection,
+          &fc1_ok,
+          [&]() {
+            return (impl.fc1_latent_scaled_fp8 != nullptr &&
+                    impl.fc1_latent_scaled_fp8->Run(
+                        cublas_handle, heuristic_cache, *normalized, latent.get(), stream)) ||
+                   (impl.fc1_latent_dense != nullptr &&
+                    impl.fc1_latent_dense->Run(
+                        cublas_handle, heuristic_cache, *normalized, latent.get(), stream));
+          })) {
+    return false;
+  }
+  bool shared_up_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kSharedExpertUp,
+          &shared_up_ok,
+          [&]() {
+            return (impl.shared_up_scaled_fp8 != nullptr &&
+                    impl.shared_up_scaled_fp8->Run(
+                        cublas_handle, heuristic_cache, *normalized, shared_up.get(), stream)) ||
+                   (impl.shared_up_dense != nullptr &&
+                    impl.shared_up_dense->Run(
+                        cublas_handle, heuristic_cache, *normalized, shared_up.get(), stream));
+          })) {
+    return false;
+  }
   if (!fc1_ok || !shared_up_ok) {
     if (debug) {
       std::cout << "expert_layer: fc1/shared_up projection failed"
@@ -2937,17 +3194,26 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  if (!SelectTopExpertsFp32(
-          *router_logits,
-          *impl.gate_score_correction_bias_device,
-          impl.config.n_group,
-          impl.config.topk_group,
-          impl.config.top_k,
-          impl.config.norm_topk_prob,
-          impl.config.routed_scaling_factor,
-          selection_scratch.indices_device->data(),
-          selection_scratch.weights_device->data(),
-          stream)) {
+  bool topk_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kTopKSelection,
+          &topk_ok,
+          [&]() {
+            return SelectTopExpertsFp32(
+                *router_logits,
+                *impl.gate_score_correction_bias_device,
+                impl.config.n_group,
+                impl.config.topk_group,
+                impl.config.top_k,
+                impl.config.norm_topk_prob,
+                impl.config.routed_scaling_factor,
+                selection_scratch.indices_device->data(),
+                selection_scratch.weights_device->data(),
+                stream);
+          })) {
+    return false;
+  }
+  if (!topk_ok) {
     if (debug) {
       std::cout << "expert_layer: device top-k selection failed\n";
       }
@@ -3439,7 +3705,8 @@ bool RunExpertLayerImpl(
 
     // CUDA graph replay fast path: when all experts are warm and graph is
     // captured, replay the entire MoE compute sequence in one graph launch.
-    if (!outer_stream_capturing &&
+    if (!expert_sublayer_profile_enabled &&
+        !outer_stream_capturing &&
         impl.moe_graph_enabled && impl.experts_contiguous &&
         batch_count == static_cast<std::size_t>(impl.config.top_k) &&
         impl.moe_graph_input_ready != nullptr &&
@@ -3675,28 +3942,33 @@ bool RunExpertLayerImpl(
       }
     }
 
-    const bool pack_ok =
-        [&]() {
-          if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
-            return PackDeviceRowMajorFp32ToNvfp4InPlace(
-                latent_input_row, {},
-                impl.scratch_latent_packed_data.data(),
-                impl.scratch_latent_block_scales.data(),
-                impl.scratch_latent_matmul_scales.data(),
-                reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-                impl.scratch_global_max_bits.data(),
-                stream);
-          } else {
-            return PackDeviceRowMajorBf16ToNvfp4InPlace(
-                latent_input_row, {},
-                impl.scratch_latent_packed_data.data(),
-                impl.scratch_latent_block_scales.data(),
-                impl.scratch_latent_matmul_scales.data(),
-                reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-                impl.scratch_global_max_bits.data(),
-                stream);
-          }
-        }();
+    bool pack_ok = false;
+    if (!measure_stage(
+            ExpertSubLayerStage::kLatentNvfp4Packing,
+            &pack_ok,
+            [&]() {
+              if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+                return PackDeviceRowMajorFp32ToNvfp4InPlace(
+                    latent_input_row, {},
+                    impl.scratch_latent_packed_data.data(),
+                    impl.scratch_latent_block_scales.data(),
+                    impl.scratch_latent_matmul_scales.data(),
+                    reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                    impl.scratch_global_max_bits.data(),
+                    stream);
+              } else {
+                return PackDeviceRowMajorBf16ToNvfp4InPlace(
+                    latent_input_row, {},
+                    impl.scratch_latent_packed_data.data(),
+                    impl.scratch_latent_block_scales.data(),
+                    impl.scratch_latent_matmul_scales.data(),
+                    reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                    impl.scratch_global_max_bits.data(),
+                    stream);
+              }
+            })) {
+      return GroupedRoutedResult::kFatal;
+    }
     if (!pack_ok) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPackFallback();
@@ -3755,46 +4027,62 @@ bool RunExpertLayerImpl(
           impl.config.routed_expert_intermediate_size * sizeof(float),
           batch_count);
       // B pointers: already on device from GatherExpertSelectionLookupsCheckedInPlace.
-      cutlass_up_ok = impl.cutlass_up_plan->Run(
-          impl.cutlass_a_ptrs.data(),
-          impl.cutlass_a_sf_ptrs.data(),
-          impl.scratch_up_packed_ptrs.data(),
-          impl.scratch_up_matmul_scale_ptrs.data(),
-          impl.cutlass_c_ptrs.data(),
-          impl.cutlass_d_ptrs.data(),
-          impl.scratch_cutlass_up_alphas.data(),
-          0.0f,
-          stream);
+      if (!measure_stage(
+              ExpertSubLayerStage::kRoutedUpProj,
+              &cutlass_up_ok,
+              [&]() {
+                return impl.cutlass_up_plan->Run(
+                    impl.cutlass_a_ptrs.data(),
+                    impl.cutlass_a_sf_ptrs.data(),
+                    impl.scratch_up_packed_ptrs.data(),
+                    impl.scratch_up_matmul_scale_ptrs.data(),
+                    impl.cutlass_c_ptrs.data(),
+                    impl.cutlass_d_ptrs.data(),
+                    impl.scratch_cutlass_up_alphas.data(),
+                    0.0f,
+                    stream);
+              })) {
+        return GroupedRoutedResult::kFatal;
+      }
       if (cutlass_up_ok && debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
                   << " CUTLASS device up_proj succeeded\n";
       }
     }
-    const bool up_ok = use_strided_contiguous_weights
-                           ? FusedRoutedUpProjPackedNvfp4SingleToken(
-                                 impl.scratch_latent_packed_data.data(),
-                                 impl.scratch_latent_block_scales.data(),
-                                 reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
-                                 impl.config.moe_latent_size,
-                                 impl.contiguous_up_packed.data(),
-                                 impl.contiguous_up_packed_stride_bytes,
-                                 impl.contiguous_up_block_scales.data(),
-                                 impl.contiguous_up_block_scale_stride_bytes,
-                                 impl.contiguous_up_tensor_scales.data(),
-                                 selected_indices_device,
-                                 grouped_up.get(),
-                                 stream)
-                           : (cutlass_up_ok ||
-                              FusedRoutedUpProjPackedNvfp4SingleToken(
-                                  impl.scratch_latent_packed_data.data(),
-                                  impl.scratch_latent_block_scales.data(),
-                                  reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
-                                  impl.config.moe_latent_size,
-                                  impl.scratch_up_packed_ptrs,
-                                  impl.scratch_up_raw_scale_ptrs,
-                                  impl.scratch_selected_up_tensor_scales,
-                                  grouped_up.get(),
-                                  stream));
+    bool up_ok = false;
+    if (cutlass_up_ok) {
+      up_ok = true;
+    } else if (!measure_stage(
+                   ExpertSubLayerStage::kRoutedUpProj,
+                   &up_ok,
+                   [&]() {
+                     return use_strided_contiguous_weights
+                                ? FusedRoutedUpProjPackedNvfp4SingleToken(
+                                      impl.scratch_latent_packed_data.data(),
+                                      impl.scratch_latent_block_scales.data(),
+                                      reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+                                      impl.config.moe_latent_size,
+                                      impl.contiguous_up_packed.data(),
+                                      impl.contiguous_up_packed_stride_bytes,
+                                      impl.contiguous_up_block_scales.data(),
+                                      impl.contiguous_up_block_scale_stride_bytes,
+                                      impl.contiguous_up_tensor_scales.data(),
+                                      selected_indices_device,
+                                      grouped_up.get(),
+                                      stream)
+                                : FusedRoutedUpProjPackedNvfp4SingleToken(
+                                      impl.scratch_latent_packed_data.data(),
+                                      impl.scratch_latent_block_scales.data(),
+                                      reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+                                      impl.config.moe_latent_size,
+                                      impl.scratch_up_packed_ptrs,
+                                      impl.scratch_up_raw_scale_ptrs,
+                                      impl.scratch_selected_up_tensor_scales,
+                                      grouped_up.get(),
+                                      stream);
+                   })) {
+      return GroupedRoutedResult::kFatal;
+    }
     if (!up_ok) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -3805,15 +4093,24 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
-    if (!ScaleRelu2PackRowsToNvfp4InPlace(
-            *grouped_up,
-            impl.scratch_row_scales.data(),
-            impl.scratch_down_act_packed,
-            impl.scratch_down_act_block_scales,
-            try_cutlass_single_token ? &impl.scratch_down_act_matmul_scales : nullptr,
-            impl.scratch_down_act_tensor_scales,
-            down_act_packed_row_stride,
-            stream)) {
+    bool relu2_pack_ok = false;
+    if (!measure_stage(
+            ExpertSubLayerStage::kRelu2Pack,
+            &relu2_pack_ok,
+            [&]() {
+              return ScaleRelu2PackRowsToNvfp4InPlace(
+                  *grouped_up,
+                  impl.scratch_row_scales.data(),
+                  impl.scratch_down_act_packed,
+                  impl.scratch_down_act_block_scales,
+                  try_cutlass_single_token ? &impl.scratch_down_act_matmul_scales : nullptr,
+                  impl.scratch_down_act_tensor_scales,
+                  down_act_packed_row_stride,
+                  stream);
+            })) {
+      return GroupedRoutedResult::kFatal;
+    }
+    if (!relu2_pack_ok) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertMergeFallback();
       return GroupedRoutedResult::kFallback;
@@ -3865,37 +4162,53 @@ bool RunExpertLayerImpl(
             impl.config.moe_latent_size * sizeof(float), batch_count);
 
         // B pointers already on device from GatherExpertSelectionLookupsCheckedInPlace.
-        cutlass_down_ok = impl.cutlass_down_plan->Run(
-            impl.cutlass_a_ptrs.data(),
-            impl.cutlass_a_sf_ptrs.data(),
-            impl.scratch_down_packed_ptrs.data(),
-            impl.scratch_down_matmul_scale_ptrs.data(),
-            impl.cutlass_c_ptrs.data(),
-            impl.cutlass_d_ptrs.data(),
-            impl.scratch_cutlass_down_alphas.data(),
-            0.0f,
-            stream);
+        if (!measure_stage(
+                ExpertSubLayerStage::kRoutedDownProj,
+                &cutlass_down_ok,
+                [&]() {
+                  return impl.cutlass_down_plan->Run(
+                      impl.cutlass_a_ptrs.data(),
+                      impl.cutlass_a_sf_ptrs.data(),
+                      impl.scratch_down_packed_ptrs.data(),
+                      impl.scratch_down_matmul_scale_ptrs.data(),
+                      impl.cutlass_c_ptrs.data(),
+                      impl.cutlass_d_ptrs.data(),
+                      impl.scratch_cutlass_down_alphas.data(),
+                      0.0f,
+                      stream);
+                })) {
+          return GroupedRoutedResult::kFatal;
+        }
 
         if (cutlass_down_ok) {
-          if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
-            cutlass_down_ok = ScaleWeightedAccumulateRowsFp32(
-                *down_output,
-                impl.scratch_row_scales.data(),
-                impl.scratch_row_scales.data(),
-                selected_weights_device,
-                batch_count,
-                routed_tensor.get(),
-                stream);
-          } else {
-            cutlass_down_ok = ScaleWeightedAccumulateRowsBf16(
-                *down_output,
-                impl.scratch_row_scales.data(),
-                impl.scratch_row_scales.data(),
-                selected_weights_device,
-                batch_count,
-                routed_tensor.get(),
-                stream);
+          bool weighted_merge_ok = false;
+          if (!measure_stage(
+                  ExpertSubLayerStage::kWeightedMerge,
+                  &weighted_merge_ok,
+                  [&]() {
+                    if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+                      return ScaleWeightedAccumulateRowsFp32(
+                          *down_output,
+                          impl.scratch_row_scales.data(),
+                          impl.scratch_row_scales.data(),
+                          selected_weights_device,
+                          batch_count,
+                          routed_tensor.get(),
+                          stream);
+                    } else {
+                      return ScaleWeightedAccumulateRowsBf16(
+                          *down_output,
+                          impl.scratch_row_scales.data(),
+                          impl.scratch_row_scales.data(),
+                          selected_weights_device,
+                          batch_count,
+                          routed_tensor.get(),
+                          stream);
+                    }
+                  })) {
+            return GroupedRoutedResult::kFatal;
           }
+          cutlass_down_ok = weighted_merge_ok;
         }
       }
       if (cutlass_down_ok && debug) {
@@ -3903,35 +4216,44 @@ bool RunExpertLayerImpl(
                   << " CUTLASS device down_proj succeeded\n";
       }
     }
-    const bool down_ok = use_strided_contiguous_weights
-                             ? FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
-                                   impl.scratch_down_act_packed.data(),
-                                   impl.scratch_down_act_block_scales.data(),
-                                   impl.scratch_down_act_tensor_scales,
-                                   selected_weights_device,
-                                   impl.config.routed_expert_intermediate_size,
-                                   impl.contiguous_down_packed.data(),
-                                   impl.contiguous_down_packed_stride_bytes,
-                                   impl.contiguous_down_block_scales.data(),
-                                   impl.contiguous_down_block_scale_stride_bytes,
-                                   impl.contiguous_down_tensor_scales.data(),
-                                   selected_indices_device,
-                                   routed_tensor.get(),
-                                   down_act_packed_row_stride,
-                                   stream)
-                             : (cutlass_down_ok ||
-                                FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
-                                    impl.scratch_down_act_packed.data(),
-                                    impl.scratch_down_act_block_scales.data(),
-                                    impl.scratch_down_act_tensor_scales,
-                                    selected_weights_device,
-                                    impl.config.routed_expert_intermediate_size,
-                                    impl.scratch_down_packed_ptrs,
-                                    impl.scratch_down_raw_scale_ptrs,
-                                    impl.scratch_selected_down_tensor_scales,
-                                    routed_tensor.get(),
-                                    down_act_packed_row_stride,
-                                    stream));
+    bool down_ok = false;
+    if (cutlass_down_ok) {
+      down_ok = true;
+    } else if (!measure_stage(
+                   ExpertSubLayerStage::kRoutedDownProj,
+                   &down_ok,
+                   [&]() {
+                     return use_strided_contiguous_weights
+                                ? FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+                                      impl.scratch_down_act_packed.data(),
+                                      impl.scratch_down_act_block_scales.data(),
+                                      impl.scratch_down_act_tensor_scales,
+                                      selected_weights_device,
+                                      impl.config.routed_expert_intermediate_size,
+                                      impl.contiguous_down_packed.data(),
+                                      impl.contiguous_down_packed_stride_bytes,
+                                      impl.contiguous_down_block_scales.data(),
+                                      impl.contiguous_down_block_scale_stride_bytes,
+                                      impl.contiguous_down_tensor_scales.data(),
+                                      selected_indices_device,
+                                      routed_tensor.get(),
+                                      down_act_packed_row_stride,
+                                      stream)
+                                : FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+                                      impl.scratch_down_act_packed.data(),
+                                      impl.scratch_down_act_block_scales.data(),
+                                      impl.scratch_down_act_tensor_scales,
+                                      selected_weights_device,
+                                      impl.config.routed_expert_intermediate_size,
+                                      impl.scratch_down_packed_ptrs,
+                                      impl.scratch_down_raw_scale_ptrs,
+                                      impl.scratch_selected_down_tensor_scales,
+                                      routed_tensor.get(),
+                                      down_act_packed_row_stride,
+                                      stream);
+                   })) {
+      return GroupedRoutedResult::kFatal;
+    }
     if (!down_ok) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -3952,7 +4274,8 @@ bool RunExpertLayerImpl(
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
-    if (impl.routed_backend_kind == RoutedMoEBackendKind::kFlashInfer) {
+    if (!expert_sublayer_profile_enabled &&
+        impl.routed_backend_kind == RoutedMoEBackendKind::kFlashInfer) {
       if (trace != nullptr ||
           token_count != 1 ||
           batch_count == 0 ||
@@ -4067,16 +4390,30 @@ bool RunExpertLayerImpl(
         return false;
       }
 
-      bool up_ok =
-          pair->up_proj->Run(cublas_handle, heuristic_cache, *latent_input, expert_up.get(), stream);
-      if (!up_ok) {
-        up_ok = retry_with_dense_fallback(
-            *pair,
-            pair->up_descriptor,
-            pair->up_tensor_scale,
-            pair->up_proj,
-            *latent_input,
-            expert_up.get());
+      bool up_ok = false;
+      if (!measure_stage(
+              ExpertSubLayerStage::kRoutedUpProj,
+              &up_ok,
+              [&]() {
+                bool local_up_ok =
+                    pair->up_proj->Run(
+                        cublas_handle,
+                        heuristic_cache,
+                        *latent_input,
+                        expert_up.get(),
+                        stream);
+                if (!local_up_ok) {
+                  local_up_ok = retry_with_dense_fallback(
+                      *pair,
+                      pair->up_descriptor,
+                      pair->up_tensor_scale,
+                      pair->up_proj,
+                      *latent_input,
+                      expert_up.get());
+                }
+                return local_up_ok;
+              })) {
+        return false;
       }
       if (!up_ok) {
         if (debug) {
@@ -4085,23 +4422,45 @@ bool RunExpertLayerImpl(
         }
         return false;
       }
-      if (!RunExpertRelu2(expert_up.get(), stream)) {
+      bool routed_relu_ok = false;
+      if (!measure_stage(
+              ExpertSubLayerStage::kRelu2Pack,
+              &routed_relu_ok,
+              [&]() {
+                return RunExpertRelu2(expert_up.get(), stream);
+              })) {
+        return false;
+      }
+      if (!routed_relu_ok) {
         if (debug) {
           std::cout << "expert_layer: routed relu2 failed for expert "
                     << selection.expert_index << "\n";
         }
         return false;
       }
-      bool down_ok = pair->down_proj->Run(
-          cublas_handle, heuristic_cache, *expert_up, expert_down.get(), stream);
-      if (!down_ok) {
-        down_ok = retry_with_dense_fallback(
-            *pair,
-            pair->down_descriptor,
-            pair->down_tensor_scale,
-            pair->down_proj,
-            *expert_up,
-            expert_down.get());
+      bool down_ok = false;
+      if (!measure_stage(
+              ExpertSubLayerStage::kRoutedDownProj,
+              &down_ok,
+              [&]() {
+                bool local_down_ok = pair->down_proj->Run(
+                    cublas_handle,
+                    heuristic_cache,
+                    *expert_up,
+                    expert_down.get(),
+                    stream);
+                if (!local_down_ok) {
+                  local_down_ok = retry_with_dense_fallback(
+                      *pair,
+                      pair->down_descriptor,
+                      pair->down_tensor_scale,
+                      pair->down_proj,
+                      *expert_up,
+                      expert_down.get());
+                }
+                return local_down_ok;
+              })) {
+        return false;
       }
       if (!down_ok) {
         if (debug) {
@@ -4110,14 +4469,26 @@ bool RunExpertLayerImpl(
         }
         return false;
       }
-      const bool add_ok = token_count == 1
-          ? RunExpertAddScaled(*expert_down, selection.weight, routed_tensor.get(), stream)
-          : RunExpertAddScaledRow(
-                *expert_down,
-                selection.weight,
-                token_index,
-                routed_tensor.get(),
-                stream);
+      bool add_ok = false;
+      if (!measure_stage(
+              ExpertSubLayerStage::kWeightedMerge,
+              &add_ok,
+              [&]() {
+                return token_count == 1
+                           ? RunExpertAddScaled(
+                                 *expert_down,
+                                 selection.weight,
+                                 routed_tensor.get(),
+                                 stream)
+                           : RunExpertAddScaledRow(
+                                 *expert_down,
+                                 selection.weight,
+                                 token_index,
+                                 routed_tensor.get(),
+                                 stream);
+              })) {
+        return false;
+      }
       if (!add_ok) {
         if (debug) {
           std::cout << "expert_layer: routed weighted accumulation failed for expert "
@@ -4175,7 +4546,16 @@ bool RunExpertLayerImpl(
     }
   }
 
-  if (!RunExpertRelu2(shared_up.get(), stream)) {
+  bool shared_relu_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kSharedExpertRelu2,
+          &shared_relu_ok,
+          [&]() {
+            return RunExpertRelu2(shared_up.get(), stream);
+          })) {
+    return false;
+  }
+  if (!shared_relu_ok) {
     if (debug) {
       std::cout << "expert_layer: shared relu2 failed\n";
     }
@@ -4183,18 +4563,35 @@ bool RunExpertLayerImpl(
   }
 
   bool shared_down_ok = false;
-  if (impl.shared_down_nvfp4 != nullptr) {
-    shared_down_ok =
-        impl.shared_down_nvfp4->Run(
-            cublas_handle, heuristic_cache, *shared_up, shared_output_device.get(), stream);
-  } else if (impl.shared_down_scaled_fp8 != nullptr) {
-    shared_down_ok =
-        impl.shared_down_scaled_fp8->Run(
-            cublas_handle, heuristic_cache, *shared_up, shared_output_device.get(), stream);
-  } else if (impl.shared_down_dense != nullptr) {
-    shared_down_ok =
-        impl.shared_down_dense->Run(
-            cublas_handle, heuristic_cache, *shared_up, shared_output_device.get(), stream);
+  if (!measure_stage(
+          ExpertSubLayerStage::kSharedExpertDown,
+          &shared_down_ok,
+          [&]() {
+            if (impl.shared_down_nvfp4 != nullptr) {
+              return impl.shared_down_nvfp4->Run(
+                  cublas_handle,
+                  heuristic_cache,
+                  *shared_up,
+                  shared_output_device.get(),
+                  stream);
+            }
+            if (impl.shared_down_scaled_fp8 != nullptr) {
+              return impl.shared_down_scaled_fp8->Run(
+                  cublas_handle,
+                  heuristic_cache,
+                  *shared_up,
+                  shared_output_device.get(),
+                  stream);
+            }
+            return impl.shared_down_dense != nullptr &&
+                   impl.shared_down_dense->Run(
+                       cublas_handle,
+                       heuristic_cache,
+                       *shared_up,
+                       shared_output_device.get(),
+                       stream);
+          })) {
+    return false;
   }
   if (!shared_down_ok) {
     if (debug) {
@@ -4203,23 +4600,41 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  if (!impl.fc2_latent->Run(
-          cublas_handle,
-          heuristic_cache,
-          *routed_tensor,
-          projected_routed.get(),
-          stream)) {
+  bool fc2_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kFc2LatentProjection,
+          &fc2_ok,
+          [&]() {
+            return impl.fc2_latent->Run(
+                cublas_handle,
+                heuristic_cache,
+                *routed_tensor,
+                projected_routed.get(),
+                stream);
+          })) {
+    return false;
+  }
+  if (!fc2_ok) {
     if (debug) {
       std::cout << "expert_layer: fc2 latent projection failed\n";
     }
     return false;
   }
-  if (!RunExpertResidualAdd(
-          *projected_routed,
-          *shared_output_device,
-          mixer_output_device.get(),
-          stream) ||
-      !RunExpertResidualAdd(input, *mixer_output_device, output, stream)) {
+  bool residual_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kResidualAdd,
+          &residual_ok,
+          [&]() {
+            return RunExpertResidualAdd(
+                       *projected_routed,
+                       *shared_output_device,
+                       mixer_output_device.get(),
+                       stream) &&
+                   RunExpertResidualAdd(input, *mixer_output_device, output, stream);
+          })) {
+    return false;
+  }
+  if (!residual_ok) {
     if (debug) {
       std::cout << "expert_layer: residual merge failed\n";
     }
@@ -4241,6 +4656,9 @@ bool RunExpertLayerImpl(
     trace->latent_output = std::move(trace_latent_output);
     trace->routed_latent_output = std::move(trace_routed_output);
     trace->shared_output = std::move(trace_shared_output);
+  }
+  if (!sublayer_profiler.Commit()) {
+    return false;
   }
   return true;
 }

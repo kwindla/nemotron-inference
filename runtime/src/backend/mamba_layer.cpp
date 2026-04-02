@@ -3,12 +3,16 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -62,6 +66,198 @@ bool OptimizedMambaDecodeKernelsEnabled() {
   static const bool kEnabled = std::getenv("NEMOTRON_DISABLE_MAMBA_SSM_KERNELS") == nullptr;
   return kEnabled;
 }
+
+bool MambaSubLayerProfileEnabled() {
+  static const bool kEnabled = []() {
+    const char* value = std::getenv("NEMOTRON_FORWARD_PROFILE");
+    return value != nullptr && std::strcmp(value, "2") == 0;
+  }();
+  return kEnabled;
+}
+
+void LogSubLayerProfileCudaFailure(const char* caller, cudaError_t error) {
+  std::cerr << caller << ": " << cudaGetErrorString(error) << "\n";
+}
+
+enum class MambaSubLayerStage : std::size_t {
+  kRmsNorm = 0,
+  kInProj,
+  kConv1dSilu,
+  kSsmUpdate,
+  kGroupedNormGating,
+  kOutProj,
+  kResidualAdd,
+  kCount,
+};
+
+constexpr std::size_t kMambaSubLayerStageCount =
+    static_cast<std::size_t>(MambaSubLayerStage::kCount);
+
+const char* MambaSubLayerStageName(MambaSubLayerStage stage) {
+  switch (stage) {
+    case MambaSubLayerStage::kRmsNorm:
+      return "rms_norm";
+    case MambaSubLayerStage::kInProj:
+      return "in_proj";
+    case MambaSubLayerStage::kConv1dSilu:
+      return "conv1d_silu";
+    case MambaSubLayerStage::kSsmUpdate:
+      return "ssm_update";
+    case MambaSubLayerStage::kGroupedNormGating:
+      return "grouped_norm_gating";
+    case MambaSubLayerStage::kOutProj:
+      return "out_proj";
+    case MambaSubLayerStage::kResidualAdd:
+      return "residual_add";
+    case MambaSubLayerStage::kCount:
+      break;
+  }
+  return "unknown";
+}
+
+struct RecordedMambaSubLayerSpan {
+  MambaSubLayerStage stage = MambaSubLayerStage::kRmsNorm;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+};
+
+class MambaSubLayerProfileTotals {
+ public:
+  void Add(MambaSubLayerStage stage, double elapsed_ms) {
+    if (!MambaSubLayerProfileEnabled()) {
+      return;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::size_t index = static_cast<std::size_t>(stage);
+    totals_ms_[index] += elapsed_ms;
+    sample_counts_[index] += 1;
+    has_samples_ = true;
+  }
+
+  ~MambaSubLayerProfileTotals() {
+    if (!MambaSubLayerProfileEnabled()) {
+      return;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_samples_) {
+      return;
+    }
+    double total_ms = 0.0;
+    std::cerr << std::fixed << std::setprecision(3);
+    for (std::size_t i = 0; i < kMambaSubLayerStageCount; ++i) {
+      if (sample_counts_[i] == 0) {
+        continue;
+      }
+      total_ms += totals_ms_[i];
+      std::cerr << "forward_profile: mamba_sublayer_"
+                << MambaSubLayerStageName(static_cast<MambaSubLayerStage>(i))
+                << "_ms=" << totals_ms_[i] << "\n";
+    }
+    std::cerr << "forward_profile: mamba_sublayer_total_ms=" << total_ms << "\n"
+              << std::flush;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::array<double, kMambaSubLayerStageCount> totals_ms_{};
+  std::array<std::size_t, kMambaSubLayerStageCount> sample_counts_{};
+  bool has_samples_ = false;
+};
+
+MambaSubLayerProfileTotals& GetMambaSubLayerProfileTotals() {
+  static MambaSubLayerProfileTotals totals;
+  return totals;
+}
+
+class MambaSubLayerProfiler {
+ public:
+  explicit MambaSubLayerProfiler(bool enabled)
+      : enabled_(enabled) {}
+
+  ~MambaSubLayerProfiler() {
+    for (RecordedMambaSubLayerSpan& span : spans_) {
+      if (span.start != nullptr) {
+        cudaEventDestroy(span.start);
+      }
+      if (span.stop != nullptr) {
+        cudaEventDestroy(span.stop);
+      }
+    }
+  }
+
+  template <typename Fn>
+  bool Measure(MambaSubLayerStage stage, cudaStream_t stream, bool* ok_out, Fn&& fn) {
+    if (ok_out == nullptr) {
+      return false;
+    }
+    if (!enabled_) {
+      *ok_out = fn();
+      return true;
+    }
+
+    RecordedMambaSubLayerSpan span;
+    span.stage = stage;
+    cudaError_t status =
+        cudaEventCreateWithFlags(&span.start, cudaEventBlockingSync);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("mamba_layer: create sublayer profile start", status);
+      return false;
+    }
+    status = cudaEventCreateWithFlags(&span.stop, cudaEventBlockingSync);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("mamba_layer: create sublayer profile stop", status);
+      cudaEventDestroy(span.start);
+      return false;
+    }
+    status = cudaEventRecord(span.start, stream);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("mamba_layer: record sublayer profile start", status);
+      cudaEventDestroy(span.start);
+      cudaEventDestroy(span.stop);
+      return false;
+    }
+
+    *ok_out = fn();
+
+    status = cudaEventRecord(span.stop, stream);
+    if (status != cudaSuccess) {
+      LogSubLayerProfileCudaFailure("mamba_layer: record sublayer profile stop", status);
+      cudaEventDestroy(span.start);
+      cudaEventDestroy(span.stop);
+      return false;
+    }
+
+    spans_.push_back(span);
+    return true;
+  }
+
+  bool Commit() {
+    if (!enabled_ || committed_) {
+      return true;
+    }
+    for (RecordedMambaSubLayerSpan& span : spans_) {
+      cudaError_t status = cudaEventSynchronize(span.stop);
+      if (status != cudaSuccess) {
+        LogSubLayerProfileCudaFailure("mamba_layer: sync sublayer profile stop", status);
+        return false;
+      }
+      float elapsed_ms = 0.0f;
+      status = cudaEventElapsedTime(&elapsed_ms, span.start, span.stop);
+      if (status != cudaSuccess) {
+        LogSubLayerProfileCudaFailure("mamba_layer: sublayer profile elapsed", status);
+        return false;
+      }
+      GetMambaSubLayerProfileTotals().Add(span.stage, elapsed_ms);
+    }
+    committed_ = true;
+    return true;
+  }
+
+ private:
+  bool enabled_ = false;
+  bool committed_ = false;
+  std::vector<RecordedMambaSubLayerSpan> spans_;
+};
 
 bool CanUseOptimizedMambaDecode(const MambaLayerConfig& config, std::size_t token_count) {
   return token_count == 1 &&
@@ -754,6 +950,16 @@ bool MambaLayerSlice::Run(
   }
 
   const bool use_optimized_decode = CanUseOptimizedMambaDecode(impl_->config, token_count);
+  const bool mamba_sublayer_profile_enabled = MambaSubLayerProfileEnabled();
+  MambaSubLayerProfiler sublayer_profiler(mamba_sublayer_profile_enabled);
+  const auto measure_stage =
+      [&](MambaSubLayerStage stage, bool* ok_out, auto&& fn) -> bool {
+        return sublayer_profiler.Measure(
+            stage,
+            stream,
+            ok_out,
+            std::forward<decltype(fn)>(fn));
+      };
   if (use_optimized_decode) {
     decode_conv_output_view =
         CreateFp32SliceView(projected, impl_->config.intermediate_size, {1, conv_dim});
@@ -771,12 +977,21 @@ bool MambaLayerSlice::Run(
     trace->projected_output.clear();
   }
 
-  if (!RmsNormFp32(
-          input,
-          *impl_->input_norm_weight,
-          impl_->config.input_rms_epsilon,
-          normalized,
-          stream)) {
+  bool norm_ok = false;
+  if (!measure_stage(
+          MambaSubLayerStage::kRmsNorm,
+          &norm_ok,
+          [&]() {
+            return RmsNormFp32(
+                input,
+                *impl_->input_norm_weight,
+                impl_->config.input_rms_epsilon,
+                normalized,
+                stream);
+          })) {
+    return false;
+  }
+  if (!norm_ok) {
     return false;
   }
 
@@ -787,12 +1002,20 @@ bool MambaLayerSlice::Run(
     }
   }
 
-  const bool in_proj_ok =
-      (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->in_proj_scaled_fp8->Run(
-           cublas_handle, heuristic_cache, *normalized, projected, stream)) ||
-      (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected, stream));
+  bool in_proj_ok = false;
+  if (!measure_stage(
+          MambaSubLayerStage::kInProj,
+          &in_proj_ok,
+          [&]() {
+            return (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+                    impl_->in_proj_scaled_fp8->Run(
+                        cublas_handle, heuristic_cache, *normalized, projected, stream)) ||
+                   (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
+                    impl_->in_proj_dense->Run(
+                        cublas_handle, heuristic_cache, *normalized, projected, stream));
+          })) {
+    return false;
+  }
   if (!in_proj_ok) {
     return false;
   }
@@ -806,105 +1029,173 @@ bool MambaLayerSlice::Run(
 
   if (token_count == 1) {
     if (use_optimized_decode) {
-      if (!MambaCausalConv1dUpdateDecodeFp32(
-              *projected,
-              impl_->config.intermediate_size,
-              conv_dim,
-              impl_->config.conv_kernel_size,
-              impl_->config.conv_state_offset_elems,
-              *impl_->conv1d_weight,
-              *impl_->conv1d_bias,
-              request_context.mamba_conv_state(),
-              decode_conv_output_view.get(),
-              stream) ||
-          !MambaSelectiveStateUpdateDecodeFp32(
-              *projected,
-              *decode_conv_output_view,
-              impl_->config.intermediate_size,
-              conv_dim,
-              impl_->config.num_heads,
-              impl_->config.head_dim,
-              impl_->config.state_size,
-              impl_->config.n_groups,
-              impl_->config.time_step_min,
-              impl_->config.ssm_state_offset_elems,
-              *impl_->A_log,
-              *impl_->D,
-              *impl_->dt_bias,
-              request_context.mamba_state(),
-              decode_gated_output_view.get(),
-              stream) ||
-          !GroupedRmsNormFp32(
-              *decode_gated_output_view,
-              *impl_->mixer_norm_weight,
-              impl_->config.n_groups,
-              impl_->config.mixer_rms_epsilon,
-              scan_output,
-              stream)) {
+      bool conv1d_ok = false;
+      if (!measure_stage(
+              MambaSubLayerStage::kConv1dSilu,
+              &conv1d_ok,
+              [&]() {
+                return MambaCausalConv1dUpdateDecodeFp32(
+                    *projected,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.conv_kernel_size,
+                    impl_->config.conv_state_offset_elems,
+                    *impl_->conv1d_weight,
+                    *impl_->conv1d_bias,
+                    request_context.mamba_conv_state(),
+                    decode_conv_output_view.get(),
+                    stream);
+              })) {
         return false;
       }
-    } else if (!MambaDecodeStepFusedFp32(
-                   *projected,
-                   impl_->config.intermediate_size,
-                   conv_dim,
-                   impl_->config.num_heads,
-                   impl_->config.head_dim,
-                   impl_->config.state_size,
-                   impl_->config.n_groups,
-                   impl_->config.conv_kernel_size,
-                   impl_->config.time_step_min,
-                   impl_->config.mixer_rms_epsilon,
-                   impl_->config.conv_state_offset_elems,
-                   impl_->config.ssm_state_offset_elems,
-                   *impl_->conv1d_weight,
-                   *impl_->conv1d_bias,
-                   *impl_->A_log,
-                   *impl_->D,
-                   *impl_->dt_bias,
-                   *impl_->mixer_norm_weight,
-                   request_context.mamba_conv_state(),
-                   request_context.mamba_state(),
-                   scan_output,
-                   stream)) {
-      return false;
+      bool ssm_ok = false;
+      if (conv1d_ok &&
+          !measure_stage(
+              MambaSubLayerStage::kSsmUpdate,
+              &ssm_ok,
+              [&]() {
+                return MambaSelectiveStateUpdateDecodeFp32(
+                    *projected,
+                    *decode_conv_output_view,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.num_heads,
+                    impl_->config.head_dim,
+                    impl_->config.state_size,
+                    impl_->config.n_groups,
+                    impl_->config.time_step_min,
+                    impl_->config.ssm_state_offset_elems,
+                    *impl_->A_log,
+                    *impl_->D,
+                    *impl_->dt_bias,
+                    request_context.mamba_state(),
+                    decode_gated_output_view.get(),
+                    stream);
+              })) {
+        return false;
+      }
+      bool grouped_norm_ok = false;
+      if (conv1d_ok && ssm_ok &&
+          !measure_stage(
+              MambaSubLayerStage::kGroupedNormGating,
+              &grouped_norm_ok,
+              [&]() {
+                return GroupedRmsNormFp32(
+                    *decode_gated_output_view,
+                    *impl_->mixer_norm_weight,
+                    impl_->config.n_groups,
+                    impl_->config.mixer_rms_epsilon,
+                    scan_output,
+                    stream);
+              })) {
+        return false;
+      }
+      if (!conv1d_ok || !ssm_ok || !grouped_norm_ok) {
+        return false;
+      }
+    } else {
+      // The fallback decode helper fuses conv1d, SSM, and grouped norm into a
+      // single call. Mode-2 breakdown stays split on the optimized decode path
+      // used by the benchmark and attributes this fallback as one fused stage.
+      bool fused_decode_ok = false;
+      if (!measure_stage(
+              MambaSubLayerStage::kSsmUpdate,
+              &fused_decode_ok,
+              [&]() {
+                return MambaDecodeStepFusedFp32(
+                    *projected,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.num_heads,
+                    impl_->config.head_dim,
+                    impl_->config.state_size,
+                    impl_->config.n_groups,
+                    impl_->config.conv_kernel_size,
+                    impl_->config.time_step_min,
+                    impl_->config.mixer_rms_epsilon,
+                    impl_->config.conv_state_offset_elems,
+                    impl_->config.ssm_state_offset_elems,
+                    *impl_->conv1d_weight,
+                    *impl_->conv1d_bias,
+                    *impl_->A_log,
+                    *impl_->D,
+                    *impl_->dt_bias,
+                    *impl_->mixer_norm_weight,
+                    request_context.mamba_conv_state(),
+                    request_context.mamba_state(),
+                    scan_output,
+                    stream);
+              })) {
+        return false;
+      }
+      if (!fused_decode_ok) {
+        return false;
+      }
     }
   } else {
-    if (!MambaConv1dSiluUpdateFp32(
-            *projected,
-            impl_->config.intermediate_size,
-            conv_dim,
-            impl_->config.conv_kernel_size,
-            impl_->config.conv_state_offset_elems,
-            *impl_->conv1d_weight,
-            *impl_->conv1d_bias,
-            request_context.mamba_conv_state(),
-            conv_output.get(),
-            stream) ||
-        !MambaSsmUpdateFp32(
-            *projected,
-            *conv_output,
-            impl_->config.intermediate_size,
-            conv_dim,
-            impl_->config.num_heads,
-            impl_->config.head_dim,
-            impl_->config.state_size,
-            impl_->config.n_groups,
-            impl_->config.time_step_min,
-            impl_->config.ssm_state_offset_elems,
-            *impl_->A_log,
-            *impl_->D,
-            *impl_->dt_bias,
-            request_context.mamba_state(),
-            y_output.get(),
-            stream) ||
-        !GroupedRmsNormGatedFp32(
-            *y_output,
-            *projected,
-            *impl_->mixer_norm_weight,
-            impl_->config.n_groups,
-            impl_->config.mixer_rms_epsilon,
-            scan_output,
-            stream)) {
+    bool conv1d_ok = false;
+    if (!measure_stage(
+            MambaSubLayerStage::kConv1dSilu,
+            &conv1d_ok,
+            [&]() {
+              return MambaConv1dSiluUpdateFp32(
+                  *projected,
+                  impl_->config.intermediate_size,
+                  conv_dim,
+                  impl_->config.conv_kernel_size,
+                  impl_->config.conv_state_offset_elems,
+                  *impl_->conv1d_weight,
+                  *impl_->conv1d_bias,
+                  request_context.mamba_conv_state(),
+                  conv_output.get(),
+                  stream);
+            })) {
+      return false;
+    }
+    bool ssm_ok = false;
+    if (conv1d_ok &&
+        !measure_stage(
+            MambaSubLayerStage::kSsmUpdate,
+            &ssm_ok,
+            [&]() {
+              return MambaSsmUpdateFp32(
+                  *projected,
+                  *conv_output,
+                  impl_->config.intermediate_size,
+                  conv_dim,
+                  impl_->config.num_heads,
+                  impl_->config.head_dim,
+                  impl_->config.state_size,
+                  impl_->config.n_groups,
+                  impl_->config.time_step_min,
+                  impl_->config.ssm_state_offset_elems,
+                  *impl_->A_log,
+                  *impl_->D,
+                  *impl_->dt_bias,
+                  request_context.mamba_state(),
+                  y_output.get(),
+                  stream);
+            })) {
+      return false;
+    }
+    bool grouped_norm_ok = false;
+    if (conv1d_ok && ssm_ok &&
+        !measure_stage(
+            MambaSubLayerStage::kGroupedNormGating,
+            &grouped_norm_ok,
+            [&]() {
+              return GroupedRmsNormGatedFp32(
+                  *y_output,
+                  *projected,
+                  *impl_->mixer_norm_weight,
+                  impl_->config.n_groups,
+                  impl_->config.mixer_rms_epsilon,
+                  scan_output,
+                  stream);
+            })) {
+      return false;
+    }
+    if (!conv1d_ok || !ssm_ok || !grouped_norm_ok) {
       return false;
     }
   }
@@ -916,14 +1207,31 @@ bool MambaLayerSlice::Run(
     }
   }
 
-  const bool out_proj_ok =
-      (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->out_proj_scaled_fp8->Run(
-           cublas_handle, heuristic_cache, *scan_output, projected_output, stream)) ||
-      (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->out_proj_dense->Run(
-           cublas_handle, heuristic_cache, *scan_output, projected_output, stream));
-  if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output, stream)) {
+  bool out_proj_ok = false;
+  if (!measure_stage(
+          MambaSubLayerStage::kOutProj,
+          &out_proj_ok,
+          [&]() {
+            return (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+                    impl_->out_proj_scaled_fp8->Run(
+                        cublas_handle, heuristic_cache, *scan_output, projected_output, stream)) ||
+                   (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
+                    impl_->out_proj_dense->Run(
+                        cublas_handle, heuristic_cache, *scan_output, projected_output, stream));
+          })) {
+    return false;
+  }
+  bool residual_ok = false;
+  if (out_proj_ok &&
+      !measure_stage(
+          MambaSubLayerStage::kResidualAdd,
+          &residual_ok,
+          [&]() {
+            return ResidualAddFp32(input, *projected_output, output, stream);
+          })) {
+    return false;
+  }
+  if (!out_proj_ok || !residual_ok) {
     return false;
   }
 
@@ -934,6 +1242,9 @@ bool MambaLayerSlice::Run(
     }
   }
 
+  if (!sublayer_profiler.Commit()) {
+    return false;
+  }
   return true;
 }
 
@@ -1042,6 +1353,16 @@ bool MambaLayerSlice::Run(
   }
 
   const bool use_optimized_decode = CanUseOptimizedMambaDecode(impl_->config, token_count);
+  const bool mamba_sublayer_profile_enabled = MambaSubLayerProfileEnabled();
+  MambaSubLayerProfiler sublayer_profiler(mamba_sublayer_profile_enabled);
+  const auto measure_stage =
+      [&](MambaSubLayerStage stage, bool* ok_out, auto&& fn) -> bool {
+        return sublayer_profiler.Measure(
+            stage,
+            stream,
+            ok_out,
+            std::forward<decltype(fn)>(fn));
+      };
   if (use_optimized_decode) {
     decode_conv_output_view =
         CreateBf16SliceView(projected, impl_->config.intermediate_size, {1, conv_dim});
@@ -1059,12 +1380,21 @@ bool MambaLayerSlice::Run(
     trace->projected_output.clear();
   }
 
-  if (!RmsNormBf16(
-          input,
-          *impl_->input_norm_weight,
-          impl_->config.input_rms_epsilon,
-          normalized,
-          stream)) {
+  bool norm_ok = false;
+  if (!measure_stage(
+          MambaSubLayerStage::kRmsNorm,
+          &norm_ok,
+          [&]() {
+            return RmsNormBf16(
+                input,
+                *impl_->input_norm_weight,
+                impl_->config.input_rms_epsilon,
+                normalized,
+                stream);
+          })) {
+    return false;
+  }
+  if (!norm_ok) {
     return false;
   }
 
@@ -1072,12 +1402,20 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  const bool in_proj_ok =
-      (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->in_proj_scaled_fp8->Run(
-           cublas_handle, heuristic_cache, *normalized, projected, stream)) ||
-      (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected, stream));
+  bool in_proj_ok = false;
+  if (!measure_stage(
+          MambaSubLayerStage::kInProj,
+          &in_proj_ok,
+          [&]() {
+            return (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+                    impl_->in_proj_scaled_fp8->Run(
+                        cublas_handle, heuristic_cache, *normalized, projected, stream)) ||
+                   (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
+                    impl_->in_proj_dense->Run(
+                        cublas_handle, heuristic_cache, *normalized, projected, stream));
+          })) {
+    return false;
+  }
   if (!in_proj_ok) {
     return false;
   }
@@ -1088,105 +1426,170 @@ bool MambaLayerSlice::Run(
 
   if (token_count == 1) {
     if (use_optimized_decode) {
-      if (!MambaCausalConv1dUpdateDecodeBf16(
-              *projected,
-              impl_->config.intermediate_size,
-              conv_dim,
-              impl_->config.conv_kernel_size,
-              impl_->config.conv_state_offset_elems,
-              *impl_->conv1d_weight,
-              *impl_->conv1d_bias,
-              request_context.mamba_conv_state(),
-              decode_conv_output_view.get(),
-              stream) ||
-          !MambaSelectiveStateUpdateDecodeBf16(
-              *projected,
-              *decode_conv_output_view,
-              impl_->config.intermediate_size,
-              conv_dim,
-              impl_->config.num_heads,
-              impl_->config.head_dim,
-              impl_->config.state_size,
-              impl_->config.n_groups,
-              impl_->config.time_step_min,
-              impl_->config.ssm_state_offset_elems,
-              *impl_->A_log,
-              *impl_->D,
-              *impl_->dt_bias,
-              request_context.mamba_state(),
-              decode_gated_output_view.get(),
-              stream) ||
-          !GroupedRmsNormBf16(
-              *decode_gated_output_view,
-              *impl_->mixer_norm_weight,
-              impl_->config.n_groups,
-              impl_->config.mixer_rms_epsilon,
-              scan_output,
-              stream)) {
+      bool conv1d_ok = false;
+      if (!measure_stage(
+              MambaSubLayerStage::kConv1dSilu,
+              &conv1d_ok,
+              [&]() {
+                return MambaCausalConv1dUpdateDecodeBf16(
+                    *projected,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.conv_kernel_size,
+                    impl_->config.conv_state_offset_elems,
+                    *impl_->conv1d_weight,
+                    *impl_->conv1d_bias,
+                    request_context.mamba_conv_state(),
+                    decode_conv_output_view.get(),
+                    stream);
+              })) {
         return false;
       }
-    } else if (!MambaDecodeStepFusedBf16(
-                   *projected,
-                   impl_->config.intermediate_size,
-                   conv_dim,
-                   impl_->config.num_heads,
-                   impl_->config.head_dim,
-                   impl_->config.state_size,
-                   impl_->config.n_groups,
-                   impl_->config.conv_kernel_size,
-                   impl_->config.time_step_min,
-                   impl_->config.mixer_rms_epsilon,
-                   impl_->config.conv_state_offset_elems,
-                   impl_->config.ssm_state_offset_elems,
-                   *impl_->conv1d_weight,
-                   *impl_->conv1d_bias,
-                   *impl_->A_log,
-                   *impl_->D,
-                   *impl_->dt_bias,
-                   *impl_->mixer_norm_weight,
-                   request_context.mamba_conv_state(),
-                   request_context.mamba_state(),
-                   scan_output,
-                   stream)) {
-      return false;
+      bool ssm_ok = false;
+      if (conv1d_ok &&
+          !measure_stage(
+              MambaSubLayerStage::kSsmUpdate,
+              &ssm_ok,
+              [&]() {
+                return MambaSelectiveStateUpdateDecodeBf16(
+                    *projected,
+                    *decode_conv_output_view,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.num_heads,
+                    impl_->config.head_dim,
+                    impl_->config.state_size,
+                    impl_->config.n_groups,
+                    impl_->config.time_step_min,
+                    impl_->config.ssm_state_offset_elems,
+                    *impl_->A_log,
+                    *impl_->D,
+                    *impl_->dt_bias,
+                    request_context.mamba_state(),
+                    decode_gated_output_view.get(),
+                    stream);
+              })) {
+        return false;
+      }
+      bool grouped_norm_ok = false;
+      if (conv1d_ok && ssm_ok &&
+          !measure_stage(
+              MambaSubLayerStage::kGroupedNormGating,
+              &grouped_norm_ok,
+              [&]() {
+                return GroupedRmsNormBf16(
+                    *decode_gated_output_view,
+                    *impl_->mixer_norm_weight,
+                    impl_->config.n_groups,
+                    impl_->config.mixer_rms_epsilon,
+                    scan_output,
+                    stream);
+              })) {
+        return false;
+      }
+      if (!conv1d_ok || !ssm_ok || !grouped_norm_ok) {
+        return false;
+      }
+    } else {
+      bool fused_decode_ok = false;
+      if (!measure_stage(
+              MambaSubLayerStage::kSsmUpdate,
+              &fused_decode_ok,
+              [&]() {
+                return MambaDecodeStepFusedBf16(
+                    *projected,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.num_heads,
+                    impl_->config.head_dim,
+                    impl_->config.state_size,
+                    impl_->config.n_groups,
+                    impl_->config.conv_kernel_size,
+                    impl_->config.time_step_min,
+                    impl_->config.mixer_rms_epsilon,
+                    impl_->config.conv_state_offset_elems,
+                    impl_->config.ssm_state_offset_elems,
+                    *impl_->conv1d_weight,
+                    *impl_->conv1d_bias,
+                    *impl_->A_log,
+                    *impl_->D,
+                    *impl_->dt_bias,
+                    *impl_->mixer_norm_weight,
+                    request_context.mamba_conv_state(),
+                    request_context.mamba_state(),
+                    scan_output,
+                    stream);
+              })) {
+        return false;
+      }
+      if (!fused_decode_ok) {
+        return false;
+      }
     }
   } else {
-    if (!MambaConv1dSiluUpdateBf16(
-            *projected,
-            impl_->config.intermediate_size,
-            conv_dim,
-            impl_->config.conv_kernel_size,
-            impl_->config.conv_state_offset_elems,
-            *impl_->conv1d_weight,
-            *impl_->conv1d_bias,
-            request_context.mamba_conv_state(),
-            conv_output.get(),
-            stream) ||
-        !MambaSsmUpdateBf16(
-            *projected,
-            *conv_output,
-            impl_->config.intermediate_size,
-            conv_dim,
-            impl_->config.num_heads,
-            impl_->config.head_dim,
-            impl_->config.state_size,
-            impl_->config.n_groups,
-            impl_->config.time_step_min,
-            impl_->config.ssm_state_offset_elems,
-            *impl_->A_log,
-            *impl_->D,
-            *impl_->dt_bias,
-            request_context.mamba_state(),
-            y_output.get(),
-            stream) ||
-        !GroupedRmsNormGatedBf16(
-            *y_output,
-            *projected,
-            *impl_->mixer_norm_weight,
-            impl_->config.n_groups,
-            impl_->config.mixer_rms_epsilon,
-            scan_output,
-            stream)) {
+    bool conv1d_ok = false;
+    if (!measure_stage(
+            MambaSubLayerStage::kConv1dSilu,
+            &conv1d_ok,
+            [&]() {
+              return MambaConv1dSiluUpdateBf16(
+                  *projected,
+                  impl_->config.intermediate_size,
+                  conv_dim,
+                  impl_->config.conv_kernel_size,
+                  impl_->config.conv_state_offset_elems,
+                  *impl_->conv1d_weight,
+                  *impl_->conv1d_bias,
+                  request_context.mamba_conv_state(),
+                  conv_output.get(),
+                  stream);
+            })) {
+      return false;
+    }
+    bool ssm_ok = false;
+    if (conv1d_ok &&
+        !measure_stage(
+            MambaSubLayerStage::kSsmUpdate,
+            &ssm_ok,
+            [&]() {
+              return MambaSsmUpdateBf16(
+                  *projected,
+                  *conv_output,
+                  impl_->config.intermediate_size,
+                  conv_dim,
+                  impl_->config.num_heads,
+                  impl_->config.head_dim,
+                  impl_->config.state_size,
+                  impl_->config.n_groups,
+                  impl_->config.time_step_min,
+                  impl_->config.ssm_state_offset_elems,
+                  *impl_->A_log,
+                  *impl_->D,
+                  *impl_->dt_bias,
+                  request_context.mamba_state(),
+                  y_output.get(),
+                  stream);
+            })) {
+      return false;
+    }
+    bool grouped_norm_ok = false;
+    if (conv1d_ok && ssm_ok &&
+        !measure_stage(
+            MambaSubLayerStage::kGroupedNormGating,
+            &grouped_norm_ok,
+            [&]() {
+              return GroupedRmsNormGatedBf16(
+                  *y_output,
+                  *projected,
+                  *impl_->mixer_norm_weight,
+                  impl_->config.n_groups,
+                  impl_->config.mixer_rms_epsilon,
+                  scan_output,
+                  stream);
+            })) {
+      return false;
+    }
+    if (!conv1d_ok || !ssm_ok || !grouped_norm_ok) {
       return false;
     }
   }
@@ -1195,14 +1598,31 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  const bool out_proj_ok =
-      (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->out_proj_scaled_fp8->Run(
-           cublas_handle, heuristic_cache, *scan_output, projected_output, stream)) ||
-      (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->out_proj_dense->Run(
-           cublas_handle, heuristic_cache, *scan_output, projected_output, stream));
-  if (!out_proj_ok || !ResidualAddBf16(input, *projected_output, output, stream)) {
+  bool out_proj_ok = false;
+  if (!measure_stage(
+          MambaSubLayerStage::kOutProj,
+          &out_proj_ok,
+          [&]() {
+            return (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+                    impl_->out_proj_scaled_fp8->Run(
+                        cublas_handle, heuristic_cache, *scan_output, projected_output, stream)) ||
+                   (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
+                    impl_->out_proj_dense->Run(
+                        cublas_handle, heuristic_cache, *scan_output, projected_output, stream));
+          })) {
+    return false;
+  }
+  bool residual_ok = false;
+  if (out_proj_ok &&
+      !measure_stage(
+          MambaSubLayerStage::kResidualAdd,
+          &residual_ok,
+          [&]() {
+            return ResidualAddBf16(input, *projected_output, output, stream);
+          })) {
+    return false;
+  }
+  if (!out_proj_ok || !residual_ok) {
     return false;
   }
 
@@ -1210,6 +1630,9 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
+  if (!sublayer_profiler.Commit()) {
+    return false;
+  }
   return true;
 }
 
