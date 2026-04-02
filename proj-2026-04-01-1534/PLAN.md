@@ -135,7 +135,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - `testing/api/full_forward_manifest_smoke_test.cpp`
   - `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`
 
-- [~] **2. Re-baseline with real operator evidence before choosing the next bottleneck**
+- [x] **2. Re-baseline with real operator evidence before choosing the next bottleneck**
   Goal:
   - replace guesswork with measured post-fastpath evidence
   Scope:
@@ -324,7 +324,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Linear fastpath correctness + layout translation | done | b31feb4 | smoke PASS with NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1; 128x4 activation layout; 8x4 deferred |
-| 2 | Re-baseline with counters and Nsight | pending | — | choose next bottleneck from evidence |
+| 2 | Re-baseline with counters and Nsight | done | — | expert staging = 92% of runtime; 588GB uploaded per run; expert residency is #1 priority |
 | 3 | Attention metadata/workspace ownership + sync cleanup | pending | — | no new attention math in this step |
 | 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
 | 5 | Production decode attention translation | pending | — | explicit decode-vs-prefill dispatcher required |
