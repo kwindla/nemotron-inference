@@ -196,7 +196,7 @@ Translate from these upstream designs, not from generic intuition:
   Expected: kernel compute floor ~33ms/token (Mamba ~22ms, attention ~3ms, GEMMs ~4ms, other ~4ms)
   Host overhead should be near-zero after 8a+8b+8c
 
-- [ ] **10. Optimize Mamba decode kernel**
+- [x] **10. Optimize Mamba decode kernel**
   Goal:
   - the FusedMambaDecodeKernel at 0.94ms × 23 layers = ~22ms/token is the hard blocker for 20ms
   - this is a single-CTA kernel (grid=1) like the old MoE kernel was
@@ -228,7 +228,7 @@ Translate from these upstream designs, not from generic intuition:
 | 8b | Decode scratch buffer reuse | done | — | request-context decode views + layer-local FP32 scratch landed; BF16 attention and NVFP4 pack buffers remain |
 | 8c | Attention activation pre-alloc | done | — | BF16 query/output pre-allocated in Impl; smoke PASS |
 | 9 | Re-profile after cleanup | done | — | 50.0 ms/token (20 tok/sec); at kernel compute floor; Mamba is next target |
-| 10 | Optimize Mamba decode kernel | pending | — | 0.94ms × 23 = 22ms/token; hard blocker for 20ms |
+| 10 | Optimize Mamba decode kernel | done | — | multi-block (64 CTAs SSM + 8 CTAs RMSNorm), warp-parallel state; smoke PASS |
 | 11 | Evidence-driven loop to 20ms | pending | — | |
 
 ## Progress Log
