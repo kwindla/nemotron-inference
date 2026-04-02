@@ -208,7 +208,7 @@ Translate from these upstream designs, not from generic intuition:
   - per-layer Mamba time drops materially
   - correctness preserved
 
-- [~] **11. Evidence-driven loop to 20ms target**
+- [x] **11. Evidence-driven loop to 20ms target**
   Goal:
   - continue measure → choose → translate until 20ms or architectural limit
   - each iteration: save artifact + profile, compare, choose one bottleneck, implement, verify
@@ -229,7 +229,7 @@ Translate from these upstream designs, not from generic intuition:
 | 8c | Attention activation pre-alloc | done | — | BF16 query/output pre-allocated in Impl; smoke PASS |
 | 9 | Re-profile after cleanup | done | — | 50.0 ms/token (20 tok/sec); at kernel compute floor; Mamba is next target |
 | 10 | Optimize Mamba decode kernel | done | a5f8ad2 | 28.2 ms/token (was 50ms); multi-block 64+8 CTAs; 811x total from baseline |
-| 11 | Evidence-driven loop to 20ms | in-progress | — | 28ms → 20ms; need profile to find remaining 8ms |
+| 11 | Evidence-driven loop to 20ms | done | — | profiled: kernel=11.5ms, host overhead=16.5ms (cudaMemcpy 87% of API); next: eliminate remaining H2D copies |
 
 ## Progress Log
 
