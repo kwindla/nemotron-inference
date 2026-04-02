@@ -60,7 +60,7 @@ Current per-expert path adds matmul_block_scales (~634 KB/pair), making each pai
   - Remove the VRAM-check skip logic — with monolithic allocation, either the whole layer fits or it doesn't
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/include/nemotron/expert_layer.h`
 
-- [ ] **3. Use prebuilt views in Run() — zero per-token uploads**
+- [x] **3. Use prebuilt views in Run() — zero per-token uploads**
   When monolithic residency is active in `Run()`:
   - Skip the entire routed expert staging loop
   - Pass the prebuilt device-side `FusedNvfp4WeightView` arrays directly to `RunFusedMoeDirectDecode`
@@ -81,6 +81,6 @@ Current per-expert path adds matmul_block_scales (~634 KB/pair), making each pai
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | MonolithicNvfp4ExpertWeights data structure | done | 5531d00 | 3 cudaMalloc per projection vs 512 current |
-| 2 | Wire into ExpertLayerSlice::Create() | done | — | 6 allocs per layer vs 1,024 current |
-| 3 | Zero per-token uploads in Run() | pending | — | |
+| 2 | Wire into ExpertLayerSlice::Create() | done | c13f438 | 6 allocs per layer vs 1,024 current |
+| 3 | Zero per-token uploads in Run() | done | — | monolithic path skips staging loop entirely |
 | 4 | Full residency verification + benchmark | pending | — | target: 23/23 resident, 0 bytes uploaded |

@@ -10,6 +10,7 @@ struct ExpertStagingCounters {
   std::atomic<std::uint64_t> total_bytes_uploaded{0};
   std::atomic<std::uint64_t> total_experts_staged{0};
   std::atomic<std::uint64_t> total_staging_calls{0};
+  std::atomic<std::uint64_t> monolithic_layers{0};
   std::atomic<std::uint64_t> staging_elapsed_us{0};
 };
 

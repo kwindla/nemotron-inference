@@ -25,6 +25,7 @@ void ResetExpertStagingCounters() {
   ResetCounter(&counters.total_bytes_uploaded);
   ResetCounter(&counters.total_experts_staged);
   ResetCounter(&counters.total_staging_calls);
+  ResetCounter(&counters.monolithic_layers);
   ResetCounter(&counters.staging_elapsed_us);
 }
 
@@ -37,6 +38,8 @@ void PrintExpertStagingCounterSummary(std::ostream& stream) {
          << LoadCounter(counters.total_experts_staged)
          << " total_staging_calls="
          << LoadCounter(counters.total_staging_calls)
+         << " monolithic_layers="
+         << LoadCounter(counters.monolithic_layers)
          << " staging_elapsed_us="
          << LoadCounter(counters.staging_elapsed_us)
          << "\n";

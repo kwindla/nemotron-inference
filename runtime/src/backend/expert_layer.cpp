@@ -1476,10 +1476,12 @@ bool ExpertLayerSlice::Run(
         impl_->fused_direct_moe_supported &&
         FusedMoeDecodeEnabled();
     if (use_fused_direct_decode) {
+      const bool use_monolithic_residency = impl_->monolithic_resident;
       const bool use_full_residency =
-          impl_->full_residency_enabled &&
-          impl_->routed_up_nvfp4_views_device != nullptr &&
-          impl_->routed_down_nvfp4_views_device != nullptr;
+          use_monolithic_residency ||
+          (impl_->full_residency_enabled &&
+           impl_->routed_up_nvfp4_views_device != nullptr &&
+           impl_->routed_down_nvfp4_views_device != nullptr);
       const bool needs_host_selected_experts = host_selection_debug || !use_full_residency;
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_up_weights;
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_down_weights;
@@ -1508,7 +1510,16 @@ bool ExpertLayerSlice::Run(
           return false;
         }
       }
-      if (use_full_residency) {
+      if (use_monolithic_residency) {
+        if (impl_->monolithic_up_views_device == nullptr ||
+            impl_->monolithic_down_views_device == nullptr) {
+          return false;
+        }
+        routed_up_device_ptr = impl_->monolithic_up_views_device->data();
+        routed_down_device_ptr = impl_->monolithic_down_views_device->data();
+        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+        staging_counters.monolithic_layers.fetch_add(1, std::memory_order_relaxed);
+      } else if (use_full_residency) {
         routed_up_device_ptr = impl_->routed_up_nvfp4_views_device->data();
         routed_down_device_ptr = impl_->routed_down_nvfp4_views_device->data();
       } else {
@@ -1568,7 +1579,8 @@ bool ExpertLayerSlice::Run(
       }
       if (debug) {
         std::cout << "expert_layer: fused direct "
-                  << (use_full_residency ? "resident" : "staged")
+                  << (use_monolithic_residency ? "monolithic"
+                                               : (use_full_residency ? "resident" : "staged"))
                   << " routed experts=" << (use_full_residency ? impl_->routed_experts.size() : experts_staged)
                   << " routed experts bytes=" << staging_bytes_uploaded
                   << " elapsed_us=" << staging_elapsed_us << "\n";
