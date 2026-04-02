@@ -119,6 +119,28 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     DeviceTensorFp8E4M3* activation_scratch = nullptr,
     cudaStream_t stream = nullptr);
 
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp8E4M3& weights,
+    const float* weight_scale_device,
+    const DeviceTensorFp8E4M3& activations,
+    const float* input_scale_device,
+    DeviceTensorFp32* output,
+    const CachedCublasLtMatmulState* cached_matmul_state = nullptr,
+    cudaStream_t stream = nullptr);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp8E4M3& weights,
+    const float* weight_scale_device,
+    const DeviceTensorFp8E4M3& activations,
+    const float* input_scale_device,
+    DeviceTensorBf16* output,
+    const CachedCublasLtMatmulState* cached_matmul_state = nullptr,
+    cudaStream_t stream = nullptr);
+
 std::unique_ptr<CachedCublasLtMatmulState> CreateDenseRowMajorFp8E4M3MatmulState(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,

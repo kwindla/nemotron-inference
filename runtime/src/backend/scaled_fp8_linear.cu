@@ -1,5 +1,6 @@
 #include "nemotron/scaled_fp8_linear.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -239,6 +240,21 @@ __global__ void QuantizeFp8RoundTripKernel(
   }
 }
 
+__global__ void QuantizeBf16ToFp8E4M3Kernel(
+    const __nv_bfloat16* input,
+    std::size_t numel,
+    float input_scale,
+    std::uint8_t* output) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const float scale = input_scale > 0.0f ? input_scale : (1.0f / 1024.0f);
+  for (std::size_t i = index; i < numel; i += stride) {
+    const float normalized = __bfloat162float(input[i]) / scale;
+    output[i] = static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(normalized, __NV_SATFINITE, __NV_E4M3));
+  }
+}
+
 __global__ void QuantizePackedFp8WeightKernel(
     const float* input,
     std::size_t numel,
@@ -349,6 +365,8 @@ struct ScaledFp8LinearOp::Impl {
   mutable std::unique_ptr<CachedCublasLtMatmulState> fp8_matmul_state_;
   mutable std::mutex fp8_matmul_state_mutex_;
   mutable bool fp8_matmul_state_attempted_ = false;
+  mutable std::unique_ptr<CachedCublasLtMatmulState> fp8_matmul_state_bf16_;
+  mutable bool fp8_matmul_state_bf16_attempted_ = false;
   mutable std::mutex rows1_dequantized_plan_mutex;
   mutable bool rows1_dequantized_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_dequantized_plan;
@@ -393,6 +411,31 @@ bool QuantizeFp32ToScaledFp8RoundTrip(
   const int block_size = 256;
   const int grid_size = static_cast<int>((numel + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
   QuantizeFp8RoundTripKernel<<<grid_size, block_size, 0, stream>>>(
+      input.data(),
+      numel,
+      ClampScale(input_scale),
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool QuantizeBf16ToFp8E4M3(
+    const DeviceTensorBf16& input,
+    float input_scale,
+    DeviceTensorFp8E4M3* output,
+    cudaStream_t stream) {
+  if (!input.valid() || output == nullptr || !output->valid() || input.shape() != output->shape()) {
+    return false;
+  }
+  const std::size_t numel = input.numel();
+  if (numel == 0) {
+    return false;
+  }
+
+  constexpr int kBlockSize = 256;
+  const int grid_size = static_cast<int>(
+      (numel + static_cast<std::size_t>(kBlockSize) - 1u) /
+      static_cast<std::size_t>(kBlockSize));
+  QuantizeBf16ToFp8E4M3Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       input.data(),
       numel,
       ClampScale(input_scale),
@@ -685,6 +728,8 @@ bool ScaledFp8LinearOp::Run(
         std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
         impl_->fp8_matmul_state_.reset();
         impl_->fp8_matmul_state_attempted_ = false;
+        impl_->fp8_matmul_state_bf16_.reset();
+        impl_->fp8_matmul_state_bf16_attempted_ = false;
       }
       const float input_scale = ClampScale(impl_->config.input_scale);
       const float weight_scale = impl_->config.weight_scale;
@@ -899,9 +944,120 @@ bool ScaledFp8LinearOp::Run(
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
   }
-  if (activations.shape().size() != 2 || activations.shape()[1] != impl_->config.input_cols) {
+  if (activations.shape().size() != 2 ||
+      activations.shape()[1] != impl_->config.input_cols ||
+      output->shape().size() != 2 ||
+      output->shape()[0] != activations.shape()[0] ||
+      output->shape()[1] != impl_->config.output_rows) {
     return false;
   }
+
+  const bool native_rollout_enabled =
+      impl_->packed_weight &&
+      impl_->packed_weight->valid() &&
+      ExperimentalFp8NativeEnabledForDescriptor(impl_->descriptor, impl_->family);
+  if (native_rollout_enabled) {
+    std::optional<CublasLtGemmPlan> plan;
+    if (activations.shape()[0] == 1) {
+      std::lock_guard<std::mutex> lock(impl_->rows1_plan_mutex);
+      if (!impl_->rows1_plan_attempted) {
+        impl_->rows1_plan =
+            BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
+        impl_->rows1_plan_attempted = true;
+      } else if (impl_->rows1_plan.has_value()) {
+        RecordScaledFp8PlanCacheHit();
+      }
+      if (impl_->rows1_plan.has_value()) {
+        plan = impl_->rows1_plan;
+      }
+    } else {
+      plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
+    }
+
+    if (plan.has_value()) {
+      bool invalidate_fp8_matmul_state = false;
+      if (!impl_->native_input_scale_ ||
+          impl_->native_input_scale_->shape() != std::vector<std::size_t>{1}) {
+        impl_->native_input_scale_ = DeviceTensorFp32::Create({1});
+        invalidate_fp8_matmul_state = true;
+      }
+      if (!impl_->native_weight_scale_ ||
+          impl_->native_weight_scale_->shape() != std::vector<std::size_t>{1}) {
+        impl_->native_weight_scale_ = DeviceTensorFp32::Create({1});
+        invalidate_fp8_matmul_state = true;
+      }
+      if (invalidate_fp8_matmul_state) {
+        impl_->native_scale_tensors_initialized = false;
+        std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
+        impl_->fp8_matmul_state_.reset();
+        impl_->fp8_matmul_state_attempted_ = false;
+        impl_->fp8_matmul_state_bf16_.reset();
+        impl_->fp8_matmul_state_bf16_attempted_ = false;
+      }
+
+      const float input_scale = ClampScale(impl_->config.input_scale);
+      const float weight_scale = impl_->config.weight_scale;
+      bool native_scales_ready =
+          impl_->native_input_scale_ &&
+          impl_->native_input_scale_->valid() &&
+          impl_->native_weight_scale_ &&
+          impl_->native_weight_scale_->valid();
+      if (native_scales_ready && !impl_->native_scale_tensors_initialized) {
+        native_scales_ready =
+            impl_->native_input_scale_->CopyFromHost(&input_scale, 1) &&
+            impl_->native_weight_scale_->CopyFromHost(&weight_scale, 1);
+        if (native_scales_ready) {
+          impl_->native_scale_tensors_initialized = true;
+        }
+      }
+
+      if (native_scales_ready) {
+        const CachedCublasLtMatmulState* cached_fp8_matmul_state = nullptr;
+        if (activations.shape()[0] == 1) {
+          std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
+          if (!impl_->fp8_matmul_state_attempted_) {
+            impl_->fp8_matmul_state_ = CreateDenseRowMajorFp8E4M3MatmulState(
+                handle,
+                *plan,
+                impl_->native_weight_scale_->data(),
+                impl_->native_input_scale_->data(),
+                CUDA_R_32F);
+            impl_->fp8_matmul_state_attempted_ = true;
+          }
+          cached_fp8_matmul_state = impl_->fp8_matmul_state_.get();
+        }
+
+        if (!impl_->fp8_activation_scratch_ ||
+            impl_->fp8_activation_scratch_->shape() != activations.shape()) {
+          impl_->fp8_activation_scratch_ = DeviceTensorFp8E4M3::Create(activations.shape());
+        }
+        DeviceTensorFp8E4M3* const fp8_activation_scratch = impl_->fp8_activation_scratch_.get();
+        if (fp8_activation_scratch != nullptr &&
+            fp8_activation_scratch->valid() &&
+            QuantizeBf16ToFp8E4M3(
+                activations,
+                input_scale,
+                fp8_activation_scratch,
+                stream)) {
+          const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
+              handle,
+              *plan,
+              *impl_->packed_weight,
+              impl_->native_weight_scale_->data(),
+              *fp8_activation_scratch,
+              impl_->native_input_scale_->data(),
+              output,
+              cached_fp8_matmul_state,
+              stream);
+          if (native_stats.has_value()) {
+            RecordScaledFp8NativeSuccess(impl_->family);
+            return true;
+          }
+        }
+      }
+    }
+  }
+
   auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
   if (!activations_fp32 ||
       !ConvertDeviceBf16ToFp32(
@@ -923,11 +1079,120 @@ bool ScaledFp8LinearOp::Run(
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
   }
-  if (output->shape().size() != 2 ||
+  if (activations.shape().size() != 2 ||
+      activations.shape()[1] != impl_->config.input_cols ||
+      output->shape().size() != 2 ||
       output->shape()[0] != activations.shape()[0] ||
       output->shape()[1] != impl_->config.output_rows) {
     return false;
   }
+
+  const bool native_rollout_enabled =
+      impl_->packed_weight &&
+      impl_->packed_weight->valid() &&
+      ExperimentalFp8NativeEnabledForDescriptor(impl_->descriptor, impl_->family);
+  if (native_rollout_enabled) {
+    std::optional<CublasLtGemmPlan> plan;
+    if (activations.shape()[0] == 1) {
+      std::lock_guard<std::mutex> lock(impl_->rows1_plan_mutex);
+      if (!impl_->rows1_plan_attempted) {
+        impl_->rows1_plan =
+            BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
+        impl_->rows1_plan_attempted = true;
+      } else if (impl_->rows1_plan.has_value()) {
+        RecordScaledFp8PlanCacheHit();
+      }
+      if (impl_->rows1_plan.has_value()) {
+        plan = impl_->rows1_plan;
+      }
+    } else {
+      plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape()[0], heuristic_cache);
+    }
+
+    if (plan.has_value()) {
+      bool invalidate_fp8_matmul_state = false;
+      if (!impl_->native_input_scale_ ||
+          impl_->native_input_scale_->shape() != std::vector<std::size_t>{1}) {
+        impl_->native_input_scale_ = DeviceTensorFp32::Create({1});
+        invalidate_fp8_matmul_state = true;
+      }
+      if (!impl_->native_weight_scale_ ||
+          impl_->native_weight_scale_->shape() != std::vector<std::size_t>{1}) {
+        impl_->native_weight_scale_ = DeviceTensorFp32::Create({1});
+        invalidate_fp8_matmul_state = true;
+      }
+      if (invalidate_fp8_matmul_state) {
+        impl_->native_scale_tensors_initialized = false;
+        std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
+        impl_->fp8_matmul_state_.reset();
+        impl_->fp8_matmul_state_attempted_ = false;
+        impl_->fp8_matmul_state_bf16_.reset();
+        impl_->fp8_matmul_state_bf16_attempted_ = false;
+      }
+
+      const float input_scale = ClampScale(impl_->config.input_scale);
+      const float weight_scale = impl_->config.weight_scale;
+      bool native_scales_ready =
+          impl_->native_input_scale_ &&
+          impl_->native_input_scale_->valid() &&
+          impl_->native_weight_scale_ &&
+          impl_->native_weight_scale_->valid();
+      if (native_scales_ready && !impl_->native_scale_tensors_initialized) {
+        native_scales_ready =
+            impl_->native_input_scale_->CopyFromHost(&input_scale, 1) &&
+            impl_->native_weight_scale_->CopyFromHost(&weight_scale, 1);
+        if (native_scales_ready) {
+          impl_->native_scale_tensors_initialized = true;
+        }
+      }
+
+      if (native_scales_ready) {
+        const CachedCublasLtMatmulState* cached_fp8_matmul_state = nullptr;
+        if (activations.shape()[0] == 1) {
+          std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
+          if (!impl_->fp8_matmul_state_bf16_attempted_) {
+            impl_->fp8_matmul_state_bf16_ = CreateDenseRowMajorFp8E4M3MatmulState(
+                handle,
+                *plan,
+                impl_->native_weight_scale_->data(),
+                impl_->native_input_scale_->data(),
+                CUDA_R_16BF);
+            impl_->fp8_matmul_state_bf16_attempted_ = true;
+          }
+          cached_fp8_matmul_state = impl_->fp8_matmul_state_bf16_.get();
+        }
+
+        if (!impl_->fp8_activation_scratch_ ||
+            impl_->fp8_activation_scratch_->shape() != activations.shape()) {
+          impl_->fp8_activation_scratch_ = DeviceTensorFp8E4M3::Create(activations.shape());
+        }
+        DeviceTensorFp8E4M3* const fp8_activation_scratch = impl_->fp8_activation_scratch_.get();
+        if (fp8_activation_scratch != nullptr &&
+            fp8_activation_scratch->valid() &&
+            QuantizeBf16ToFp8E4M3(
+                activations,
+                input_scale,
+                fp8_activation_scratch,
+                stream)) {
+          const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
+              handle,
+              *plan,
+              *impl_->packed_weight,
+              impl_->native_weight_scale_->data(),
+              *fp8_activation_scratch,
+              impl_->native_input_scale_->data(),
+              output,
+              cached_fp8_matmul_state,
+              stream);
+          if (native_stats.has_value()) {
+            RecordScaledFp8NativeSuccess(impl_->family);
+            return true;
+          }
+        }
+      }
+    }
+  }
+
   auto output_fp32 = DeviceTensorFp32::Create(output->shape());
   if (!output_fp32) {
     return false;

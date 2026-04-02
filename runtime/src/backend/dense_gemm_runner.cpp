@@ -1020,6 +1020,59 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       stream);
 }
 
+template <typename OutputTensorT>
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3QuantizedToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp8E4M3& weights,
+    const float* weight_scale_device,
+    const DeviceTensorFp8E4M3& activations,
+    const float* input_scale_device,
+    OutputTensorT* output,
+    const CachedCublasLtMatmulState* cached_matmul_state,
+    cudaStream_t stream) {
+  if (!handle.valid() ||
+      !weights.valid() ||
+      !activations.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      plan.execution.backend_kind != GemmBackendKind::kCublasLtDense ||
+      activations.shape().size() != 2 ||
+      weights.shape().size() != 2 ||
+      output->shape().size() != 2) {
+    return std::nullopt;
+  }
+
+  const std::size_t m = activations.shape()[0];
+  const std::size_t n = plan.execution.launch_plan.n;
+  const std::size_t k = plan.execution.launch_plan.k;
+  if (activations.shape()[1] != k ||
+      output->shape()[0] != m ||
+      output->shape()[1] != n ||
+      weights.shape()[0] != n ||
+      weights.shape()[1] != k) {
+    return std::nullopt;
+  }
+
+  return RunDenseRowMajorTypedToDevice(
+      handle,
+      plan,
+      activations.data(),
+      CUDA_R_8F_E4M3,
+      input_scale_device,
+      weights.data(),
+      CUDA_R_8F_E4M3,
+      weight_scale_device,
+      1.0f,
+      Fp8FastAccumSupported(),
+      m,
+      n,
+      k,
+      output,
+      cached_matmul_state,
+      stream);
+}
+
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
@@ -1073,20 +1126,57 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     return std::nullopt;
   }
 
-  return RunDenseRowMajorTypedToDevice(
+  return RunDenseRowMajorFp8E4M3ToDevice(
       handle,
       plan,
-      quantized_activations->data(),
-      CUDA_R_8F_E4M3,
-      input_scale_device,
-      weights.data(),
-      CUDA_R_8F_E4M3,
+      weights,
       weight_scale_device,
-      1.0f,
-      Fp8FastAccumSupported(),
-      m,
-      n,
-      k,
+      *quantized_activations,
+      input_scale_device,
+      output,
+      cached_matmul_state,
+      stream);
+}
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp8E4M3& weights,
+    const float* weight_scale_device,
+    const DeviceTensorFp8E4M3& activations,
+    const float* input_scale_device,
+    DeviceTensorFp32* output,
+    const CachedCublasLtMatmulState* cached_matmul_state,
+    cudaStream_t stream) {
+  return RunDenseRowMajorFp8E4M3QuantizedToDevice(
+      handle,
+      plan,
+      weights,
+      weight_scale_device,
+      activations,
+      input_scale_device,
+      output,
+      cached_matmul_state,
+      stream);
+}
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp8E4M3& weights,
+    const float* weight_scale_device,
+    const DeviceTensorFp8E4M3& activations,
+    const float* input_scale_device,
+    DeviceTensorBf16* output,
+    const CachedCublasLtMatmulState* cached_matmul_state,
+    cudaStream_t stream) {
+  return RunDenseRowMajorFp8E4M3QuantizedToDevice(
+      handle,
+      plan,
+      weights,
+      weight_scale_device,
+      activations,
+      input_scale_device,
       output,
       cached_matmul_state,
       stream);
