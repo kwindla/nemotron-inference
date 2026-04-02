@@ -49,7 +49,7 @@ Current per-expert path adds matmul_block_scales (~634 KB/pair), making each pai
   Important: views use `block_scales_data` (raw row-major), NOT `matmul_block_scales_data` (swizzled). The fused decode kernel reads raw block scales via `Nvfp4RowMajorDot` in `fused_decode_common.cuh`.
   Key files: `runtime/include/nemotron/monolithic_expert_weights.h` (new), `runtime/src/backend/monolithic_expert_weights.cu` (new), `runtime/CMakeLists.txt`
 
-- [ ] **2. Wire monolithic weights into ExpertLayerSlice::Create()**
+- [x] **2. Wire monolithic weights into ExpertLayerSlice::Create()**
   In `expert_layer.cpp`, when `NEMOTRON_EXPERT_MONOLITHIC=1` (default enabled):
   - Allocate one `MonolithicNvfp4ExpertWeights` for up_proj (E=128, N=1856, K=2688)
   - Allocate one `MonolithicNvfp4ExpertWeights` for down_proj (E=128, N=2688, K=1856)
@@ -80,7 +80,7 @@ Current per-expert path adds matmul_block_scales (~634 KB/pair), making each pai
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | MonolithicNvfp4ExpertWeights data structure | done | — | 3 cudaMalloc per projection vs 512 current |
-| 2 | Wire into ExpertLayerSlice::Create() | pending | — | 6 allocs per layer vs 1,024 current |
+| 1 | MonolithicNvfp4ExpertWeights data structure | done | 5531d00 | 3 cudaMalloc per projection vs 512 current |
+| 2 | Wire into ExpertLayerSlice::Create() | done | — | 6 allocs per layer vs 1,024 current |
 | 3 | Zero per-token uploads in Run() | pending | — | |
 | 4 | Full residency verification + benchmark | pending | — | target: 23/23 resident, 0 bytes uploaded |

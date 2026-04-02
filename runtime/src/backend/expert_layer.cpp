@@ -26,6 +26,7 @@
 #include "nemotron/expert_staging_counters.h"
 #include "nemotron/fused_moe_decode.h"
 #include "nemotron/linear_op.h"
+#include "nemotron/monolithic_expert_weights.h"
 #include "nemotron/nvfp4_packing.h"
 #include "nemotron/nvfp4_weight.h"
 
@@ -492,6 +493,42 @@ bool ExpertFullResidencyEnabled() {
   return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
+bool ExpertMonolithicEnabled() {
+  const char* value = std::getenv("NEMOTRON_EXPERT_MONOLITHIC");
+  return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+const float* RawNvfp4TensorScalePtr(const GemmDescriptor& descriptor) {
+  if (descriptor.tensor_scale_data == nullptr ||
+      descriptor.tensor_scale_nbytes != sizeof(float)) {
+    return nullptr;
+  }
+  return reinterpret_cast<const float*>(descriptor.tensor_scale_data);
+}
+
+bool UploadDescriptorToMonolithic(
+    MonolithicNvfp4ExpertWeights* weights,
+    std::size_t expert_index,
+    const GemmDescriptor& descriptor) {
+  if (weights == nullptr ||
+      descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
+      descriptor.packed_data == nullptr ||
+      descriptor.block_scales_data == nullptr) {
+    return false;
+  }
+  const float* tensor_scale = RawNvfp4TensorScalePtr(descriptor);
+  if (tensor_scale == nullptr) {
+    return false;
+  }
+  return weights->UploadExpert(
+      expert_index,
+      descriptor.packed_data,
+      descriptor.packed_nbytes,
+      descriptor.block_scales_data,
+      descriptor.block_scales_nbytes,
+      tensor_scale);
+}
+
 std::uint64_t ExpertResidencyMinimumHeadroomBytes() {
   return (ParseEnvMiB("NEMOTRON_FORWARD_VRAM_RESERVE_MB", kDefaultForwardVramReserveMiB) +
           kExpertRuntimeHeadroomMiB) *
@@ -638,11 +675,16 @@ struct ExpertLayerSlice::Impl {
   const GemmDescriptor* shared_down_nvfp4 = nullptr;
   std::unique_ptr<DeviceNvfp4Weight> shared_down_nvfp4_device;
   std::vector<RoutedExpertRuntime> routed_experts;
+  std::unique_ptr<MonolithicNvfp4ExpertWeights> monolithic_up;
+  std::unique_ptr<MonolithicNvfp4ExpertWeights> monolithic_down;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_up_views_device;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_down_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
   std::uint64_t resident_shared_expert_bytes = 0;
   std::uint64_t resident_routed_expert_bytes = 0;
   bool full_residency_enabled = false;
+  bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
 };
 
@@ -996,17 +1038,26 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   }
 
   const bool full_residency_requested = ExpertFullResidencyEnabled();
+  const bool monolithic_requested = ExpertMonolithicEnabled() && !uses_latent_projection;
   const std::uint64_t residency_budget_bytes = ExpertResidencyBudgetBytes();
   const std::uint64_t minimum_headroom_bytes = ExpertResidencyMinimumHeadroomBytes();
   std::uint64_t resident_routed_expert_bytes = 0;
+  std::unique_ptr<MonolithicNvfp4ExpertWeights> monolithic_up;
+  std::unique_ptr<MonolithicNvfp4ExpertWeights> monolithic_down;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_up_views_device;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_down_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
   bool full_residency_enabled = false;
+  bool monolithic_resident = false;
+  std::uint64_t monolithic_up_bytes = 0;
+  std::uint64_t monolithic_down_bytes = 0;
   std::size_t fully_resident_layer_count = 0;
   std::size_t nonresident_layer_count = 0;
   std::size_t uploaded_routed_experts = 0;
   std::string residency_reason = "disabled";
   std::string residency_detail;
+  std::string monolithic_detail;
   std::uint64_t cumulative_resident_routed_expert_bytes = 0;
   std::uint64_t estimated_routed_layer_bytes = 0;
   for (const Impl::RoutedExpertRuntime& runtime_pair : routed_experts) {
@@ -1022,6 +1073,20 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   const cudaError_t mem_info_status = cudaMemGetInfo(&free_vram_bytes_raw, &total_vram_bytes_raw);
   const bool has_mem_info = mem_info_status == cudaSuccess;
   const std::uint64_t free_vram_bytes = static_cast<std::uint64_t>(free_vram_bytes_raw);
+  const auto clear_monolithic_residency_uploads = [&]() {
+    monolithic_up_views_device.reset();
+    monolithic_down_views_device.reset();
+    monolithic_up.reset();
+    monolithic_down.reset();
+    routed_up_nvfp4_views_device.reset();
+    routed_down_nvfp4_views_device.reset();
+    resident_routed_expert_bytes = 0;
+    monolithic_up_bytes = 0;
+    monolithic_down_bytes = 0;
+    uploaded_routed_experts = 0;
+    full_residency_enabled = false;
+    monolithic_resident = false;
+  };
   const auto clear_routed_residency_uploads = [&]() {
     for (Impl::RoutedExpertRuntime& runtime_pair : routed_experts) {
       runtime_pair.up_proj_device.reset();
@@ -1031,6 +1096,77 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     routed_down_nvfp4_views_device.reset();
     resident_routed_expert_bytes = 0;
   };
+  if (full_residency_requested && fused_direct_moe_supported && monolithic_requested) {
+    try {
+      monolithic_up = MonolithicNvfp4ExpertWeights::Create(
+          config.n_routed_experts,
+          config.routed_expert_intermediate_size,
+          config.hidden_size);
+      monolithic_down = MonolithicNvfp4ExpertWeights::Create(
+          config.n_routed_experts,
+          config.hidden_size,
+          config.routed_expert_intermediate_size);
+      if (!monolithic_up || !monolithic_up->valid() ||
+          !monolithic_down || !monolithic_down->valid()) {
+        monolithic_detail = "allocation failed";
+        clear_monolithic_residency_uploads();
+      } else {
+        bool monolithic_upload_failed = false;
+        for (std::size_t expert_index = 0; expert_index < routed_experts.size(); ++expert_index) {
+          const Impl::RoutedExpertRuntime& runtime_pair = routed_experts[expert_index];
+          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr ||
+              !UploadDescriptorToMonolithic(
+                  monolithic_up.get(), expert_index, *runtime_pair.up_proj) ||
+              !UploadDescriptorToMonolithic(
+                  monolithic_down.get(), expert_index, *runtime_pair.down_proj)) {
+            monolithic_detail = "expert upload failed";
+            monolithic_upload_failed = true;
+            break;
+          }
+        }
+        if (monolithic_upload_failed) {
+          clear_monolithic_residency_uploads();
+        } else {
+          std::vector<FusedNvfp4WeightView> monolithic_up_views = monolithic_up->BuildAllViews();
+          std::vector<FusedNvfp4WeightView> monolithic_down_views = monolithic_down->BuildAllViews();
+          if (monolithic_up_views.size() != routed_experts.size() ||
+              monolithic_down_views.size() != routed_experts.size()) {
+            monolithic_detail = "view build failed";
+            clear_monolithic_residency_uploads();
+          } else {
+            monolithic_up_views_device =
+                DeviceArray<FusedNvfp4WeightView>::CopyFromHost(monolithic_up_views);
+            monolithic_down_views_device =
+                DeviceArray<FusedNvfp4WeightView>::CopyFromHost(monolithic_down_views);
+            routed_up_nvfp4_views_device =
+                DeviceArray<FusedNvfp4WeightView>::CopyFromHost(monolithic_up_views);
+            routed_down_nvfp4_views_device =
+                DeviceArray<FusedNvfp4WeightView>::CopyFromHost(monolithic_down_views);
+            if (!monolithic_up_views_device ||
+                !monolithic_down_views_device ||
+                !routed_up_nvfp4_views_device ||
+                !routed_down_nvfp4_views_device) {
+              monolithic_detail = "view upload failed";
+              clear_monolithic_residency_uploads();
+            } else {
+              monolithic_up_bytes = static_cast<std::uint64_t>(monolithic_up->total_bytes());
+              monolithic_down_bytes = static_cast<std::uint64_t>(monolithic_down->total_bytes());
+              resident_routed_expert_bytes = monolithic_up_bytes + monolithic_down_bytes;
+              uploaded_routed_experts = routed_experts.size();
+              full_residency_enabled = true;
+              monolithic_resident = true;
+            }
+          }
+        }
+      }
+    } catch (const std::exception& error) {
+      monolithic_detail = error.what();
+      clear_monolithic_residency_uploads();
+    } catch (...) {
+      monolithic_detail = "unknown";
+      clear_monolithic_residency_uploads();
+    }
+  }
   auto& residency_tracker = GetExpertResidencyTracker();
   {
     std::lock_guard<std::mutex> lock(residency_tracker.mutex);
@@ -1041,6 +1177,10 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     } else if (!fused_direct_moe_supported) {
       residency_reason = "unsupported";
       ++residency_tracker.nonresident_layer_count;
+    } else if (monolithic_resident) {
+      residency_reason = "monolithic";
+      residency_tracker.resident_routed_expert_bytes += resident_routed_expert_bytes;
+      ++residency_tracker.resident_layer_count;
     } else if (residency_tracker.skip_remaining_layers_for_vram) {
       residency_reason = "vram_skip";
       ++residency_tracker.nonresident_layer_count;
@@ -1149,15 +1289,27 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->shared_down_nvfp4 = shared_down_nvfp4;
   impl->shared_down_nvfp4_device = std::move(shared_down_nvfp4_device);
   impl->routed_experts = std::move(routed_experts);
+  impl->monolithic_up = std::move(monolithic_up);
+  impl->monolithic_down = std::move(monolithic_down);
+  impl->monolithic_up_views_device = std::move(monolithic_up_views_device);
+  impl->monolithic_down_views_device = std::move(monolithic_down_views_device);
   impl->routed_up_nvfp4_views_device = std::move(routed_up_nvfp4_views_device);
   impl->routed_down_nvfp4_views_device = std::move(routed_down_nvfp4_views_device);
   impl->resident_shared_expert_bytes = resident_shared_expert_bytes;
   impl->resident_routed_expert_bytes = resident_routed_expert_bytes;
   impl->full_residency_enabled = full_residency_enabled;
+  impl->monolithic_resident = monolithic_resident;
   impl->fused_direct_moe_supported = fused_direct_moe_supported;
   if (debug) {
     const std::uint64_t resident_total_expert_bytes =
         resident_shared_expert_bytes + resident_routed_expert_bytes;
+    std::cout << "expert_layer_create: layer=" << config.layer_index
+              << " monolithic=" << (monolithic_resident ? "true" : "false")
+              << " up_bytes=" << monolithic_up_bytes
+              << " down_bytes=" << monolithic_down_bytes
+              << " total_mib="
+              << (static_cast<double>(monolithic_up_bytes + monolithic_down_bytes) / (1024.0 * 1024.0))
+              << "\n";
     std::cout << "expert_layer_create: layer=" << config.layer_index
               << " fused_direct_moe_supported=" << fused_direct_moe_supported
               << " expert_full_residency_requested=" << full_residency_requested
@@ -1179,6 +1331,10 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
               << " resident_total_expert_mib="
               << (static_cast<double>(resident_total_expert_bytes) / (1024.0 * 1024.0))
               << "\n";
+    if (!monolithic_detail.empty()) {
+      std::cout << "expert_layer_create: layer=" << config.layer_index
+                << " monolithic_detail=" << monolithic_detail << "\n";
+    }
     if (!residency_detail.empty()) {
       std::cout << "expert_layer_create: layer=" << config.layer_index
                 << " expert_residency_detail=" << residency_detail << "\n";
@@ -1226,6 +1382,13 @@ bool ExpertLayerSlice::valid() const {
           (impl_->shared_down_family == Impl::SharedDownFamily::kDense &&
            impl_->shared_down_dense != nullptr &&
            impl_->shared_down_dense->valid())) &&
+         (!impl_->monolithic_resident ||
+          (impl_->monolithic_up != nullptr &&
+           impl_->monolithic_up->valid() &&
+           impl_->monolithic_down != nullptr &&
+           impl_->monolithic_down->valid() &&
+           impl_->monolithic_up_views_device != nullptr &&
+           impl_->monolithic_down_views_device != nullptr)) &&
          (!impl_->full_residency_enabled ||
           (impl_->routed_up_nvfp4_views_device != nullptr &&
            impl_->routed_down_nvfp4_views_device != nullptr)) &&
