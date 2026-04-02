@@ -45,7 +45,7 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
   - Compute still scales linearly with KV length (unavoidable for exact attention), but memory footprint is O(1) and GPU utilization is much higher.
   Key files: `runtime/src/backend/attention_device_fallback.cu`, `runtime/include/nemotron/attention_device_fallback.h`
 
-- [~] **2. Wire production kernel into attention layer dispatcher**
+- [x] **2. Wire production kernel into attention layer dispatcher**
   In `attention_layer.cpp`, add an explicit dispatcher:
   - `token_count == 1` AND not cuDNN → use production decode kernel
   - `token_count > 1` → use existing fallback (or cuDNN if available)
@@ -53,10 +53,13 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
   Keep the existing device-vs-host compare hook behind `NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION`.
   Key files: `runtime/src/backend/attention_layer.cpp`
 
-- [ ] **3. Verify correctness and benchmark**
+- [x] **3. Verify correctness and benchmark**
   - Smoke test PASS
-  - Benchmark steady-state decode: target ≤20ms/token mean
-  - Verify attention time is now ~constant across decode positions (not scaling with KV length)
+  - Benchmark: **13.8ms/token mean, 72.5 tok/sec, 1,657x from original baseline**
+  - Attention latency flattened: 0.4ms variance (was 5ms), 0.010ms/call (was 0.51ms) — **51x faster**
+  - Attention dropped from 24.1% to 0.6% of GPU time
+  - Kernel compute floor: ~9.0ms/token. Host overhead: ~4.8ms/token
+  - Nsight profile saved: `artifacts/profiles/decode_production_attention_20260402`
   Key files: benchmark scripts
 
 ## Progress
@@ -65,3 +68,30 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
 | 1 | Warp-cooperative decode attention kernel | done | — | 2 blocks × 256 threads, GQA-aware, online softmax, lane-sharded; compile PASS |
 | 2 | Wire into attention layer dispatcher | done | — | NEMOTRON_FORWARD_ATTENTION_PRODUCTION gate; smoke PASS |
 | 3 | Verify and benchmark | done | — | 13.8ms/token, 72.5 tok/sec, 1657x from baseline |
+
+## Final Profile (decode_production_attention_20260402)
+
+| Kernel | GPU Time (%) | Per-token (ms) |
+|--------|-------------|----------------|
+| CUTLASS NVFP4 GEMMs (MoE experts) | 39.1% | 3.5 |
+| NVFP4 activation pack | 10.3% | 0.9 |
+| lm_head GEMV | 9.3% | 0.8 |
+| CUTLASS NVFP4 (Mamba/shared expert) | 6.6% | 0.6 |
+| Mamba projection GEMVs | 5.6% | 0.5 |
+| Attention projection GEMVs | 4.5% | 0.4 |
+| RmsNorm | 3.7% | 0.3 |
+| FusedMambaDecodeHead | 2.8% | 0.3 |
+| DeviceExpertSelection | 1.3% | 0.1 |
+| **PagedAttentionDecodeProduction** | **0.6%** | **0.06** |
+| Other (residual, norm, argmax, etc.) | ~2% | ~0.2 |
+| **Kernel total** | | **~9.0** |
+| **Host overhead** | | **~4.8** |
+| **Measured wall time** | | **13.8** |
+
+## Remaining Optimization Opportunities
+
+1. **Host overhead (~4.8ms)**: remaining cudaMemcpy calls from model construction bleed into the profile. Actual per-token overhead is lower but still measurable.
+2. **CUTLASS NVFP4 GEMMs (3.5ms)**: 39% of GPU time. These are already cuBLASLt-optimized. Batched/grouped GEMM could reduce launch overhead.
+3. **lm_head GEMV (0.8ms)**: single large dense GEMV, 17 calls. Already cuBLASLt.
+4. **NVFP4 pack (0.9ms)**: 5 kernels per pack (reduction + write + pack + memset + swizzle). Could be fused.
+5. **Mamba kernel (0.3ms)**: already multi-block, well-optimized.
