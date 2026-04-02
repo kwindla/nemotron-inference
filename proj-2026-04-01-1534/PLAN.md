@@ -95,7 +95,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 ## Steps
 
-- [x] **1. Make the linear fastpath correct on the real benchmark path**
+- [ ] **1. Make the linear fastpath correct on the real benchmark path**
   Goal:
   - turn `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` from a diagnostic mode into a correct hot path
   Scope:
@@ -323,7 +323,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Linear fastpath correctness + layout translation | done | d4931e8 | NVFP4 8x4 scale layout for M<=32 decode activations |
+| 1 | Linear fastpath correctness + layout translation | in progress | d4931e8 | runtime now forces validated small-M `128x4`; `8x4` execute contract still needs a backend-correct re-enable |
 | 2 | Re-baseline with counters and Nsight | pending | — | choose next bottleneck from evidence |
 | 3 | Attention metadata/workspace ownership + sync cleanup | pending | — | no new attention math in this step |
 | 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
@@ -349,3 +349,8 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend`, `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test -j4`, and `cmake --build build-benchmarks --target nano_fused_decode_bench -j4` all passed after rerunning the phase-1 builds sequentially to avoid a parallel archive-link race in the shared build tree.
   - what risk remains: this checkpoint intentionally does not add an aligned-buffer workaround to the descriptor path, so any NVFP4 caller that still uses descriptor-backed plans without the device fastpath would retain the original pointer-alignment constraint.
   - what the next step is: rerun the real-model fastpath smoke/parity commands to confirm the runtime-only NVFP4 path clears the cuBLASLt plan rejects on the benchmark path.
+- 2026-04-01: Step 1 follow-up: isolated the remaining real-model NVFP4 corruption to the small-`M` activation scale-factor layout used by the runtime bridge, then forced the validated `128x4` path in `linear_op.cpp`.
+  - what changed: added large-dimension `M=1` NVFP4 regression coverage in `nvfp4_gemm_runner_test` and `linear_op_test`; the repro showed that the cuBLASLt fastpath diverged badly from the reference path when activations were packed with the small-`M` `8x4` layout, but matched again when the same bridge was forced to `128x4`. `RuntimeNvfp4PackOptions()` now pins the runtime fastpath to `swizzled_128x4` while leaving the generic 8x4 packing support in place for later backend-correct re-enable.
+  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4`, `cmake --build build-phase1-tests --target nvfp4_gemm_runner_test device_nvfp4_matrix_test linear_op_test -j4`, and `ctest --test-dir build-phase1-tests -R 'nvfp4_gemm_runner_test|device_nvfp4_matrix_test|linear_op_test' --output-on-failure` all passed. The new large-dimension small-`M` unit repro now passes on both the low-level GEMM runner and the `UploadedLinearOp::Run()` path.
+  - what risk remains: the full real-model smoke has not yet been carried to completion after relinking `full_forward_manifest_smoke_test`; it no longer reproduces the old immediate prompt-logit invalidation, but the long-running smoke still needs a definitive pass/fail result and the original `8x4` runtime contract remains intentionally disabled pending a backend-correct implementation.
+  - what the next step is: rerun the real-model smoke/parity commands to completion on the relinked binaries, confirm that the fastpath now stays on the validated path end-to-end, and only then decide whether to keep the temporary `128x4` divergence or resume `8x4` work with a backend-verified swizzle/descriptor translation.

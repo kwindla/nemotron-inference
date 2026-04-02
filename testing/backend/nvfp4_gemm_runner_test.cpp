@@ -8,6 +8,8 @@
 #include "nemotron/kernel_catalog.h"
 #include "nemotron/manifest.h"
 #include "nemotron/nvfp4_gemm_runner.h"
+#include "nemotron/linear_reference_kernels.h"
+#include "nemotron/nvfp4_packing.h"
 #include "nemotron/nvfp4_weight.h"
 #include "nemotron/tensor_catalog.h"
 #include "nemotron/weight_arena.h"
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <cmath>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -41,9 +44,12 @@ using nemotron::KernelCatalog;
 using nemotron::LoadVerifiedManifestFromJsonFile;
 using nemotron::MakeNvfp4PackedMatrixDeviceView;
 using nemotron::ManifestLoadResult;
+using nemotron::Nvfp4PackOptions;
 using nemotron::Nvfp4PackedMatrixDeviceView;
+using nemotron::PackRowMajorFp32ToNvfp4;
 using nemotron::PrepareGemmExecution;
 using nemotron::RunNvfp4RowMajorFp32AccumToDevice;
+using nemotron::RunNvfp4RowMajorReferenceToDevice;
 using nemotron::RunNvfp4RowMajorFp32SourceToDevice;
 using nemotron::TensorCatalog;
 using nemotron::WeightArena;
@@ -223,6 +229,34 @@ GemmDescriptor make_activation_descriptor(
   return descriptor;
 }
 
+GemmDescriptor make_nvfp4_descriptor(
+    std::size_t output_rows,
+    std::size_t input_cols,
+    const std::uint8_t* packed_data,
+    std::size_t packed_nbytes,
+    const std::uint8_t* block_scales_data,
+    std::size_t block_scales_nbytes,
+    const std::uint8_t* tensor_scale_data,
+    std::size_t tensor_scale_nbytes) {
+  GemmDescriptor descriptor;
+  descriptor.tensor_name = "nvfp4_test_tensor";
+  descriptor.op_class = "nvfp4_test_tensor";
+  descriptor.kernel_family = nemotron::GemmKernelFamily::kCublasLtNvfp4BlockScaled;
+  descriptor.output_rows = output_rows;
+  descriptor.input_cols = input_cols;
+  descriptor.storage_dtype = "nvfp4_e2m1";
+  descriptor.compute_dtype = "fp32_accum";
+  descriptor.layout_tag = "cublaslt_fp4_tn_v1";
+  descriptor.alignment_bytes = 16;
+  descriptor.packed_data = packed_data;
+  descriptor.packed_nbytes = packed_nbytes;
+  descriptor.block_scales_data = block_scales_data;
+  descriptor.block_scales_nbytes = block_scales_nbytes;
+  descriptor.tensor_scale_data = tensor_scale_data;
+  descriptor.tensor_scale_nbytes = tensor_scale_nbytes;
+  return descriptor;
+}
+
 bool all_zero(const std::vector<float>& values) {
   for (float value : values) {
     if (value != 0.0f) {
@@ -230,6 +264,27 @@ bool all_zero(const std::vector<float>& values) {
     }
   }
   return true;
+}
+
+float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+  if (lhs.size() != rhs.size()) {
+    return std::numeric_limits<float>::infinity();
+  }
+  float max_diff = 0.0f;
+  for (std::size_t i = 0; i < lhs.size(); ++i) {
+    max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
+  }
+  return max_diff;
+}
+
+std::size_t count_nonfinite(const std::vector<float>& values) {
+  std::size_t count = 0;
+  for (float value : values) {
+    if (!std::isfinite(value)) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 bool test_nvfp4_gemm_runner_executes_row_major_contract() {
@@ -440,13 +495,151 @@ bool test_nvfp4_gemm_runner_executes_from_device_fp32_source() {
                 "zero-valued FP32 activations and zero-valued NVFP4 weights should produce zero output");
 }
 
+bool test_nvfp4_gemm_runner_matches_reference_for_nonzero_m1() {
+  const auto handle = CublasLtHandle::Create();
+  if (!handle || !handle->valid()) {
+    std::cout << "nvfp4_gemm_runner_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  constexpr std::size_t kRows = 1;
+  constexpr std::size_t kInputCols = 5376;
+  constexpr std::size_t kOutputRows = 4096;
+
+  std::vector<float> weights(kOutputRows * kInputCols, 0.0f);
+  for (std::size_t row = 0; row < kOutputRows; ++row) {
+    for (std::size_t col = 0; col < kInputCols; ++col) {
+      const int pattern = static_cast<int>((row * 17 + col * 13) % 29) - 14;
+      weights[row * kInputCols + col] = static_cast<float>(pattern) * 0.0078125f;
+    }
+  }
+  const auto packed_weights = PackRowMajorFp32ToNvfp4(weights.data(), kOutputRows, kInputCols);
+  if (!expect(packed_weights.has_value() && packed_weights->valid(),
+              "nonzero NVFP4 weight pack should succeed")) {
+    return false;
+  }
+
+  const auto descriptor = make_nvfp4_descriptor(
+      kOutputRows,
+      kInputCols,
+      packed_weights->packed_data(),
+      packed_weights->packed_nbytes(),
+      packed_weights->block_scales_data(),
+      packed_weights->block_scales_nbytes(),
+      packed_weights->tensor_scale_data(),
+      packed_weights->tensor_scale_nbytes());
+  auto weight = DeviceNvfp4Weight::Upload(descriptor);
+  if (!expect(static_cast<bool>(weight) && weight->valid(), "nonzero NVFP4 weight upload should succeed")) {
+    return false;
+  }
+
+  const auto launch_plan = BuildGemmLaunchPlan(descriptor, kRows);
+  if (!expect(launch_plan.has_value(), "nonzero NVFP4 launch plan should build")) {
+    return false;
+  }
+
+  GemmHeuristicCache cache;
+  const auto execution = PrepareGemmExecution(*launch_plan, &cache);
+  if (!expect(execution.has_value(), "nonzero NVFP4 execution should prepare")) {
+    return false;
+  }
+
+  const auto plan = BuildCublasLtGemmPlan(*execution);
+  if (!expect(plan.has_value(), "nonzero NVFP4 cublasLt plan should build")) {
+    return false;
+  }
+
+  auto activation_source = DeviceTensorFp32::Create({kRows, kInputCols});
+  auto fastpath_output = DeviceTensorFp32::Create({kRows, kOutputRows});
+  auto reference_output = DeviceTensorFp32::Create({kRows, kOutputRows});
+  if (!expect(
+          activation_source && activation_source->valid() &&
+              fastpath_output && fastpath_output->valid() &&
+              reference_output && reference_output->valid(),
+          "nonzero FP32-source test should allocate its tensors")) {
+    return false;
+  }
+
+  std::vector<float> activations(kRows * kInputCols, 0.0f);
+  for (std::size_t row = 0; row < kRows; ++row) {
+    for (std::size_t col = 0; col < kInputCols; ++col) {
+      const int pattern = static_cast<int>((row * 11 + col * 7) % 23) - 11;
+      activations[row * kInputCols + col] =
+          static_cast<float>(pattern) * 0.015625f;
+    }
+  }
+  if (!expect(
+          activation_source->CopyFromHost(activations.data(), activations.size()),
+          "nonzero FP32 activation source should upload")) {
+    return false;
+  }
+
+  Nvfp4PackOptions pack_options;
+  pack_options.execution_scale_layout = nemotron::Nvfp4ScaleLayout::kSwizzled128x4;
+  const auto fastpath_stats = RunNvfp4RowMajorFp32SourceToDevice(
+      *handle,
+      *plan,
+      *activation_source,
+      *weight,
+      fastpath_output.get(),
+      pack_options);
+  if (!expect(fastpath_stats.has_value(), "nonzero FP32-source NVFP4 path should execute successfully")) {
+    return false;
+  }
+
+  if (!expect(
+          RunNvfp4RowMajorReferenceToDevice(
+              *activation_source,
+              *weight,
+              reference_output.get(),
+              pack_options),
+          "nonzero FP32-source NVFP4 reference path should execute successfully")) {
+    return false;
+  }
+
+  std::vector<float> fastpath_host(fastpath_output->numel(), 0.0f);
+  std::vector<float> reference_host(reference_output->numel(), 0.0f);
+  if (!expect(
+          fastpath_output->CopyToHost(fastpath_host.data(), fastpath_host.size()),
+          "nonzero fastpath output should download successfully") ||
+      !expect(
+          reference_output->CopyToHost(reference_host.data(), reference_host.size()),
+          "nonzero reference output should download successfully")) {
+    return false;
+  }
+
+  const std::size_t nonfinite_count = count_nonfinite(fastpath_host);
+  if (!expect(
+          nonfinite_count == 0,
+          "nonzero FP32-source NVFP4 fastpath output should stay finite")) {
+    std::cerr << "nonzero_m1_diagnostic: nonfinite_count=" << nonfinite_count << "\n";
+    return false;
+  }
+
+  const float diff = max_abs_diff(fastpath_host, reference_host);
+  if (!expect(
+          diff <= 5.0e-2f,
+          "nonzero FP32-source NVFP4 fastpath output should stay close to the reference path")) {
+    std::cerr << "nonzero_m1_diagnostic: max_abs_diff=" << diff
+              << " fastpath0=" << fastpath_host.front()
+              << " reference0=" << reference_host.front()
+              << "\n";
+    return false;
+  }
+
+  return expect(
+      fastpath_stats->rows == kRows && fastpath_stats->cols == kOutputRows,
+      "nonzero FP32-source NVFP4 stats should report the expected output shape");
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_nvfp4_gemm_runner_executes_row_major_contract() &&
       test_nvfp4_gemm_runner_rejects_dense_plan() &&
-      test_nvfp4_gemm_runner_executes_from_device_fp32_source();
+      test_nvfp4_gemm_runner_executes_from_device_fp32_source() &&
+      test_nvfp4_gemm_runner_matches_reference_for_nonzero_m1();
 
   if (!ok) {
     return 1;

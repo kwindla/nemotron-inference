@@ -129,7 +129,12 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(
     const GemmDescriptor& descriptor,
     std::size_t rows) {
   Nvfp4PackOptions options;
-  options.execution_scale_layout = ResolveActivationNvfp4ScaleLayout(rows);
+  // The row-major cuBLASLt NVFP4 fastpath is numerically stable with the
+  // 128x4 activation scale-factor layout, but the 8x4 variant still diverges
+  // from the validated reference path on real small-M kernels. Keep 8x4
+  // support available in the packer utilities, but force the runtime bridge to
+  // use the validated 128x4 layout until the 8x4 execute contract is fixed.
+  options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
   const char* raw_value = std::getenv(kNvfp4ActivationTensorScaleEnvVar);
   if (raw_value == nullptr || raw_value[0] == '\0') {
     if (debug) {
