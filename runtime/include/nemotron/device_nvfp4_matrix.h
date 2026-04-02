@@ -38,6 +38,9 @@ class DeviceNvfp4Matrix {
   const std::uint8_t* matmul_block_scales_data() const;
   const std::uint8_t* tensor_scale_data() const;
   Nvfp4ScaleLayout scale_layout() const;
+  bool PackInto(
+      const DeviceTensorFp32& source,
+      const Nvfp4PackOptions& options = {});
 
   bool CopyPackedToHost(std::vector<std::uint8_t>* output) const;
   bool CopyBlockScalesToHost(std::vector<std::uint8_t>* output) const;

@@ -24,6 +24,7 @@ struct UploadedLinearOp::Impl {
   GemmDescriptor descriptor;
   std::unique_ptr<DeviceDenseWeightFp32> dense_weight;
   std::unique_ptr<DeviceNvfp4Weight> nvfp4_weight;
+  std::unique_ptr<DeviceNvfp4Matrix> activation_pack;
 };
 
 namespace {
@@ -353,6 +354,20 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor&
         }
         return nullptr;
       }
+      impl->activation_pack = DeviceNvfp4Matrix::Create(
+          1,
+          descriptor.input_cols,
+          ResolveActivationNvfp4ScaleLayout(
+              1,
+              RuntimeNvfp4PackOptions(debug, descriptor, 1).execution_scale_layout));
+      if (!impl->activation_pack || !impl->activation_pack->valid()) {
+        if (debug) {
+          std::cerr << "linear_op_create: NVFP4 activation pack allocation failed for "
+                    << descriptor.tensor_name
+                    << " cols=" << descriptor.input_cols << "\n";
+        }
+        return nullptr;
+      }
       break;
   }
   return std::unique_ptr<UploadedLinearOp>(new UploadedLinearOp(std::move(impl)));
@@ -372,7 +387,10 @@ bool UploadedLinearOp::valid() const {
     case GemmKernelFamily::kDenseRowMajor:
       return impl_->dense_weight && impl_->dense_weight->valid();
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
-      return impl_->nvfp4_weight && impl_->nvfp4_weight->valid();
+      return impl_->nvfp4_weight &&
+             impl_->nvfp4_weight->valid() &&
+             impl_->activation_pack &&
+             impl_->activation_pack->valid();
   }
   return false;
 }
@@ -492,15 +510,37 @@ bool UploadedLinearOp::Run(
         } else {
           counters.nvfp4_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
         }
-        if (plan.has_value() &&
-            RunNvfp4RowMajorFp32SourceToDevice(
+        bool execute_ok = false;
+        if (plan.has_value()) {
+          if (rows == 1) {
+            const Nvfp4PackedMatrixDeviceView weight_view =
+                MakeNvfp4PackedMatrixDeviceView(*impl_->nvfp4_weight);
+            execute_ok =
+                weight_view.valid() &&
+                impl_->activation_pack != nullptr &&
+                impl_->activation_pack->valid() &&
+                impl_->activation_pack->PackInto(activations, pack_options) &&
+                RunNvfp4RowMajorFp32AccumToDevice(
                     handle,
                     *plan,
-                    activations,
-                    *impl_->nvfp4_weight,
-                    output,
-                    pack_options)
-                    .has_value()) {
+                    MakeNvfp4PackedMatrixDeviceView(*impl_->activation_pack),
+                    impl_->activation_pack->host_tensor_scale(),
+                    weight_view,
+                    impl_->nvfp4_weight->host_tensor_scale(),
+                    output)
+                    .has_value();
+          } else {
+            execute_ok = RunNvfp4RowMajorFp32SourceToDevice(
+                             handle,
+                             *plan,
+                             activations,
+                             *impl_->nvfp4_weight,
+                             output,
+                             pack_options)
+                             .has_value();
+          }
+        }
+        if (execute_ok) {
           counters.nvfp4_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
           if (trace_enabled) {
             AppendLinearOpTraceEntry(LinearOpTraceEntry{

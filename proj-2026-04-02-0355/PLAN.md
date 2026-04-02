@@ -33,7 +33,7 @@ The host overhead comes from four categories:
   Accept when: zero `ReadDeviceFloat` D2H calls in the decode hot path; cuBLASLt descriptors built once.
   Key files: `nvfp4_gemm_runner.cpp`, `nvfp4_weight.cpp`, `device_nvfp4_matrix.cu`, `expert_layer.cpp`, `linear_op.cpp`
 
-- [ ] **2. Pre-allocate NVFP4 activation pack buffers**
+- [x] **2. Pre-allocate NVFP4 activation pack buffers**
   Goal: eliminate per-call DeviceNvfp4Matrix allocation (4 cudaMalloc + 4 cudaFree per pack).
   Fix:
   - In `ExpertLayerSlice::Impl`: pre-allocate DeviceNvfp4Matrix buffers at Create() for the two activation shapes: normalized `[1, hidden_size]` and post-relu2 `[1, routed_expert_intermediate_size]` (plus shared `[1, shared_expert_intermediate_size]`). Pack into these buffers on each call.
@@ -58,6 +58,6 @@ The host overhead comes from four categories:
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Cache tensor scales + cuBLASLt plans | done | — | host tensor scales + cuBLASLt cache + FillZero removed; smoke PASS |
-| 2 | Pre-allocate NVFP4 pack buffers | pending | — | ~200 alloc/free cycles → 0 |
+| 2 | Pre-allocate NVFP4 pack buffers | done | — | PackInto + expert/linear pre-alloc; smoke PASS |
 | 3 | Device-side expert selection | pending | — | eliminate router_logits D2H |
 | 4 | Benchmark and profile | pending | — | target ≤20ms |

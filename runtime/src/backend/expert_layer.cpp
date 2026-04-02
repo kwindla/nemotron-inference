@@ -766,6 +766,9 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceTensorFp32> output_scratch;
   std::unique_ptr<DeviceTensorFp32> routed_up_scratch;
   std::unique_ptr<DeviceTensorFp32> shared_up_scratch;
+  std::unique_ptr<DeviceNvfp4Matrix> normalized_pack;
+  std::unique_ptr<DeviceNvfp4Matrix> routed_activated_pack;
+  std::unique_ptr<DeviceNvfp4Matrix> shared_activated_pack;
   std::uint64_t resident_shared_expert_bytes = 0;
   std::uint64_t resident_routed_expert_bytes = 0;
   bool full_residency_enabled = false;
@@ -796,11 +799,20 @@ bool RunMoeDirectDecodeViaCublaslt(
     const std::vector<float>& routed_down_tensor_scales_host,
     const std::vector<FusedNvfp4WeightView>& routed_up_views,
     const std::vector<FusedNvfp4WeightView>& routed_down_views,
+    DeviceNvfp4Matrix* normalized_pack,
+    DeviceNvfp4Matrix* routed_activated_pack,
+    DeviceNvfp4Matrix* shared_activated_pack,
     DeviceTensorFp32* output,
     MoeDirectDecodeScratch* scratch) {
   if (!cublas_handle.valid() ||
       !input.valid() ||
       !normalized.valid() ||
+      normalized_pack == nullptr ||
+      !normalized_pack->valid() ||
+      routed_activated_pack == nullptr ||
+      !routed_activated_pack->valid() ||
+      shared_activated_pack == nullptr ||
+      !shared_activated_pack->valid() ||
       output == nullptr ||
       !output->valid() ||
       input.shape() != normalized.shape() ||
@@ -829,7 +841,6 @@ bool RunMoeDirectDecodeViaCublaslt(
   }
 
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
-  auto normalized_packed = PackDeviceRowMajorFp32ToNvfp4(normalized, pack_options);
   std::unique_ptr<DeviceTensorFp32> routed_output_owned;
   std::unique_ptr<DeviceTensorFp32> routed_up_output_owned;
   std::unique_ptr<DeviceTensorFp32> shared_up_output_owned;
@@ -850,8 +861,7 @@ bool RunMoeDirectDecodeViaCublaslt(
     routed_up_output = routed_up_output_owned.get();
     shared_up_output = shared_up_output_owned.get();
   }
-  if (!normalized_packed ||
-      !normalized_packed->valid() ||
+  if (!normalized_pack->PackInto(normalized, pack_options) ||
       routed_output == nullptr ||
       routed_up_output == nullptr ||
       shared_up_output == nullptr ||
@@ -863,7 +873,7 @@ bool RunMoeDirectDecodeViaCublaslt(
   }
 
   const Nvfp4PackedMatrixDeviceView normalized_view =
-      MakeNvfp4PackedMatrixDeviceView(*normalized_packed);
+      MakeNvfp4PackedMatrixDeviceView(*normalized_pack);
   const Nvfp4PackedMatrixDeviceView routed_up_weight_view =
       MakeNvfp4PackedMatrixDeviceView(routed_up_views.front());
   const Nvfp4PackedMatrixDeviceView routed_down_weight_view =
@@ -919,7 +929,7 @@ bool RunMoeDirectDecodeViaCublaslt(
              cublas_handle,
              *routed_up_plan,
              normalized_view,
-             normalized_packed->host_tensor_scale(),
+             normalized_pack->host_tensor_scale(),
              expert_up_view,
              routed_up_tensor_scales_host[slot],
              routed_up_output)
@@ -928,15 +938,12 @@ bool RunMoeDirectDecodeViaCublaslt(
       return false;
     }
 
-    auto routed_activated_packed =
-        PackDeviceRowMajorFp32ToNvfp4(*routed_up_output, pack_options);
-    if (!routed_activated_packed ||
-        !routed_activated_packed->valid() ||
+    if (!routed_activated_pack->PackInto(*routed_up_output, pack_options) ||
         !RunNvfp4RowMajorFp32AccumToDevice(
              cublas_handle,
              *routed_down_plan,
-             MakeNvfp4PackedMatrixDeviceView(*routed_activated_packed),
-             routed_activated_packed->host_tensor_scale(),
+             MakeNvfp4PackedMatrixDeviceView(*routed_activated_pack),
+             routed_activated_pack->host_tensor_scale(),
              expert_down_view,
              routed_down_tensor_scales_host[slot],
              output)
@@ -953,7 +960,7 @@ bool RunMoeDirectDecodeViaCublaslt(
            cublas_handle,
            *shared_up_plan,
            normalized_view,
-           normalized_packed->host_tensor_scale(),
+           normalized_pack->host_tensor_scale(),
            shared_up_weight_view,
            shared_up_weight.host_tensor_scale(),
            shared_up_output)
@@ -962,15 +969,12 @@ bool RunMoeDirectDecodeViaCublaslt(
     return false;
   }
 
-  auto shared_activated_packed =
-      PackDeviceRowMajorFp32ToNvfp4(*shared_up_output, pack_options);
-  if (!shared_activated_packed ||
-      !shared_activated_packed->valid() ||
+  if (!shared_activated_pack->PackInto(*shared_up_output, pack_options) ||
       !RunNvfp4RowMajorFp32AccumToDevice(
            cublas_handle,
            *shared_down_plan,
-           MakeNvfp4PackedMatrixDeviceView(*shared_activated_packed),
-           shared_activated_packed->host_tensor_scale(),
+           MakeNvfp4PackedMatrixDeviceView(*shared_activated_pack),
+           shared_activated_pack->host_tensor_scale(),
            shared_down_weight_view,
            shared_down_weight.host_tensor_scale(),
            output)
@@ -1574,6 +1578,31 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     return debug_fail("decode scratch allocation failed");
   }
 
+  std::unique_ptr<DeviceNvfp4Matrix> normalized_pack;
+  std::unique_ptr<DeviceNvfp4Matrix> routed_activated_pack;
+  std::unique_ptr<DeviceNvfp4Matrix> shared_activated_pack;
+  if (fused_direct_moe_supported) {
+    const Nvfp4ScaleLayout pack_scale_layout =
+        ResolveActivationNvfp4ScaleLayout(1, RuntimeMoeNvfp4PackOptions().execution_scale_layout);
+    normalized_pack = DeviceNvfp4Matrix::Create(1, config.hidden_size, pack_scale_layout);
+    routed_activated_pack = DeviceNvfp4Matrix::Create(
+        1,
+        config.routed_expert_intermediate_size,
+        pack_scale_layout);
+    shared_activated_pack = DeviceNvfp4Matrix::Create(
+        1,
+        config.shared_expert_intermediate_size,
+        pack_scale_layout);
+    if (!normalized_pack ||
+        !normalized_pack->valid() ||
+        !routed_activated_pack ||
+        !routed_activated_pack->valid() ||
+        !shared_activated_pack ||
+        !shared_activated_pack->valid()) {
+      return debug_fail("NVFP4 activation pack buffer allocation failed");
+    }
+  }
+
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->topology =
@@ -1608,6 +1637,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->output_scratch = std::move(output_scratch);
   impl->routed_up_scratch = std::move(routed_up_scratch);
   impl->shared_up_scratch = std::move(shared_up_scratch);
+  impl->normalized_pack = std::move(normalized_pack);
+  impl->routed_activated_pack = std::move(routed_activated_pack);
+  impl->shared_activated_pack = std::move(shared_activated_pack);
   impl->resident_shared_expert_bytes = resident_shared_expert_bytes;
   impl->resident_routed_expert_bytes = resident_routed_expert_bytes;
   impl->full_residency_enabled = full_residency_enabled;
@@ -1715,6 +1747,13 @@ bool ExpertLayerSlice::valid() const {
          impl_->routed_up_scratch->valid() &&
          impl_->shared_up_scratch != nullptr &&
          impl_->shared_up_scratch->valid() &&
+         (!impl_->fused_direct_moe_supported ||
+          (impl_->normalized_pack != nullptr &&
+           impl_->normalized_pack->valid() &&
+           impl_->routed_activated_pack != nullptr &&
+           impl_->routed_activated_pack->valid() &&
+           impl_->shared_activated_pack != nullptr &&
+           impl_->shared_activated_pack->valid())) &&
          impl_->routed_experts.size() == impl_->config.n_routed_experts;
 }
 
@@ -1955,6 +1994,9 @@ bool ExpertLayerSlice::Run(
               routed_down_tensor_scales_host,
               routed_up_views,
               routed_down_views,
+              impl_->normalized_pack.get(),
+              impl_->routed_activated_pack.get(),
+              impl_->shared_activated_pack.get(),
               output,
               moe_scratch_ptr)) {
         return true;

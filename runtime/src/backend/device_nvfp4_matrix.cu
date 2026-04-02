@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <device_types.h>
 
+#include <cmath>
+#include <optional>
 #include <utility>
 
 #include "nemotron/nvfp4_scale_layout.h"
@@ -344,6 +346,111 @@ Nvfp4ScaleLayout DeviceNvfp4Matrix::scale_layout() const {
   return impl_ ? impl_->scale_layout : Nvfp4ScaleLayout::kSwizzled128x4;
 }
 
+bool DeviceNvfp4Matrix::PackInto(
+    const DeviceTensorFp32& source,
+    const Nvfp4PackOptions& options) {
+  if (!valid() || !source.valid() || source.shape().size() != 2) {
+    return false;
+  }
+
+  const std::size_t rows = source.shape()[0];
+  const std::size_t cols = source.shape()[1];
+  const Nvfp4ScaleLayout scale_layout =
+      ResolveActivationNvfp4ScaleLayout(rows, options.execution_scale_layout);
+  if (rows != impl_->rows ||
+      cols != impl_->cols ||
+      scale_layout != impl_->scale_layout) {
+    return false;
+  }
+
+  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols, scale_layout);
+  if (!layout.has_value()) {
+    return false;
+  }
+
+  const std::optional<float> fixed_tensor_scale = NormalizeFixedTensorScale(options);
+  if (options.fixed_tensor_scale.has_value() && !fixed_tensor_scale.has_value()) {
+    return false;
+  }
+
+  auto* tensor_scale_data = reinterpret_cast<float*>(impl_->tensor_scale_data);
+  if (fixed_tensor_scale.has_value()) {
+    const float host_tensor_scale = *fixed_tensor_scale;
+    if (!CheckCuda(cudaMemcpy(
+            tensor_scale_data,
+            &host_tensor_scale,
+            sizeof(host_tensor_scale),
+            cudaMemcpyHostToDevice))) {
+      return false;
+    }
+    impl_->host_tensor_scale = host_tensor_scale;
+  } else {
+    auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
+    if (!CheckCuda(cudaMemset(global_max_bits, 0, impl_->tensor_scale_nbytes))) {
+      return false;
+    }
+
+    const std::size_t numel = rows * cols;
+    constexpr std::size_t kReductionThreadsPerBlock = 128;
+    const std::size_t reduction_grid_size =
+        (numel + kReductionThreadsPerBlock - 1u) / kReductionThreadsPerBlock;
+    ComputeGlobalMaxAbsKernel<<<static_cast<unsigned int>(reduction_grid_size), kReductionThreadsPerBlock>>>(
+        source.data(),
+        numel,
+        global_max_bits);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+
+    WriteTensorScaleKernel<<<1, 1>>>(
+        global_max_bits,
+        tensor_scale_data);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+    if (!CheckCuda(cudaMemcpy(
+            &impl_->host_tensor_scale,
+            tensor_scale_data,
+            sizeof(float),
+            cudaMemcpyDeviceToHost))) {
+      return false;
+    }
+  }
+
+  constexpr std::size_t kThreadsPerBlock = 128;
+  const std::size_t total_blocks = rows * (cols / kBlockWidth);
+  const std::size_t grid_size = (total_blocks + kThreadsPerBlock - 1u) / kThreadsPerBlock;
+  PackRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+      source.data(),
+      rows,
+      cols,
+      tensor_scale_data,
+      impl_->packed_data,
+      impl_->block_scales_data);
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  if (!CheckCuda(cudaMemset(
+          impl_->matmul_block_scales_data,
+          0,
+          impl_->matmul_block_scales_nbytes))) {
+    return false;
+  }
+  SwizzleBlockScalesForMatmulKernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+      impl_->block_scales_data,
+      rows,
+      layout->logical_blocks_per_row,
+      layout->padded_blocks_per_row,
+      scale_layout,
+      impl_->matmul_block_scales_data);
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  return true;
+}
+
 bool DeviceNvfp4Matrix::CopyPackedToHost(std::vector<std::uint8_t>* output) const {
   if (!valid() || output == nullptr) {
     return false;
@@ -394,91 +501,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
   const Nvfp4ScaleLayout scale_layout =
       ResolveActivationNvfp4ScaleLayout(rows, options.execution_scale_layout);
   auto packed = DeviceNvfp4Matrix::Create(rows, cols, scale_layout);
-  if (!packed || !packed->valid()) {
-    return nullptr;
-  }
-
-  const std::optional<float> fixed_tensor_scale = NormalizeFixedTensorScale(options);
-  if (options.fixed_tensor_scale.has_value() && !fixed_tensor_scale.has_value()) {
-    return nullptr;
-  }
-
-  if (fixed_tensor_scale.has_value()) {
-    const float host_tensor_scale = *fixed_tensor_scale;
-    if (!CheckCuda(
-            cudaMemcpy(
-                const_cast<std::uint8_t*>(packed->tensor_scale_data()),
-                &host_tensor_scale,
-                sizeof(host_tensor_scale),
-                cudaMemcpyHostToDevice))) {
-      return nullptr;
-    }
-    packed->impl_->host_tensor_scale = host_tensor_scale;
-  } else {
-    auto* tensor_scale_data =
-        reinterpret_cast<float*>(const_cast<std::uint8_t*>(packed->tensor_scale_data()));
-    auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
-    if (!CheckCuda(cudaMemset(global_max_bits, 0, packed->tensor_scale_nbytes()))) {
-      return nullptr;
-    }
-    const std::size_t numel = rows * cols;
-    constexpr std::size_t kThreadsPerBlock = 128;
-    const std::size_t reduction_grid_size = (numel + kThreadsPerBlock - 1u) / kThreadsPerBlock;
-    ComputeGlobalMaxAbsKernel<<<static_cast<unsigned int>(reduction_grid_size), kThreadsPerBlock>>>(
-        source.data(),
-        numel,
-        global_max_bits);
-    if (!CheckCuda(cudaGetLastError())) {
-      return nullptr;
-    }
-
-    WriteTensorScaleKernel<<<1, 1>>>(
-        global_max_bits,
-        tensor_scale_data);
-    if (!CheckCuda(cudaGetLastError())) {
-      return nullptr;
-    }
-    if (!CheckCuda(cudaMemcpy(
-            &packed->impl_->host_tensor_scale,
-            packed->tensor_scale_data(),
-            sizeof(float),
-            cudaMemcpyDeviceToHost))) {
-      return nullptr;
-    }
-  }
-
-  constexpr std::size_t kThreadsPerBlock = 128;
-  const std::size_t total_blocks = rows * (cols / kBlockWidth);
-  const std::size_t grid_size = (total_blocks + kThreadsPerBlock - 1u) / kThreadsPerBlock;
-  PackRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
-      source.data(),
-      rows,
-      cols,
-      reinterpret_cast<const float*>(packed->tensor_scale_data()),
-      const_cast<std::uint8_t*>(packed->packed_data()),
-      const_cast<std::uint8_t*>(packed->block_scales_data()));
-  if (!CheckCuda(cudaGetLastError())) {
-    return nullptr;
-  }
-
-  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols, scale_layout);
-  if (!layout.has_value()) {
-    return nullptr;
-  }
-  if (!CheckCuda(cudaMemset(
-          const_cast<std::uint8_t*>(packed->matmul_block_scales_data()),
-          0,
-          packed->matmul_block_scales_nbytes()))) {
-    return nullptr;
-  }
-  SwizzleBlockScalesForMatmulKernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
-      packed->block_scales_data(),
-      rows,
-      layout->logical_blocks_per_row,
-      layout->padded_blocks_per_row,
-      scale_layout,
-      const_cast<std::uint8_t*>(packed->matmul_block_scales_data()));
-  if (!CheckCuda(cudaGetLastError())) {
+  if (!packed || !packed->valid() || !packed->PackInto(source, options)) {
     return nullptr;
   }
 
