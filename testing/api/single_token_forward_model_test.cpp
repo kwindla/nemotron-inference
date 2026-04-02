@@ -153,10 +153,44 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
                 "ssm-state bytes should match the single Mamba layer footprint");
 }
 
+bool test_known_nano_config_matches_runtime_expectations() {
+  const SingleTokenForwardConfig config = nemotron::KnownNemotron3Nano30BA3BConfig();
+  return expect(config.hidden_size == 2688, "nano config should preserve hidden size") &&
+         expect(config.total_layer_count == 52, "nano config should preserve layer count") &&
+         expect(config.vocab_size == 131072, "nano config should preserve vocab size") &&
+         expect(config.max_tokens == 1, "nano config should stay single-token for Phase 1") &&
+         expect(config.attention_head_count == 32, "nano config should preserve attention head count") &&
+         expect(config.attention_kv_head_count == 2, "nano config should preserve KV head count") &&
+         expect(config.attention_head_dim == 128, "nano config should preserve attention head dim") &&
+         expect(config.mamba_num_heads == 64, "nano config should preserve Mamba head count") &&
+         expect(config.mamba_head_dim == 64, "nano config should preserve Mamba head dim") &&
+         expect(config.mamba_intermediate_size == config.mamba_num_heads * config.mamba_head_dim,
+                "nano config should use runtime Mamba inner width for intermediate size") &&
+         expect(config.mamba_state_size == 128, "nano config should preserve Mamba state size") &&
+         expect(config.mamba_n_groups == 8, "nano config should preserve Mamba group count") &&
+         expect(config.mamba_conv_kernel_size == 4, "nano config should preserve Mamba conv kernel size") &&
+         expect(config.moe_latent_size == 2688,
+                "nano config should use hidden-size routed outputs for direct MoE") &&
+         expect(config.routed_expert_intermediate_size == 1856,
+                "nano config should preserve routed expert width") &&
+         expect(config.shared_expert_intermediate_size == 3712,
+                "nano config should preserve shared expert width") &&
+         expect(config.n_routed_experts == 128, "nano config should preserve routed expert count") &&
+         expect(config.experts_per_token == 6, "nano config should preserve experts per token") &&
+         expect(config.expert_n_group == 1, "nano config should preserve router group count") &&
+         expect(config.expert_topk_group == 1, "nano config should preserve top-k group count") &&
+         expect(config.layer_norm_epsilon == 1.0e-5f, "nano config should preserve layer norm epsilon") &&
+         expect(config.mamba_time_step_min == 1.0e-3f, "nano config should preserve time step minimum") &&
+         expect(config.routed_scaling_factor == 2.5f,
+                "nano config should preserve routed scaling factor") &&
+         expect(config.norm_topk_prob, "nano config should preserve normalized top-k routing");
+}
+
 }  // namespace
 
 int main() {
-  const bool ok = test_single_token_forward_plan_tracks_layer_order_and_state_layout();
+  const bool ok = test_single_token_forward_plan_tracks_layer_order_and_state_layout() &&
+                  test_known_nano_config_matches_runtime_expectations();
   if (!ok) {
     return 1;
   }

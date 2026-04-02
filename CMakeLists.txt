@@ -10,7 +10,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 include(CTest)
 
 if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 121)
+  # Local Phase 1 bring-up targets GeForce RTX 5090 (CC 12.0 => CMake arch 120).
+  # GB10/DGX Spark-specific builds should override this explicitly to 121.
+  set(CMAKE_CUDA_ARCHITECTURES 120)
 endif()
 
 option(NEMOTRON_RUNTIME_ENABLE_PROBES "Build pre-implementation feasibility probes" ON)

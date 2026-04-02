@@ -25,6 +25,7 @@ The v1 cache design note is in [docs/v1_cache_architecture.md](/home/khkramer/sr
 The focused sub-plan for the first oracle-checked end-to-end forward path is in [docs/initial_forward_pass_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/initial_forward_pass_plan.md).
 The GB10 performance-planning note is in [docs/gb10_performance_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_performance_plan.md).
 The GB10 performance history log is in [docs/gb10_performance_progress.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_performance_progress.md).
+The Blackwell inference progress log is in [docs/blackwell_inference_progress.md](docs/blackwell_inference_progress.md).
 The short GB10 operator policy note is in [docs/gb10_execution_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_execution_policy.md).
 The provisional startup-residency note is in [docs/startup_residency_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/startup_residency_policy.md).
 
@@ -35,6 +36,24 @@ Configure and build the current runtime libraries, tests, and probes:
 ```bash
 cmake -S . -B build
 cmake --build build -j
+```
+
+The default local build target is now GeForce RTX 5090 / Blackwell consumer (`CMAKE_CUDA_ARCHITECTURES=120`).
+Use `-DCMAKE_CUDA_ARCHITECTURES=121` explicitly for GB10 / DGX Spark builds.
+
+Generate a local Nano manifest for RTX 5090:
+
+```bash
+./tools/manifest/generate_forward_manifest_rtx5090_nano.sh
+```
+
+That wrapper expects the Nano checkpoint under
+`artifacts/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` by default.
+
+Generate the existing GB10-oriented manifest explicitly:
+
+```bash
+./tools/manifest/generate_forward_manifest.sh
 ```
 
 Run the current C++ tests:

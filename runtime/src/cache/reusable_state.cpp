@@ -1,9 +1,23 @@
 #include "nemotron/reusable_state.h"
 
+#include <cuda_runtime.h>
+
 #include <unordered_map>
 #include <utility>
 
 namespace nemotron {
+namespace {
+
+bool CheckCuda(cudaError_t status) {
+  return status == cudaSuccess;
+}
+
+bool HasCudaDevice() {
+  int device_count = 0;
+  return CheckCuda(cudaGetDeviceCount(&device_count)) && device_count > 0;
+}
+
+}  // namespace
 
 struct ReusableStateArena::Impl {
   struct StateAllocation {
@@ -12,6 +26,7 @@ struct ReusableStateArena::Impl {
     std::string label;
     std::size_t bytes = 0;
     std::size_t ref_count = 0;
+    void* device_ptr = nullptr;
   };
 
   ReusableStateId next_id = 1;
@@ -51,12 +66,24 @@ ReusableStateHandle ReusableStateArena::Allocate(
   handle.kind = kind;
   handle.bytes = bytes;
 
+  void* device_ptr = nullptr;
+  if (HasCudaDevice()) {
+    if (!CheckCuda(cudaMalloc(&device_ptr, bytes))) {
+      return {};
+    }
+    if (!CheckCuda(cudaMemset(device_ptr, 0, bytes))) {
+      cudaFree(device_ptr);
+      return {};
+    }
+  }
+
   impl_->allocations.emplace(handle.id, Impl::StateAllocation{
                                         handle.id,
                                         kind,
                                         label,
                                         bytes,
                                         1,
+                                        device_ptr,
                                     });
   impl_->current_bytes += bytes;
   return handle;
@@ -135,6 +162,9 @@ void ReusableStateArena::Release(const ReusableStateHandle& handle) {
 
   --it->second.ref_count;
   if (it->second.ref_count == 0) {
+    if (it->second.device_ptr != nullptr) {
+      cudaFree(it->second.device_ptr);
+    }
     impl_->current_bytes -= it->second.bytes;
     impl_->allocations.erase(it);
   }
@@ -143,6 +173,44 @@ void ReusableStateArena::Release(const ReusableStateHandle& handle) {
 void ReusableStateArena::Release(const ReusableStateDescriptor& descriptor) {
   Release(descriptor.kv_state);
   Release(descriptor.mamba_state);
+}
+
+bool ReusableStateArena::CopyFromDevice(
+    const ReusableStateHandle& handle,
+    std::size_t offset_bytes,
+    const void* device_src,
+    std::size_t bytes) {
+  if (!handle.valid() || device_src == nullptr || bytes == 0 || offset_bytes + bytes > handle.bytes) {
+    return false;
+  }
+  auto it = impl_->allocations.find(handle.id);
+  if (it == impl_->allocations.end() ||
+      it->second.kind != handle.kind ||
+      it->second.bytes != handle.bytes ||
+      it->second.device_ptr == nullptr) {
+    return false;
+  }
+  auto* device_dst = static_cast<std::byte*>(it->second.device_ptr) + offset_bytes;
+  return CheckCuda(cudaMemcpy(device_dst, device_src, bytes, cudaMemcpyDeviceToDevice));
+}
+
+bool ReusableStateArena::CopyToDevice(
+    const ReusableStateHandle& handle,
+    std::size_t offset_bytes,
+    void* device_dst,
+    std::size_t bytes) const {
+  if (!handle.valid() || device_dst == nullptr || bytes == 0 || offset_bytes + bytes > handle.bytes) {
+    return false;
+  }
+  auto it = impl_->allocations.find(handle.id);
+  if (it == impl_->allocations.end() ||
+      it->second.kind != handle.kind ||
+      it->second.bytes != handle.bytes ||
+      it->second.device_ptr == nullptr) {
+    return false;
+  }
+  const auto* device_src = static_cast<const std::byte*>(it->second.device_ptr) + offset_bytes;
+  return CheckCuda(cudaMemcpy(device_dst, device_src, bytes, cudaMemcpyDeviceToDevice));
 }
 
 std::optional<ReusableStateView> ReusableStateArena::Describe(ReusableStateId id) const {
@@ -156,6 +224,7 @@ std::optional<ReusableStateView> ReusableStateArena::Describe(ReusableStateId id
       it->second.label,
       it->second.bytes,
       it->second.ref_count,
+      it->second.device_ptr != nullptr,
   };
 }
 

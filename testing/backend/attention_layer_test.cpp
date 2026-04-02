@@ -287,9 +287,23 @@ bool test_attention_layer_slice_matches_cpu_reference() {
   if (!expect(input->CopyFromHost(input_host.data(), input_host.size()), "input upload should succeed")) {
     return false;
   }
+  if (!expect(
+          request_context->EnsureAttentionTokens(kTokens),
+          "request context should reserve KV pages for the prefill token window")) {
+    return false;
+  }
 
   GemmHeuristicCache heuristic_cache;
-  if (!expect(slice->Run(*cublas, *cudnn, &heuristic_cache, *request_context, *input, output.get()),
+  if (!expect(
+          slice->Run(
+              *cublas,
+              *cudnn,
+              &heuristic_cache,
+              *request_context,
+              0,
+              kTokens,
+              *input,
+              output.get()),
               "attention slice should execute successfully")) {
     return false;
   }
@@ -312,10 +326,209 @@ bool test_attention_layer_slice_matches_cpu_reference() {
   return expect(nearly_equal(actual, expected, 2e-2f), "attention slice should match CPU reference");
 }
 
+bool test_attention_layer_slice_continues_from_existing_prefix() {
+  const auto cublas = CublasLtHandle::Create();
+  const auto cudnn = CudnnHandle::Create();
+  if (!cublas || !cublas->valid() || !cudnn) {
+    std::cout << "attention_layer_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  constexpr std::size_t kHidden = 128;
+  constexpr std::size_t kQueryHeads = 2;
+  constexpr std::size_t kKvHeads = 2;
+  constexpr std::size_t kHeadDim = 64;
+  constexpr std::size_t kPrefixTokens = 2;
+  constexpr std::size_t kDecodeTokens = 1;
+  constexpr std::size_t kTotalTokens = kPrefixTokens + kDecodeTokens;
+  constexpr float kEpsilon = 1e-5f;
+
+  std::vector<float> norm_weight_host(kHidden, 1.0f);
+  AlignedHostArray<float> q_weight(kHidden * kHidden);
+  AlignedHostArray<float> k_weight(kHidden * kHidden);
+  AlignedHostArray<float> v_weight(kHidden * kHidden);
+  AlignedHostArray<float> o_weight(kHidden * kHidden);
+  if (!q_weight.valid() || !k_weight.valid() || !v_weight.valid() || !o_weight.valid()) {
+    std::cout << "attention_layer_test: SKIP (aligned host allocation failed)\n";
+    return true;
+  }
+  std::fill(q_weight.data(), q_weight.data() + q_weight.count(), 0.0f);
+  std::fill(k_weight.data(), k_weight.data() + k_weight.count(), 0.0f);
+  std::fill(v_weight.data(), v_weight.data() + v_weight.count(), 0.0f);
+  std::fill(o_weight.data(), o_weight.data() + o_weight.count(), 0.0f);
+  for (std::size_t i = 0; i < kHidden; ++i) {
+    q_weight.data()[i * kHidden + i] = 1.0f;
+    k_weight.data()[i * kHidden + i] = 1.0f;
+    v_weight.data()[i * kHidden + i] = 1.0f;
+    o_weight.data()[i * kHidden + i] = 1.0f;
+  }
+
+  AttentionLayerBindings bindings;
+  const auto norm_descriptor = make_norm_descriptor(norm_weight_host);
+  const auto q_descriptor = make_dense_descriptor("layers.0.self_attn.q_proj.weight", q_weight, kHidden, kHidden);
+  const auto k_descriptor = make_dense_descriptor("layers.0.self_attn.k_proj.weight", k_weight, kHidden, kHidden);
+  const auto v_descriptor = make_dense_descriptor("layers.0.self_attn.v_proj.weight", v_weight, kHidden, kHidden);
+  const auto o_descriptor = make_dense_descriptor("layers.0.self_attn.o_proj.weight", o_weight, kHidden, kHidden);
+  bindings.norm_weight = &norm_descriptor;
+  bindings.q_proj = &q_descriptor;
+  bindings.k_proj = &k_descriptor;
+  bindings.v_proj = &v_descriptor;
+  bindings.o_proj = &o_descriptor;
+
+  AttentionLayerConfig layer_config;
+  layer_config.layer_index = 0;
+  layer_config.hidden_size = kHidden;
+  layer_config.query_head_count = kQueryHeads;
+  layer_config.kv_head_count = kKvHeads;
+  layer_config.head_dim = kHeadDim;
+  layer_config.rms_epsilon = kEpsilon;
+
+  auto slice = AttentionLayerSlice::Create(layer_config, bindings);
+  if (!expect(slice != nullptr && slice->valid(), "attention slice should build for continuation test")) {
+    return false;
+  }
+
+  RequestExecutionConfig request_config;
+  request_config.hidden_size = kHidden;
+  request_config.max_tokens = 4;
+  request_config.scratch_tokens = 4;
+  request_config.attention_kv_cache = AttentionKvCacheConfig{
+      1,
+      kKvHeads,
+      kHeadDim,
+      16,
+      KvCacheDataType::kBf16,
+  };
+  request_config.attention_total_pages = 4;
+  auto request_context = RequestExecutionContext::Create(request_config);
+  if (!expect(request_context != nullptr && request_context->valid(), "continuation request context should build")) {
+    return false;
+  }
+
+  std::vector<float> input_host(kTotalTokens * kHidden, 0.0f);
+  for (std::size_t token = 0; token < kTotalTokens; ++token) {
+    for (std::size_t dim = 0; dim < kHidden; ++dim) {
+      const float base = static_cast<float>((token + 2) * ((dim % 19) - 9));
+      input_host[token * kHidden + dim] = base / 11.0f;
+    }
+  }
+  const std::vector<float> prefix_host(
+      input_host.begin(),
+      input_host.begin() + static_cast<std::ptrdiff_t>(kPrefixTokens * kHidden));
+  const std::vector<float> decode_host(
+      input_host.begin() + static_cast<std::ptrdiff_t>(kPrefixTokens * kHidden),
+      input_host.end());
+
+  auto prefix_input = DeviceTensorFp32::Create({kPrefixTokens, kHidden});
+  auto prefix_output = DeviceTensorFp32::Create({kPrefixTokens, kHidden});
+  auto decode_input = DeviceTensorFp32::Create({kDecodeTokens, kHidden});
+  auto decode_output = DeviceTensorFp32::Create({kDecodeTokens, kHidden});
+  if (!prefix_input || !prefix_output || !decode_input || !decode_output) {
+    std::cout << "attention_layer_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+  if (!expect(prefix_input->CopyFromHost(prefix_host.data(), prefix_host.size()), "prefix input upload should succeed") ||
+      !expect(decode_input->CopyFromHost(decode_host.data(), decode_host.size()), "decode input upload should succeed")) {
+    return false;
+  }
+
+  GemmHeuristicCache heuristic_cache;
+  if (!expect(
+          request_context->EnsureAttentionTokens(kPrefixTokens),
+          "request context should reserve KV pages for the prefix")) {
+    return false;
+  }
+  if (!expect(
+          slice->Run(
+              *cublas,
+              *cudnn,
+              &heuristic_cache,
+              *request_context,
+              0,
+              kPrefixTokens,
+              *prefix_input,
+              prefix_output.get()),
+          "prefix attention pass should succeed")) {
+    return false;
+  }
+  if (!expect(
+          request_context->SetSequenceLength(kPrefixTokens),
+          "prefix pass should commit sequence length")) {
+    return false;
+  }
+  if (!expect(
+          request_context->EnsureAttentionTokens(kTotalTokens),
+          "request context should reserve KV pages for the appended decode token")) {
+    return false;
+  }
+  if (!expect(
+          slice->Run(
+              *cublas,
+              *cudnn,
+              &heuristic_cache,
+              *request_context,
+              kPrefixTokens,
+              kTotalTokens,
+              *decode_input,
+              decode_output.get()),
+          "decode continuation pass should succeed")) {
+    return false;
+  }
+  if (!expect(
+          request_context->AdvanceDecodePosition(kDecodeTokens),
+          "decode continuation should advance request positions")) {
+    return false;
+  }
+
+  const std::vector<float> normed = cpu_rms_norm(input_host, norm_weight_host, kTotalTokens, kHidden, kEpsilon);
+  const std::vector<float> q_cpu = cpu_matmul_row_major(
+      normed,
+      std::vector<float>(q_weight.data(), q_weight.data() + q_weight.count()),
+      kTotalTokens,
+      kHidden,
+      kHidden);
+  const std::vector<float> k_cpu = cpu_matmul_row_major(
+      normed,
+      std::vector<float>(k_weight.data(), k_weight.data() + k_weight.count()),
+      kTotalTokens,
+      kHidden,
+      kHidden);
+  const std::vector<float> v_cpu = cpu_matmul_row_major(
+      normed,
+      std::vector<float>(v_weight.data(), v_weight.data() + v_weight.count()),
+      kTotalTokens,
+      kHidden,
+      kHidden);
+  const std::vector<float> attention_cpu =
+      cpu_attention(q_cpu, k_cpu, v_cpu, kTotalTokens, kQueryHeads, kKvHeads, kHeadDim);
+  const std::vector<float> projected_cpu = cpu_matmul_row_major(
+      attention_cpu,
+      std::vector<float>(o_weight.data(), o_weight.data() + o_weight.count()),
+      kTotalTokens,
+      kHidden,
+      kHidden);
+  std::vector<float> expected_decode(kDecodeTokens * kHidden, 0.0f);
+  for (std::size_t i = 0; i < expected_decode.size(); ++i) {
+    expected_decode[i] =
+        decode_host[i] + projected_cpu[(kPrefixTokens * kHidden) + i];
+  }
+
+  std::vector<float> actual_decode(expected_decode.size(), 0.0f);
+  if (!expect(
+          decode_output->CopyToHost(actual_decode.data(), actual_decode.size()),
+          "decode continuation output download should succeed")) {
+    return false;
+  }
+  return expect(
+      nearly_equal(actual_decode, expected_decode, 2e-2f),
+      "attention continuation should match the CPU decode reference");
+}
+
 }  // namespace
 
 int main() {
-  if (!test_attention_layer_slice_matches_cpu_reference()) {
+  if (!test_attention_layer_slice_matches_cpu_reference() ||
+      !test_attention_layer_slice_continues_from_existing_prefix()) {
     return 1;
   }
   std::cout << "attention_layer_test: PASS\n";

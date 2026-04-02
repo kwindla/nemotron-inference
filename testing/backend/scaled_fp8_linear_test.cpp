@@ -45,13 +45,13 @@ std::vector<float> cpu_reference(
   std::vector<float> output(rows * output_rows, 0.0f);
   for (std::size_t row = 0; row < rows; ++row) {
     for (std::size_t out = 0; out < output_rows; ++out) {
-      float accum = 0.0f;
+      double accum = 0.0;
       for (std::size_t col = 0; col < input_cols; ++col) {
         const float quantized_input = decode_fp8(encode_fp8(activations[row * input_cols + col] / input_scale)) * input_scale;
         const float weight = decode_fp8(weight_fp8[out * input_cols + col]) * weight_scale;
-        accum += quantized_input * weight;
+        accum += static_cast<double>(quantized_input) * static_cast<double>(weight);
       }
-      output[row * output_rows + out] = accum;
+      output[row * output_rows + out] = static_cast<float>(accum);
     }
   }
   return output;

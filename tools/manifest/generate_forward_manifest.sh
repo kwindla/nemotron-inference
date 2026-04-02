@@ -7,6 +7,8 @@ OUTPUT_MANIFEST=${OUTPUT_MANIFEST:-${ROOT_DIR}/artifacts/manifests/forward_runti
 SOURCE_REVISION=${SOURCE_REVISION:-b1ffe4992d7db6d768453a551a656b8d12c638fb}
 TOKENIZER_REVISION=${TOKENIZER_REVISION:-${SOURCE_REVISION}}
 PACKER_VERSION=${PACKER_VERSION:-forward-manifest-v1-dev}
+GPU_FAMILY=${GPU_FAMILY:-GB10}
+COMPUTE_CAPABILITY=${COMPUTE_CAPABILITY:-12.1}
 
 ARGS=(
   --model-dir "${MODEL_DIR}"
@@ -14,10 +16,14 @@ ARGS=(
   --source-revision "${SOURCE_REVISION}"
   --tokenizer-revision "${TOKENIZER_REVISION}"
   --packer-version "${PACKER_VERSION}"
+  --gpu-family "${GPU_FAMILY}"
+  --compute-capability "${COMPUTE_CAPABILITY}"
 )
 
 if [[ "${COMPUTE_CHECKSUMS:-0}" == "1" ]]; then
   ARGS+=(--compute-checksums)
 fi
+
+mkdir -p "$(dirname "${OUTPUT_MANIFEST}")"
 
 python3 "${ROOT_DIR}/tools/manifest/generate_forward_manifest.py" "${ARGS[@]}"

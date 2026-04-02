@@ -17,10 +17,13 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +41,56 @@ bool expect(bool condition, const std::string& message) {
     return false;
   }
   return true;
+}
+
+bool all_finite(const std::vector<float>& values) {
+  return std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+}
+
+std::optional<std::int32_t> argmax_token_id(const std::vector<float>& logits) {
+  if (logits.empty() || !all_finite(logits)) {
+    return std::nullopt;
+  }
+  const auto max_it = std::max_element(logits.begin(), logits.end());
+  if (max_it == logits.end()) {
+    return std::nullopt;
+  }
+  return static_cast<std::int32_t>(std::distance(logits.begin(), max_it));
+}
+
+float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+  if (lhs.size() != rhs.size()) {
+    return std::numeric_limits<float>::infinity();
+  }
+  float max_diff = 0.0f;
+  for (std::size_t i = 0; i < lhs.size(); ++i) {
+    max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
+  }
+  return max_diff;
+}
+
+std::vector<float> slice_row(
+    const std::vector<float>& values,
+    std::size_t row_index,
+    std::size_t row_width) {
+  if (row_width == 0) {
+    return {};
+  }
+  const std::size_t row_offset = row_index * row_width;
+  if (row_offset + row_width > values.size()) {
+    return {};
+  }
+  return std::vector<float>(
+      values.begin() + static_cast<std::ptrdiff_t>(row_offset),
+      values.begin() + static_cast<std::ptrdiff_t>(row_offset + row_width));
+}
+
+std::vector<float> copy_tensor_to_host(const nemotron::DeviceTensorFp32& tensor) {
+  std::vector<float> host(tensor.numel(), 0.0f);
+  if (!tensor.CopyToHost(host.data(), host.size())) {
+    return {};
+  }
+  return host;
 }
 
 void print_issues(
@@ -60,6 +113,22 @@ void print_issues(
 bool has_cuda_device() {
   int device_count = 0;
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
+
+bool should_build_forward_model() {
+  const char* build_model_env = std::getenv("NEMOTRON_FORWARD_BUILD_MODEL");
+  return build_model_env != nullptr && std::string(build_model_env) == "1";
+}
+
+std::optional<nemotron::SingleTokenForwardConfig> config_for_manifest(
+    const nemotron::PackedModelManifest& manifest) {
+  if (manifest.runtime.model_id == "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4") {
+    return nemotron::KnownNemotron3Nano30BA3BConfig();
+  }
+  if (manifest.runtime.model_id == "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4") {
+    return nemotron::KnownNemotron3Super120BA12BConfig();
+  }
+  return std::nullopt;
 }
 
 template <typename DescriptorT, typename LookupFn>
@@ -98,6 +167,206 @@ nemotron::RuntimeBootstrapOptions make_options() {
   options.verify_manifest_files = false;
   options.materialize_weight_arena = false;
   return options;
+}
+
+nemotron::SerializedPromptIdentity make_identity(
+    const std::vector<std::int32_t>& token_ids,
+    const std::string& model_id) {
+  nemotron::SerializedPromptIdentity identity;
+  identity.token_ids = token_ids;
+  identity.tenant_namespace = "smoke-tenant";
+  identity.tokenizer_revision = "smoke-tokenizer";
+  identity.serializer_revision = "smoke-serializer";
+  identity.model_revision = model_id;
+  return identity;
+}
+
+bool env_enabled(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  return value != nullptr && std::string(value) != "0";
+}
+
+std::optional<std::size_t> env_size_t(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  if (value == nullptr || *value == '\0') {
+    return std::nullopt;
+  }
+  try {
+    return static_cast<std::size_t>(std::stoull(value));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+struct SplitPrefillComparison {
+  std::vector<float> full_row;
+  std::vector<float> split_row;
+  bool request_state_match = false;
+};
+
+std::optional<SplitPrefillComparison> compare_split_prefill_rows(
+    const nemotron::SingleTokenForwardModel& model,
+    const std::vector<std::int32_t>& token_ids,
+    std::size_t reused_prefix_tokens,
+    const nemotron::SingleTokenForwardConfig& config,
+    std::optional<std::size_t> stop_layer_index = std::nullopt) {
+  if (reused_prefix_tokens == 0 || reused_prefix_tokens >= token_ids.size()) {
+    return std::nullopt;
+  }
+
+  const std::size_t suffix_tokens = token_ids.size() - reused_prefix_tokens;
+  auto full_context = model.CreateRequestContext();
+  auto split_context = model.CreateRequestContext();
+  if (full_context == nullptr || !full_context->valid() ||
+      split_context == nullptr || !split_context->valid()) {
+    return std::nullopt;
+  }
+
+  auto full_logits = nemotron::DeviceTensorFp32::Create({token_ids.size(), config.vocab_size});
+  auto prefix_logits = nemotron::DeviceTensorFp32::Create({reused_prefix_tokens, config.vocab_size});
+  auto suffix_logits = nemotron::DeviceTensorFp32::Create({suffix_tokens, config.vocab_size});
+  if (full_logits == nullptr || !full_logits->valid() ||
+      prefix_logits == nullptr || !prefix_logits->valid() ||
+      suffix_logits == nullptr || !suffix_logits->valid()) {
+    return std::nullopt;
+  }
+
+  nemotron::SingleTokenForwardTrace full_trace;
+  nemotron::SingleTokenForwardTrace split_trace;
+  const std::vector<std::size_t> capture_layer_indices =
+      stop_layer_index.has_value() ? std::vector<std::size_t>{*stop_layer_index} : std::vector<std::size_t>{};
+  nemotron::SingleTokenForwardTrace* full_trace_ptr =
+      stop_layer_index.has_value() ? &full_trace : nullptr;
+  nemotron::SingleTokenForwardTrace* split_trace_ptr =
+      stop_layer_index.has_value() ? &split_trace : nullptr;
+
+  if (!model.RunPrefill(
+          token_ids.data(),
+          token_ids.size(),
+          *full_context,
+          full_logits.get(),
+          capture_layer_indices,
+          full_trace_ptr,
+          stop_layer_index) ||
+      !model.RunPrefill(
+          token_ids.data(),
+          reused_prefix_tokens,
+          *split_context,
+          prefix_logits.get(),
+          {},
+          nullptr,
+          stop_layer_index) ||
+      !model.ContinuePrefill(
+          token_ids.data() + reused_prefix_tokens,
+          suffix_tokens,
+          *split_context,
+          suffix_logits.get(),
+          capture_layer_indices,
+          split_trace_ptr,
+          stop_layer_index)) {
+    return std::nullopt;
+  }
+
+  SplitPrefillComparison comparison;
+  comparison.request_state_match =
+      full_context->sequence_length() == split_context->sequence_length() &&
+      full_context->decode_position() == split_context->decode_position();
+
+  if (stop_layer_index.has_value()) {
+    if (full_trace.captured_layers.size() != 1 || split_trace.captured_layers.size() != 1) {
+      return std::nullopt;
+    }
+    comparison.full_row = slice_row(
+        full_trace.captured_layers.front().hidden,
+        token_ids.size() - 1,
+        config.hidden_size);
+    comparison.split_row = slice_row(
+        split_trace.captured_layers.front().hidden,
+        suffix_tokens - 1,
+        config.hidden_size);
+  } else {
+    const std::vector<float> full_host = copy_tensor_to_host(*full_logits);
+    const std::vector<float> split_host = copy_tensor_to_host(*suffix_logits);
+    comparison.full_row = slice_row(full_host, token_ids.size() - 1, config.vocab_size);
+    comparison.split_row = slice_row(split_host, suffix_tokens - 1, config.vocab_size);
+  }
+
+  if (comparison.full_row.empty() || comparison.split_row.empty()) {
+    return std::nullopt;
+  }
+  return comparison;
+}
+
+void maybe_print_first_split_prefill_divergent_layer(
+    const nemotron::SingleTokenForwardModel& model,
+    const std::vector<std::int32_t>& token_ids,
+    std::size_t reused_prefix_tokens,
+    const nemotron::SingleTokenForwardConfig& config) {
+  if (!env_enabled("NEMOTRON_FORWARD_TRACE_DIVERGENCE")) {
+    return;
+  }
+
+  const auto& layers = model.plan().layers;
+  if (layers.empty()) {
+    std::cerr << "split_prefill_diagnostic: model plan has no layers\n";
+    return;
+  }
+
+  std::size_t low = 0;
+  std::size_t high = layers.size() - 1;
+  std::optional<std::size_t> first_mismatch_index;
+  while (low <= high) {
+    const std::size_t mid = low + ((high - low) / 2u);
+    const auto comparison =
+        compare_split_prefill_rows(model, token_ids, reused_prefix_tokens, config, layers[mid].layer_index);
+    if (!comparison.has_value()) {
+      std::cerr << "split_prefill_diagnostic: comparison failed at layer_index="
+                << layers[mid].layer_index << "\n";
+      return;
+    }
+    const auto full_argmax = argmax_token_id(comparison->full_row);
+    const auto split_argmax = argmax_token_id(comparison->split_row);
+    const bool mismatch =
+        !comparison->request_state_match ||
+        !full_argmax.has_value() ||
+        !split_argmax.has_value() ||
+        *full_argmax != *split_argmax ||
+        max_abs_diff(comparison->full_row, comparison->split_row) > 1.0e-3f;
+    if (mismatch) {
+      first_mismatch_index = mid;
+      if (mid == 0) {
+        break;
+      }
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  if (!first_mismatch_index.has_value()) {
+    std::cerr << "split_prefill_diagnostic: no divergent layer found before final logits\n";
+    return;
+  }
+
+  const auto& entry = layers[*first_mismatch_index];
+  const auto comparison =
+      compare_split_prefill_rows(model, token_ids, reused_prefix_tokens, config, entry.layer_index);
+  if (!comparison.has_value()) {
+    std::cerr << "split_prefill_diagnostic: failed to reproduce divergence at layer_index="
+              << entry.layer_index << "\n";
+    return;
+  }
+  const auto full_argmax = argmax_token_id(comparison->full_row);
+  const auto split_argmax = argmax_token_id(comparison->split_row);
+  std::cerr << "split_prefill_diagnostic: first_divergent_layer_index=" << entry.layer_index
+            << " kind=" << static_cast<int>(entry.kind)
+            << " max_abs_diff=" << max_abs_diff(comparison->full_row, comparison->split_row)
+            << " request_state_match=" << comparison->request_state_match;
+  if (full_argmax.has_value() && split_argmax.has_value()) {
+    std::cerr << " full_argmax=" << *full_argmax
+              << " split_argmax=" << *split_argmax;
+  }
+  std::cerr << "\n";
 }
 
 bool run_full_forward_manifest_smoke() {
@@ -180,9 +449,19 @@ bool run_full_forward_manifest_smoke() {
   if (!expect(static_cast<bool>(environment), "runtime environment should build from the forward manifest")) {
     return false;
   }
+  if (!should_build_forward_model()) {
+    std::cout << "full_forward_manifest_smoke_test: PASS (runtime environment built)\n";
+    return true;
+  }
 
-  const nemotron::SingleTokenForwardConfig config =
-      nemotron::KnownNemotron3Super120BA12BConfig();
+  const auto config_opt = config_for_manifest(load_result.manifest);
+  if (!expect(config_opt.has_value(), "manifest smoke test requires a known runtime config")) {
+    std::cerr << "forward_model_debug: unsupported model_id="
+              << load_result.manifest.runtime.model_id << "\n";
+    return false;
+  }
+  nemotron::SingleTokenForwardConfig config = *config_opt;
+  config.max_tokens = std::max<std::size_t>(config.max_tokens, 6);
   auto model = nemotron::SingleTokenForwardModel::Create(*environment, config);
   if (!expect(model != nullptr && model->valid(), "forward model should build from the runtime environment")) {
     const auto plan = nemotron::BuildSingleTokenForwardPlan(*environment->model_schedule(), config);
@@ -282,24 +561,375 @@ bool run_full_forward_manifest_smoke() {
   }
 
   auto request_context = model->CreateRequestContext();
-  auto logits = nemotron::DeviceTensorFp32::Create({1, config.vocab_size});
-  if (!expect(request_context != nullptr && request_context->valid(), "request context should be creatable") ||
-      !expect(logits != nullptr && logits->valid(), "logits tensor should be creatable")) {
+  if (!expect(request_context != nullptr && request_context->valid(), "request context should be creatable")) {
     return false;
   }
 
-  if (!expect(model->RunSingleToken(0, *request_context, logits.get()), "single-token forward execution should succeed")) {
+  nemotron::GreedyDecodeConfig decode_config;
+  decode_config.max_new_tokens = 2;
+  decode_config.eos_token_ids = {2, 11};
+  nemotron::GreedyDecodeResult decode_result;
+  const std::int32_t prompt_token_ids[] = {1};
+  if (!expect(
+          model->RunGreedyDecode(
+              prompt_token_ids,
+              std::size(prompt_token_ids),
+              decode_config,
+              *request_context,
+              &decode_result),
+          "greedy decode loop should execute successfully")) {
     return false;
   }
-
-  std::vector<float> host_logits(logits->numel(), 0.0f);
-  if (!expect(logits->CopyToHost(host_logits.data(), host_logits.size()), "logits should copy back to host")) {
+  if (!expect(
+          !decode_result.generated_token_ids.empty(),
+          "greedy decode loop should emit at least one token when capacity permits")) {
     return false;
   }
-  for (float value : host_logits) {
-    if (!std::isfinite(value)) {
-      return expect(false, "logits should be finite");
+  if (!expect(
+          decode_result.generated_token_ids.size() <= decode_config.max_new_tokens,
+          "greedy decode loop should not exceed the requested decode budget")) {
+    return false;
+  }
+  if (!expect(
+          request_context->sequence_length() ==
+              (std::size(prompt_token_ids) + decode_result.generated_token_ids.size()),
+          "request sequence length should include the consumed generated tokens")) {
+    return false;
+  }
+  if (!expect(
+          request_context->decode_position() == request_context->sequence_length(),
+          "decode position should stay aligned with the committed sequence length")) {
+    return false;
+  }
+  if (!decode_result.hit_eos) {
+    if (!expect(
+            decode_result.generated_token_ids.size() == decode_config.max_new_tokens,
+            "non-EOS decode should run to the requested decode budget")) {
+      return false;
     }
+  } else {
+    const std::int32_t emitted_eos = decode_result.generated_token_ids.back();
+    if (!expect(
+            emitted_eos == 2 || emitted_eos == 11,
+            "EOS termination should use the configured Nano EOS ids")) {
+      return false;
+    }
+  }
+
+  auto turn1_context = model->CreateRequestContext();
+  auto turn2_cached_context = model->CreateRequestContext();
+  auto turn2_baseline_context = model->CreateRequestContext();
+  if (!expect(
+          turn1_context != nullptr && turn1_context->valid(),
+          "cached turn-1 request context should be creatable") ||
+      !expect(
+          turn2_cached_context != nullptr && turn2_cached_context->valid(),
+          "cached turn-2 request context should be creatable") ||
+      !expect(
+          turn2_baseline_context != nullptr && turn2_baseline_context->valid(),
+          "baseline turn-2 request context should be creatable")) {
+    return false;
+  }
+
+  const std::string conversation_id = "full-forward-manifest-smoke";
+  const auto turn1_identity =
+      make_identity(std::vector<std::int32_t>{std::begin(prompt_token_ids), std::end(prompt_token_ids)},
+                    load_result.manifest.runtime.model_id);
+  nemotron::GreedyDecodeConfig turn_decode_config;
+  turn_decode_config.max_new_tokens = 1;
+  turn_decode_config.eos_token_ids = {2, 11};
+  nemotron::GreedyDecodeResult turn1_result;
+  std::size_t turn1_match = 0;
+  if (!expect(
+          model->RunGreedyConversationTurn(
+              turn1_identity,
+              conversation_id,
+              turn_decode_config,
+              *turn1_context,
+              &turn1_result,
+              &turn1_match),
+          "cached turn-1 execution should succeed")) {
+    return false;
+  }
+  if (!expect(
+          turn1_match == 0,
+          "turn-1 execution should cold-start without a reusable committed head") ||
+      !expect(
+          turn1_result.generated_token_ids.size() == 1,
+          "turn-1 execution should emit one token for the follow-up turn")) {
+    return false;
+  }
+  const auto turn1_prompt_head = environment->prefix_cache().PromptHeadForConversation(conversation_id);
+  const auto turn1_committed_head = environment->prefix_cache().CommittedHeadForConversation(conversation_id);
+  if (!expect(
+          turn1_prompt_head.has_value() && turn1_committed_head.has_value(),
+          "turn-1 execution should publish prompt and committed conversation heads")) {
+    return false;
+  }
+
+  auto turn2_identity = turn1_identity;
+  turn2_identity.token_ids.insert(
+      turn2_identity.token_ids.end(),
+      turn1_result.generated_token_ids.begin(),
+      turn1_result.generated_token_ids.end());
+  turn2_identity.token_ids.push_back(17);
+  const std::size_t turn2_reused_prefix_tokens =
+      turn1_identity.token_ids.size() + turn1_result.generated_token_ids.size();
+  const std::size_t turn2_suffix_tokens =
+      turn2_identity.token_ids.size() - turn2_reused_prefix_tokens;
+  if (const auto stop_layer_index = env_size_t("NEMOTRON_FORWARD_COMPARE_SPLIT_PREFILL_LAYER");
+      stop_layer_index.has_value()) {
+    const bool activate_fused_moe_compare = env_enabled("NEMOTRON_FORWARD_COMPARE_FUSED_MOE");
+    const bool activate_device_attention_compare = env_enabled("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION");
+    const bool activate_fused_mamba_compare = env_enabled("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA");
+    if (activate_fused_moe_compare) {
+      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MOE_ACTIVE", "1", 1);
+    }
+    if (activate_device_attention_compare) {
+      setenv("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION_ACTIVE", "1", 1);
+    }
+    if (activate_fused_mamba_compare) {
+      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA_ACTIVE", "1", 1);
+    }
+    const auto comparison = compare_split_prefill_rows(
+        *model,
+        turn2_identity.token_ids,
+        turn2_reused_prefix_tokens,
+        config,
+        *stop_layer_index);
+    if (activate_fused_moe_compare) {
+      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MOE_ACTIVE", "0", 1);
+    }
+    if (activate_device_attention_compare) {
+      setenv("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION_ACTIVE", "0", 1);
+    }
+    if (activate_fused_mamba_compare) {
+      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA_ACTIVE", "0", 1);
+    }
+    if (!expect(
+            comparison.has_value(),
+            "targeted split-prefill layer comparison should succeed")) {
+      return false;
+    }
+    const auto full_argmax = argmax_token_id(comparison->full_row);
+    const auto split_argmax = argmax_token_id(comparison->split_row);
+    std::cout << "targeted_split_prefill: layer_index=" << *stop_layer_index
+              << " max_abs_diff=" << max_abs_diff(comparison->full_row, comparison->split_row)
+              << " request_state_match=" << comparison->request_state_match;
+    if (full_argmax.has_value()) {
+      std::cout << " full_argmax=" << *full_argmax;
+    }
+    if (split_argmax.has_value()) {
+      std::cout << " split_argmax=" << *split_argmax;
+    }
+    if (!comparison->full_row.empty() && !comparison->split_row.empty()) {
+      std::cout << " full0=" << comparison->full_row.front()
+                << " split0=" << comparison->split_row.front();
+    }
+    std::cout << "\n";
+    return full_argmax.has_value() &&
+           split_argmax.has_value() &&
+           *full_argmax == *split_argmax &&
+           max_abs_diff(comparison->full_row, comparison->split_row) <= 1.0e-3f &&
+           comparison->request_state_match;
+  }
+  auto turn2_full_prefill_context = model->CreateRequestContext();
+  auto turn2_split_prefill_context = model->CreateRequestContext();
+  if (!expect(
+          turn2_full_prefill_context != nullptr && turn2_full_prefill_context->valid(),
+          "turn-2 full-prefill request context should be creatable") ||
+      !expect(
+          turn2_split_prefill_context != nullptr && turn2_split_prefill_context->valid(),
+          "turn-2 split-prefill request context should be creatable")) {
+    return false;
+  }
+  auto turn2_full_prefill_logits =
+      nemotron::DeviceTensorFp32::Create({turn2_identity.token_ids.size(), config.vocab_size});
+  auto turn2_prefix_prefill_logits =
+      nemotron::DeviceTensorFp32::Create({turn2_reused_prefix_tokens, config.vocab_size});
+  auto turn2_suffix_prefill_logits =
+      nemotron::DeviceTensorFp32::Create({turn2_suffix_tokens, config.vocab_size});
+  if (!expect(
+          turn2_full_prefill_logits != nullptr && turn2_full_prefill_logits->valid(),
+          "turn-2 full-prefill logits buffer should allocate") ||
+      !expect(
+          turn2_prefix_prefill_logits != nullptr && turn2_prefix_prefill_logits->valid(),
+          "turn-2 prefix-prefill logits buffer should allocate") ||
+      !expect(
+          turn2_suffix_prefill_logits != nullptr && turn2_suffix_prefill_logits->valid(),
+          "turn-2 suffix-prefill logits buffer should allocate")) {
+    return false;
+  }
+  if (!expect(
+          model->RunPrefill(
+              turn2_identity.token_ids.data(),
+              turn2_identity.token_ids.size(),
+              *turn2_full_prefill_context,
+              turn2_full_prefill_logits.get()),
+          "turn-2 full prefill should succeed") ||
+      !expect(
+          model->RunPrefill(
+              turn2_identity.token_ids.data(),
+              turn2_reused_prefix_tokens,
+              *turn2_split_prefill_context,
+              turn2_prefix_prefill_logits.get()),
+          "turn-2 reused-prefix prefill should succeed") ||
+      !expect(
+          model->ContinuePrefill(
+              turn2_identity.token_ids.data() + turn2_reused_prefix_tokens,
+              turn2_suffix_tokens,
+              *turn2_split_prefill_context,
+              turn2_suffix_prefill_logits.get()),
+          "turn-2 suffix continuation prefill should succeed")) {
+    return false;
+  }
+  const std::vector<float> turn2_full_prefill_host = copy_tensor_to_host(*turn2_full_prefill_logits);
+  const std::vector<float> turn2_suffix_prefill_host = copy_tensor_to_host(*turn2_suffix_prefill_logits);
+  if (!expect(
+          all_finite(turn2_full_prefill_host) && all_finite(turn2_suffix_prefill_host),
+          "turn-2 prefill logits should stay finite")) {
+    return false;
+  }
+  const std::vector<float> turn2_full_last_row =
+      slice_row(turn2_full_prefill_host, turn2_identity.token_ids.size() - 1, config.vocab_size);
+  const std::vector<float> turn2_suffix_last_row =
+      slice_row(turn2_suffix_prefill_host, turn2_suffix_tokens - 1, config.vocab_size);
+  const auto turn2_full_argmax = argmax_token_id(turn2_full_last_row);
+  const auto turn2_suffix_argmax = argmax_token_id(turn2_suffix_last_row);
+  const bool turn2_split_prefill_ok =
+      expect(
+          !turn2_full_last_row.empty() && !turn2_suffix_last_row.empty(),
+          "turn-2 prefill row slicing should succeed") &&
+      expect(
+          turn2_full_argmax.has_value() && turn2_suffix_argmax.has_value(),
+          "turn-2 prefill argmax selection should succeed") &&
+      expect(
+          *turn2_full_argmax == *turn2_suffix_argmax,
+          "turn-2 full-prefill and split-prefill next-token argmax should match") &&
+      expect(
+          max_abs_diff(turn2_full_last_row, turn2_suffix_last_row) <= 1.0e-3f,
+          "turn-2 full-prefill and split-prefill logits should match within tolerance") &&
+      expect(
+          turn2_full_prefill_context->sequence_length() == turn2_split_prefill_context->sequence_length() &&
+              turn2_full_prefill_context->decode_position() == turn2_split_prefill_context->decode_position(),
+          "turn-2 full-prefill and split-prefill request state should match");
+  if (!turn2_split_prefill_ok) {
+    maybe_print_first_split_prefill_divergent_layer(
+        *model,
+        turn2_identity.token_ids,
+        turn2_reused_prefix_tokens,
+        config);
+    return false;
+  }
+  nemotron::GreedyDecodeResult turn2_cached_result;
+  nemotron::GreedyDecodeResult turn2_baseline_result;
+  std::size_t turn2_match = 0;
+  if (!expect(
+          model->RunGreedyConversationTurn(
+              turn2_identity,
+              conversation_id,
+              turn_decode_config,
+              *turn2_cached_context,
+              &turn2_cached_result,
+              &turn2_match),
+          "cached turn-2 execution should succeed") ||
+      !expect(
+          model->RunGreedyDecode(
+              turn2_identity.token_ids.data(),
+              turn2_identity.token_ids.size(),
+              turn_decode_config,
+              *turn2_baseline_context,
+              &turn2_baseline_result),
+          "baseline turn-2 execution should succeed")) {
+    return false;
+  }
+  if (!expect(
+          turn2_match == turn2_reused_prefix_tokens,
+          "turn-2 execution should reuse the committed head from turn 1") ||
+      !expect(
+          turn2_cached_result.generated_token_ids == turn2_baseline_result.generated_token_ids,
+          "cached turn-2 decode should match the baseline decode tokens") ||
+      !expect(
+          turn2_cached_result.hit_eos == turn2_baseline_result.hit_eos &&
+              turn2_cached_result.hit_capacity_limit == turn2_baseline_result.hit_capacity_limit,
+          "cached turn-2 stop conditions should match the baseline decode path") ||
+      !expect(
+          turn2_cached_context->sequence_length() == turn2_baseline_context->sequence_length() &&
+              turn2_cached_context->decode_position() == turn2_baseline_context->decode_position(),
+          "cached turn-2 request state should match the baseline decode state")) {
+    return false;
+  }
+  const auto turn2_prompt_head = environment->prefix_cache().PromptHeadForConversation(conversation_id);
+  const auto turn2_committed_head = environment->prefix_cache().CommittedHeadForConversation(conversation_id);
+  if (!expect(
+          turn2_prompt_head.has_value() && turn2_committed_head.has_value(),
+          "turn-2 execution should republish prompt and committed heads")) {
+    return false;
+  }
+  const auto turn2_prompt_view = environment->prefix_cache().Describe(*turn2_prompt_head);
+  const auto turn2_committed_view = environment->prefix_cache().Describe(*turn2_committed_head);
+  if (!expect(
+          turn2_prompt_view.has_value() &&
+              turn2_prompt_view->identity.token_ids == turn2_identity.token_ids,
+          "turn-2 prompt head should track the full prompt identity") ||
+      !expect(
+          turn2_committed_view.has_value() &&
+              turn2_committed_view->has_boundary_logits &&
+              turn2_committed_view->boundary_logits_count == config.vocab_size &&
+              turn2_committed_view->identity.token_ids.size() ==
+                  turn2_identity.token_ids.size() + turn2_cached_result.generated_token_ids.size(),
+          "turn-2 committed head should extend the prompt with generated tokens")) {
+    return false;
+  }
+
+  auto turn3_cached_context = model->CreateRequestContext();
+  auto turn3_baseline_context = model->CreateRequestContext();
+  if (!expect(
+          turn3_cached_context != nullptr && turn3_cached_context->valid(),
+          "cached turn-3 request context should be creatable") ||
+      !expect(
+          turn3_baseline_context != nullptr && turn3_baseline_context->valid(),
+          "baseline turn-3 request context should be creatable")) {
+    return false;
+  }
+  const auto turn3_identity = turn2_committed_view->identity;
+  nemotron::GreedyDecodeResult turn3_cached_result;
+  nemotron::GreedyDecodeResult turn3_baseline_result;
+  std::size_t turn3_match = 0;
+  if (!expect(
+          model->RunGreedyConversationTurn(
+              turn3_identity,
+              conversation_id,
+              turn_decode_config,
+              *turn3_cached_context,
+              &turn3_cached_result,
+              &turn3_match),
+          "cached turn-3 exact-hit execution should succeed") ||
+      !expect(
+          model->RunGreedyDecode(
+              turn3_identity.token_ids.data(),
+              turn3_identity.token_ids.size(),
+              turn_decode_config,
+              *turn3_baseline_context,
+              &turn3_baseline_result),
+          "baseline turn-3 exact-hit execution should succeed")) {
+    return false;
+  }
+  if (!expect(
+          turn3_match == turn3_identity.token_ids.size(),
+          "turn-3 execution should reuse the exact committed head without prompt replay") ||
+      !expect(
+          turn3_cached_result.generated_token_ids == turn3_baseline_result.generated_token_ids,
+          "cached turn-3 decode should match the baseline decode tokens") ||
+      !expect(
+          turn3_cached_result.hit_eos == turn3_baseline_result.hit_eos &&
+              turn3_cached_result.hit_capacity_limit == turn3_baseline_result.hit_capacity_limit,
+          "cached turn-3 stop conditions should match the baseline decode path") ||
+      !expect(
+          turn3_cached_context->sequence_length() == turn3_baseline_context->sequence_length() &&
+              turn3_cached_context->decode_position() == turn3_baseline_context->decode_position(),
+          "cached turn-3 request state should match the baseline decode state")) {
+    return false;
   }
   return true;
 }

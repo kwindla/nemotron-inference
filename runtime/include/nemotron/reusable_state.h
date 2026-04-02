@@ -48,6 +48,7 @@ struct ReusableStateView {
   std::string label;
   std::size_t bytes = 0;
   std::size_t ref_count = 0;
+  bool has_device_storage = false;
 };
 
 class ReusableStateArena {
@@ -74,6 +75,17 @@ class ReusableStateArena {
   bool Retain(const ReusableStateDescriptor& descriptor);
   void Release(const ReusableStateHandle& handle);
   void Release(const ReusableStateDescriptor& descriptor);
+
+  bool CopyFromDevice(
+      const ReusableStateHandle& handle,
+      std::size_t offset_bytes,
+      const void* device_src,
+      std::size_t bytes);
+  bool CopyToDevice(
+      const ReusableStateHandle& handle,
+      std::size_t offset_bytes,
+      void* device_dst,
+      std::size_t bytes) const;
 
   std::optional<ReusableStateView> Describe(ReusableStateId id) const;
   std::size_t current_bytes() const;

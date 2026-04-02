@@ -1,0 +1,7 @@
+add_executable(
+  nano_fused_decode_bench
+  nano_fused_decode_bench.cpp
+)
+
+target_link_libraries(nano_fused_decode_bench PRIVATE nemotron_runtime_api)
+target_compile_features(nano_fused_decode_bench PRIVATE cxx_std_17)

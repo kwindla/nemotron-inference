@@ -8,6 +8,8 @@ from typing import Any
 
 
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+DEFAULT_GPU_FAMILY = "RTX5090"
+DEFAULT_COMPUTE_CAPABILITY = "12.0"
 DEFAULT_SOURCE_REVISION = "b1ffe4992d7db6d768453a551a656b8d12c638fb"
 DEFAULT_TOKENIZER_REVISION = DEFAULT_SOURCE_REVISION
 CHECKSUM_PLACEHOLDER = "fnv1a64:0000000000000000"
@@ -64,6 +66,9 @@ EXPERT_STANDALONE_SUFFIXES = {
 }
 
 NVFP4_WEIGHT_SUFFIXES = {
+    "mixer.in_proj.weight",
+    "mixer.out_proj.weight",
+    "mixer.shared_experts.up_proj.weight",
     "mixer.shared_experts.down_proj.weight",
 }
 
@@ -78,8 +83,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-revision", default="")
     parser.add_argument("--tokenizer-revision", default="")
     parser.add_argument("--packer-version", default="forward-manifest-v1-dev")
-    parser.add_argument("--gpu-family", default="GB10")
-    parser.add_argument("--compute-capability", default="12.1")
+    parser.add_argument(
+        "--gpu-family",
+        default=DEFAULT_GPU_FAMILY,
+        help=(
+            "Target GPU family label stored in manifest target_platform. "
+            f"Default: {DEFAULT_GPU_FAMILY}."
+        ),
+    )
+    parser.add_argument(
+        "--compute-capability",
+        default=DEFAULT_COMPUTE_CAPABILITY,
+        help=(
+            "Target compute capability stored in manifest target_platform as a dotted string "
+            "(for example 12.0, 12.1). "
+            f"Default: {DEFAULT_COMPUTE_CAPABILITY}."
+        ),
+    )
     parser.add_argument(
         "--compute-checksums",
         action="store_true",

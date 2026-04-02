@@ -4,6 +4,8 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+#include <iostream>
 #include <vector>
 
 namespace nemotron {
@@ -24,13 +26,21 @@ bool CheckCuda(cudaError_t status) {
 
 std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
     const GemmDescriptor& descriptor) {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const auto debug_fail = [&](const char* message) -> std::unique_ptr<DeviceDenseWeightFp32> {
+    if (debug) {
+      std::cerr << "dense_weight: upload failed for " << descriptor.tensor_name
+                << ": " << message << "\n";
+    }
+    return nullptr;
+  };
   if (descriptor.kernel_family != GemmKernelFamily::kDenseRowMajor ||
       descriptor.output_rows == 0 ||
       descriptor.input_cols == 0 ||
       descriptor.layout_tag != "row_major" ||
       descriptor.is_scaled() ||
       !descriptor.packed_bytes().valid()) {
-    return nullptr;
+    return debug_fail("descriptor is not a supported dense row-major weight");
   }
 
   const bool is_fp32 = descriptor.storage_dtype == "fp32";
@@ -39,14 +49,14 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
   const bool is_fp8 =
       descriptor.storage_dtype == "fp8_e4m3fn" || descriptor.storage_dtype == "fp8_e4m3";
   if (!is_fp32 && !is_bf16 && !is_fp8) {
-    return nullptr;
+    return debug_fail("storage dtype is unsupported");
   }
   if (descriptor.compute_dtype != "fp32" &&
       descriptor.compute_dtype != "float32" &&
       descriptor.compute_dtype != "float" &&
       descriptor.compute_dtype != "bf16" &&
       descriptor.compute_dtype != "bfloat16") {
-    return nullptr;
+    return debug_fail("compute dtype is unsupported");
   }
 
   const std::size_t count = descriptor.output_rows * descriptor.input_cols;
@@ -54,12 +64,12 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
       is_fp32 ? (count * sizeof(float))
               : (is_bf16 ? (count * sizeof(__nv_bfloat16)) : count * sizeof(__nv_fp8_e4m3));
   if (descriptor.packed_nbytes != expected_bytes) {
-    return nullptr;
+    return debug_fail("packed byte count does not match logical shape");
   }
 
   int device_count = 0;
   if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
-    return nullptr;
+    return debug_fail("no CUDA device available");
   }
 
   std::vector<float> bf16_converted;
@@ -86,7 +96,7 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
   impl->input_cols = descriptor.input_cols;
   const std::size_t upload_bytes = count * sizeof(float);
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->data), upload_bytes))) {
-    return nullptr;
+    return debug_fail("cudaMalloc failed");
   }
   if (!CheckCuda(cudaMemcpy(
           impl->data,
@@ -94,7 +104,7 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
           upload_bytes,
           cudaMemcpyHostToDevice))) {
     cudaFree(impl->data);
-    return nullptr;
+    return debug_fail("cudaMemcpy host-to-device failed");
   }
 
   return std::unique_ptr<DeviceDenseWeightFp32>(new DeviceDenseWeightFp32(std::move(impl)));

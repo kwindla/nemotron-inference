@@ -1,5 +1,10 @@
 #include "nemotron/prefix_cache.h"
+#include "nemotron/request_context.h"
 
+#include <cuda_bf16.h>
+
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -7,10 +12,14 @@
 
 namespace {
 
+using nemotron::AttentionKvCacheConfig;
 using nemotron::CacheLookupRequest;
 using nemotron::CacheMatchSource;
 using nemotron::ConversationCheckpointKind;
+using nemotron::KvCacheDataType;
 using nemotron::PrefixCache;
+using nemotron::RequestExecutionConfig;
+using nemotron::RequestExecutionContext;
 using nemotron::ReusableStateArena;
 using nemotron::ReusableStateDescriptor;
 using nemotron::ReusableStateHandle;
@@ -57,6 +66,42 @@ ReusableStateDescriptor make_state(
       mamba_bytes,
   };
   return state;
+}
+
+RequestExecutionConfig make_request_config() {
+  RequestExecutionConfig config;
+  config.hidden_size = 16;
+  config.max_tokens = 8;
+  config.scratch_tokens = 4;
+  config.attention_kv_cache = AttentionKvCacheConfig{
+      2,
+      2,
+      4,
+      4,
+      KvCacheDataType::kBf16,
+  };
+  config.attention_total_pages = 4;
+  config.mamba_conv_state_bytes_fp32 = 12 * sizeof(float);
+  config.mamba_state_bytes_fp32 = 20 * sizeof(float);
+  return config;
+}
+
+std::uint16_t bf16_bits(__nv_bfloat16 value) {
+  std::uint16_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+bool same_bf16(const std::vector<__nv_bfloat16>& lhs, const std::vector<__nv_bfloat16>& rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < lhs.size(); ++i) {
+    if (bf16_bits(lhs[i]) != bf16_bits(rhs[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool test_conversation_head_hit() {
@@ -306,6 +351,119 @@ bool test_replacing_node_state_releases_old_owned_state() {
          expect(arena.current_bytes() == 6144, "arena bytes should reflect only the replacement descriptor");
 }
 
+bool test_snapshot_publish_and_restore_round_trip() {
+  auto source = RequestExecutionContext::Create(make_request_config());
+  auto restored = RequestExecutionContext::Create(make_request_config());
+  if (!source || !restored || !source->valid() || !restored->valid()) {
+    std::cout << "prefix_cache_test: SKIP snapshot round-trip (no CUDA device available)\n";
+    return true;
+  }
+
+  constexpr std::size_t kTokenCount = 5;
+  if (!expect(source->SetSequenceLength(kTokenCount), "source request should allocate the prefix token window")) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> key_host(source->key_cache()->numel());
+  std::vector<__nv_bfloat16> value_host(source->value_cache()->numel());
+  for (std::size_t i = 0; i < key_host.size(); ++i) {
+    key_host[i] = __float2bfloat16(static_cast<float>((static_cast<int>(i % 29) - 14)) / 9.0f);
+    value_host[i] = __float2bfloat16(static_cast<float>((static_cast<int>(i % 31) - 15)) / 7.0f);
+  }
+  std::vector<float> conv_host(source->mamba_conv_state()->numel(), 0.0f);
+  std::vector<float> ssm_host(source->mamba_state()->numel(), 0.0f);
+  for (std::size_t i = 0; i < conv_host.size(); ++i) {
+    conv_host[i] = static_cast<float>((static_cast<int>(i % 17) - 8)) / 5.0f;
+  }
+  for (std::size_t i = 0; i < ssm_host.size(); ++i) {
+    ssm_host[i] = static_cast<float>((static_cast<int>(i % 23) - 11)) / 3.0f;
+  }
+
+  if (!expect(
+          source->key_cache()->CopyFromHost(key_host.data(), key_host.size()),
+          "source key cache should upload") ||
+      !expect(
+          source->value_cache()->CopyFromHost(value_host.data(), value_host.size()),
+          "source value cache should upload") ||
+      !expect(
+          source->mamba_conv_state()->CopyFromHost(conv_host.data(), conv_host.size()),
+          "source conv state should upload") ||
+      !expect(
+          source->mamba_state()->CopyFromHost(ssm_host.data(), ssm_host.size()),
+          "source ssm state should upload")) {
+    return false;
+  }
+
+  ReusableStateArena arena(/*max_bytes=*/1 << 20);
+  PrefixCache cache(/*max_bytes=*/1 << 20, &arena);
+  const SerializedPromptIdentity identity = make_identity({7, 8, 9, 10, 11});
+  const std::vector<float> boundary_logits = {0.5f, -1.25f, 3.75f, 2.0f};
+  const auto node_id = cache.PublishConversationHeadSnapshot(
+      "conv-snapshot",
+      ConversationCheckpointKind::kCommittedHead,
+      identity,
+      *source,
+      "prefix-cache-test",
+      &boundary_logits);
+  if (!expect(node_id != 0, "snapshot-backed conversation publish should succeed")) {
+    return false;
+  }
+  if (!expect(arena.allocation_count() == 2, "cache-owned snapshot should leave one descriptor pair resident")) {
+    return false;
+  }
+
+  CacheLookupRequest request;
+  request.identity = make_identity({7, 8, 9, 10, 11, 12});
+  request.conversation_id = "conv-snapshot";
+  const auto match = cache.Lookup(request);
+  if (!expect(match.hit(), "snapshot-backed conversation publish should be discoverable by lookup") ||
+      !expect(match.node_id == node_id, "lookup should return the published snapshot node") ||
+      !expect(match.matched_token_count == kTokenCount, "lookup should report the cached token count")) {
+    return false;
+  }
+  const auto cached_boundary_logits = cache.CopyBoundaryLogits(node_id);
+  if (!expect(
+          cache.RestoreMatchState(match, *restored),
+          "lookup match should restore the cached request state")) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> restored_key(key_host.size());
+  std::vector<__nv_bfloat16> restored_value(value_host.size());
+  std::vector<float> restored_conv(conv_host.size(), 0.0f);
+  std::vector<float> restored_ssm(ssm_host.size(), 0.0f);
+  if (!expect(
+          restored->key_cache()->CopyToHost(restored_key.data(), restored_key.size()),
+          "restored key cache should download") ||
+      !expect(
+          restored->value_cache()->CopyToHost(restored_value.data(), restored_value.size()),
+          "restored value cache should download") ||
+      !expect(
+          restored->mamba_conv_state()->CopyToHost(restored_conv.data(), restored_conv.size()),
+          "restored conv state should download") ||
+      !expect(
+          restored->mamba_state()->CopyToHost(restored_ssm.data(), restored_ssm.size()),
+          "restored ssm state should download")) {
+    return false;
+  }
+
+  cache.Clear();
+
+  return expect(
+             restored->sequence_length() == kTokenCount && restored->decode_position() == kTokenCount,
+             "restored snapshot should resume at the cached token boundary") &&
+         expect(same_bf16(restored_key, key_host), "restored key cache should match the cached snapshot exactly") &&
+         expect(
+             same_bf16(restored_value, value_host),
+             "restored value cache should match the cached snapshot exactly") &&
+         expect(
+             cached_boundary_logits.has_value() && *cached_boundary_logits == boundary_logits,
+             "cached boundary logits should survive snapshot-backed publish and lookup") &&
+         expect(restored_conv == conv_host, "restored conv state should match the cached snapshot exactly") &&
+         expect(restored_ssm == ssm_host, "restored ssm state should match the cached snapshot exactly") &&
+         expect(arena.current_bytes() == 0, "clearing the cache should release the cached snapshot bytes");
+}
+
 }  // namespace
 
 int main() {
@@ -321,7 +479,8 @@ int main() {
       test_dedup_identity_across_roles() &&
       test_eviction_by_bytes_clears_mappings() &&
       test_cache_eviction_releases_owned_state() &&
-      test_replacing_node_state_releases_old_owned_state();
+      test_replacing_node_state_releases_old_owned_state() &&
+      test_snapshot_publish_and_restore_round_trip();
 
   if (!ok) {
     return 1;

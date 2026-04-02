@@ -1,6 +1,13 @@
 build/
+build-*/
 artifacts/
 testing/oracle/**/*.bin
 claude-todo.md
 **/__pycache__/
 *.pyc
+.env
+.playwright-mcp/
+.codex/active_plan.json
+.codex/runtime/
+codex-jobs/
+proj-*/

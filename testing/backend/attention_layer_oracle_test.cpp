@@ -313,10 +313,23 @@ bool run_attention_oracle_fixture() {
   if (!expect(input->CopyFromHost(input_hidden.data(), input_hidden.size()), "fixture input should upload")) {
     return false;
   }
+  if (!expect(
+          request->EnsureAttentionTokens(metadata->token_count),
+          "request context should reserve KV pages for the oracle token window")) {
+    return false;
+  }
 
   GemmHeuristicCache heuristic_cache;
   if (!expect(
-          slice->Run(*cublas, *cudnn, &heuristic_cache, *request, *input, output.get()),
+          slice->Run(
+              *cublas,
+              *cudnn,
+              &heuristic_cache,
+              *request,
+              0,
+              metadata->token_count,
+              *input,
+              output.get()),
           "attention oracle slice should execute")) {
     return false;
   }
