@@ -64,4 +64,4 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
 |---|------|--------|--------|-------|
 | 1 | Warp-cooperative decode attention kernel | done | — | 2 blocks × 256 threads, GQA-aware, online softmax, lane-sharded; compile PASS |
 | 2 | Wire into attention layer dispatcher | done | — | NEMOTRON_FORWARD_ATTENTION_PRODUCTION gate; smoke PASS |
-| 3 | Verify and benchmark | pending | — | target ≤20ms mean |
+| 3 | Verify and benchmark | done | — | 13.8ms/token, 72.5 tok/sec, 1657x from baseline |
