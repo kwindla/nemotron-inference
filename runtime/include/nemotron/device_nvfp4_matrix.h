@@ -33,6 +33,7 @@ class DeviceNvfp4Matrix {
   std::size_t matmul_block_scales_nbytes() const;
   std::size_t tensor_scale_nbytes() const;
   float host_tensor_scale() const;
+  const float* device_tensor_scale_ptr() const;
   const std::uint8_t* packed_data() const;
   const std::uint8_t* block_scales_data() const;
   const std::uint8_t* matmul_block_scales_data() const;
@@ -62,5 +63,10 @@ class DeviceNvfp4Matrix {
 std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
     const DeviceTensorFp32& source,
     const Nvfp4PackOptions& options = {});
+
+bool MultiplyDeviceTensorScales(
+    const float* activation_tensor_scale_device,
+    const float* weight_tensor_scale_device,
+    float* alpha_device);
 
 }  // namespace nemotron

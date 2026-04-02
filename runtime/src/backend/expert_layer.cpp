@@ -816,8 +816,6 @@ bool RunMoeDirectDecodeViaCublaslt(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
     const float* selected_weights_device,
-    const std::vector<float>& routed_up_tensor_scales_host,
-    const std::vector<float>& routed_down_tensor_scales_host,
     const std::vector<FusedNvfp4WeightView>& routed_up_views,
     const std::vector<FusedNvfp4WeightView>& routed_down_views,
     DeviceNvfp4Matrix* normalized_pack,
@@ -849,8 +847,6 @@ bool RunMoeDirectDecodeViaCublaslt(
       !shared_up_weight.valid() ||
       !shared_down_weight.valid() ||
       selected_weights_device == nullptr ||
-      routed_up_descriptors.size() != routed_up_tensor_scales_host.size() ||
-      routed_up_descriptors.size() != routed_down_tensor_scales_host.size() ||
       routed_up_descriptors.size() != routed_up_views.size() ||
       routed_up_descriptors.size() != routed_down_views.size() ||
       (scratch != nullptr &&
@@ -949,9 +945,9 @@ bool RunMoeDirectDecodeViaCublaslt(
              cublas_handle,
              *routed_up_plan,
              normalized_view,
-             normalized_pack->host_tensor_scale(),
+             normalized_pack->device_tensor_scale_ptr(),
              expert_up_view,
-             routed_up_tensor_scales_host[slot],
+             expert_up_view.tensor_scale_data,
              routed_up_output)
              .has_value() ||
         !Relu2InPlaceFp32(routed_up_output)) {
@@ -963,9 +959,9 @@ bool RunMoeDirectDecodeViaCublaslt(
              cublas_handle,
              *routed_down_plan,
              MakeNvfp4PackedMatrixDeviceView(*routed_activated_pack),
-             routed_activated_pack->host_tensor_scale(),
+             routed_activated_pack->device_tensor_scale_ptr(),
              expert_down_view,
-             routed_down_tensor_scales_host[slot],
+             expert_down_view.tensor_scale_data,
              output)
              .has_value() ||
         !AccumulateScaledFp32ByDeviceWeight(
@@ -981,9 +977,9 @@ bool RunMoeDirectDecodeViaCublaslt(
            cublas_handle,
            *shared_up_plan,
            normalized_view,
-           normalized_pack->host_tensor_scale(),
+           normalized_pack->device_tensor_scale_ptr(),
            shared_up_weight_view,
-           shared_up_weight.host_tensor_scale(),
+           shared_up_weight_view.tensor_scale_data,
            shared_up_output)
            .has_value() ||
       !Relu2InPlaceFp32(shared_up_output)) {
@@ -995,9 +991,9 @@ bool RunMoeDirectDecodeViaCublaslt(
            cublas_handle,
            *shared_down_plan,
            MakeNvfp4PackedMatrixDeviceView(*shared_activated_pack),
-           shared_activated_pack->host_tensor_scale(),
+           shared_activated_pack->device_tensor_scale_ptr(),
            shared_down_weight_view,
-           shared_down_weight.host_tensor_scale(),
+           shared_down_weight_view.tensor_scale_data,
            output)
            .has_value() ||
       !ResidualAddFp32(*routed_output, *output, routed_output) ||
@@ -1909,14 +1905,10 @@ bool ExpertLayerSlice::Run(
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_down_weights;
       std::vector<const GemmDescriptor*> routed_up_descriptors;
       std::vector<const GemmDescriptor*> routed_down_descriptors;
-      std::vector<float> routed_up_tensor_scales_host;
-      std::vector<float> routed_down_tensor_scales_host;
       std::vector<FusedNvfp4WeightView> routed_up_views;
       std::vector<FusedNvfp4WeightView> routed_down_views;
       routed_up_descriptors.reserve(selected_expert_indices.size());
       routed_down_descriptors.reserve(selected_expert_indices.size());
-      routed_up_tensor_scales_host.reserve(selected_expert_indices.size());
-      routed_down_tensor_scales_host.reserve(selected_expert_indices.size());
       routed_up_views.reserve(selected_expert_indices.size());
       routed_down_views.reserve(selected_expert_indices.size());
 
@@ -1937,10 +1929,6 @@ bool ExpertLayerSlice::Run(
           }
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
-          routed_up_tensor_scales_host.push_back(
-              impl_->monolithic_up->host_tensor_scale(expert_index));
-          routed_down_tensor_scales_host.push_back(
-              impl_->monolithic_down->host_tensor_scale(expert_index));
           routed_up_views.push_back(impl_->monolithic_up->GetView(expert_index));
           routed_down_views.push_back(impl_->monolithic_down->GetView(expert_index));
         }
@@ -1960,8 +1948,6 @@ bool ExpertLayerSlice::Run(
           }
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
-          routed_up_tensor_scales_host.push_back(runtime_pair.up_proj_device->host_tensor_scale());
-          routed_down_tensor_scales_host.push_back(runtime_pair.down_proj_device->host_tensor_scale());
           routed_up_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.up_proj_device));
           routed_down_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.down_proj_device));
         }
@@ -2000,8 +1986,6 @@ bool ExpertLayerSlice::Run(
           staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
-          routed_up_tensor_scales_host.push_back(up_weight->host_tensor_scale());
-          routed_down_tensor_scales_host.push_back(down_weight->host_tensor_scale());
           routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
           routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
           staged_up_weights.push_back(std::move(up_weight));
@@ -2030,8 +2014,6 @@ bool ExpertLayerSlice::Run(
               input,
               *normalized,
               selected_weights_device->data(),
-              routed_up_tensor_scales_host,
-              routed_down_tensor_scales_host,
               routed_up_views,
               routed_down_views,
               impl_->normalized_pack.get(),

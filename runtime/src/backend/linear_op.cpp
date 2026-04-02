@@ -524,9 +524,9 @@ bool UploadedLinearOp::Run(
                     handle,
                     *plan,
                     MakeNvfp4PackedMatrixDeviceView(*impl_->activation_pack),
-                    impl_->activation_pack->host_tensor_scale(),
+                    impl_->activation_pack->device_tensor_scale_ptr(),
                     weight_view,
-                    impl_->nvfp4_weight->host_tensor_scale(),
+                    weight_view.tensor_scale_data,
                     output)
                     .has_value();
           } else {

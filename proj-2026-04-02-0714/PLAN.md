@@ -24,7 +24,7 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
   Keep the original as fallback behind `NEMOTRON_FORWARD_EXPERT_SELECT_LEGACY=1`.
   Key files: `runtime/src/backend/fused_moe_decode.cu`
 
-- [ ] **2. Eliminate PackInto D2H tensor scale readback**
+- [x] **2. Eliminate PackInto D2H tensor scale readback**
   `DeviceNvfp4Matrix::PackInto()` does a `cudaMemcpy(D2H, 4 bytes)` after computing the activation tensor scale on device. This happens 184 times per token (8 packs × 23 MoE layers). Each forces a pipeline stall.
   Fix: keep the tensor scale on device. Modify the NVFP4 GEMM runner to accept a device pointer for alpha instead of a host float. Use cuBLASLt's `CUBLASLT_POINTER_MODE_DEVICE` to pass the alpha as a device pointer. Compute `alpha = act_tensor_scale * weight_tensor_scale` on device via a tiny multiply kernel that writes to a pre-allocated device float.
   Alternative simpler fix: since we already cache the weight tensor scale on host, and the activation tensor scale is computed on device, compute alpha on device as `act_scale_device * weight_scale_host_constant` via a single-element device kernel, then pass the device alpha pointer to cuBLASLt.
@@ -41,5 +41,5 @@ Target: ≤20 ms/token mean, ≥50 tok/sec.
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Fix expert selection <<<1,1>>> → <<<1,32>>> | done | — | warp-parallel iterated top-1; smoke PASS |
-| 2 | Eliminate PackInto D2H tensor scale | pending | — | -0.6ms/token expected |
+| 2 | Eliminate PackInto D2H tensor scale | done | — | device-alpha via POINTER_MODE_DEVICE + device multiply; smoke PASS |
 | 3 | Benchmark and profile | pending | — | target ≤20ms |

@@ -109,6 +109,18 @@ __global__ void WriteTensorScaleKernel(
   *tensor_scale_data = tensor_scale;
 }
 
+__global__ void MultiplyTensorScalesKernel(
+    const float* activation_tensor_scale_device,
+    const float* weight_tensor_scale_device,
+    float* alpha_device) {
+  if (activation_tensor_scale_device == nullptr ||
+      weight_tensor_scale_device == nullptr ||
+      alpha_device == nullptr) {
+    return;
+  }
+  *alpha_device = (*activation_tensor_scale_device) * (*weight_tensor_scale_device);
+}
+
 __global__ void PackRowMajorFp32ToNvfp4Kernel(
     const float* source,
     std::size_t rows,
@@ -222,7 +234,6 @@ struct DeviceNvfp4Matrix::Impl {
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scale_data = nullptr;
-  float host_tensor_scale = 1.0f;
 };
 
 std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
@@ -323,7 +334,15 @@ std::size_t DeviceNvfp4Matrix::tensor_scale_nbytes() const {
 }
 
 float DeviceNvfp4Matrix::host_tensor_scale() const {
-  return impl_ ? impl_->host_tensor_scale : 0.0f;
+  float host_tensor_scale = 0.0f;
+  if (!CopyTensorScaleToHost(&host_tensor_scale)) {
+    return 0.0f;
+  }
+  return host_tensor_scale;
+}
+
+const float* DeviceNvfp4Matrix::device_tensor_scale_ptr() const {
+  return impl_ ? reinterpret_cast<const float*>(impl_->tensor_scale_data) : nullptr;
 }
 
 const std::uint8_t* DeviceNvfp4Matrix::packed_data() const {
@@ -383,7 +402,6 @@ bool DeviceNvfp4Matrix::PackInto(
             cudaMemcpyHostToDevice))) {
       return false;
     }
-    impl_->host_tensor_scale = host_tensor_scale;
   } else {
     auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
     if (!CheckCuda(cudaMemset(global_max_bits, 0, impl_->tensor_scale_nbytes))) {
@@ -406,13 +424,6 @@ bool DeviceNvfp4Matrix::PackInto(
         global_max_bits,
         tensor_scale_data);
     if (!CheckCuda(cudaGetLastError())) {
-      return false;
-    }
-    if (!CheckCuda(cudaMemcpy(
-            &impl_->host_tensor_scale,
-            tensor_scale_data,
-            sizeof(float),
-            cudaMemcpyDeviceToHost))) {
       return false;
     }
   }
@@ -485,8 +496,8 @@ bool DeviceNvfp4Matrix::CopyTensorScaleToHost(float* output) const {
   if (!valid() || output == nullptr) {
     return false;
   }
-  *output = impl_->host_tensor_scale;
-  return true;
+  return CheckCuda(
+      cudaMemcpy(output, impl_->tensor_scale_data, sizeof(*output), cudaMemcpyDeviceToHost));
 }
 
 std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
@@ -506,6 +517,22 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
   }
 
   return packed;
+}
+
+bool MultiplyDeviceTensorScales(
+    const float* activation_tensor_scale_device,
+    const float* weight_tensor_scale_device,
+    float* alpha_device) {
+  if (activation_tensor_scale_device == nullptr ||
+      weight_tensor_scale_device == nullptr ||
+      alpha_device == nullptr) {
+    return false;
+  }
+  MultiplyTensorScalesKernel<<<1, 1>>>(
+      activation_tensor_scale_device,
+      weight_tensor_scale_device,
+      alpha_device);
+  return CheckCuda(cudaGetLastError());
 }
 
 }  // namespace nemotron

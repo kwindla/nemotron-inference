@@ -191,8 +191,17 @@ struct CachedNvfp4MatmulResources {
   cublasLtMatrixLayout_t c_desc = nullptr;
   cublasLtMatmulHeuristicResult_t heuristic{};
   int heuristic_count = 0;
+  bool device_pointer_mode_supported = false;
+  float* device_alpha = nullptr;
+  float* device_beta = nullptr;
 
   ~CachedNvfp4MatmulResources() {
+    if (device_beta != nullptr) {
+      cudaFree(device_beta);
+    }
+    if (device_alpha != nullptr) {
+      cudaFree(device_alpha);
+    }
     if (c_desc != nullptr) {
       cublasLtMatrixLayoutDestroy(c_desc);
     }
@@ -401,6 +410,26 @@ bool InitializeCachedNvfp4MatmulResources(
     }
     return false;
   }
+
+  std::uint32_t pointer_mode_mask = 0;
+  std::size_t size_written = 0;
+  if (CheckCublas(
+          cublasLtMatmulAlgoCapGetAttribute(
+              &resources->heuristic.algo,
+              CUBLASLT_ALGO_CAP_POINTER_MODE_MASK,
+              &pointer_mode_mask,
+              sizeof(pointer_mode_mask),
+              &size_written)) &&
+      size_written == sizeof(pointer_mode_mask) &&
+      (pointer_mode_mask & CUBLASLT_POINTER_MODE_MASK_DEVICE) != 0u) {
+    resources->device_pointer_mode_supported = true;
+    if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&resources->device_alpha), sizeof(float))) ||
+        !CheckCuda(cudaMalloc(reinterpret_cast<void**>(&resources->device_beta), sizeof(float))) ||
+        !CheckCuda(cudaMemset(resources->device_beta, 0, sizeof(float)))) {
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -440,60 +469,22 @@ CachedNvfp4MatmulResources* GetCachedNvfp4MatmulResources(
   return resources_ptr;
 }
 
-}  // namespace
+struct PreparedNvfp4MatmulCall {
+  std::size_t m = 0;
+  std::size_t n = 0;
+  std::size_t k = 0;
+  CachedNvfp4MatmulResources* resources = nullptr;
+  const std::uint8_t* activations_packed_data = nullptr;
+  const std::uint8_t* weights_packed_data = nullptr;
+  float* output_data = nullptr;
+};
 
-bool Nvfp4PackedMatrixDeviceView::valid() const {
-  return packed_data != nullptr &&
-         packed_nbytes > 0 &&
-         block_scales_data != nullptr &&
-         block_scales_nbytes > 0 &&
-         tensor_scale_data != nullptr &&
-         tensor_scale_nbytes >= sizeof(float) &&
-         rows > 0 &&
-         cols > 0;
-}
-
-Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Weight& matrix) {
-  return Nvfp4PackedMatrixDeviceView{
-      matrix.packed_data(),
-      matrix.packed_nbytes(),
-      matrix.matmul_block_scales_data(),
-      matrix.matmul_block_scales_nbytes(),
-      reinterpret_cast<const float*>(matrix.tensor_scale_data()),
-      matrix.tensor_scale_nbytes(),
-      matrix.output_rows(),
-      matrix.input_cols(),
-  };
-}
-
-Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Matrix& matrix) {
-  return Nvfp4PackedMatrixDeviceView{
-      matrix.packed_data(),
-      matrix.packed_nbytes(),
-      matrix.matmul_block_scales_data(),
-      matrix.matmul_block_scales_nbytes(),
-      reinterpret_cast<const float*>(matrix.tensor_scale_data()),
-      matrix.tensor_scale_nbytes(),
-      matrix.rows(),
-      matrix.cols(),
-  };
-}
-
-std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
+std::optional<PreparedNvfp4MatmulCall> PrepareNvfp4MatmulCall(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const Nvfp4PackedMatrixDeviceView& activations,
-    float activation_tensor_scale_host,
     const Nvfp4PackedMatrixDeviceView& weights,
-    float weight_tensor_scale_host,
     DeviceTensorFp32* output) {
-  if (!std::isfinite(activation_tensor_scale_host) ||
-      activation_tensor_scale_host <= 0.0f ||
-      !std::isfinite(weight_tensor_scale_host) ||
-      weight_tensor_scale_host <= 0.0f) {
-    return std::nullopt;
-  }
-
   if (!handle.valid() ||
       !activations.valid() ||
       !weights.valid() ||
@@ -559,23 +550,53 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     return std::nullopt;
   }
 
-  const float alpha = activation_tensor_scale_host * weight_tensor_scale_host;
-  const float beta = 0.0f;
+  return PreparedNvfp4MatmulCall{
+      m,
+      n,
+      k,
+      resources,
+      activations.packed_data,
+      weights.packed_data,
+      output->data(),
+  };
+}
+
+std::optional<Nvfp4RowMajorDeviceStats> ExecutePreparedNvfp4Matmul(
+    CublasLtHandle& handle,
+    const PreparedNvfp4MatmulCall& prepared,
+    const void* alpha,
+    const void* beta,
+    cublasLtPointerMode_t pointer_mode) {
+  const auto check_cublas = [&](cublasStatus_t status, const char* op) {
+    if (CheckCublas(status)) {
+      return true;
+    }
+    LogCublasFailure(op, status, prepared.m, prepared.n, prepared.k);
+    return false;
+  };
+
   if (!check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              prepared.resources->op_desc,
+              CUBLASLT_MATMUL_DESC_POINTER_MODE,
+              &pointer_mode,
+              sizeof(pointer_mode)),
+          "cublasLtMatmulDescSetAttribute(POINTER_MODE)") ||
+      !check_cublas(
           cublasLtMatmul(
               handle.handle(),
-              resources->op_desc,
-              &alpha,
-              activations.packed_data,
-              resources->a_desc,
-              weights.packed_data,
-              resources->b_desc,
-              &beta,
-              output->data(),
-              resources->c_desc,
-              output->data(),
-              resources->c_desc,
-              &resources->heuristic.algo,
+              prepared.resources->op_desc,
+              alpha,
+              prepared.activations_packed_data,
+              prepared.resources->a_desc,
+              prepared.weights_packed_data,
+              prepared.resources->b_desc,
+              beta,
+              prepared.output_data,
+              prepared.resources->c_desc,
+              prepared.output_data,
+              prepared.resources->c_desc,
+              &prepared.resources->heuristic.algo,
               handle.workspace(),
               handle.workspace_bytes(),
               nullptr),
@@ -584,11 +605,139 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
   }
 
   return Nvfp4RowMajorDeviceStats{
-      m,
-      n,
-      resources->heuristic.workspaceSize,
-      resources->heuristic_count,
+      prepared.m,
+      prepared.n,
+      prepared.resources->heuristic.workspaceSize,
+      prepared.resources->heuristic_count,
   };
+}
+
+}  // namespace
+
+bool Nvfp4PackedMatrixDeviceView::valid() const {
+  return packed_data != nullptr &&
+         packed_nbytes > 0 &&
+         block_scales_data != nullptr &&
+         block_scales_nbytes > 0 &&
+         tensor_scale_data != nullptr &&
+         tensor_scale_nbytes >= sizeof(float) &&
+         rows > 0 &&
+         cols > 0;
+}
+
+Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Weight& matrix) {
+  return Nvfp4PackedMatrixDeviceView{
+      matrix.packed_data(),
+      matrix.packed_nbytes(),
+      matrix.matmul_block_scales_data(),
+      matrix.matmul_block_scales_nbytes(),
+      reinterpret_cast<const float*>(matrix.tensor_scale_data()),
+      matrix.tensor_scale_nbytes(),
+      matrix.output_rows(),
+      matrix.input_cols(),
+  };
+}
+
+Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Matrix& matrix) {
+  return Nvfp4PackedMatrixDeviceView{
+      matrix.packed_data(),
+      matrix.packed_nbytes(),
+      matrix.matmul_block_scales_data(),
+      matrix.matmul_block_scales_nbytes(),
+      matrix.device_tensor_scale_ptr(),
+      matrix.tensor_scale_nbytes(),
+      matrix.rows(),
+      matrix.cols(),
+  };
+}
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const Nvfp4PackedMatrixDeviceView& activations,
+    float activation_tensor_scale_host,
+    const Nvfp4PackedMatrixDeviceView& weights,
+    float weight_tensor_scale_host,
+    DeviceTensorFp32* output) {
+  if (!std::isfinite(activation_tensor_scale_host) ||
+      activation_tensor_scale_host <= 0.0f ||
+      !std::isfinite(weight_tensor_scale_host) ||
+      weight_tensor_scale_host <= 0.0f) {
+    return std::nullopt;
+  }
+
+  if (!handle.valid() ||
+      !activations.valid() ||
+      !weights.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      plan.execution.backend_kind != GemmBackendKind::kCublasLtNvfp4BlockScaled ||
+      plan.scale_mode != CublasLtScaleMode::kVec16UE4M3 ||
+      plan.contract != CublasLtContract::kRowMajorA_N_RowMajorB_T) {
+    return std::nullopt;
+  }
+  const auto prepared = PrepareNvfp4MatmulCall(handle, plan, activations, weights, output);
+  if (!prepared.has_value()) {
+    return std::nullopt;
+  }
+
+  const float alpha = activation_tensor_scale_host * weight_tensor_scale_host;
+  const float beta = 0.0f;
+  return ExecutePreparedNvfp4Matmul(
+      handle,
+      *prepared,
+      &alpha,
+      &beta,
+      CUBLASLT_POINTER_MODE_HOST);
+}
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const Nvfp4PackedMatrixDeviceView& activations,
+    const float* activation_tensor_scale_device,
+    const Nvfp4PackedMatrixDeviceView& weights,
+    const float* weight_tensor_scale_device,
+    DeviceTensorFp32* output) {
+  const auto prepared = PrepareNvfp4MatmulCall(handle, plan, activations, weights, output);
+  if (!prepared.has_value()) {
+    return std::nullopt;
+  }
+
+  if (activation_tensor_scale_device != nullptr &&
+      weight_tensor_scale_device != nullptr &&
+      prepared->resources->device_pointer_mode_supported &&
+      prepared->resources->device_alpha != nullptr &&
+      prepared->resources->device_beta != nullptr &&
+      MultiplyDeviceTensorScales(
+          activation_tensor_scale_device,
+          weight_tensor_scale_device,
+          prepared->resources->device_alpha)) {
+    return ExecutePreparedNvfp4Matmul(
+        handle,
+        *prepared,
+        prepared->resources->device_alpha,
+        prepared->resources->device_beta,
+        CUBLASLT_POINTER_MODE_DEVICE);
+  }
+
+  const auto activation_tensor_scale_host =
+      ReadTensorScaleHostFallback(activation_tensor_scale_device);
+  const auto weight_tensor_scale_host =
+      ReadTensorScaleHostFallback(weight_tensor_scale_device);
+  if (!activation_tensor_scale_host.has_value() ||
+      !weight_tensor_scale_host.has_value()) {
+    return std::nullopt;
+  }
+
+  const float alpha = *activation_tensor_scale_host * *weight_tensor_scale_host;
+  const float beta = 0.0f;
+  return ExecutePreparedNvfp4Matmul(
+      handle,
+      *prepared,
+      &alpha,
+      &beta,
+      CUBLASLT_POINTER_MODE_HOST);
 }
 
 std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
@@ -597,21 +746,13 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     const Nvfp4PackedMatrixDeviceView& activations,
     const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output) {
-  const auto activation_tensor_scale_host =
-      ReadTensorScaleHostFallback(activations.tensor_scale_data);
-  const auto weight_tensor_scale_host =
-      ReadTensorScaleHostFallback(weights.tensor_scale_data);
-  if (!activation_tensor_scale_host.has_value() ||
-      !weight_tensor_scale_host.has_value()) {
-    return std::nullopt;
-  }
   return RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       activations,
-      *activation_tensor_scale_host,
+      activations.tensor_scale_data,
       weights,
-      *weight_tensor_scale_host,
+      weights.tensor_scale_data,
       output);
 }
 
@@ -621,18 +762,14 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     const Nvfp4PackedMatrixDeviceView& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output) {
-  const auto activation_tensor_scale_host =
-      ReadTensorScaleHostFallback(activations.tensor_scale_data);
-  if (!activation_tensor_scale_host.has_value()) {
-    return std::nullopt;
-  }
+  const Nvfp4PackedMatrixDeviceView weight_view = MakeNvfp4PackedMatrixDeviceView(weights);
   return RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       activations,
-      *activation_tensor_scale_host,
-      MakeNvfp4PackedMatrixDeviceView(weights),
-      weights.host_tensor_scale(),
+      activations.tensor_scale_data,
+      weight_view,
+      weight_view.tensor_scale_data,
       output);
 }
 
@@ -647,13 +784,14 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
   if (!packed || !packed->valid()) {
     return std::nullopt;
   }
+  const Nvfp4PackedMatrixDeviceView weight_view = MakeNvfp4PackedMatrixDeviceView(weights);
   return RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       MakeNvfp4PackedMatrixDeviceView(*packed),
-      packed->host_tensor_scale(),
-      MakeNvfp4PackedMatrixDeviceView(weights),
-      weights.host_tensor_scale(),
+      packed->device_tensor_scale_ptr(),
+      weight_view,
+      weight_view.tensor_scale_data,
       output);
 }
 
