@@ -22,9 +22,10 @@ V1 uses **exact-prefix cache nodes** with full reusable state at selected bounda
 
 - global shared roots
 - per-conversation committed heads
-- optional per-conversation prompt heads
 
 V1 does **not** use dense small-block Mamba snapshotting as the primary design.
+
+Prompt-head nodes remain a possible follow-up in the cache API, but they are explicitly out of scope for this multi-turn runtime milestone.
 
 ## Request Model
 
@@ -58,15 +59,6 @@ Represents the end of the last completed assistant turn for a conversation.
 
 This is the primary v1 fast path for multi-turn chat.
 
-### Conversation Prompt Head
-
-Represents the end of the current user turn before assistant generation.
-
-This is optional in v1 and mainly exists to support:
-
-- regenerate
-- retry with identical prompt state
-
 ## Node Contents
 
 Each reusable node stores:
@@ -94,11 +86,10 @@ If the runtime materializes Mamba recurrent state as multiple tensors, the reusa
 2. If `conversation_id` is present, probe that conversation's committed head first.
 3. If the committed head exists and its tokens are an exact prefix of the request tokens, use it.
 4. Otherwise, search the global prefix index for the longest exact-prefix match.
-5. Optionally, if prompt-head mode is enabled and the request is a regenerate/retry, check the conversation prompt head.
-6. Restore cached KV and Mamba state from the best matching node.
-7. Prefill only the uncached tail.
-8. Decode the assistant response.
-9. On successful completion, commit a new conversation head node.
+5. Restore cached KV and Mamba state from the best matching node.
+6. Prefill only the uncached tail.
+7. Decode the assistant response.
+8. On successful completion, commit a new conversation head node.
 
 ## Commit Rules
 
@@ -107,12 +98,6 @@ After the assistant turn completes:
 - create or refresh the conversation committed-head node at the new prefix boundary
 - update the conversation map to point to that node
 - keep only one committed head per conversation in v1
-
-If prompt-head mode is enabled:
-
-- materialize a prompt-head node after user-turn prefill
-- use it for regenerate or retry on the same turn
-- do not treat prompt heads as conversation history
 
 ## Runtime Control
 
@@ -178,6 +163,7 @@ This means v1 can get most of the TTFT benefit without paying the memory cost of
 
 These are later paths, not the v1 foundation:
 
+- prompt-head regenerate/retry support
 - dense partial-prefix checkpoints
 - hierarchical checkpoints with bounded recompute
 - host spill for reusable nodes
@@ -192,7 +178,6 @@ V1 cache tests must cover:
 - conversation-ID fast path
 - fallback to global longest-prefix lookup
 - committed-head append-only reuse
-- regenerate from prompt head
 - eviction by bytes
 - namespace isolation
 - continuation parity after restoring cached state

@@ -659,11 +659,10 @@ bool run_full_forward_manifest_smoke() {
           "turn-1 execution should emit one token for the follow-up turn")) {
     return false;
   }
-  const auto turn1_prompt_head = environment->prefix_cache().PromptHeadForConversation(conversation_id);
   const auto turn1_committed_head = environment->prefix_cache().CommittedHeadForConversation(conversation_id);
   if (!expect(
-          turn1_prompt_head.has_value() && turn1_committed_head.has_value(),
-          "turn-1 execution should publish prompt and committed conversation heads")) {
+          turn1_committed_head.has_value(),
+          "turn-1 execution should publish a committed conversation head")) {
     return false;
   }
 
@@ -859,20 +858,14 @@ bool run_full_forward_manifest_smoke() {
           "cached turn-2 request state should match the baseline decode state")) {
     return false;
   }
-  const auto turn2_prompt_head = environment->prefix_cache().PromptHeadForConversation(conversation_id);
   const auto turn2_committed_head = environment->prefix_cache().CommittedHeadForConversation(conversation_id);
   if (!expect(
-          turn2_prompt_head.has_value() && turn2_committed_head.has_value(),
-          "turn-2 execution should republish prompt and committed heads")) {
+          turn2_committed_head.has_value(),
+          "turn-2 execution should refresh the committed head")) {
     return false;
   }
-  const auto turn2_prompt_view = environment->prefix_cache().Describe(*turn2_prompt_head);
   const auto turn2_committed_view = environment->prefix_cache().Describe(*turn2_committed_head);
   if (!expect(
-          turn2_prompt_view.has_value() &&
-              turn2_prompt_view->identity.token_ids == turn2_identity.token_ids,
-          "turn-2 prompt head should track the full prompt identity") ||
-      !expect(
           turn2_committed_view.has_value() &&
               turn2_committed_view->has_boundary_logits &&
               turn2_committed_view->boundary_logits_count == config.vocab_size &&

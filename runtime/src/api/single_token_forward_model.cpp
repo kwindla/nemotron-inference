@@ -1067,15 +1067,6 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
     }
   }
 
-  if (impl_->prefix_cache != nullptr && impl_->prefix_cache->enabled()) {
-    impl_->prefix_cache->PublishConversationHeadSnapshot(
-        conversation_id,
-        ConversationCheckpointKind::kPromptHead,
-        identity,
-        request_context,
-        conversation_id + "/prompt",
-        &logits_host);
-  }
   const std::size_t logits_row_index = exact_cache_hit ? 0 : (prefill_token_count - 1);
   auto next_token = ArgMaxTokenId(logits_host, logits_row_index, impl_->config.vocab_size);
   if (!next_token.has_value()) {
