@@ -190,7 +190,7 @@ Translate from these upstream designs, not from generic intuition:
   Approach: move the BF16 decode buffers to `AttentionLayerSlice::Impl`, sized for max token count
   Key files: `attention_layer.cpp`
 
-- [ ] **9. Re-profile after sync/alloc cleanup**
+- [x] **9. Re-profile after sync/alloc cleanup**
   Goal:
   - measure the improvement from step 8 and identify the new bottleneck
   Expected: kernel compute floor ~33ms/token (Mamba ~22ms, attention ~3ms, GEMMs ~4ms, other ~4ms)
@@ -227,7 +227,7 @@ Translate from these upstream designs, not from generic intuition:
 | 8a | Remove explicit syncs + dead allocs | done | — | hot-path syncs removed; per-alloc device checks cached; cudaFree still barriers |
 | 8b | Decode scratch buffer reuse | done | — | request-context decode views + layer-local FP32 scratch landed; BF16 attention and NVFP4 pack buffers remain |
 | 8c | Attention activation pre-alloc | done | — | BF16 query/output pre-allocated in Impl; smoke PASS |
-| 9 | Re-profile after cleanup | pending | — | kernel floor ~33ms; host should be near-zero |
+| 9 | Re-profile after cleanup | done | — | 50.0 ms/token (20 tok/sec); at kernel compute floor; Mamba is next target |
 | 10 | Optimize Mamba decode kernel | pending | — | 0.94ms × 23 = 22ms/token; hard blocker for 20ms |
 | 11 | Evidence-driven loop to 20ms | pending | — | |
 
