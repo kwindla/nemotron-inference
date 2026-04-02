@@ -58,6 +58,24 @@ bool DecodeConsistentPrefillEnabled() {
          EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_DECODE");
 }
 
+bool DecodeScratchEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
+  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
+}
+
+std::unique_ptr<DeviceTensorFp32> CreateDecodeRowView(
+    DeviceTensorFp32* buffer,
+    std::size_t hidden_size) {
+  if (buffer == nullptr ||
+      !buffer->valid() ||
+      buffer->shape().size() != 2 ||
+      buffer->shape()[0] == 0 ||
+      buffer->shape()[1] != hidden_size) {
+    return nullptr;
+  }
+  return DeviceTensorFp32::CreateView({1, hidden_size}, buffer->data());
+}
+
 std::size_t ParseEnvMiB(const char* env_var, std::size_t default_value_mib) {
   const char* value = std::getenv(env_var);
   if (value == nullptr || value[0] == '\0') {
@@ -1292,12 +1310,32 @@ bool SingleTokenForwardModel::RunTokens(
     return false;
   }
 
-  auto hidden = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto residual = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto scratch = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  DeviceTensorFp32* current = hidden.get();
-  DeviceTensorFp32* next = residual.get();
-  if (current == nullptr || next == nullptr || scratch == nullptr) {
+  std::unique_ptr<DeviceTensorFp32> hidden_owned;
+  std::unique_ptr<DeviceTensorFp32> residual_owned;
+  std::unique_ptr<DeviceTensorFp32> scratch_owned;
+  std::unique_ptr<DeviceTensorFp32> hidden_view;
+  std::unique_ptr<DeviceTensorFp32> residual_view;
+  std::unique_ptr<DeviceTensorFp32> scratch_view;
+  DeviceTensorFp32* current = nullptr;
+  DeviceTensorFp32* next = nullptr;
+  DeviceTensorFp32* scratch_tensor = nullptr;
+  const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
+  if (use_decode_scratch) {
+    hidden_view = CreateDecodeRowView(request_context.hidden(), impl_->config.hidden_size);
+    residual_view = CreateDecodeRowView(request_context.residual(), impl_->config.hidden_size);
+    scratch_view = CreateDecodeRowView(request_context.scratch(), impl_->config.hidden_size);
+    current = hidden_view.get();
+    next = residual_view.get();
+    scratch_tensor = scratch_view.get();
+  } else {
+    hidden_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    residual_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    scratch_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    current = hidden_owned.get();
+    next = residual_owned.get();
+    scratch_tensor = scratch_owned.get();
+  }
+  if (current == nullptr || next == nullptr || scratch_tensor == nullptr) {
     std::cerr << "single_token_forward_model: per-run buffers unavailable\n";
     return false;
   }
@@ -1460,11 +1498,11 @@ bool SingleTokenForwardModel::RunTokens(
             *current,
             *impl_->final_norm_weight,
             impl_->config.layer_norm_epsilon,
-            scratch.get())) {
+            scratch_tensor)) {
       std::cerr << "single_token_forward_model: final RMSNorm failed\n";
       return false;
     }
-    logits_input = scratch.get();
+    logits_input = scratch_tensor;
   }
 
   if (trace != nullptr) {

@@ -11,6 +11,7 @@ namespace nemotron {
 class DeviceTensorFp32 {
  public:
   static std::unique_ptr<DeviceTensorFp32> Create(std::vector<std::size_t> shape);
+  static std::unique_ptr<DeviceTensorFp32> CreateView(std::vector<std::size_t> shape, float* data);
 
   DeviceTensorFp32(DeviceTensorFp32&&) noexcept;
   DeviceTensorFp32& operator=(DeviceTensorFp32&&) noexcept;

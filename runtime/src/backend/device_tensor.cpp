@@ -12,6 +12,7 @@ struct DeviceTensorFp32::Impl {
   std::size_t numel = 0;
   std::size_t bytes = 0;
   float* data = nullptr;
+  bool owns_data = false;
 };
 
 struct DeviceTensorBf16::Impl {
@@ -58,9 +59,27 @@ std::unique_ptr<DeviceTensorFp32> DeviceTensorFp32::Create(std::vector<std::size
   impl->shape = std::move(shape);
   impl->numel = numel;
   impl->bytes = numel * sizeof(float);
+  impl->owns_data = true;
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->data), impl->bytes))) {
     return nullptr;
   }
+  return std::unique_ptr<DeviceTensorFp32>(new DeviceTensorFp32(std::move(impl)));
+}
+
+std::unique_ptr<DeviceTensorFp32> DeviceTensorFp32::CreateView(
+    std::vector<std::size_t> shape,
+    float* data) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(float);
+  impl->data = data;
+  impl->owns_data = false;
   return std::unique_ptr<DeviceTensorFp32>(new DeviceTensorFp32(std::move(impl)));
 }
 
@@ -71,7 +90,7 @@ DeviceTensorFp32::DeviceTensorFp32(DeviceTensorFp32&&) noexcept = default;
 DeviceTensorFp32& DeviceTensorFp32::operator=(DeviceTensorFp32&&) noexcept = default;
 
 DeviceTensorFp32::~DeviceTensorFp32() {
-  if (impl_ && impl_->data != nullptr) {
+  if (impl_ && impl_->owns_data && impl_->data != nullptr) {
     cudaFree(impl_->data);
   }
 }

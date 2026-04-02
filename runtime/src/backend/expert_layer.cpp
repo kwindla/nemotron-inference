@@ -563,6 +563,11 @@ bool MoeCublasLtEnabled() {
   return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
+bool DecodeScratchEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
+  return value == nullptr || (value[0] != '\0' && std::strcmp(value, "0") != 0);
+}
+
 Nvfp4PackOptions RuntimeMoeNvfp4PackOptions() {
   Nvfp4PackOptions options;
   options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
@@ -756,11 +761,22 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_down_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
+  std::unique_ptr<DeviceTensorFp32> normalized_scratch;
+  std::unique_ptr<DeviceTensorFp32> router_logits_scratch;
+  std::unique_ptr<DeviceTensorFp32> output_scratch;
+  std::unique_ptr<DeviceTensorFp32> routed_up_scratch;
+  std::unique_ptr<DeviceTensorFp32> shared_up_scratch;
   std::uint64_t resident_shared_expert_bytes = 0;
   std::uint64_t resident_routed_expert_bytes = 0;
   bool full_residency_enabled = false;
   bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
+};
+
+struct MoeDirectDecodeScratch {
+  DeviceTensorFp32* output_accum = nullptr;
+  DeviceTensorFp32* routed_up = nullptr;
+  DeviceTensorFp32* shared_up = nullptr;
 };
 
 bool RunMoeDirectDecodeViaCublaslt(
@@ -778,7 +794,8 @@ bool RunMoeDirectDecodeViaCublaslt(
     const std::vector<ExpertSelection>& selected_experts,
     const std::vector<FusedNvfp4WeightView>& routed_up_views,
     const std::vector<FusedNvfp4WeightView>& routed_down_views,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    MoeDirectDecodeScratch* scratch) {
   if (!cublas_handle.valid() ||
       !input.valid() ||
       !normalized.valid() ||
@@ -799,28 +816,44 @@ bool RunMoeDirectDecodeViaCublaslt(
       !shared_down_weight.valid() ||
       selected_experts.empty() ||
       selected_experts.size() != routed_up_views.size() ||
-      selected_experts.size() != routed_down_views.size()) {
+      selected_experts.size() != routed_down_views.size() ||
+      (scratch != nullptr &&
+       (scratch->output_accum == nullptr ||
+        scratch->routed_up == nullptr ||
+        scratch->shared_up == nullptr))) {
     return false;
   }
 
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
   auto normalized_packed = PackDeviceRowMajorFp32ToNvfp4(normalized, pack_options);
-  auto routed_output = DeviceTensorFp32::Create({1, config.hidden_size});
-  auto shared_output = DeviceTensorFp32::Create({1, config.hidden_size});
-  auto routed_up_output =
-      DeviceTensorFp32::Create({1, config.routed_expert_intermediate_size});
-  auto routed_down_output = DeviceTensorFp32::Create({1, config.hidden_size});
-  auto shared_up_output =
-      DeviceTensorFp32::Create({1, config.shared_expert_intermediate_size});
-  auto mixer_output = DeviceTensorFp32::Create({1, config.hidden_size});
+  std::unique_ptr<DeviceTensorFp32> routed_output_owned;
+  std::unique_ptr<DeviceTensorFp32> routed_up_output_owned;
+  std::unique_ptr<DeviceTensorFp32> shared_up_output_owned;
+  DeviceTensorFp32* routed_output = nullptr;
+  DeviceTensorFp32* routed_up_output = nullptr;
+  DeviceTensorFp32* shared_up_output = nullptr;
+  if (scratch != nullptr) {
+    routed_output = scratch->output_accum;
+    routed_up_output = scratch->routed_up;
+    shared_up_output = scratch->shared_up;
+  } else {
+    routed_output_owned = DeviceTensorFp32::Create({1, config.hidden_size});
+    routed_up_output_owned =
+        DeviceTensorFp32::Create({1, config.routed_expert_intermediate_size});
+    shared_up_output_owned =
+        DeviceTensorFp32::Create({1, config.shared_expert_intermediate_size});
+    routed_output = routed_output_owned.get();
+    routed_up_output = routed_up_output_owned.get();
+    shared_up_output = shared_up_output_owned.get();
+  }
   if (!normalized_packed ||
       !normalized_packed->valid() ||
-      !routed_output ||
-      !shared_output ||
-      !routed_up_output ||
-      !routed_down_output ||
-      !shared_up_output ||
-      !mixer_output ||
+      routed_output == nullptr ||
+      routed_up_output == nullptr ||
+      shared_up_output == nullptr ||
+      !routed_output->valid() ||
+      !routed_up_output->valid() ||
+      !shared_up_output->valid() ||
       !routed_output->FillZero()) {
     return false;
   }
@@ -883,9 +916,9 @@ bool RunMoeDirectDecodeViaCublaslt(
              *routed_up_plan,
              normalized_view,
              expert_up_view,
-             routed_up_output.get())
+             routed_up_output)
              .has_value() ||
-        !Relu2InPlaceFp32(routed_up_output.get())) {
+        !Relu2InPlaceFp32(routed_up_output)) {
       return false;
     }
 
@@ -898,12 +931,12 @@ bool RunMoeDirectDecodeViaCublaslt(
              *routed_down_plan,
              MakeNvfp4PackedMatrixDeviceView(*routed_activated_packed),
              expert_down_view,
-             routed_down_output.get())
+             output)
              .has_value() ||
         !AccumulateScaledFp32(
-             *routed_down_output,
+             *output,
              selected_experts[slot].weight,
-             routed_output.get())) {
+             routed_output)) {
       return false;
     }
   }
@@ -913,9 +946,9 @@ bool RunMoeDirectDecodeViaCublaslt(
            *shared_up_plan,
            normalized_view,
            shared_up_weight_view,
-           shared_up_output.get())
+           shared_up_output)
            .has_value() ||
-      !Relu2InPlaceFp32(shared_up_output.get())) {
+      !Relu2InPlaceFp32(shared_up_output)) {
     return false;
   }
 
@@ -928,10 +961,10 @@ bool RunMoeDirectDecodeViaCublaslt(
            *shared_down_plan,
            MakeNvfp4PackedMatrixDeviceView(*shared_activated_packed),
            shared_down_weight_view,
-           shared_output.get())
+           output)
            .has_value() ||
-      !ResidualAddFp32(*routed_output, *shared_output, mixer_output.get()) ||
-      !ResidualAddFp32(input, *mixer_output, output)) {
+      !ResidualAddFp32(*routed_output, *output, routed_output) ||
+      !ResidualAddFp32(input, *routed_output, output)) {
     return false;
   }
 
@@ -1516,6 +1549,19 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     cumulative_resident_routed_expert_bytes = residency_tracker.resident_routed_expert_bytes;
   }
 
+  auto normalized_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto router_logits_scratch = DeviceTensorFp32::Create({1, config.n_routed_experts});
+  auto output_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto routed_up_scratch = DeviceTensorFp32::Create({1, config.routed_expert_intermediate_size});
+  auto shared_up_scratch = DeviceTensorFp32::Create({1, config.shared_expert_intermediate_size});
+  if (!normalized_scratch ||
+      !router_logits_scratch ||
+      !output_scratch ||
+      !routed_up_scratch ||
+      !shared_up_scratch) {
+    return debug_fail("decode scratch allocation failed");
+  }
+
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->topology =
@@ -1545,6 +1591,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->monolithic_down_views_device = std::move(monolithic_down_views_device);
   impl->routed_up_nvfp4_views_device = std::move(routed_up_nvfp4_views_device);
   impl->routed_down_nvfp4_views_device = std::move(routed_down_nvfp4_views_device);
+  impl->normalized_scratch = std::move(normalized_scratch);
+  impl->router_logits_scratch = std::move(router_logits_scratch);
+  impl->output_scratch = std::move(output_scratch);
+  impl->routed_up_scratch = std::move(routed_up_scratch);
+  impl->shared_up_scratch = std::move(shared_up_scratch);
   impl->resident_shared_expert_bytes = resident_shared_expert_bytes;
   impl->resident_routed_expert_bytes = resident_routed_expert_bytes;
   impl->full_residency_enabled = full_residency_enabled;
@@ -1642,6 +1693,16 @@ bool ExpertLayerSlice::valid() const {
          (!impl_->full_residency_enabled ||
           (impl_->routed_up_nvfp4_views_device != nullptr &&
            impl_->routed_down_nvfp4_views_device != nullptr)) &&
+         impl_->normalized_scratch != nullptr &&
+         impl_->normalized_scratch->valid() &&
+         impl_->router_logits_scratch != nullptr &&
+         impl_->router_logits_scratch->valid() &&
+         impl_->output_scratch != nullptr &&
+         impl_->output_scratch->valid() &&
+         impl_->routed_up_scratch != nullptr &&
+         impl_->routed_up_scratch->valid() &&
+         impl_->shared_up_scratch != nullptr &&
+         impl_->shared_up_scratch->valid() &&
          impl_->routed_experts.size() == impl_->config.n_routed_experts;
 }
 
@@ -1687,9 +1748,21 @@ bool ExpertLayerSlice::Run(
     return false;
   }
 
-  auto normalized = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto router_logits = DeviceTensorFp32::Create({token_count, impl_->config.n_routed_experts});
-  if (!normalized || !router_logits) {
+  std::unique_ptr<DeviceTensorFp32> normalized_owned;
+  std::unique_ptr<DeviceTensorFp32> router_logits_owned;
+  DeviceTensorFp32* normalized = nullptr;
+  DeviceTensorFp32* router_logits = nullptr;
+  const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
+  if (use_decode_scratch) {
+    normalized = impl_->normalized_scratch.get();
+    router_logits = impl_->router_logits_scratch.get();
+  } else {
+    normalized_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    router_logits_owned = DeviceTensorFp32::Create({token_count, impl_->config.n_routed_experts});
+    normalized = normalized_owned.get();
+    router_logits = router_logits_owned.get();
+  }
+  if (normalized == nullptr || router_logits == nullptr) {
     if (debug) {
       std::cout << "expert_layer: scratch allocation failed\n";
     }
@@ -1697,10 +1770,10 @@ bool ExpertLayerSlice::Run(
   }
 
   const bool norm_ok =
-      RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.rms_epsilon, normalized.get());
+      RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.rms_epsilon, normalized);
   const bool gate_ok =
       norm_ok &&
-      impl_->gate_weight->Run(cublas_handle, heuristic_cache, *normalized, router_logits.get());
+      impl_->gate_weight->Run(cublas_handle, heuristic_cache, *normalized, router_logits);
   if (!norm_ok || !gate_ok) {
     if (debug) {
       std::cout << "expert_layer: norm or gate projection failed"
@@ -1833,6 +1906,14 @@ bool ExpertLayerSlice::Run(
         }
       }
 
+      MoeDirectDecodeScratch moe_scratch;
+      MoeDirectDecodeScratch* moe_scratch_ptr = nullptr;
+      if (use_decode_scratch) {
+        moe_scratch.output_accum = impl_->output_scratch.get();
+        moe_scratch.routed_up = impl_->routed_up_scratch.get();
+        moe_scratch.shared_up = impl_->shared_up_scratch.get();
+        moe_scratch_ptr = &moe_scratch;
+      }
       if (RunMoeDirectDecodeViaCublaslt(
               impl_->config,
               routed_up_descriptors,
@@ -1848,7 +1929,8 @@ bool ExpertLayerSlice::Run(
               selected_experts,
               routed_up_views,
               routed_down_views,
-              output)) {
+              output,
+              moe_scratch_ptr)) {
         return true;
       }
 

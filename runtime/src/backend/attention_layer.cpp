@@ -111,6 +111,11 @@ bool DeviceAttentionCompareEnabled() {
          (active == nullptr || std::strcmp(active, "0") != 0);
 }
 
+bool DecodeScratchEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
+  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
+}
+
 const KernelTensorDescriptor* FindKernelBinding(
     const LayerScheduleEntry& layer,
     const KernelCatalog& kernel_catalog,
@@ -383,6 +388,11 @@ struct AttentionLayerSlice::Impl {
   std::unique_ptr<UploadedLinearOp> k_proj;
   std::unique_ptr<UploadedLinearOp> v_proj;
   std::unique_ptr<UploadedLinearOp> o_proj;
+  std::unique_ptr<DeviceTensorFp32> normed_scratch;
+  std::unique_ptr<DeviceTensorFp32> q_scratch;
+  std::unique_ptr<DeviceTensorFp32> k_scratch;
+  std::unique_ptr<DeviceTensorFp32> v_scratch;
+  std::unique_ptr<DeviceTensorFp32> attn_output_scratch;
   std::array<std::int32_t, 1> query_sequence_lengths_host{0};
   std::array<std::int32_t, 1> query_sequence_starts_host{0};
   PagedAttentionBatchPlan batch_plan;
@@ -459,7 +469,21 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   auto k_proj = UploadedLinearOp::Create(*bindings.k_proj);
   auto v_proj = UploadedLinearOp::Create(*bindings.v_proj);
   auto o_proj = UploadedLinearOp::Create(*bindings.o_proj);
-  if (!norm_weight || !q_proj || !k_proj || !v_proj || !o_proj) {
+  auto normed_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto q_scratch = DeviceTensorFp32::Create({1, query_width});
+  auto k_scratch = DeviceTensorFp32::Create({1, kv_width});
+  auto v_scratch = DeviceTensorFp32::Create({1, kv_width});
+  auto attn_output_scratch = DeviceTensorFp32::Create({1, query_width});
+  if (!norm_weight ||
+      !q_proj ||
+      !k_proj ||
+      !v_proj ||
+      !o_proj ||
+      !normed_scratch ||
+      !q_scratch ||
+      !k_scratch ||
+      !v_scratch ||
+      !attn_output_scratch) {
     return debug_fail("weight materialization failed");
   }
 
@@ -470,6 +494,11 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   impl->k_proj = std::move(k_proj);
   impl->v_proj = std::move(v_proj);
   impl->o_proj = std::move(o_proj);
+  impl->normed_scratch = std::move(normed_scratch);
+  impl->q_scratch = std::move(q_scratch);
+  impl->k_scratch = std::move(k_scratch);
+  impl->v_scratch = std::move(v_scratch);
+  impl->attn_output_scratch = std::move(attn_output_scratch);
   impl->seq_len_q = DeviceBuffer<std::int32_t>::Create(1);
   impl->seq_len_kv = DeviceBuffer<std::int32_t>::Create(1);
   impl->query_starts = DeviceBuffer<std::int32_t>::Create(1);
@@ -505,6 +534,16 @@ bool AttentionLayerSlice::valid() const {
          impl_->v_proj->valid() &&
          impl_->o_proj != nullptr &&
          impl_->o_proj->valid() &&
+         impl_->normed_scratch != nullptr &&
+         impl_->normed_scratch->valid() &&
+         impl_->q_scratch != nullptr &&
+         impl_->q_scratch->valid() &&
+         impl_->k_scratch != nullptr &&
+         impl_->k_scratch->valid() &&
+         impl_->v_scratch != nullptr &&
+         impl_->v_scratch->valid() &&
+         impl_->attn_output_scratch != nullptr &&
+         impl_->attn_output_scratch->valid() &&
          impl_->seq_len_q.has_value() &&
          impl_->seq_len_kv.has_value() &&
          impl_->query_starts.has_value() &&
@@ -554,13 +593,41 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  auto normed = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto q = DeviceTensorFp32::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
-  auto k = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-  auto v = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-  auto attn_output_fp32 = DeviceTensorFp32::Create(
-      {token_count, impl_->config.query_head_count * impl_->config.head_dim});
-  auto projected = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+  std::unique_ptr<DeviceTensorFp32> normed_owned;
+  std::unique_ptr<DeviceTensorFp32> q_owned;
+  std::unique_ptr<DeviceTensorFp32> k_owned;
+  std::unique_ptr<DeviceTensorFp32> v_owned;
+  std::unique_ptr<DeviceTensorFp32> attn_output_owned;
+  std::unique_ptr<DeviceTensorFp32> projected_owned;
+  DeviceTensorFp32* normed = nullptr;
+  DeviceTensorFp32* q = nullptr;
+  DeviceTensorFp32* k = nullptr;
+  DeviceTensorFp32* v = nullptr;
+  DeviceTensorFp32* attn_output_fp32 = nullptr;
+  DeviceTensorFp32* projected = nullptr;
+  const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
+  if (use_decode_scratch) {
+    normed = impl_->normed_scratch.get();
+    q = impl_->q_scratch.get();
+    k = impl_->k_scratch.get();
+    v = impl_->v_scratch.get();
+    attn_output_fp32 = impl_->attn_output_scratch.get();
+    projected = output;
+  } else {
+    normed_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    q_owned = DeviceTensorFp32::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
+    k_owned = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    v_owned = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    attn_output_owned = DeviceTensorFp32::Create(
+        {token_count, impl_->config.query_head_count * impl_->config.head_dim});
+    projected_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    normed = normed_owned.get();
+    q = q_owned.get();
+    k = k_owned.get();
+    v = v_owned.get();
+    attn_output_fp32 = attn_output_owned.get();
+    projected = projected_owned.get();
+  }
   if (!normed || !q || !k || !v || !attn_output_fp32 || !projected) {
     if (debug) {
       std::cout << "attention_layer: scratch allocation failed\n";
@@ -569,10 +636,10 @@ bool AttentionLayerSlice::Run(
   }
 
   const bool norm_ok =
-      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed.get());
-  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q.get());
-  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k.get());
-  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v.get());
+      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed);
+  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q);
+  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k);
+  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v);
   if (!norm_ok || !q_ok || !k_ok || !v_ok) {
     if (debug) {
       std::cout << "attention_layer: norm/qkv failed"
@@ -802,7 +869,7 @@ bool AttentionLayerSlice::Run(
           token_count,
           impl_->config.query_head_count,
           impl_->config.head_dim,
-          attn_output_fp32.get())) {
+          attn_output_fp32)) {
     if (debug) {
       std::cout << "attention_layer: failed to convert attention output to FP32\n";
     }
@@ -859,7 +926,7 @@ bool AttentionLayerSlice::Run(
     }
   }
 
-  const bool o_ok = impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected.get());
+  const bool o_ok = impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected);
   const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output);
   if (!o_ok || !residual_ok) {
     if (debug) {

@@ -170,7 +170,7 @@ Translate from these upstream designs, not from generic intuition:
   Safety: all ops on default stream; stream ordering sufficient; keep sync before D2H copies.
   Key files: `primitive_ops.cu`, `dense_gemm_runner.cpp`, `nvfp4_gemm_runner.cpp`, `device_nvfp4_matrix.cu`, `embedding_table.cu`, `device_argmax.cu`, `scaled_fp8_linear.cu`, `device_tensor.cpp`, `expert_layer.cpp`
 
-- [ ] **8b. Replace per-token temp allocations with decode scratch buffers**
+- [x] **8b. Replace per-token temp allocations with decode scratch buffers**
   Goal:
   - eliminate per-token cudaMalloc/cudaFree that cause implicit sync barriers
   - this is where the bulk of the host overhead improvement comes from
@@ -178,17 +178,16 @@ Translate from these upstream designs, not from generic intuition:
   - `RunTokens()` allocates fresh `[token_count, hidden_size]` tensors every call despite request context owning persistent `hidden`, `residual`, `scratch` buffers
   - for `token_count==1` decode, all shapes are deterministic from layer config
   Approach:
-  - add a decode scratch pool to `RequestExecutionContext` with pre-allocated buffers for all per-token temporaries
-  - shapes needed (Nano): attention q/output `[1,4096]`, k/v `[1,256]`, BF16 `[1,32,1,128]`; Mamba projected `[1,10304]`, scan_output `[1,4096]`; MoE router `[1,128]`, routed-up `[1,1856]`, shared-up `[1,3712]`; plus NVFP4 activation pack buffers
-  - `RunTokens()` should use request-context buffers instead of allocating fresh ones
-  - layer slice `Run()` methods take scratch pointers instead of allocating internally
-  Key files: `request_context.cpp`, `single_token_forward_model.cpp`, `mamba_layer.cpp`, `expert_layer.cpp`, `attention_layer.cpp`, `device_nvfp4_matrix.cu`
+  - bind `[1, hidden_size]` decode views onto the existing request-context `hidden` / `residual` / `scratch` buffers instead of allocating top-level activations per token
+  - pre-allocate decode-only FP32 scratch in each layer slice `Impl` for deterministic `token_count == 1` temporaries, while leaving multi-token prefill on the existing allocation path
+  - gate the reuse path behind `NEMOTRON_FORWARD_DECODE_SCRATCH=1` (default enabled)
+  Key files: `device_tensor.cpp`, `single_token_forward_model.cpp`, `mamba_layer.cpp`, `expert_layer.cpp`, `attention_layer.cpp`
 
 - [ ] **8c. Pre-allocate attention activation buffers**
   Goal:
-  - eliminate per-call FP32/BF16 attention activation allocations
-  Sites: `attention_layer.cpp:557-563` (FP32 q/k/v/output), `attention_layer.cpp:664-667` (BF16 buffers)
-  Approach: move to AttentionLayerSlice::Impl, sized for max token count
+  - eliminate the remaining per-call BF16 attention activation allocations
+  Sites: `attention_layer.cpp:664-667` (BF16 query/output buffers)
+  Approach: move the BF16 decode buffers to `AttentionLayerSlice::Impl`, sized for max token count
   Key files: `attention_layer.cpp`
 
 - [ ] **9. Re-profile after sync/alloc cleanup**
@@ -226,13 +225,20 @@ Translate from these upstream designs, not from generic intuition:
 | 6 | Replace MoE scalar matmuls with cuBLASLt | done | — | 57.2 ms/token (was 1805ms); 400x total speedup from baseline; smoke PASS |
 | 7 | Re-measure and decide | done | — | Mamba=66% GPU, sync/alloc=42% wall; both need fixing for 20ms |
 | 8a | Remove explicit syncs + dead allocs | done | — | hot-path syncs removed; per-alloc device checks cached; cudaFree still barriers |
-| 8b | Decode scratch buffer reuse | pending | — | bulk of host overhead improvement |
-| 8c | Attention activation pre-alloc | pending | — | attention-specific alloc cleanup |
+| 8b | Decode scratch buffer reuse | done | — | request-context decode views + layer-local FP32 scratch landed; BF16 attention and NVFP4 pack buffers remain |
+| 8c | Attention activation pre-alloc | pending | — | remaining BF16 attention alloc cleanup |
 | 9 | Re-profile after cleanup | pending | — | kernel floor ~33ms; host should be near-zero |
 | 10 | Optimize Mamba decode kernel | pending | — | 0.94ms × 23 = 22ms/token; hard blocker for 20ms |
 | 11 | Evidence-driven loop to 20ms | pending | — | |
 
 ## Progress Log
+
+### 2026-04-01 Step 8b Checkpoint
+
+- What changed: `RunTokens()` now reuses the request-context activation buffers for single-token decode by binding non-owning `[1, hidden_size]` FP32 views onto `hidden`, `residual`, and `scratch` instead of allocating fresh tensors each call. `AttentionLayerSlice::Impl`, `MambaLayerSlice::Impl`, and `ExpertLayerSlice::Impl` now pre-allocate decode-only FP32 scratch tensors at `Create()` time and reuse them for `token_count == 1`. The direct-MoE cuBLASLt path was also rewritten to reuse a persistent hidden-size accumulation scratch plus the final output buffer instead of allocating hidden-size temporaries per token.
+- What was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4` passed. `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test -j4` passed.
+- What risk remains: the attention BF16 query/output buffers are still allocated per decode call and are deferred to step 8c. NVFP4 activation packing still allocates transient buffers, so step 9 profiling is still required to confirm how much host overhead remains after this checkpoint. This checkpoint only covers compilation, not smoke-test execution or Nsight re-measurement.
+- What the next step is: implement step 8c to remove the remaining BF16 attention allocations, then re-profile decode wall time for step 9.
 
 ### 2026-04-01 Step 6 Checkpoint
 
