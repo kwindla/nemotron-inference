@@ -105,63 +105,35 @@ Translate from these upstream designs, not from generic intuition:
   - the next bottleneck is identified from trace data
   Key files: `benchmarks/nano_fused_decode/run_nsight_capture.sh`
 
-- [ ] **6a. Remove explicit cudaDeviceSynchronize from hot-path ops + fix dead allocations**
+- [ ] **6. Replace scalar MoE expert matmuls with cuBLASLt (sequential, unfused)**
   Goal:
-  - remove unconditional `cudaDeviceSynchronize()` from all hot-path operators
-  - move dead expert allocations after the fused-path early return
-  - remove per-alloc `cudaGetDeviceCount()` (check once at startup)
+  - replace the 77ms single-CTA `FusedMoeDirectDecodeKernel` (98.4% of GPU time) with cuBLASLt GEMM calls for expert projections
+  - the current kernel does NVFP4 matmul via scalar `Nvfp4RowMajorDot` with double-precision accumulation in one thread block — no tensor cores
+  - cuBLASLt NVFP4 GEMMs already run at ~18μs for similar shapes (Mamba projections) in this same build
   Scope:
-  - sync removal only — no allocation pattern changes yet
-  - IMPORTANT: `cudaFree` is also an implicit sync barrier, so this step alone may show muted gains. The full benefit requires step 6b (allocation reuse) to also land.
-  Safety:
-  - all current ops run on the default CUDA stream; stream ordering guarantees correctness without explicit syncs between device ops
-  - keep syncs that precede host reads (D2H copies are blocking anyway via `cudaMemcpyDeviceToHost`)
-  - error localization gets harder — async kernel faults surface at the next blocking call, not at the failing op
-  Confirmed sync sites to remove:
-  - `primitive_ops.cu:89,107` — RmsNorm, ResidualAdd
-  - `dense_gemm_runner.cpp:325` — dense GEMM
-  - `nvfp4_gemm_runner.cpp:397` — NVFP4 GEMM
-  - `device_nvfp4_matrix.cu:424,432,449,470` — NVFP4 activation pack (4 syncs per pack)
-  - `embedding_table.cu:183,190,218` — embedding lookup
-  - `device_argmax.cu:90` — argmax
-  - `scaled_fp8_linear.cu:213,296` — scaled FP8 quantize + GEMM (used by Mamba projections)
-  Also fix:
-  - `device_tensor.cpp:50,125` — remove per-alloc `cudaGetDeviceCount()`
-  - `expert_layer.cpp:1442-1445` — move 4 dead tensor allocs after fused early return
-  Key files: `primitive_ops.cu`, `dense_gemm_runner.cpp`, `nvfp4_gemm_runner.cpp`, `device_nvfp4_matrix.cu`, `embedding_table.cu`, `device_argmax.cu`, `scaled_fp8_linear.cu`, `device_tensor.cpp`, `expert_layer.cpp`
-
-- [ ] **6b. Replace per-token temporary allocations with request-context scratch buffers**
-  Goal:
-  - eliminate ~281 `cudaMalloc/cudaFree` per token by reusing pre-allocated buffers
-  Scope:
-  - allocation reuse only — use request-context-owned scratch buffers instead of per-op temporaries
-  - request-context scratch (not model-global) to avoid races with multiple concurrent requests
-  Key allocation sites to convert:
-  - `single_token_forward_model.cpp:1295-1297` — model-level hidden/residual/scratch tensors per RunTokens call
-  - `mamba_layer.cpp:492-495` — per-call Mamba scratch
-  - `expert_layer.cpp:1440-1445` — per-call expert scratch (for non-fused fallback)
-  - `attention_layer.cpp:557-563,664-667` — per-call attention FP32 scratch + BF16 buffers
-  - `device_nvfp4_matrix.cu:409,436` — temp buffers in NVFP4 activation pack
-  - `scaled_fp8_linear.cu` — quantized activation temp buffer
-  Approach:
-  - for `token_count == 1` decode, all shapes are deterministic from layer config — allocate at request-context creation
-  - add a scratch buffer pool to `RequestExecutionContext` sized for the max-shape layer in the model
-  - operators take a scratch pointer + size instead of allocating internally
-  Key files: `request_context.cpp`, `single_token_forward_model.cpp`, `mamba_layer.cpp`, `expert_layer.cpp`, `attention_layer.cpp`, `device_nvfp4_matrix.cu`, `scaled_fp8_linear.cu`
-
-- [ ] **6c. Pre-allocate attention BF16 buffers and cuDNN plan/workspace**
-  Goal:
-  - eliminate per-call attention buffer allocations and cuDNN plan rebuilds
-  Scope:
-  - attention-layer-specific allocation reuse
-  Key sites:
-  - `attention_layer.cpp:664-667` — BF16 query, KV scatter, output buffers allocated per call
-  - `attention_layer.cpp:748` — cuDNN plan built per call (when cuDNN is available)
-  - `cudnn_paged_attention.cpp:133,296,363` — cuDNN plan creation, workspace alloc, execute sync
-  Approach:
-  - move BF16 buffers to AttentionLayerSlice::Impl, sized for max token count
-  - cache cuDNN plan/workspace in Impl (rebuild only when batch plan shape changes)
-  Key files: `attention_layer.cpp`, `attention_device_fallback.cu`, `cudnn_paged_attention.cpp`
+  - expert matmul path only — replace the fused kernel's matmul with cuBLASLt calls
+  - keep routing, activation (relu2), weighted accumulation as simple device kernels between the GEMMs
+  - do NOT attempt batched/grouped GEMM yet — sequential first to prove the shapes work
+  Implementation:
+  - add a new `RunMoeDirectDecodeViaCublaslt()` path in `expert_layer.cpp` alongside the existing fused kernel
+  - for each of the `top_k` selected routed experts:
+    - cuBLASLt NVFP4 GEMM: `normalized [1×2688]` × `up_proj [1856×2688]` → `up_out [1×1856]`
+    - apply `relu2` (small element-wise kernel or inline)
+    - cuBLASLt NVFP4 GEMM: `activated [1×1856]` × `down_proj [2688×1856]` → `down_out [1×2688]`
+    - multiply by routing weight and accumulate into routed output
+  - for shared expert: same pattern with shared expert shapes (3712×2688, 2688×3712)
+  - add routed + shared + residual input → output
+  - the monolithic expert weight views already have the right device pointers; build `Nvfp4PackedMatrixDeviceView` from each `FusedNvfp4WeightView` for the cuBLASLt runner
+  - gate behind `NEMOTRON_FORWARD_MOE_CUBLASLT=1` (default enabled). When disabled, fall back to the existing fused kernel.
+  - IMPORTANT: the cuBLASLt path uses `matmul_block_scales` (swizzled), not `block_scales` (raw). The monolithic buffers store raw block scales. Either swizzle at Create() time into a parallel buffer, or build the cuBLASLt view from the existing per-expert `DeviceNvfp4Weight` matmul scales if they're still available.
+  Expected impact:
+  - 14 cuBLASLt calls × ~18μs each = ~0.25ms per MoE layer (vs 77ms current)
+  - 23 MoE layers × 0.25ms = ~5.7ms total (vs 1,771ms current)
+  - even if expert shapes are 2-3x slower than Mamba shapes, this is still a 100x+ improvement
+  Accept when:
+  - smoke test PASS with `NEMOTRON_FORWARD_MOE_CUBLASLT=1`
+  - benchmark shows MoE per-layer time drops from ~77ms to sub-ms
+  Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/nvfp4_gemm_runner.cpp`
 
 - [ ] **7. Re-measure and decide: production attention or next structural fix**
   Goal:
@@ -215,9 +187,7 @@ Translate from these upstream designs, not from generic intuition:
 | 3 | Attention sync cleanup | done | 6fb664b | persistent buffers, removed 6 syncs |
 | 4 | Monolithic expert residency | done | 5a624e1 | 23/23 resident, 0 uploads, 1805 ms/token |
 | 5 | Profile next bottleneck | done | — | FusedMoeDirectDecode = 98.4% of GPU time (77ms/call × 23 layers = 1771ms/token) |
-| 6a | Remove explicit syncs + fix dead allocs | pending | — | muted gains alone; needs 6b |
-| 6b | Request-context scratch buffers | pending | — | ~281 mallocs/token → 0 |
-| 6c | Attention BF16 + cuDNN plan reuse | pending | — | attention-specific alloc cleanup |
+| 6 | Replace MoE scalar matmuls with cuBLASLt | pending | — | 98.4% of GPU time; 77ms → sub-ms expected |
 | 7 | Re-measure and decide | pending | — | attention or kernel optimization next? |
 | 8 | Production decode attention | pending | — | contingent on step 7 evidence |
 | 9 | Evidence-driven loop | pending | — | |
