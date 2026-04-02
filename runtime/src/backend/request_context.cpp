@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
@@ -9,13 +10,87 @@
 
 namespace nemotron {
 
+struct RequestExecutionContext::ForwardGraphState {
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+  bool captured = false;
+  const bool env_enabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_FORWARD") == nullptr;
+  bool enabled = env_enabled;
+
+  ForwardGraphState() = default;
+
+  ForwardGraphState(ForwardGraphState&& other) noexcept
+      : graph(other.graph),
+        graph_exec(other.graph_exec),
+        captured(other.captured),
+        env_enabled(other.env_enabled),
+        enabled(other.enabled) {
+    other.graph = nullptr;
+    other.graph_exec = nullptr;
+    other.captured = false;
+    other.enabled = other.env_enabled;
+  }
+
+  ForwardGraphState& operator=(ForwardGraphState&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    Reset();
+    graph = other.graph;
+    graph_exec = other.graph_exec;
+    captured = other.captured;
+    enabled = other.enabled;
+    other.graph = nullptr;
+    other.graph_exec = nullptr;
+    other.captured = false;
+    other.enabled = other.env_enabled;
+    return *this;
+  }
+
+  ForwardGraphState(const ForwardGraphState&) = delete;
+  ForwardGraphState& operator=(const ForwardGraphState&) = delete;
+
+  ~ForwardGraphState() {
+    Reset();
+  }
+
+  void Reset() {
+    if (graph_exec != nullptr) {
+      cudaGraphExecDestroy(graph_exec);
+      graph_exec = nullptr;
+    }
+    if (graph != nullptr) {
+      cudaGraphDestroy(graph);
+      graph = nullptr;
+    }
+    captured = false;
+    enabled = env_enabled;
+  }
+
+  void Disable() {
+    if (graph_exec != nullptr) {
+      cudaGraphExecDestroy(graph_exec);
+      graph_exec = nullptr;
+    }
+    if (graph != nullptr) {
+      cudaGraphDestroy(graph);
+      graph = nullptr;
+    }
+    captured = false;
+    enabled = false;
+  }
+};
+
 namespace {
 
 bool FitsInt32(std::size_t value) {
   return value <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
 }
 
-bool CopyInt32ScalarFromDevice(DeviceBuffer<std::int32_t>* buffer, const std::int32_t* source_device) {
+bool CopyInt32ScalarFromDevice(
+    DeviceBuffer<std::int32_t>* buffer,
+    const std::int32_t* source_device,
+    cudaStream_t stream) {
   if (buffer == nullptr ||
       buffer->data() == nullptr ||
       buffer->count() == 0 ||
@@ -27,7 +102,7 @@ bool CopyInt32ScalarFromDevice(DeviceBuffer<std::int32_t>* buffer, const std::in
              source_device,
              sizeof(std::int32_t),
              cudaMemcpyDeviceToDevice,
-             nullptr) == cudaSuccess;
+             stream) == cudaSuccess;
 }
 
 }  // namespace
@@ -218,7 +293,7 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   if (!context->token_ids_device_.Resize(config.max_tokens)) {
     return nullptr;
   }
-  if (!context->InitializeAttentionDecodeMetadata()) {
+  if (!context->InitializeAttentionDecodeMetadata(nullptr)) {
     return nullptr;
   }
   if (!context->EnsureExpertSelectionCapacity(config.expert_selection_capacity)) {
@@ -289,13 +364,17 @@ RequestExecutionContext::RequestExecutionContext(
       kv_pages_by_layer_(config_.attention_kv_cache.layer_count),
       kv_page_ids_device_by_layer_(config_.attention_kv_cache.layer_count),
       attention_decode_page_tables_by_layer_(config_.attention_kv_cache.layer_count),
-      attention_decode_page_table_counts_by_layer_(config_.attention_kv_cache.layer_count, 0) {}
+      attention_decode_page_table_counts_by_layer_(config_.attention_kv_cache.layer_count, 0),
+      forward_graph_state_(std::make_unique<ForwardGraphState>()) {}
 
 RequestExecutionContext::RequestExecutionContext(RequestExecutionContext&&) noexcept = default;
 RequestExecutionContext& RequestExecutionContext::operator=(RequestExecutionContext&&) noexcept = default;
 RequestExecutionContext::~RequestExecutionContext() = default;
 
 bool RequestExecutionContext::valid() const {
+  if (!forward_graph_state_) {
+    return false;
+  }
   if (!hidden_ || !hidden_->valid() ||
       !residual_ || !residual_->valid() ||
       !scratch_ || !scratch_->valid() ||
@@ -386,6 +465,14 @@ std::size_t RequestExecutionContext::sequence_length() const {
 
 std::size_t RequestExecutionContext::decode_position() const {
   return decode_position_;
+}
+
+std::size_t RequestExecutionContext::current_decode_token_index() const {
+  return current_decode_token_index_;
+}
+
+std::size_t RequestExecutionContext::decode_token_count() const {
+  return decode_token_count_;
 }
 
 DeviceTensorFp32* RequestExecutionContext::hidden() {
@@ -565,6 +652,10 @@ const DeviceBuffer<std::int32_t>* RequestExecutionContext::token_ids_device() co
 }
 
 bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
+  return EnsureAttentionTokens(token_count, nullptr);
+}
+
+bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count, cudaStream_t stream) {
   if (!kv_arena_.has_value()) {
     return token_count == 0;
   }
@@ -592,7 +683,7 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
               kv_page_ids_device_by_layer_[layer_index].data() + synced_count,
               (page_count - synced_count) * sizeof(std::int32_t),
               cudaMemcpyDeviceToDevice,
-              nullptr) != cudaSuccess) {
+              stream) != cudaSuccess) {
         return false;
       }
       attention_decode_page_table_counts_by_layer_[layer_index] = page_count;
@@ -814,6 +905,52 @@ const DeviceTensorBf16* RequestExecutionContext::attention_output_bf16_decode() 
   return attention_output_bf16_decode_.get();
 }
 
+bool RequestExecutionContext::forward_graph_enabled() const {
+  return forward_graph_state_ != nullptr && forward_graph_state_->enabled;
+}
+
+bool RequestExecutionContext::forward_graph_captured() const {
+  return forward_graph_state_ != nullptr && forward_graph_state_->captured;
+}
+
+bool RequestExecutionContext::SetForwardGraph(cudaGraph_t graph, cudaGraphExec_t graph_exec) {
+  if (forward_graph_state_ == nullptr ||
+      graph == nullptr ||
+      graph_exec == nullptr ||
+      !forward_graph_state_->enabled) {
+    return false;
+  }
+  if (forward_graph_state_->graph_exec != nullptr) {
+    cudaGraphExecDestroy(forward_graph_state_->graph_exec);
+  }
+  if (forward_graph_state_->graph != nullptr) {
+    cudaGraphDestroy(forward_graph_state_->graph);
+  }
+  forward_graph_state_->graph = graph;
+  forward_graph_state_->graph_exec = graph_exec;
+  forward_graph_state_->captured = true;
+  return true;
+}
+
+bool RequestExecutionContext::LaunchForwardGraph(cudaStream_t stream) const {
+  return forward_graph_state_ != nullptr &&
+         forward_graph_state_->captured &&
+         forward_graph_state_->graph_exec != nullptr &&
+         cudaGraphLaunch(forward_graph_state_->graph_exec, stream) == cudaSuccess;
+}
+
+void RequestExecutionContext::DisableForwardGraph() {
+  if (forward_graph_state_ != nullptr) {
+    forward_graph_state_->Disable();
+  }
+}
+
+void RequestExecutionContext::ResetForwardGraph() {
+  if (forward_graph_state_ != nullptr) {
+    forward_graph_state_->Reset();
+  }
+}
+
 bool RequestExecutionContext::EnsureExpertSelectionCapacity(std::size_t selection_count) {
   if (selection_count <= expert_selection_capacity_) {
     return true;
@@ -864,20 +1001,22 @@ const std::vector<float>* RequestExecutionContext::expert_selection_weights_host
   return &expert_selection_weights_host_;
 }
 
-bool RequestExecutionContext::SetSequenceLength(std::size_t sequence_length) {
+bool RequestExecutionContext::SetSequenceLength(std::size_t sequence_length, cudaStream_t stream) {
   if (sequence_length > config_.max_tokens) {
     return false;
   }
-  if (!EnsureAttentionTokens(sequence_length) ||
-      !SetAttentionDecodeSequenceLength(sequence_length)) {
+  if (!EnsureAttentionTokens(sequence_length, stream) ||
+      !SetAttentionDecodeSequenceLength(sequence_length, stream)) {
     return false;
   }
   sequence_length_ = sequence_length;
   decode_position_ = sequence_length;
+  current_decode_token_index_ = 0;
+  decode_token_count_ = 0;
   return true;
 }
 
-bool RequestExecutionContext::AdvanceDecodePosition(std::size_t token_count) {
+bool RequestExecutionContext::AdvanceDecodePosition(std::size_t token_count, cudaStream_t stream) {
   if (token_count == 0) {
     return true;
   }
@@ -888,16 +1027,19 @@ bool RequestExecutionContext::AdvanceDecodePosition(std::size_t token_count) {
   const std::size_t next_sequence_length =
       next_decode_position > sequence_length_ ? next_decode_position : sequence_length_;
   const std::size_t sequence_delta = next_sequence_length - sequence_length_;
-  if (!EnsureAttentionTokens(next_sequence_length) ||
-      !AdvanceAttentionDecodeSequenceLength(sequence_delta)) {
+  if (!EnsureAttentionTokens(next_sequence_length, stream) ||
+      !AdvanceAttentionDecodeSequenceLength(sequence_delta, stream)) {
     return false;
   }
+  current_decode_token_index_ = decode_token_count_;
+  decode_token_count_ += token_count;
   decode_position_ = next_decode_position;
   sequence_length_ = next_sequence_length;
   return true;
 }
 
 bool RequestExecutionContext::ResetForNewRequest() {
+  ResetForwardGraph();
   bool ok = hidden_->FillZero() && residual_->FillZero() && scratch_->FillZero();
   if (hidden_decode_bf16_) {
     ok = ok && hidden_decode_bf16_->FillZero();
@@ -966,13 +1108,14 @@ bool RequestExecutionContext::ResetForNewRequest() {
     ok = ok && attention_output_bf16_decode_->FillZero();
   }
   if (attention_decode_seq_len_kv_device_.count() != 0) {
-    ok = ok && SetAttentionDecodeSequenceLength(0);
+    ok = ok && SetAttentionDecodeSequenceLength(0, nullptr);
   }
   if (attention_decode_seq_len_q_device_.count() != 0) {
     ok = ok && attention_decode_seq_len_values_device_.count() > 1 &&
          CopyInt32ScalarFromDevice(
              &attention_decode_seq_len_q_device_,
-             attention_decode_seq_len_values_device_.data() + 1);
+             attention_decode_seq_len_values_device_.data() + 1,
+             nullptr);
   }
   for (std::size_t layer_index = 0; layer_index < attention_decode_page_tables_by_layer_.size(); ++layer_index) {
     attention_decode_page_table_counts_by_layer_[layer_index] = 0;
@@ -1002,10 +1145,12 @@ bool RequestExecutionContext::ResetForNewRequest() {
   }
   sequence_length_ = 0;
   decode_position_ = 0;
+  current_decode_token_index_ = 0;
+  decode_token_count_ = 0;
   return ok;
 }
 
-bool RequestExecutionContext::InitializeAttentionDecodeMetadata() {
+bool RequestExecutionContext::InitializeAttentionDecodeMetadata(cudaStream_t stream) {
   if (config_.attention_kv_cache.layer_count == 0) {
     return true;
   }
@@ -1029,10 +1174,12 @@ bool RequestExecutionContext::InitializeAttentionDecodeMetadata() {
   if (!attention_decode_seq_len_values_device_.CopyFromHost(seq_len_values) ||
       !CopyInt32ScalarFromDevice(
           &attention_decode_seq_len_kv_device_,
-          attention_decode_seq_len_values_device_.data()) ||
+          attention_decode_seq_len_values_device_.data(),
+          stream) ||
       !CopyInt32ScalarFromDevice(
           &attention_decode_seq_len_q_device_,
-          attention_decode_seq_len_values_device_.data() + 1)) {
+          attention_decode_seq_len_values_device_.data() + 1,
+          stream)) {
     return false;
   }
   for (DeviceBuffer<std::int32_t>& page_table : attention_decode_page_tables_by_layer_) {
@@ -1044,7 +1191,9 @@ bool RequestExecutionContext::InitializeAttentionDecodeMetadata() {
   return true;
 }
 
-bool RequestExecutionContext::SetAttentionDecodeSequenceLength(std::size_t sequence_length) {
+bool RequestExecutionContext::SetAttentionDecodeSequenceLength(
+    std::size_t sequence_length,
+    cudaStream_t stream) {
   if (!FitsInt32(sequence_length)) {
     return false;
   }
@@ -1056,10 +1205,13 @@ bool RequestExecutionContext::SetAttentionDecodeSequenceLength(std::size_t seque
   }
   return CopyInt32ScalarFromDevice(
       &attention_decode_seq_len_kv_device_,
-      attention_decode_seq_len_values_device_.data() + sequence_length);
+      attention_decode_seq_len_values_device_.data() + sequence_length,
+      stream);
 }
 
-bool RequestExecutionContext::AdvanceAttentionDecodeSequenceLength(std::size_t token_count) {
+bool RequestExecutionContext::AdvanceAttentionDecodeSequenceLength(
+    std::size_t token_count,
+    cudaStream_t stream) {
   if (token_count == 0 || attention_decode_seq_len_kv_device_.count() == 0) {
     return true;
   }
@@ -1070,7 +1222,8 @@ bool RequestExecutionContext::AdvanceAttentionDecodeSequenceLength(std::size_t t
   }
   return CopyInt32ScalarFromDevice(
       &attention_decode_seq_len_kv_device_,
-      attention_decode_seq_len_values_device_.data() + next_sequence_length);
+      attention_decode_seq_len_values_device_.data() + next_sequence_length,
+      stream);
 }
 
 }  // namespace nemotron

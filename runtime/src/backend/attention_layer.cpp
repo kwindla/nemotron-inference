@@ -184,7 +184,8 @@ bool AttentionLayerSlice::Run(
     GemmHeuristicCache* heuristic_cache,
     RequestExecutionContext& request_context,
     const DeviceTensorFp32& input,
-    DeviceTensorFp32* output) const {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) const {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   if (!valid() ||
       !cublas_handle.valid() ||
@@ -216,7 +217,7 @@ bool AttentionLayerSlice::Run(
   std::size_t cache_start_token = 0;
   std::size_t total_sequence_tokens = token_count;
   if (new_request) {
-    if (!request_context.SetSequenceLength(token_count)) {
+    if (!request_context.SetSequenceLength(token_count, stream)) {
       if (debug) {
         std::cout << "attention_layer: failed to set sequence length\n";
       }
@@ -231,7 +232,7 @@ bool AttentionLayerSlice::Run(
       return false;
     }
     cache_start_token = total_sequence_tokens - token_count;
-    if (!request_context.EnsureAttentionTokens(total_sequence_tokens)) {
+    if (!request_context.EnsureAttentionTokens(total_sequence_tokens, stream)) {
       if (debug) {
         std::cout << "attention_layer: failed to ensure attention tokens for decode append\n";
       }
@@ -323,10 +324,10 @@ bool AttentionLayerSlice::Run(
   }
 
   const bool norm_ok =
-      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed);
-  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q);
-  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k);
-  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v);
+      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed, stream);
+  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q, stream);
+  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k, stream);
+  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v, stream);
   if (!norm_ok || !q_ok || !k_ok || !v_ok) {
     if (debug) {
       std::cout << "attention_layer: norm/qkv failed"
@@ -371,7 +372,8 @@ bool AttentionLayerSlice::Run(
       token_count,
       impl_->config.query_head_count,
       impl_->config.head_dim,
-      query_bf16);
+      query_bf16,
+      stream);
   const bool query_fp8_ok = !use_fp8_decode_attention ||
       ConvertRowMajorMatrixToAttentionFp8E4M3(
           *q,
@@ -379,7 +381,8 @@ bool AttentionLayerSlice::Run(
           impl_->config.query_head_count,
           impl_->config.head_dim,
           request_context.config().attention_kv_cache.q_scale,
-          query_fp8);
+          query_fp8,
+          stream);
   const bool scatter_bf16_ok = ScatterKvRowMajorMatricesToPagedCacheBf16(
       *k,
       *v,
@@ -391,7 +394,8 @@ bool AttentionLayerSlice::Run(
       layer_page_ids_device->data(),
       layer_page_id_count,
       request_context.key_cache(),
-      request_context.value_cache());
+      request_context.value_cache(),
+      stream);
   const bool scatter_fp8_ok = !use_fp8_kv_cache ||
       ScatterKvRowMajorMatricesToPagedCacheFp8E4M3(
           *k,
@@ -406,10 +410,11 @@ bool AttentionLayerSlice::Run(
           layer_page_ids_device->data(),
           layer_page_id_count,
           request_context.key_cache_fp8(),
-          request_context.value_cache_fp8());
+          request_context.value_cache_fp8(),
+          stream);
   if (!query_bf16_ok || !query_fp8_ok ||
       !scatter_bf16_ok || !scatter_fp8_ok ||
-      !output_bf16->FillZero()) {
+      !output_bf16->FillZero(stream)) {
     if (debug) {
       std::cout << "attention_layer: failed to prepare device attention inputs"
                 << " query_bf16_ok=" << query_bf16_ok
@@ -503,7 +508,7 @@ bool AttentionLayerSlice::Run(
           output_bf16->data(),
           nullptr,
       };
-      if (!decode_plan->Execute(cudnn_handle, execution)) {
+      if (!decode_plan->Execute(cudnn_handle, execution, stream, false)) {
         if (debug) {
           std::cout << "attention_layer: cached decode attention execute failed\n";
         }
@@ -515,7 +520,8 @@ bool AttentionLayerSlice::Run(
               token_count,
               impl_->config.query_head_count,
               impl_->config.head_dim,
-              attn_output_fp32)) {
+              attn_output_fp32,
+              stream)) {
         if (debug) {
           std::cout << "attention_layer: failed to convert cached decode output\n";
         }
@@ -523,8 +529,8 @@ bool AttentionLayerSlice::Run(
       }
 
       const bool o_ok =
-          impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected);
-      const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output);
+          impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected, stream);
+      const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output, stream);
       if (!o_ok || !residual_ok) {
         if (debug) {
           std::cout << "attention_layer: cached decode output projection or residual failed"
@@ -620,7 +626,7 @@ bool AttentionLayerSlice::Run(
       output_bf16->data(),
       nullptr,
   };
-  if (!attention_plan->Execute(cudnn_handle, execution)) {
+  if (!attention_plan->Execute(cudnn_handle, execution, stream, false)) {
     if (debug) {
       std::cout << "attention_layer: cuDNN attention execute failed\n";
     }
@@ -632,15 +638,17 @@ bool AttentionLayerSlice::Run(
           token_count,
           impl_->config.query_head_count,
           impl_->config.head_dim,
-          attn_output_fp32)) {
+          attn_output_fp32,
+          stream)) {
     if (debug) {
       std::cout << "attention_layer: failed to convert attention output to row-major fp32\n";
     }
     return false;
   }
 
-  const bool o_ok = impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected);
-  const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output);
+  const bool o_ok =
+      impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected, stream);
+  const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output, stream);
   if (!o_ok || !residual_ok) {
     if (debug) {
       std::cout << "attention_layer: output projection or residual failed"
@@ -658,7 +666,8 @@ bool AttentionLayerSlice::Run(
     GemmHeuristicCache* heuristic_cache,
     RequestExecutionContext& request_context,
     const DeviceTensorBf16& input,
-    DeviceTensorBf16* output) const {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) const {
   if (!valid() ||
       !cublas_handle.valid() ||
       !cudnn_handle.valid() ||
@@ -688,7 +697,7 @@ bool AttentionLayerSlice::Run(
   if (!input_fp32 || !output_fp32) {
     return false;
   }
-  if (!ConvertDeviceBf16ToFp32(input.data(), input.numel(), input_fp32->data())) {
+  if (!ConvertDeviceBf16ToFp32(input.data(), input.numel(), input_fp32->data(), stream)) {
     return false;
   }
   if (!Run(
@@ -697,10 +706,11 @@ bool AttentionLayerSlice::Run(
           heuristic_cache,
           request_context,
           *input_fp32,
-          output_fp32.get())) {
+          output_fp32.get(),
+          stream)) {
     return false;
   }
-  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data(), stream);
 }
 
 }  // namespace nemotron

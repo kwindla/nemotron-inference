@@ -35,6 +35,7 @@
 #include "nemotron/paged_kv_cache.h"
 #include "nemotron/primitive_ops.h"
 #include "nemotron/runtime_environment.h"
+#include "nemotron/runtime_stats.h"
 #include "../backend/storage_conversion.h"
 
 namespace nemotron {
@@ -1148,7 +1149,19 @@ bool SingleTokenForwardModel::RunDecodeStep(
     }
     return false;
   }
-  if (!request_context.AdvanceDecodePosition(1)) {
+  const bool capture_second_decode_token =
+      request_context.forward_graph_enabled() &&
+      !request_context.forward_graph_captured() &&
+      request_context.sequence_length() != 0 &&
+      request_context.sequence_length() == request_context.decode_position() &&
+      request_context.decode_token_count() == 1 &&
+      capture_layer_indices.empty() &&
+      trace == nullptr &&
+      !stop_layer_index.has_value() &&
+      !ForwardProfileEnabled();
+  const cudaStream_t advance_stream =
+      capture_second_decode_token ? cudaStreamPerThread : nullptr;
+  if (!request_context.AdvanceDecodePosition(1, advance_stream)) {
     if (debug) {
       std::cout << "single_token_forward_model: failed to advance decode position\n";
     }
@@ -1327,6 +1340,163 @@ bool SingleTokenForwardModel::RunPrefill(
     DeviceTensorBf16* current = current_view_bf16.get();
     DeviceTensorBf16* next = next_view_bf16.get();
     DeviceTensorBf16* scratch_bf16 = scratch_view_bf16.get();
+
+    const bool use_forward_graph =
+        request_context.forward_graph_enabled() &&
+        capture_layer_indices.empty() &&
+        trace == nullptr &&
+        !stop_layer_index.has_value() &&
+        !profile;
+    const std::size_t decode_token_index = request_context.current_decode_token_index();
+    const auto clear_cuda_error = []() {
+      static_cast<void>(cudaGetLastError());
+    };
+    auto run_bf16_decode_forward = [&](cudaStream_t stream) -> bool {
+      DeviceTensorBf16* graph_current = current;
+      DeviceTensorBf16* graph_next = next;
+
+      if (!LookupEmbeddingRowsDeviceIdsBf16(
+               *impl_->embedding_table,
+               token_ids_device->data(),
+               token_count,
+               graph_current,
+               stream)
+               .has_value()) {
+        return false;
+      }
+
+      for (const Impl::LayerEntry& layer : impl_->layers) {
+        bool ok = false;
+        switch (layer.plan.kind) {
+          case ForwardLayerKind::kAttention:
+            ok = layer.attention_slice != nullptr &&
+                 layer.attention_slice->valid() &&
+                 layer.attention_slice->Run(
+                     *impl_->cublas,
+                     *impl_->cudnn,
+                     impl_->heuristic_cache.get(),
+                     request_context,
+                     *graph_current,
+                     graph_next,
+                     stream);
+            break;
+          case ForwardLayerKind::kMamba:
+            ok = layer.mamba_slice != nullptr &&
+                 layer.mamba_slice->valid() &&
+                 layer.mamba_slice->Run(
+                     *impl_->cublas,
+                     impl_->heuristic_cache.get(),
+                     request_context,
+                     *graph_current,
+                     graph_next,
+                     nullptr,
+                     stream);
+            break;
+          case ForwardLayerKind::kExpert:
+            ok = layer.expert_slice != nullptr &&
+                 layer.expert_slice->valid() &&
+                 layer.expert_slice->RunWithRequestContext(
+                     *impl_->cublas,
+                     impl_->heuristic_cache.get(),
+                     request_context,
+                     *graph_current,
+                     graph_next,
+                     nullptr,
+                     stream);
+            break;
+        }
+        if (!ok) {
+          return false;
+        }
+        std::swap(graph_current, graph_next);
+      }
+
+      const DeviceTensorBf16* logits_input = graph_current;
+      if (impl_->final_norm_weight != nullptr) {
+        if (!RmsNormBf16(
+                *graph_current,
+                *impl_->final_norm_weight,
+                impl_->config.layer_norm_epsilon,
+                scratch_bf16,
+                stream)) {
+          return false;
+        }
+        logits_input = scratch_bf16;
+      }
+
+      return impl_->lm_head_op->Run(
+          *impl_->cublas,
+          impl_->heuristic_cache.get(),
+          *logits_input,
+          logits,
+          stream);
+    };
+
+    if (use_forward_graph && request_context.forward_graph_captured()) {
+      if (token_ids_device->CopyFromHostAsync(token_ids, token_count) &&
+          request_context.LaunchForwardGraph(nullptr)) {
+        RecordForwardGraphReplay();
+        destroy_profile_events();
+        return true;
+      }
+      request_context.DisableForwardGraph();
+      clear_cuda_error();
+    } else if (use_forward_graph && decode_token_index == 1) {
+      cudaGraph_t forward_graph = nullptr;
+      cudaGraphExec_t forward_graph_exec = nullptr;
+      const cudaStream_t capture_stream = cudaStreamPerThread;
+      const auto destroy_forward_graph = [&]() {
+        if (forward_graph_exec != nullptr) {
+          cudaGraphExecDestroy(forward_graph_exec);
+          forward_graph_exec = nullptr;
+        }
+        if (forward_graph != nullptr) {
+          cudaGraphDestroy(forward_graph);
+          forward_graph = nullptr;
+        }
+      };
+
+      bool capture_ok = token_ids_device->CopyFromHostAsync(token_ids, token_count, capture_stream);
+      bool capture_started = false;
+      if (capture_ok) {
+        capture_started =
+            cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
+        capture_ok = capture_started;
+      }
+      if (capture_ok) {
+        capture_ok = run_bf16_decode_forward(capture_stream);
+      }
+      if (capture_ok) {
+        capture_ok =
+            cudaStreamEndCapture(capture_stream, &forward_graph) == cudaSuccess &&
+            forward_graph != nullptr;
+      } else if (capture_started) {
+        cudaGraph_t discarded_graph = nullptr;
+        if (cudaStreamEndCapture(capture_stream, &discarded_graph) == cudaSuccess &&
+            discarded_graph != nullptr) {
+          cudaGraphDestroy(discarded_graph);
+        }
+      }
+      if (capture_ok) {
+        capture_ok =
+            cudaGraphInstantiate(&forward_graph_exec, forward_graph, 0) == cudaSuccess &&
+            request_context.SetForwardGraph(forward_graph, forward_graph_exec);
+      }
+      if (capture_ok) {
+        forward_graph = nullptr;
+        forward_graph_exec = nullptr;
+        RecordForwardGraphCapture();
+        capture_ok = request_context.LaunchForwardGraph(capture_stream);
+      }
+      if (capture_ok) {
+        RecordForwardGraphReplay();
+        destroy_profile_events();
+        return true;
+      }
+      destroy_forward_graph();
+      request_context.DisableForwardGraph();
+      clear_cuda_error();
+    }
 
     if (!token_ids_device->CopyFromHostAsync(token_ids, token_count) ||
         !LookupEmbeddingRowsDeviceIdsBf16(

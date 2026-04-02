@@ -56,6 +56,8 @@ struct RuntimeExecutionStats {
   std::atomic<std::uint64_t> grouped_routed_expert_fastpath_uses{0};
   std::atomic<std::uint64_t> moe_graph_captures{0};
   std::atomic<std::uint64_t> moe_graph_replays{0};
+  std::atomic<std::uint64_t> forward_graph_captures{0};
+  std::atomic<std::uint64_t> forward_graph_replays{0};
   std::atomic<std::uint64_t> grouped_routed_expert_fastpath_fallbacks{0};
   std::atomic<std::uint64_t> grouped_routed_expert_prereq_fallbacks{0};
   std::atomic<std::uint64_t> grouped_routed_expert_lookup_fallbacks{0};
@@ -126,6 +128,8 @@ void ResetRuntimeExecutionStats() {
   stats.grouped_routed_expert_fastpath_uses.store(0, std::memory_order_relaxed);
   stats.moe_graph_captures.store(0, std::memory_order_relaxed);
   stats.moe_graph_replays.store(0, std::memory_order_relaxed);
+  stats.forward_graph_captures.store(0, std::memory_order_relaxed);
+  stats.forward_graph_replays.store(0, std::memory_order_relaxed);
   stats.grouped_routed_expert_fastpath_fallbacks.store(0, std::memory_order_relaxed);
   stats.grouped_routed_expert_prereq_fallbacks.store(0, std::memory_order_relaxed);
   stats.grouped_routed_expert_lookup_fallbacks.store(0, std::memory_order_relaxed);
@@ -236,6 +240,10 @@ RuntimeExecutionStatsSnapshot GetRuntimeExecutionStatsSnapshot() {
       stats.grouped_routed_expert_fastpath_uses.load(std::memory_order_relaxed);
   snapshot.moe_graph_captures = stats.moe_graph_captures.load(std::memory_order_relaxed);
   snapshot.moe_graph_replays = stats.moe_graph_replays.load(std::memory_order_relaxed);
+  snapshot.forward_graph_captures =
+      stats.forward_graph_captures.load(std::memory_order_relaxed);
+  snapshot.forward_graph_replays =
+      stats.forward_graph_replays.load(std::memory_order_relaxed);
   snapshot.grouped_routed_expert_fastpath_fallbacks =
       stats.grouped_routed_expert_fastpath_fallbacks.load(std::memory_order_relaxed);
   snapshot.grouped_routed_expert_prereq_fallbacks =
@@ -471,6 +479,14 @@ void RecordMoeGraphCapture() {
 
 void RecordMoeGraphReplay() {
   MutableRuntimeExecutionStats().moe_graph_replays.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordForwardGraphCapture() {
+  MutableRuntimeExecutionStats().forward_graph_captures.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordForwardGraphReplay() {
+  MutableRuntimeExecutionStats().forward_graph_replays.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RecordGroupedRoutedExpertFastpathFallback() {

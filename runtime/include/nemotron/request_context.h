@@ -6,6 +6,8 @@
 #include <optional>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/device_buffer.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/paged_kv_cache.h"
@@ -45,6 +47,8 @@ class RequestExecutionContext {
   const RequestExecutionConfig& config() const;
   std::size_t sequence_length() const;
   std::size_t decode_position() const;
+  std::size_t current_decode_token_index() const;
+  std::size_t decode_token_count() const;
 
   DeviceTensorFp32* hidden();
   const DeviceTensorFp32* hidden() const;
@@ -86,6 +90,7 @@ class RequestExecutionContext {
   const DeviceBuffer<std::int32_t>* token_ids_device() const;
 
   bool EnsureAttentionTokens(std::size_t token_count);
+  bool EnsureAttentionTokens(std::size_t token_count, cudaStream_t stream);
   std::size_t allocated_kv_pages() const;
   std::size_t allocated_kv_pages(std::size_t layer_index) const;
   const std::vector<KvPageHandle>* kv_pages(std::size_t layer_index) const;
@@ -138,11 +143,20 @@ class RequestExecutionContext {
   DeviceTensorFp32* expert_aux_scratch();
   const DeviceTensorFp32* expert_aux_scratch() const;
 
-  bool SetSequenceLength(std::size_t sequence_length);
-  bool AdvanceDecodePosition(std::size_t token_count);
+  bool forward_graph_enabled() const;
+  bool forward_graph_captured() const;
+  bool SetForwardGraph(cudaGraph_t graph, cudaGraphExec_t graph_exec);
+  bool LaunchForwardGraph(cudaStream_t stream = nullptr) const;
+  void DisableForwardGraph();
+  void ResetForwardGraph();
+
+  bool SetSequenceLength(std::size_t sequence_length, cudaStream_t stream = nullptr);
+  bool AdvanceDecodePosition(std::size_t token_count, cudaStream_t stream = nullptr);
   bool ResetForNewRequest();
 
  private:
+  struct ForwardGraphState;
+
   RequestExecutionContext(
       RequestExecutionConfig config,
       std::unique_ptr<DeviceTensorFp32> hidden,
@@ -174,9 +188,9 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorFp8E4M3> value_cache_fp8,
       std::optional<PagedKvCacheArena> kv_arena);
 
-  bool InitializeAttentionDecodeMetadata();
-  bool SetAttentionDecodeSequenceLength(std::size_t sequence_length);
-  bool AdvanceAttentionDecodeSequenceLength(std::size_t token_count);
+  bool InitializeAttentionDecodeMetadata(cudaStream_t stream = nullptr);
+  bool SetAttentionDecodeSequenceLength(std::size_t sequence_length, cudaStream_t stream);
+  bool AdvanceAttentionDecodeSequenceLength(std::size_t token_count, cudaStream_t stream);
 
   RequestExecutionConfig config_;
   std::unique_ptr<DeviceTensorFp32> hidden_;
@@ -225,6 +239,9 @@ class RequestExecutionContext {
   std::size_t expert_selection_capacity_ = 0;
   std::size_t sequence_length_ = 0;
   std::size_t decode_position_ = 0;
+  std::size_t current_decode_token_index_ = 0;
+  std::size_t decode_token_count_ = 0;
+  std::unique_ptr<ForwardGraphState> forward_graph_state_;
 };
 
 }  // namespace nemotron

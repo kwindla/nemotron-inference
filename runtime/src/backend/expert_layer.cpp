@@ -2602,82 +2602,92 @@ bool RunExpertRmsNorm(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& weight,
     float epsilon,
-    DeviceTensorFp32* output) {
-  return RmsNormFp32(input, weight, epsilon, output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
+  return RmsNormFp32(input, weight, epsilon, output, stream);
 }
 
 bool RunExpertRmsNorm(
     const DeviceTensorBf16& input,
     const DeviceTensorFp32& weight,
     float epsilon,
-    DeviceTensorBf16* output) {
-  return RmsNormBf16(input, weight, epsilon, output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
+  return RmsNormBf16(input, weight, epsilon, output, stream);
 }
 
 bool RunExpertResidualAdd(
     const DeviceTensorFp32& lhs,
     const DeviceTensorFp32& rhs,
-    DeviceTensorFp32* output) {
-  return ResidualAddFp32(lhs, rhs, output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
+  return ResidualAddFp32(lhs, rhs, output, stream);
 }
 
 bool RunExpertResidualAdd(
     const DeviceTensorBf16& lhs,
     const DeviceTensorBf16& rhs,
-    DeviceTensorBf16* output) {
-  return ResidualAddBf16(lhs, rhs, output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
+  return ResidualAddBf16(lhs, rhs, output, stream);
 }
 
-bool RunExpertRelu2(DeviceTensorFp32* tensor) {
-  return Relu2InPlaceFp32(tensor);
+bool RunExpertRelu2(DeviceTensorFp32* tensor, cudaStream_t stream) {
+  return Relu2InPlaceFp32(tensor, stream);
 }
 
-bool RunExpertRelu2(DeviceTensorBf16* tensor) {
-  return Relu2InPlaceBf16(tensor);
+bool RunExpertRelu2(DeviceTensorBf16* tensor, cudaStream_t stream) {
+  return Relu2InPlaceBf16(tensor, stream);
 }
 
 bool RunExpertAddScaled(
     const DeviceTensorFp32& input,
     float scale,
-    DeviceTensorFp32* accumulator) {
-  return AddScaledFp32(input, scale, accumulator);
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream) {
+  return AddScaledFp32(input, scale, accumulator, stream);
 }
 
 bool RunExpertAddScaled(
     const DeviceTensorBf16& input,
     float scale,
-    DeviceTensorBf16* accumulator) {
-  return AddScaledBf16(input, scale, accumulator);
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream) {
+  return AddScaledBf16(input, scale, accumulator, stream);
 }
 
 bool RunExpertAddScaledRow(
     const DeviceTensorFp32& input_row,
     float scale,
     std::size_t row_index,
-    DeviceTensorFp32* accumulator) {
-  return AddScaledRowFp32(input_row, scale, row_index, accumulator);
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream) {
+  return AddScaledRowFp32(input_row, scale, row_index, accumulator, stream);
 }
 
 bool RunExpertAddScaledRow(
     const DeviceTensorBf16& input_row,
     float scale,
     std::size_t row_index,
-    DeviceTensorBf16* accumulator) {
-  return AddScaledRowBf16(input_row, scale, row_index, accumulator);
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream) {
+  return AddScaledRowBf16(input_row, scale, row_index, accumulator, stream);
 }
 
 bool RunExpertCopyRow(
     const DeviceTensorFp32& input,
     std::size_t row_index,
-    DeviceTensorFp32* output_row) {
-  return CopyRowFp32(input, row_index, output_row);
+    DeviceTensorFp32* output_row,
+    cudaStream_t stream) {
+  return CopyRowFp32(input, row_index, output_row, stream);
 }
 
 bool RunExpertCopyRow(
     const DeviceTensorBf16& input,
     std::size_t row_index,
-    DeviceTensorBf16* output_row) {
-  return CopyRowBf16(input, row_index, output_row);
+    DeviceTensorBf16* output_row,
+    cudaStream_t stream) {
+  return CopyRowBf16(input, row_index, output_row, stream);
 }
 
 template <typename ImplT, typename ActivationTensorT>
@@ -2688,7 +2698,8 @@ bool RunExpertLayerImpl(
     RequestExecutionContext* request_context,
     const ActivationTensorT& input,
     ActivationTensorT* output,
-    ExpertLayerRunTrace* trace) {
+    ExpertLayerRunTrace* trace,
+    cudaStream_t stream) {
   static_assert(
       std::is_same_v<ActivationTensorT, DeviceTensorFp32> ||
           std::is_same_v<ActivationTensorT, DeviceTensorBf16>,
@@ -2827,10 +2838,16 @@ bool RunExpertLayerImpl(
   }
 
   const bool norm_ok =
-      RunExpertRmsNorm(input, *impl.input_norm_weight, impl.config.rms_epsilon, normalized.get());
+      RunExpertRmsNorm(
+          input,
+          *impl.input_norm_weight,
+          impl.config.rms_epsilon,
+          normalized.get(),
+          stream);
   const bool gate_ok =
       norm_ok &&
-      impl.gate_weight->Run(cublas_handle, heuristic_cache, *normalized, router_logits.get());
+      impl.gate_weight->Run(
+          cublas_handle, heuristic_cache, *normalized, router_logits.get(), stream);
   if (!norm_ok || !gate_ok) {
     if (debug) {
       std::cout << "expert_layer: norm or gate projection failed"
@@ -2842,14 +2859,18 @@ bool RunExpertLayerImpl(
 
   const bool fc1_ok =
       (impl.fc1_latent_scaled_fp8 != nullptr &&
-       impl.fc1_latent_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, latent.get())) ||
+       impl.fc1_latent_scaled_fp8->Run(
+           cublas_handle, heuristic_cache, *normalized, latent.get(), stream)) ||
       (impl.fc1_latent_dense != nullptr &&
-       impl.fc1_latent_dense->Run(cublas_handle, heuristic_cache, *normalized, latent.get()));
+       impl.fc1_latent_dense->Run(
+           cublas_handle, heuristic_cache, *normalized, latent.get(), stream));
   const bool shared_up_ok =
       (impl.shared_up_scaled_fp8 != nullptr &&
-       impl.shared_up_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, shared_up.get())) ||
+       impl.shared_up_scaled_fp8->Run(
+           cublas_handle, heuristic_cache, *normalized, shared_up.get(), stream)) ||
       (impl.shared_up_dense != nullptr &&
-       impl.shared_up_dense->Run(cublas_handle, heuristic_cache, *normalized, shared_up.get()));
+       impl.shared_up_dense->Run(
+           cublas_handle, heuristic_cache, *normalized, shared_up.get(), stream));
   if (!fc1_ok || !shared_up_ok) {
     if (debug) {
       std::cout << "expert_layer: fc1/shared_up projection failed"
@@ -2859,7 +2880,7 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  if (!routed_tensor->FillZero()) {
+  if (!routed_tensor->FillZero(stream)) {
     if (debug) {
       std::cout << "expert_layer: routed tensor zero fill failed\n";
     }
@@ -2925,7 +2946,8 @@ bool RunExpertLayerImpl(
           impl.config.norm_topk_prob,
           impl.config.routed_scaling_factor,
           selection_scratch.indices_device->data(),
-          selection_scratch.weights_device->data())) {
+          selection_scratch.weights_device->data(),
+          stream)) {
     if (debug) {
       std::cout << "expert_layer: device top-k selection failed\n";
       }
@@ -3376,7 +3398,7 @@ bool RunExpertLayerImpl(
     if (op_slot == nullptr || !op_slot->valid()) {
       return false;
     }
-    return op_slot->Run(cublas_handle, heuristic_cache, activation, output_tensor);
+    return op_slot->Run(cublas_handle, heuristic_cache, activation, output_tensor, stream);
   };
 
   enum class GroupedRoutedResult {
@@ -3409,20 +3431,34 @@ bool RunExpertLayerImpl(
     const bool use_strided_contiguous_weights = impl.experts_contiguous;
     const bool try_cutlass_single_token =
         CutlassMoeEnabled() && !use_strided_contiguous_weights;
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool outer_stream_capturing =
+        stream != nullptr &&
+        cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
+        capture_status != cudaStreamCaptureStatusNone;
 
     // CUDA graph replay fast path: when all experts are warm and graph is
     // captured, replay the entire MoE compute sequence in one graph launch.
-    if (impl.moe_graph_enabled && impl.experts_contiguous &&
+    if (!outer_stream_capturing &&
+        impl.moe_graph_enabled && impl.experts_contiguous &&
         batch_count == static_cast<std::size_t>(impl.config.top_k) &&
         impl.moe_graph_input_ready != nullptr &&
         impl.moe_graph_output_ready != nullptr) {
       cudaStream_t graph_stream = cudaStreamPerThread;
       const std::size_t latent_elements = impl.config.moe_latent_size;
       bool graph_ok =
-          cudaMemcpyAsync(impl.scratch_graph_indices.data(), selected_indices_device,
-                          batch_count * sizeof(std::int32_t), cudaMemcpyDeviceToDevice) == cudaSuccess &&
-          cudaMemcpyAsync(impl.scratch_graph_weights.data(), selected_weights_device,
-                          batch_count * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+          cudaMemcpyAsync(
+              impl.scratch_graph_indices.data(),
+              selected_indices_device,
+              batch_count * sizeof(std::int32_t),
+              cudaMemcpyDeviceToDevice,
+              stream) == cudaSuccess &&
+          cudaMemcpyAsync(
+              impl.scratch_graph_weights.data(),
+              selected_weights_device,
+              batch_count * sizeof(float),
+              cudaMemcpyDeviceToDevice,
+              stream) == cudaSuccess;
       if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
         graph_ok = graph_ok &&
                    cudaMemcpyAsync(
@@ -3435,10 +3471,11 @@ bool RunExpertLayerImpl(
                    ConvertDeviceBf16ToFp32(
                        latent_input_row.data(),
                        latent_elements,
-                       impl.scratch_graph_latent_in.data());
+                       impl.scratch_graph_latent_in.data(),
+                       stream);
       }
       graph_ok = graph_ok &&
-          cudaEventRecord(impl.moe_graph_input_ready, nullptr) == cudaSuccess &&
+          cudaEventRecord(impl.moe_graph_input_ready, stream) == cudaSuccess &&
           cudaStreamWaitEvent(graph_stream, impl.moe_graph_input_ready, 0) == cudaSuccess;
       if (!impl.moe_graph_captured) {
         auto graph_latent_view = DeviceTensorFp32::CreateView(
@@ -3533,20 +3570,22 @@ bool RunExpertLayerImpl(
         graph_ok =
             cudaGraphLaunch(impl.moe_graph_exec, graph_stream) == cudaSuccess &&
             cudaEventRecord(impl.moe_graph_output_ready, graph_stream) == cudaSuccess &&
-            cudaStreamWaitEvent(nullptr, impl.moe_graph_output_ready, 0) == cudaSuccess;
+            cudaStreamWaitEvent(stream, impl.moe_graph_output_ready, 0) == cudaSuccess;
         if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
           graph_ok = graph_ok &&
                      cudaMemcpyAsync(
                          routed_tensor->data(),
                          impl.scratch_graph_output.data(),
                          latent_elements * sizeof(float),
-                         cudaMemcpyDeviceToDevice) == cudaSuccess;
+                         cudaMemcpyDeviceToDevice,
+                         stream) == cudaSuccess;
         } else {
           graph_ok = graph_ok &&
                      ConvertDeviceFp32ToBf16(
                          impl.scratch_graph_output.data(),
                          latent_elements,
-                         routed_tensor->data());
+                         routed_tensor->data(),
+                         stream);
         }
         if (graph_ok) {
           RecordMoeGraphReplay();
@@ -3645,7 +3684,8 @@ bool RunExpertLayerImpl(
                 impl.scratch_latent_block_scales.data(),
                 impl.scratch_latent_matmul_scales.data(),
                 reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-                impl.scratch_global_max_bits.data());
+                impl.scratch_global_max_bits.data(),
+                stream);
           } else {
             return PackDeviceRowMajorBf16ToNvfp4InPlace(
                 latent_input_row, {},
@@ -3653,7 +3693,8 @@ bool RunExpertLayerImpl(
                 impl.scratch_latent_block_scales.data(),
                 impl.scratch_latent_matmul_scales.data(),
                 reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-                impl.scratch_global_max_bits.data());
+                impl.scratch_global_max_bits.data(),
+                stream);
           }
         }();
     if (!pack_ok) {
@@ -3723,7 +3764,7 @@ bool RunExpertLayerImpl(
           impl.cutlass_d_ptrs.data(),
           impl.scratch_cutlass_up_alphas.data(),
           0.0f,
-          nullptr);
+          stream);
       if (cutlass_up_ok && debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
                   << " CUTLASS device up_proj succeeded\n";
@@ -3741,7 +3782,8 @@ bool RunExpertLayerImpl(
                                  impl.contiguous_up_block_scale_stride_bytes,
                                  impl.contiguous_up_tensor_scales.data(),
                                  selected_indices_device,
-                                 grouped_up.get())
+                                 grouped_up.get(),
+                                 stream)
                            : (cutlass_up_ok ||
                               FusedRoutedUpProjPackedNvfp4SingleToken(
                                   impl.scratch_latent_packed_data.data(),
@@ -3751,7 +3793,8 @@ bool RunExpertLayerImpl(
                                   impl.scratch_up_packed_ptrs,
                                   impl.scratch_up_raw_scale_ptrs,
                                   impl.scratch_selected_up_tensor_scales,
-                                  grouped_up.get()));
+                                  grouped_up.get(),
+                                  stream));
     if (!up_ok) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -3769,7 +3812,8 @@ bool RunExpertLayerImpl(
             impl.scratch_down_act_block_scales,
             try_cutlass_single_token ? &impl.scratch_down_act_matmul_scales : nullptr,
             impl.scratch_down_act_tensor_scales,
-            down_act_packed_row_stride)) {
+            down_act_packed_row_stride,
+            stream)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertMergeFallback();
       return GroupedRoutedResult::kFallback;
@@ -3802,7 +3846,8 @@ bool RunExpertLayerImpl(
           cudaMemsetAsync(
               impl.scratch_cutlass_down_output.data(),
               0,
-              down_output_count * sizeof(float)) == cudaSuccess) {
+              down_output_count * sizeof(float),
+              stream) == cudaSuccess) {
         // Build all pointer arrays on device — zero host involvement.
         BuildStridedDevicePointerArray(
             const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_ptrs.data())),
@@ -3829,7 +3874,7 @@ bool RunExpertLayerImpl(
             impl.cutlass_d_ptrs.data(),
             impl.scratch_cutlass_down_alphas.data(),
             0.0f,
-            nullptr);
+            stream);
 
         if (cutlass_down_ok) {
           if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
@@ -3839,7 +3884,8 @@ bool RunExpertLayerImpl(
                 impl.scratch_row_scales.data(),
                 selected_weights_device,
                 batch_count,
-                routed_tensor.get());
+                routed_tensor.get(),
+                stream);
           } else {
             cutlass_down_ok = ScaleWeightedAccumulateRowsBf16(
                 *down_output,
@@ -3847,7 +3893,8 @@ bool RunExpertLayerImpl(
                 impl.scratch_row_scales.data(),
                 selected_weights_device,
                 batch_count,
-                routed_tensor.get());
+                routed_tensor.get(),
+                stream);
           }
         }
       }
@@ -3870,7 +3917,8 @@ bool RunExpertLayerImpl(
                                    impl.contiguous_down_tensor_scales.data(),
                                    selected_indices_device,
                                    routed_tensor.get(),
-                                   down_act_packed_row_stride)
+                                   down_act_packed_row_stride,
+                                   stream)
                              : (cutlass_down_ok ||
                                 FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
                                     impl.scratch_down_act_packed.data(),
@@ -3882,7 +3930,8 @@ bool RunExpertLayerImpl(
                                     impl.scratch_down_raw_scale_ptrs,
                                     impl.scratch_selected_down_tensor_scales,
                                     routed_tensor.get(),
-                                    down_act_packed_row_stride));
+                                    down_act_packed_row_stride,
+                                    stream));
     if (!down_ok) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -3947,7 +3996,7 @@ bool RunExpertLayerImpl(
 
     const ActivationTensorT* latent_input = latent.get();
     if (token_count != 1) {
-      if (!RunExpertCopyRow(*latent, token_index, latent_row.get())) {
+      if (!RunExpertCopyRow(*latent, token_index, latent_row.get(), stream)) {
         if (debug) {
           std::cout << "expert_layer: latent row copy failed\n";
         }
@@ -4018,7 +4067,8 @@ bool RunExpertLayerImpl(
         return false;
       }
 
-      bool up_ok = pair->up_proj->Run(cublas_handle, heuristic_cache, *latent_input, expert_up.get());
+      bool up_ok =
+          pair->up_proj->Run(cublas_handle, heuristic_cache, *latent_input, expert_up.get(), stream);
       if (!up_ok) {
         up_ok = retry_with_dense_fallback(
             *pair,
@@ -4035,14 +4085,15 @@ bool RunExpertLayerImpl(
         }
         return false;
       }
-      if (!RunExpertRelu2(expert_up.get())) {
+      if (!RunExpertRelu2(expert_up.get(), stream)) {
         if (debug) {
           std::cout << "expert_layer: routed relu2 failed for expert "
                     << selection.expert_index << "\n";
         }
         return false;
       }
-      bool down_ok = pair->down_proj->Run(cublas_handle, heuristic_cache, *expert_up, expert_down.get());
+      bool down_ok = pair->down_proj->Run(
+          cublas_handle, heuristic_cache, *expert_up, expert_down.get(), stream);
       if (!down_ok) {
         down_ok = retry_with_dense_fallback(
             *pair,
@@ -4060,8 +4111,13 @@ bool RunExpertLayerImpl(
         return false;
       }
       const bool add_ok = token_count == 1
-          ? RunExpertAddScaled(*expert_down, selection.weight, routed_tensor.get())
-          : RunExpertAddScaledRow(*expert_down, selection.weight, token_index, routed_tensor.get());
+          ? RunExpertAddScaled(*expert_down, selection.weight, routed_tensor.get(), stream)
+          : RunExpertAddScaledRow(
+                *expert_down,
+                selection.weight,
+                token_index,
+                routed_tensor.get(),
+                stream);
       if (!add_ok) {
         if (debug) {
           std::cout << "expert_layer: routed weighted accumulation failed for expert "
@@ -4119,7 +4175,7 @@ bool RunExpertLayerImpl(
     }
   }
 
-  if (!RunExpertRelu2(shared_up.get())) {
+  if (!RunExpertRelu2(shared_up.get(), stream)) {
     if (debug) {
       std::cout << "expert_layer: shared relu2 failed\n";
     }
@@ -4129,13 +4185,16 @@ bool RunExpertLayerImpl(
   bool shared_down_ok = false;
   if (impl.shared_down_nvfp4 != nullptr) {
     shared_down_ok =
-        impl.shared_down_nvfp4->Run(cublas_handle, heuristic_cache, *shared_up, shared_output_device.get());
+        impl.shared_down_nvfp4->Run(
+            cublas_handle, heuristic_cache, *shared_up, shared_output_device.get(), stream);
   } else if (impl.shared_down_scaled_fp8 != nullptr) {
     shared_down_ok =
-        impl.shared_down_scaled_fp8->Run(cublas_handle, heuristic_cache, *shared_up, shared_output_device.get());
+        impl.shared_down_scaled_fp8->Run(
+            cublas_handle, heuristic_cache, *shared_up, shared_output_device.get(), stream);
   } else if (impl.shared_down_dense != nullptr) {
     shared_down_ok =
-        impl.shared_down_dense->Run(cublas_handle, heuristic_cache, *shared_up, shared_output_device.get());
+        impl.shared_down_dense->Run(
+            cublas_handle, heuristic_cache, *shared_up, shared_output_device.get(), stream);
   }
   if (!shared_down_ok) {
     if (debug) {
@@ -4144,14 +4203,23 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  if (!impl.fc2_latent->Run(cublas_handle, heuristic_cache, *routed_tensor, projected_routed.get())) {
+  if (!impl.fc2_latent->Run(
+          cublas_handle,
+          heuristic_cache,
+          *routed_tensor,
+          projected_routed.get(),
+          stream)) {
     if (debug) {
       std::cout << "expert_layer: fc2 latent projection failed\n";
     }
     return false;
   }
-  if (!RunExpertResidualAdd(*projected_routed, *shared_output_device, mixer_output_device.get()) ||
-      !RunExpertResidualAdd(input, *mixer_output_device, output)) {
+  if (!RunExpertResidualAdd(
+          *projected_routed,
+          *shared_output_device,
+          mixer_output_device.get(),
+          stream) ||
+      !RunExpertResidualAdd(input, *mixer_output_device, output, stream)) {
     if (debug) {
       std::cout << "expert_layer: residual merge failed\n";
     }
@@ -4184,7 +4252,8 @@ bool ExpertLayerSlice::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& input,
     DeviceTensorFp32* output,
-    ExpertLayerRunTrace* trace) const {
+    ExpertLayerRunTrace* trace,
+    cudaStream_t stream) const {
   return valid() &&
          RunExpertLayerImpl(
              *impl_,
@@ -4193,7 +4262,8 @@ bool ExpertLayerSlice::Run(
              nullptr,
              input,
              output,
-             trace);
+             trace,
+             stream);
 }
 
 bool ExpertLayerSlice::Run(
@@ -4201,7 +4271,8 @@ bool ExpertLayerSlice::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& input,
     DeviceTensorBf16* output,
-    ExpertLayerRunTrace* trace) const {
+    ExpertLayerRunTrace* trace,
+    cudaStream_t stream) const {
   if (!valid() ||
       !cublas_handle.valid() ||
       !input.valid() ||
@@ -4219,7 +4290,8 @@ bool ExpertLayerSlice::Run(
       nullptr,
       input,
       output,
-      trace);
+      trace,
+      stream);
 }
 
 bool ExpertLayerSlice::RunWithRequestContext(
@@ -4228,7 +4300,8 @@ bool ExpertLayerSlice::RunWithRequestContext(
     RequestExecutionContext& request_context,
     const DeviceTensorFp32& input,
     DeviceTensorFp32* output,
-    ExpertLayerRunTrace* trace) const {
+    ExpertLayerRunTrace* trace,
+    cudaStream_t stream) const {
   return valid() &&
          RunExpertLayerImpl(
              *impl_,
@@ -4237,7 +4310,8 @@ bool ExpertLayerSlice::RunWithRequestContext(
              &request_context,
              input,
              output,
-             trace);
+             trace,
+             stream);
 }
 
 bool ExpertLayerSlice::RunWithRequestContext(
@@ -4246,7 +4320,8 @@ bool ExpertLayerSlice::RunWithRequestContext(
     RequestExecutionContext& request_context,
     const DeviceTensorBf16& input,
     DeviceTensorBf16* output,
-    ExpertLayerRunTrace* trace) const {
+    ExpertLayerRunTrace* trace,
+    cudaStream_t stream) const {
   if (!valid() ||
       !cublas_handle.valid() ||
       !request_context.valid() ||
@@ -4265,7 +4340,8 @@ bool ExpertLayerSlice::RunWithRequestContext(
       &request_context,
       input,
       output,
-      trace);
+      trace,
+      stream);
 }
 
 }  // namespace nemotron
