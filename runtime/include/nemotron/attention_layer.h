@@ -3,6 +3,8 @@
 #include <memory>
 #include <optional>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/cublaslt_handle.h"
 #include "nemotron/cudnn_handle.h"
 #include "nemotron/gemm_catalog.h"
@@ -70,14 +72,16 @@ class AttentionLayerSlice {
       GemmHeuristicCache* heuristic_cache,
       RequestExecutionContext& request_context,
       const DeviceTensorFp32& input,
-      DeviceTensorFp32* output) const;
+      DeviceTensorFp32* output,
+      cudaStream_t stream = nullptr) const;
   bool Run(
       CublasLtHandle& cublas_handle,
       const CudnnHandle& cudnn_handle,
       GemmHeuristicCache* heuristic_cache,
       RequestExecutionContext& request_context,
       const DeviceTensorBf16& input,
-      DeviceTensorBf16* output) const;
+      DeviceTensorBf16* output,
+      cudaStream_t stream = nullptr) const;
 
  private:
   struct Impl;

@@ -678,7 +678,8 @@ bool MambaLayerSlice::Run(
     RequestExecutionContext& request_context,
     const DeviceTensorFp32& input,
     DeviceTensorFp32* output,
-    MambaLayerRunTrace* trace) const {
+    MambaLayerRunTrace* trace,
+    cudaStream_t stream) const {
   if (!valid() ||
       !cublas_handle.valid() ||
       !request_context.valid() ||
@@ -770,7 +771,12 @@ bool MambaLayerSlice::Run(
     trace->projected_output.clear();
   }
 
-  if (!RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.input_rms_epsilon, normalized)) {
+  if (!RmsNormFp32(
+          input,
+          *impl_->input_norm_weight,
+          impl_->config.input_rms_epsilon,
+          normalized,
+          stream)) {
     return false;
   }
 
@@ -783,9 +789,10 @@ bool MambaLayerSlice::Run(
 
   const bool in_proj_ok =
       (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->in_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, projected)) ||
+       impl_->in_proj_scaled_fp8->Run(
+           cublas_handle, heuristic_cache, *normalized, projected, stream)) ||
       (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected));
+       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected, stream));
   if (!in_proj_ok) {
     return false;
   }
@@ -808,7 +815,8 @@ bool MambaLayerSlice::Run(
               *impl_->conv1d_weight,
               *impl_->conv1d_bias,
               request_context.mamba_conv_state(),
-              decode_conv_output_view.get()) ||
+              decode_conv_output_view.get(),
+              stream) ||
           !MambaSelectiveStateUpdateDecodeFp32(
               *projected,
               *decode_conv_output_view,
@@ -824,13 +832,15 @@ bool MambaLayerSlice::Run(
               *impl_->D,
               *impl_->dt_bias,
               request_context.mamba_state(),
-              decode_gated_output_view.get()) ||
+              decode_gated_output_view.get(),
+              stream) ||
           !GroupedRmsNormFp32(
               *decode_gated_output_view,
               *impl_->mixer_norm_weight,
               impl_->config.n_groups,
               impl_->config.mixer_rms_epsilon,
-              scan_output)) {
+              scan_output,
+              stream)) {
         return false;
       }
     } else if (!MambaDecodeStepFusedFp32(
@@ -854,7 +864,8 @@ bool MambaLayerSlice::Run(
                    *impl_->mixer_norm_weight,
                    request_context.mamba_conv_state(),
                    request_context.mamba_state(),
-                   scan_output)) {
+                   scan_output,
+                   stream)) {
       return false;
     }
   } else {
@@ -867,7 +878,8 @@ bool MambaLayerSlice::Run(
             *impl_->conv1d_weight,
             *impl_->conv1d_bias,
             request_context.mamba_conv_state(),
-            conv_output.get()) ||
+            conv_output.get(),
+            stream) ||
         !MambaSsmUpdateFp32(
             *projected,
             *conv_output,
@@ -883,14 +895,16 @@ bool MambaLayerSlice::Run(
             *impl_->D,
             *impl_->dt_bias,
             request_context.mamba_state(),
-            y_output.get()) ||
+            y_output.get(),
+            stream) ||
         !GroupedRmsNormGatedFp32(
             *y_output,
             *projected,
             *impl_->mixer_norm_weight,
             impl_->config.n_groups,
             impl_->config.mixer_rms_epsilon,
-            scan_output)) {
+            scan_output,
+            stream)) {
       return false;
     }
   }
@@ -904,10 +918,12 @@ bool MambaLayerSlice::Run(
 
   const bool out_proj_ok =
       (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->out_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *scan_output, projected_output)) ||
+       impl_->out_proj_scaled_fp8->Run(
+           cublas_handle, heuristic_cache, *scan_output, projected_output, stream)) ||
       (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->out_proj_dense->Run(cublas_handle, heuristic_cache, *scan_output, projected_output));
-  if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output)) {
+       impl_->out_proj_dense->Run(
+           cublas_handle, heuristic_cache, *scan_output, projected_output, stream));
+  if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output, stream)) {
     return false;
   }
 
@@ -927,7 +943,8 @@ bool MambaLayerSlice::Run(
     RequestExecutionContext& request_context,
     const DeviceTensorBf16& input,
     DeviceTensorBf16* output,
-    MambaLayerRunTrace* trace) const {
+    MambaLayerRunTrace* trace,
+    cudaStream_t stream) const {
   if (!valid() ||
       !cublas_handle.valid() ||
       !request_context.valid() ||
@@ -1042,7 +1059,12 @@ bool MambaLayerSlice::Run(
     trace->projected_output.clear();
   }
 
-  if (!RmsNormBf16(input, *impl_->input_norm_weight, impl_->config.input_rms_epsilon, normalized)) {
+  if (!RmsNormBf16(
+          input,
+          *impl_->input_norm_weight,
+          impl_->config.input_rms_epsilon,
+          normalized,
+          stream)) {
     return false;
   }
 
@@ -1052,9 +1074,10 @@ bool MambaLayerSlice::Run(
 
   const bool in_proj_ok =
       (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->in_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, projected)) ||
+       impl_->in_proj_scaled_fp8->Run(
+           cublas_handle, heuristic_cache, *normalized, projected, stream)) ||
       (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected));
+       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected, stream));
   if (!in_proj_ok) {
     return false;
   }
@@ -1074,7 +1097,8 @@ bool MambaLayerSlice::Run(
               *impl_->conv1d_weight,
               *impl_->conv1d_bias,
               request_context.mamba_conv_state(),
-              decode_conv_output_view.get()) ||
+              decode_conv_output_view.get(),
+              stream) ||
           !MambaSelectiveStateUpdateDecodeBf16(
               *projected,
               *decode_conv_output_view,
@@ -1090,13 +1114,15 @@ bool MambaLayerSlice::Run(
               *impl_->D,
               *impl_->dt_bias,
               request_context.mamba_state(),
-              decode_gated_output_view.get()) ||
+              decode_gated_output_view.get(),
+              stream) ||
           !GroupedRmsNormBf16(
               *decode_gated_output_view,
               *impl_->mixer_norm_weight,
               impl_->config.n_groups,
               impl_->config.mixer_rms_epsilon,
-              scan_output)) {
+              scan_output,
+              stream)) {
         return false;
       }
     } else if (!MambaDecodeStepFusedBf16(
@@ -1120,7 +1146,8 @@ bool MambaLayerSlice::Run(
                    *impl_->mixer_norm_weight,
                    request_context.mamba_conv_state(),
                    request_context.mamba_state(),
-                   scan_output)) {
+                   scan_output,
+                   stream)) {
       return false;
     }
   } else {
@@ -1133,7 +1160,8 @@ bool MambaLayerSlice::Run(
             *impl_->conv1d_weight,
             *impl_->conv1d_bias,
             request_context.mamba_conv_state(),
-            conv_output.get()) ||
+            conv_output.get(),
+            stream) ||
         !MambaSsmUpdateBf16(
             *projected,
             *conv_output,
@@ -1149,14 +1177,16 @@ bool MambaLayerSlice::Run(
             *impl_->D,
             *impl_->dt_bias,
             request_context.mamba_state(),
-            y_output.get()) ||
+            y_output.get(),
+            stream) ||
         !GroupedRmsNormGatedBf16(
             *y_output,
             *projected,
             *impl_->mixer_norm_weight,
             impl_->config.n_groups,
             impl_->config.mixer_rms_epsilon,
-            scan_output)) {
+            scan_output,
+            stream)) {
       return false;
     }
   }
@@ -1167,10 +1197,12 @@ bool MambaLayerSlice::Run(
 
   const bool out_proj_ok =
       (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
-       impl_->out_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *scan_output, projected_output)) ||
+       impl_->out_proj_scaled_fp8->Run(
+           cublas_handle, heuristic_cache, *scan_output, projected_output, stream)) ||
       (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
-       impl_->out_proj_dense->Run(cublas_handle, heuristic_cache, *scan_output, projected_output));
-  if (!out_proj_ok || !ResidualAddBf16(input, *projected_output, output)) {
+       impl_->out_proj_dense->Run(
+           cublas_handle, heuristic_cache, *scan_output, projected_output, stream));
+  if (!out_proj_ok || !ResidualAddBf16(input, *projected_output, output, stream)) {
     return false;
   }
 

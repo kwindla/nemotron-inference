@@ -384,12 +384,66 @@ bool test_nvfp4_weight_upload_rejects_descriptor_without_scale_bytes() {
                 "device-resident NVFP4 weight upload should reject descriptors without scale bytes");
 }
 
+bool test_nvfp4_weight_view_allows_execution_scales_without_raw_block_scales() {
+  if (!has_cuda_device()) {
+    std::cout << "nvfp4_weight_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  std::uint8_t* packed_data = nullptr;
+  std::uint8_t* matmul_block_scales = nullptr;
+  std::uint8_t* tensor_scale = nullptr;
+  constexpr std::size_t kPackedBytes = 16;
+  constexpr std::size_t kMatmulScaleBytes = 32;
+  constexpr std::size_t kTensorScaleBytes = sizeof(float);
+  const bool allocated =
+      cudaMalloc(reinterpret_cast<void**>(&packed_data), kPackedBytes) == cudaSuccess &&
+      cudaMalloc(reinterpret_cast<void**>(&matmul_block_scales), kMatmulScaleBytes) == cudaSuccess &&
+      cudaMalloc(reinterpret_cast<void**>(&tensor_scale), kTensorScaleBytes) == cudaSuccess;
+  if (!allocated) {
+    if (tensor_scale != nullptr) {
+      cudaFree(tensor_scale);
+    }
+    if (matmul_block_scales != nullptr) {
+      cudaFree(matmul_block_scales);
+    }
+    if (packed_data != nullptr) {
+      cudaFree(packed_data);
+    }
+    return expect(false, "device allocations for NVFP4 view test should succeed");
+  }
+
+  auto view = DeviceNvfp4Weight::CreateView(
+      32,
+      16,
+      packed_data,
+      kPackedBytes,
+      nullptr,
+      0,
+      matmul_block_scales,
+      kMatmulScaleBytes,
+      tensor_scale,
+      kTensorScaleBytes);
+
+  const bool ok =
+      expect(static_cast<bool>(view), "NVFP4 view creation should allow missing raw block scales") &&
+      expect(view->valid(), "NVFP4 view without raw block scales should still be valid") &&
+      expect(view->block_scales_data() == nullptr, "NVFP4 view should expose null raw block scales") &&
+      expect(view->block_scales_nbytes() == 0, "NVFP4 view should expose zero raw block scale bytes");
+
+  cudaFree(tensor_scale);
+  cudaFree(matmul_block_scales);
+  cudaFree(packed_data);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_nvfp4_weight_upload_round_trips_packed_and_scale_bytes() &&
-      test_nvfp4_weight_upload_rejects_descriptor_without_scale_bytes();
+      test_nvfp4_weight_upload_rejects_descriptor_without_scale_bytes() &&
+      test_nvfp4_weight_view_allows_execution_scales_without_raw_block_scales();
 
   if (!ok) {
     return 1;

@@ -99,10 +99,12 @@ struct ArtifactLoader::Impl {
   explicit Impl(
       const PackedModelManifest& loaded_manifest,
       std::filesystem::path loaded_manifest_path,
-      ArtifactLoadMode requested_load_mode)
+      ArtifactLoadMode requested_load_mode,
+      bool requested_prefetch_mapped_files)
       : manifest_path(std::move(loaded_manifest_path)),
         manifest(loaded_manifest),
-        load_mode(requested_load_mode) {}
+        load_mode(requested_load_mode),
+        prefetch_mapped_files(requested_prefetch_mapped_files) {}
 
   ~Impl() {
     for (MappedFile& mapped_file : mapped_files) {
@@ -159,6 +161,21 @@ struct ArtifactLoader::Impl {
         close(fd);
         return false;
       }
+#ifdef POSIX_FADV_WILLNEED
+      if (prefetch_mapped_files) {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+      }
+#endif
+#ifdef MADV_SEQUENTIAL
+      if (prefetch_mapped_files) {
+        madvise(mapped, mapped_file.size, MADV_SEQUENTIAL);
+      }
+#endif
+#ifdef MADV_WILLNEED
+      if (prefetch_mapped_files) {
+        madvise(mapped, mapped_file.size, MADV_WILLNEED);
+      }
+#endif
       mapped_file.data = static_cast<const std::uint8_t*>(mapped);
     } else {
 #ifdef POSIX_FADV_SEQUENTIAL
@@ -180,6 +197,7 @@ struct ArtifactLoader::Impl {
   std::filesystem::path manifest_path;
   PackedModelManifest manifest;
   ArtifactLoadMode load_mode = ArtifactLoadMode::kMmap;
+  bool prefetch_mapped_files = false;
   std::vector<MappedFile> mapped_files;
   std::unordered_map<std::string, std::size_t> mapped_file_indices;
   std::unordered_map<std::string, std::size_t> tensor_indices;
@@ -195,12 +213,13 @@ std::unique_ptr<ArtifactLoader> ArtifactLoader::OpenVerified(
 std::unique_ptr<ArtifactLoader> ArtifactLoader::OpenVerifiedWithMode(
     const PackedModelManifest& manifest,
     const std::filesystem::path& manifest_path,
-    ArtifactLoadMode mode) {
+    ArtifactLoadMode mode,
+    bool prefetch_mapped_files) {
   if (HasManifestErrors(ValidateManifest(manifest))) {
     return nullptr;
   }
 
-  auto impl = std::make_unique<Impl>(manifest, manifest_path, mode);
+  auto impl = std::make_unique<Impl>(manifest, manifest_path, mode, prefetch_mapped_files);
   for (std::size_t tensor_index = 0; tensor_index < impl->manifest.tensors.size(); ++tensor_index) {
     const TensorManifestEntry& tensor = impl->manifest.tensors[tensor_index];
     impl->tensor_indices.emplace(tensor.name, tensor_index);

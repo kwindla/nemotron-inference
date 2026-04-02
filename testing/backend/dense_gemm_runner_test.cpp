@@ -41,6 +41,7 @@ using nemotron::LoadVerifiedManifestFromJsonFile;
 using nemotron::ManifestLoadResult;
 using nemotron::PrepareGemmExecution;
 using nemotron::RunDenseRowMajorFp32;
+using nemotron::RunDenseRowMajorFp32ReferenceToDevice;
 using nemotron::RunDenseRowMajorFp32ToDevice;
 using nemotron::TensorCatalog;
 using nemotron::WeightArena;
@@ -421,13 +422,81 @@ bool test_dense_gemm_runner_rejects_non_fp32_dense_descriptor() {
                 "first real dense GEMM runner should reject non-fp32 dense descriptors");
 }
 
+bool test_dense_reference_runner_matches_cpu_reference() {
+  const auto handle = CublasLtHandle::Create();
+  if (!handle || !handle->valid()) {
+    std::cout << "dense_gemm_runner_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  TempDir temp_dir;
+  const std::filesystem::path dense_path = temp_dir.path() / "weights" / "dense.bin";
+  const std::vector<float> weights = {
+      0.5f, -1.0f, 2.0f,
+      1.5f,  0.0f, 3.0f,
+  };
+  const std::string weight_bytes = bytes_from_vector(weights);
+  write_file(dense_path, weight_bytes);
+
+  const std::filesystem::path manifest_path = temp_dir.path() / "manifest.json";
+  write_file(
+      manifest_path,
+      make_manifest_json("weights/dense.bin", fnv1a64_hex(weight_bytes)));
+
+  const LoadedDenseCatalog loaded = load_dense_catalog(manifest_path);
+  if (!expect(loaded.gemm_catalog.valid(), "dense GEMM catalog should be valid before reference execution")) {
+    return false;
+  }
+
+  const auto* dense = loaded.gemm_catalog.FindDescriptor("mlp.up_proj");
+  if (!expect(dense != nullptr, "dense GEMM descriptor should exist before reference execution")) {
+    return false;
+  }
+
+  const std::vector<float> host_activations = {
+      1.0f, -2.0f, 0.5f,
+      0.0f,  1.0f, 3.0f,
+  };
+  auto device_activations = DeviceTensorFp32::Create({2, 3});
+  auto device_output = DeviceTensorFp32::Create({2, 2});
+  auto device_weight = DeviceDenseWeightFp32::Upload(*dense);
+  if (!expect(device_activations && device_output && device_weight, "reference path resources should allocate")) {
+    return false;
+  }
+  if (!expect(device_activations->CopyFromHost(host_activations.data(), host_activations.size()),
+              "reference activations should upload successfully")) {
+    return false;
+  }
+
+  const auto stats = RunDenseRowMajorFp32ReferenceToDevice(
+      *device_weight,
+      *device_activations,
+      device_output.get());
+  if (!expect(stats.has_value(), "device reference dense GEMM runner should execute successfully")) {
+    return false;
+  }
+
+  std::vector<float> host_output(device_output->numel(), 0.0f);
+  if (!expect(device_output->CopyToHost(host_output.data(), host_output.size()),
+              "reference output should download successfully")) {
+    return false;
+  }
+
+  const auto reference = cpu_reference(host_activations, 2, weights, 2, 3);
+  return expect(stats->rows == 2 && stats->cols == 2, "device reference runner should report the correct output shape") &&
+         expect(stats->heuristic_count == 0, "device reference runner should not report a cublasLt heuristic") &&
+         expect(nearly_equal(host_output, reference, 1e-5f),
+                "device reference runner output should match the CPU reference");
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_dense_gemm_runner_executes_against_cpu_reference() &&
       test_dense_gemm_runner_device_tensor_path_executes_against_cpu_reference() &&
-      test_dense_gemm_runner_rejects_non_fp32_dense_descriptor();
+      test_dense_gemm_runner_rejects_non_fp32_dense_descriptor() &&
+      test_dense_reference_runner_matches_cpu_reference();
 
   if (!ok) {
     return 1;

@@ -265,6 +265,8 @@ bool test_attention_layer_slice_matches_cpu_reference() {
       KvCacheDataType::kBf16,
   };
   request_config.attention_total_pages = 4;
+  request_config.attention_query_head_count = kQueryHeads;
+  request_config.attention_head_dim = kHeadDim;
   auto request_context = RequestExecutionContext::Create(request_config);
   if (!expect(request_context != nullptr && request_context->valid(), "request context should build")) {
     return false;

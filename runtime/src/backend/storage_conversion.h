@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 namespace nemotron {
 
@@ -30,23 +31,27 @@ bool UploadPackedFloatToDeviceBf16(
 bool ConvertDeviceFp32ToBf16(
     const float* device_input,
     std::size_t element_count,
-    __nv_bfloat16* device_output);
+    __nv_bfloat16* device_output,
+    cudaStream_t stream = nullptr);
 
 bool ConvertDeviceBf16ToFp32(
     const __nv_bfloat16* device_input,
     std::size_t element_count,
-    float* device_output);
+    float* device_output,
+    cudaStream_t stream = nullptr);
 
 bool QuantizeDeviceFp32ToScaledFp8RoundTripBf16(
     const float* device_input,
     std::size_t element_count,
     float input_scale,
-    __nv_bfloat16* device_output);
+    __nv_bfloat16* device_output,
+    cudaStream_t stream = nullptr);
 
 bool QuantizeDeviceFp32ToFp8E4M3(
     const float* device_input,
     std::size_t element_count,
     float input_scale,
-    std::uint8_t* device_output);
+    std::uint8_t* device_output,
+    cudaStream_t stream = nullptr);
 
 }  // namespace nemotron

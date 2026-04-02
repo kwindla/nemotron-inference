@@ -329,13 +329,63 @@ bool test_dense_weight_upload_accepts_bf16_descriptor() {
       "BF16 dense weight upload should convert values to FP32");
 }
 
+bool test_dense_weight_view_aliases_existing_device_storage() {
+  if (!has_cuda_device()) {
+    std::cout << "dense_weight_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  const std::vector<float> source = {
+      0.5f, -1.0f, 1.5f,
+      2.0f, -2.5f, 3.0f,
+  };
+
+  nemotron::GemmDescriptor descriptor;
+  descriptor.tensor_name = "fp32.view";
+  descriptor.op_class = "dense_linear";
+  descriptor.kernel_family = nemotron::GemmKernelFamily::kDenseRowMajor;
+  descriptor.output_rows = 2;
+  descriptor.input_cols = 3;
+  descriptor.storage_dtype = "fp32";
+  descriptor.compute_dtype = "fp32";
+  descriptor.layout_tag = "row_major";
+  descriptor.alignment_bytes = 16;
+  descriptor.packed_data = reinterpret_cast<const std::uint8_t*>(source.data());
+  descriptor.packed_nbytes = source.size() * sizeof(float);
+
+  auto uploaded = DeviceDenseWeightFp32::Upload(descriptor);
+  if (!expect(static_cast<bool>(uploaded), "source dense upload should succeed")) {
+    return false;
+  }
+
+  auto view = DeviceDenseWeightFp32::CreateView(2, 3, const_cast<float*>(uploaded->data()));
+  if (!expect(static_cast<bool>(view) && view->valid(), "dense view should be valid")) {
+    return false;
+  }
+
+  std::vector<float> round_trip(view->numel(), 0.0f);
+  if (!expect(
+          cudaMemcpy(
+              round_trip.data(),
+              view->data(),
+              round_trip.size() * sizeof(float),
+              cudaMemcpyDeviceToHost) == cudaSuccess,
+          "dense view should copy back to host")) {
+    return false;
+  }
+
+  return expect(nearly_equal(round_trip, source, 1.0e-6f),
+                "dense view should alias the original device storage");
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_dense_weight_upload_round_trips_descriptor_bytes() &&
       test_dense_weight_upload_rejects_non_fp32_descriptor() &&
-      test_dense_weight_upload_accepts_bf16_descriptor();
+      test_dense_weight_upload_accepts_bf16_descriptor() &&
+      test_dense_weight_view_aliases_existing_device_storage();
 
   if (!ok) {
     return 1;

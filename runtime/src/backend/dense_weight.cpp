@@ -4,7 +4,9 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#include <vector>
+#include <cstring>
+
+#include "storage_conversion.h"
 
 namespace nemotron {
 
@@ -12,6 +14,7 @@ struct DeviceDenseWeightFp32::Impl {
   std::size_t output_rows = 0;
   std::size_t input_cols = 0;
   float* data = nullptr;
+  bool owns_memory = true;
 };
 
 namespace {
@@ -20,25 +23,74 @@ bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
 
-}  // namespace
-
-std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
-    const GemmDescriptor& descriptor) {
+std::optional<PackedFloatStorage> PackedStorageForDenseDescriptor(const GemmDescriptor& descriptor) {
   if (descriptor.kernel_family != GemmKernelFamily::kDenseRowMajor ||
       descriptor.output_rows == 0 ||
       descriptor.input_cols == 0 ||
       descriptor.layout_tag != "row_major" ||
       descriptor.is_scaled() ||
       !descriptor.packed_bytes().valid()) {
-    return nullptr;
+    return std::nullopt;
   }
+  if (descriptor.storage_dtype == "fp32") {
+    return PackedFloatStorage::kFp32;
+  }
+  if (descriptor.storage_dtype == "bf16" || descriptor.storage_dtype == "bfloat16") {
+    return PackedFloatStorage::kBf16;
+  }
+  if (descriptor.storage_dtype == "fp8_e4m3fn" || descriptor.storage_dtype == "fp8_e4m3") {
+    return PackedFloatStorage::kFp8E4M3;
+  }
+  return std::nullopt;
+}
 
-  const bool is_fp32 = descriptor.storage_dtype == "fp32";
-  const bool is_bf16 =
-      descriptor.storage_dtype == "bf16" || descriptor.storage_dtype == "bfloat16";
-  const bool is_fp8 =
-      descriptor.storage_dtype == "fp8_e4m3fn" || descriptor.storage_dtype == "fp8_e4m3";
-  if (!is_fp32 && !is_bf16 && !is_fp8) {
+}  // namespace
+
+std::optional<std::vector<float>> ReadDenseWeightToHostFp32(
+    const GemmDescriptor& descriptor,
+    float storage_scale) {
+  const auto storage = PackedStorageForDenseDescriptor(descriptor);
+  if (!storage.has_value()) {
+    return std::nullopt;
+  }
+  const std::size_t count = descriptor.output_rows * descriptor.input_cols;
+  std::vector<float> output(count, 0.0f);
+  switch (*storage) {
+    case PackedFloatStorage::kFp32:
+      if (descriptor.packed_nbytes != count * sizeof(float)) {
+        return std::nullopt;
+      }
+      std::memcpy(output.data(), descriptor.packed_data, descriptor.packed_nbytes);
+      break;
+    case PackedFloatStorage::kBf16: {
+      if (descriptor.packed_nbytes != count * sizeof(__nv_bfloat16)) {
+        return std::nullopt;
+      }
+      const auto* src = reinterpret_cast<const __nv_bfloat16*>(descriptor.packed_data);
+      for (std::size_t i = 0; i < count; ++i) {
+        output[i] = __bfloat162float(src[i]) * storage_scale;
+      }
+      break;
+    }
+    case PackedFloatStorage::kFp8E4M3: {
+      if (descriptor.packed_nbytes != count * sizeof(__nv_fp8_e4m3)) {
+        return std::nullopt;
+      }
+      const auto* src = reinterpret_cast<const __nv_fp8_e4m3*>(descriptor.packed_data);
+      for (std::size_t i = 0; i < count; ++i) {
+        output[i] = static_cast<float>(src[i]) * storage_scale;
+      }
+      break;
+    }
+  }
+  return output;
+}
+
+std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
+    const GemmDescriptor& descriptor,
+    float storage_scale) {
+  const auto storage = PackedStorageForDenseDescriptor(descriptor);
+  if (!storage.has_value()) {
     return nullptr;
   }
   if (descriptor.compute_dtype != "fp32" &&
@@ -51,8 +103,9 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
 
   const std::size_t count = descriptor.output_rows * descriptor.input_cols;
   const std::size_t expected_bytes =
-      is_fp32 ? (count * sizeof(float))
-              : (is_bf16 ? (count * sizeof(__nv_bfloat16)) : count * sizeof(__nv_fp8_e4m3));
+      *storage == PackedFloatStorage::kFp32 ? (count * sizeof(float))
+      : (*storage == PackedFloatStorage::kBf16 ? (count * sizeof(__nv_bfloat16))
+                                               : count * sizeof(__nv_fp8_e4m3));
   if (descriptor.packed_nbytes != expected_bytes) {
     return nullptr;
   }
@@ -62,25 +115,6 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
     return nullptr;
   }
 
-  std::vector<float> bf16_converted;
-  std::vector<float> fp8_converted;
-  const void* upload_source = descriptor.packed_data;
-  if (is_bf16) {
-    bf16_converted.assign(count, 0.0f);
-    const auto* src = reinterpret_cast<const __nv_bfloat16*>(descriptor.packed_data);
-    for (std::size_t i = 0; i < count; ++i) {
-      bf16_converted[i] = __bfloat162float(src[i]);
-    }
-    upload_source = bf16_converted.data();
-  } else if (is_fp8) {
-    fp8_converted.assign(count, 0.0f);
-    const auto* src = reinterpret_cast<const __nv_fp8_e4m3*>(descriptor.packed_data);
-    for (std::size_t i = 0; i < count; ++i) {
-      fp8_converted[i] = static_cast<float>(src[i]);
-    }
-    upload_source = fp8_converted.data();
-  }
-
   auto impl = std::make_unique<Impl>();
   impl->output_rows = descriptor.output_rows;
   impl->input_cols = descriptor.input_cols;
@@ -88,15 +122,32 @@ std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::Upload(
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->data), upload_bytes))) {
     return nullptr;
   }
-  if (!CheckCuda(cudaMemcpy(
-          impl->data,
-          upload_source,
-          upload_bytes,
-          cudaMemcpyHostToDevice))) {
+  if (!UploadPackedFloatToDeviceFp32(
+          descriptor.packed_data,
+          count,
+          *storage,
+          storage_scale,
+          impl->data)) {
     cudaFree(impl->data);
     return nullptr;
   }
 
+  return std::unique_ptr<DeviceDenseWeightFp32>(new DeviceDenseWeightFp32(std::move(impl)));
+}
+
+std::unique_ptr<DeviceDenseWeightFp32> DeviceDenseWeightFp32::CreateView(
+    std::size_t output_rows,
+    std::size_t input_cols,
+    float* data) {
+  if (output_rows == 0 || input_cols == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->output_rows = output_rows;
+  impl->input_cols = input_cols;
+  impl->data = data;
+  impl->owns_memory = false;
   return std::unique_ptr<DeviceDenseWeightFp32>(new DeviceDenseWeightFp32(std::move(impl)));
 }
 
@@ -107,7 +158,7 @@ DeviceDenseWeightFp32::DeviceDenseWeightFp32(DeviceDenseWeightFp32&&) noexcept =
 DeviceDenseWeightFp32& DeviceDenseWeightFp32::operator=(DeviceDenseWeightFp32&&) noexcept = default;
 
 DeviceDenseWeightFp32::~DeviceDenseWeightFp32() {
-  if (impl_ && impl_->data != nullptr) {
+  if (impl_ && impl_->owns_memory && impl_->data != nullptr) {
     cudaFree(impl_->data);
   }
 }

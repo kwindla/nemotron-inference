@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/cublaslt_gemm_plan.h"
 #include "nemotron/cublaslt_handle.h"
 #include "nemotron/dense_weight.h"
@@ -34,7 +36,8 @@ std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
 bool QuantizeFp32ToScaledFp8RoundTrip(
     const DeviceTensorFp32& input,
     float input_scale,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 class ScaledFp8LinearOp {
  public:
@@ -60,19 +63,22 @@ class ScaledFp8LinearOp {
       CublasLtHandle& handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorFp32& activations,
-      DeviceTensorFp32* output) const;
+      DeviceTensorFp32* output,
+      cudaStream_t stream = nullptr) const;
 
   bool Run(
       CublasLtHandle& handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorBf16& activations,
-      DeviceTensorFp32* output) const;
+      DeviceTensorFp32* output,
+      cudaStream_t stream = nullptr) const;
 
   bool Run(
       CublasLtHandle& handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorBf16& activations,
-      DeviceTensorBf16* output) const;
+      DeviceTensorBf16* output,
+      cudaStream_t stream = nullptr) const;
 
  private:
   struct Impl;

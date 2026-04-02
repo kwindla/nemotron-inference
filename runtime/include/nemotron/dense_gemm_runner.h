@@ -4,6 +4,8 @@
 #include <optional>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/cublaslt_gemm_plan.h"
 #include "nemotron/cublaslt_handle.h"
 #include "nemotron/dense_weight.h"
@@ -31,42 +33,48 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     CublasLtHandle& handle,
@@ -75,7 +83,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     float alpha_scale,
     const DeviceTensorFp32& activations,
     float input_scale,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ReferenceToDevice(
     const DeviceDenseWeightFp32& weights,
@@ -86,7 +95,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorHostResult> RunDenseRowMajorFp32(
     CublasLtHandle& handle,

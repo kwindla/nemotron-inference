@@ -396,6 +396,10 @@ bool run_mamba_layer_fixture() {
   request_config.hidden_size = metadata->hidden_size;
   request_config.max_tokens = 1;
   request_config.scratch_tokens = 1;
+  request_config.mamba_hidden_size = metadata->hidden_size;
+  request_config.mamba_projection_size =
+      metadata->intermediate_size + conv_dim + metadata->num_heads;
+  request_config.mamba_intermediate_size = metadata->intermediate_size;
   request_config.mamba_conv_state_bytes_fp32 = conv_state_elems * sizeof(float);
   request_config.mamba_state_bytes_fp32 = ssm_state_elems * sizeof(float);
 

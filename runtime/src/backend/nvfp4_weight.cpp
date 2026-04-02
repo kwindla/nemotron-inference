@@ -19,6 +19,7 @@ struct DeviceNvfp4Weight::Impl {
   std::size_t matmul_block_scales_nbytes = 0;
   std::uint8_t* tensor_scale_data = nullptr;
   std::size_t tensor_scale_nbytes = 0;
+  bool owns_memory = true;
 };
 
 namespace {
@@ -112,6 +113,42 @@ std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescripto
   return std::unique_ptr<DeviceNvfp4Weight>(new DeviceNvfp4Weight(std::move(impl)));
 }
 
+std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::CreateView(
+    std::size_t output_rows,
+    std::size_t input_cols,
+    std::uint8_t* packed_data,
+    std::size_t packed_nbytes,
+    std::uint8_t* block_scales_data,
+    std::size_t block_scales_nbytes,
+    std::uint8_t* matmul_block_scales_data,
+    std::size_t matmul_block_scales_nbytes,
+    std::uint8_t* tensor_scale_data,
+    std::size_t tensor_scale_nbytes) {
+  const bool has_raw_block_scales =
+      (block_scales_data != nullptr && block_scales_nbytes > 0) ||
+      (block_scales_data == nullptr && block_scales_nbytes == 0);
+  if (output_rows == 0 || input_cols == 0 ||
+      packed_data == nullptr || packed_nbytes == 0 ||
+      !has_raw_block_scales ||
+      matmul_block_scales_data == nullptr || matmul_block_scales_nbytes == 0 ||
+      tensor_scale_data == nullptr || tensor_scale_nbytes == 0) {
+    return nullptr;
+  }
+  auto impl = std::make_unique<Impl>();
+  impl->output_rows = output_rows;
+  impl->input_cols = input_cols;
+  impl->packed_data = packed_data;
+  impl->packed_nbytes = packed_nbytes;
+  impl->block_scales_data = block_scales_data;
+  impl->block_scales_nbytes = block_scales_nbytes;
+  impl->matmul_block_scales_data = matmul_block_scales_data;
+  impl->matmul_block_scales_nbytes = matmul_block_scales_nbytes;
+  impl->tensor_scale_data = tensor_scale_data;
+  impl->tensor_scale_nbytes = tensor_scale_nbytes;
+  impl->owns_memory = false;
+  return std::unique_ptr<DeviceNvfp4Weight>(new DeviceNvfp4Weight(std::move(impl)));
+}
+
 DeviceNvfp4Weight::DeviceNvfp4Weight(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 DeviceNvfp4Weight::DeviceNvfp4Weight(DeviceNvfp4Weight&&) noexcept = default;
@@ -119,7 +156,7 @@ DeviceNvfp4Weight::DeviceNvfp4Weight(DeviceNvfp4Weight&&) noexcept = default;
 DeviceNvfp4Weight& DeviceNvfp4Weight::operator=(DeviceNvfp4Weight&&) noexcept = default;
 
 DeviceNvfp4Weight::~DeviceNvfp4Weight() {
-  if (!impl_) {
+  if (!impl_ || !impl_->owns_memory) {
     return;
   }
   ReleaseBuffer(&impl_->tensor_scale_data);
@@ -129,15 +166,19 @@ DeviceNvfp4Weight::~DeviceNvfp4Weight() {
 }
 
 bool DeviceNvfp4Weight::valid() const {
-  return impl_ != nullptr &&
-         impl_->output_rows > 0 &&
+  if (impl_ == nullptr) {
+    return false;
+  }
+  const bool has_optional_raw_block_scales =
+      (impl_->block_scales_data != nullptr && impl_->block_scales_nbytes > 0) ||
+      (impl_->block_scales_data == nullptr && impl_->block_scales_nbytes == 0);
+  return impl_->output_rows > 0 &&
          impl_->input_cols > 0 &&
          impl_->packed_data != nullptr &&
-         impl_->block_scales_data != nullptr &&
+         has_optional_raw_block_scales &&
          impl_->matmul_block_scales_data != nullptr &&
          impl_->tensor_scale_data != nullptr &&
          impl_->packed_nbytes > 0 &&
-         impl_->block_scales_nbytes > 0 &&
          impl_->matmul_block_scales_nbytes > 0 &&
          impl_->tensor_scale_nbytes > 0;
 }

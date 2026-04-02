@@ -301,6 +301,8 @@ bool run_attention_oracle_fixture() {
       KvCacheDataType::kBf16,
   };
   request_config.attention_total_pages = metadata->total_pages * (metadata->layer_index + 1);
+  request_config.attention_query_head_count = metadata->query_head_count;
+  request_config.attention_head_dim = metadata->head_dim;
 
   auto request = RequestExecutionContext::Create(request_config);
   auto input = DeviceTensorFp32::Create({metadata->token_count, metadata->hidden_size});

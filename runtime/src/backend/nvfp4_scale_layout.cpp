@@ -1,5 +1,7 @@
 #include "nemotron/nvfp4_scale_layout.h"
 
+#include <algorithm>
+
 namespace nemotron {
 namespace {
 
@@ -65,6 +67,29 @@ std::size_t ExecutionNvfp4ScaleBytes(std::size_t rows, std::size_t cols) {
   return layout ? layout->nbytes() : 0;
 }
 
+bool SwizzleRowMajorNvfp4ScalesForExecutionInto(
+    const std::uint8_t* row_major_scales,
+    std::size_t rows,
+    std::size_t cols,
+    std::uint8_t* swizzled_scales,
+    std::size_t swizzled_nbytes) {
+  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols);
+  if (!layout || row_major_scales == nullptr || swizzled_scales == nullptr || swizzled_nbytes != layout->nbytes()) {
+    return false;
+  }
+
+  std::fill(swizzled_scales, swizzled_scales + swizzled_nbytes, 0u);
+  for (std::size_t row = 0; row < layout->logical_rows; ++row) {
+    for (std::size_t block_col = 0; block_col < layout->logical_blocks_per_row; ++block_col) {
+      const std::size_t source_offset = row * layout->logical_blocks_per_row + block_col;
+      const std::size_t destination_offset =
+          ExecutionScaleOffset(row, block_col, layout->padded_blocks_per_row);
+      swizzled_scales[destination_offset] = row_major_scales[source_offset];
+    }
+  }
+  return true;
+}
+
 std::vector<std::uint8_t> SwizzleRowMajorNvfp4ScalesForExecution(
     const std::uint8_t* row_major_scales,
     std::size_t rows,
@@ -75,13 +100,13 @@ std::vector<std::uint8_t> SwizzleRowMajorNvfp4ScalesForExecution(
   }
 
   std::vector<std::uint8_t> swizzled(layout->nbytes(), 0u);
-  for (std::size_t row = 0; row < layout->logical_rows; ++row) {
-    for (std::size_t block_col = 0; block_col < layout->logical_blocks_per_row; ++block_col) {
-      const std::size_t source_offset = row * layout->logical_blocks_per_row + block_col;
-      const std::size_t destination_offset =
-          ExecutionScaleOffset(row, block_col, layout->padded_blocks_per_row);
-      swizzled[destination_offset] = row_major_scales[source_offset];
-    }
+  if (!SwizzleRowMajorNvfp4ScalesForExecutionInto(
+          row_major_scales,
+          rows,
+          cols,
+          swizzled.data(),
+          swizzled.size())) {
+    return {};
   }
   return swizzled;
 }

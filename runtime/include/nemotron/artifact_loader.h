@@ -45,7 +45,8 @@ class ArtifactLoader {
   static std::unique_ptr<ArtifactLoader> OpenVerifiedWithMode(
       const PackedModelManifest& manifest,
       const std::filesystem::path& manifest_path,
-      ArtifactLoadMode mode);
+      ArtifactLoadMode mode,
+      bool prefetch_mapped_files = false);
 
   ArtifactLoader(ArtifactLoader&&) noexcept;
   ArtifactLoader& operator=(ArtifactLoader&&) noexcept;

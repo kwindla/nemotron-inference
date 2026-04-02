@@ -477,7 +477,9 @@ std::size_t CudnnPagedAttentionPlan::workspace_bytes() const {
 
 bool CudnnPagedAttentionPlan::Execute(
     const CudnnHandle& handle,
-    const CudnnPagedAttentionExecution& execution) const {
+    const CudnnPagedAttentionExecution& execution,
+    cudaStream_t stream,
+    bool synchronize) const {
   if (!valid() ||
       !handle.valid() ||
       execution.query == nullptr ||
@@ -510,11 +512,18 @@ bool CudnnPagedAttentionPlan::Execute(
     variant_pack[kAmaxOUid] = impl_->amax_o;
   }
 
-  return impl_->graph->execute(
+  if (cudnnSetStream(reinterpret_cast<cudnnHandle_t>(handle.handle()), stream) != CUDNN_STATUS_SUCCESS) {
+    return false;
+  }
+
+  const bool ok = impl_->graph->execute(
              reinterpret_cast<cudnnHandle_t>(handle.handle()),
              variant_pack,
-             impl_->workspace).is_good() &&
-         CheckCuda(cudaDeviceSynchronize());
+             impl_->workspace).is_good();
+  if (!ok) {
+    return false;
+  }
+  return !synchronize || CheckCuda(cudaStreamSynchronize(stream));
 }
 
 }  // namespace nemotron

@@ -78,7 +78,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
     std::size_t m,
     std::size_t n,
     std::size_t k,
-    OutputTensorT* output) {
+    OutputTensorT* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       activations_data == nullptr ||
       weights_data == nullptr ||
@@ -98,7 +99,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
 
   cublasLtMatmulHeuristicResult_t heuristic{};
   int returned_results = 0;
-  bool ok = output->FillZero();
+  bool ok = output->FillZero(stream);
 
   ok &= CheckCublas(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
   const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
@@ -202,7 +203,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
         &heuristic.algo,
         handle.workspace(),
         handle.workspace_bytes(),
-        nullptr));
+        stream));
     ok &= CheckCuda(cudaGetLastError());
   }
 
@@ -241,7 +242,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -279,7 +281,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
@@ -287,7 +290,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -325,7 +329,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
@@ -333,7 +338,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -371,7 +377,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
@@ -379,7 +386,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -409,7 +417,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       !ConvertDeviceFp32ToBf16(
           activations.data(),
           activations.numel(),
-          converted_activations->data())) {
+          converted_activations->data(),
+          stream)) {
     return std::nullopt;
   }
 
@@ -425,7 +434,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
@@ -433,7 +443,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -470,7 +481,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
@@ -478,7 +490,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const DeviceTensorBf16& activations,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -515,7 +528,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
@@ -525,7 +539,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     float alpha_scale,
     const DeviceTensorFp32& activations,
     float input_scale,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
       !activations.valid() ||
@@ -555,7 +570,8 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
           activations.data(),
           activations.numel(),
           input_scale,
-          quantized_activations->data())) {
+          quantized_activations->data(),
+          stream)) {
     return std::nullopt;
   }
 
@@ -571,14 +587,16 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
       m,
       n,
       k,
-      output);
+      output,
+      stream);
 }
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   const auto* descriptor = plan.execution.launch_plan.descriptor;
   if (descriptor == nullptr) {
     return std::nullopt;
@@ -589,7 +607,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     return std::nullopt;
   }
 
-  return RunDenseRowMajorFp32ToDevice(handle, plan, *uploaded_weights, activations, output);
+  return RunDenseRowMajorFp32ToDevice(handle, plan, *uploaded_weights, activations, output, stream);
 }
 
 std::optional<DenseRowMajorHostResult> RunDenseRowMajorFp32(

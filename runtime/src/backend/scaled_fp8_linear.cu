@@ -249,7 +249,8 @@ std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
 bool QuantizeFp32ToScaledFp8RoundTrip(
     const DeviceTensorFp32& input,
     float input_scale,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!input.valid() || output == nullptr || !output->valid() || input.shape() != output->shape()) {
     return false;
   }
@@ -260,7 +261,7 @@ bool QuantizeFp32ToScaledFp8RoundTrip(
 
   const int block_size = 256;
   const int grid_size = static_cast<int>((numel + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
-  QuantizeFp8RoundTripKernel<<<grid_size, block_size>>>(
+  QuantizeFp8RoundTripKernel<<<grid_size, block_size, 0, stream>>>(
       input.data(),
       numel,
       ClampScale(input_scale),
@@ -371,7 +372,8 @@ bool ScaledFp8LinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output) const {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) const {
   (void)heuristic_cache;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
@@ -428,7 +430,8 @@ bool ScaledFp8LinearOp::Run(
           ClampScale(impl_->config.input_scale) * impl_->config.weight_scale,
           activations,
           impl_->config.input_scale,
-          output);
+          output,
+          stream);
       if (native_stats.has_value()) {
         RecordScaledFp8NativeSuccess(impl_->family);
         return true;
@@ -471,7 +474,8 @@ bool ScaledFp8LinearOp::Run(
   if (!QuantizeFp32ToScaledFp8RoundTrip(
           activations,
           impl_->config.input_scale,
-          quantized_activations)) {
+          quantized_activations,
+          stream)) {
     std::cerr << "scaled_fp8_linear: failed to quantize activations on device\n";
     return false;
   }
@@ -513,7 +517,8 @@ bool ScaledFp8LinearOp::Run(
           *dequantized_plan,
           *impl_->weight,
           *quantized_activations,
-          output)
+          output,
+          stream)
           .has_value()) {
     RecordScaledFp8DequantizedDenseSuccess();
     return true;
@@ -538,7 +543,8 @@ bool ScaledFp8LinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& activations,
-    DeviceTensorFp32* output) const {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) const {
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
   }
@@ -547,17 +553,22 @@ bool ScaledFp8LinearOp::Run(
   }
   auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
   if (!activations_fp32 ||
-      !ConvertDeviceBf16ToFp32(activations.data(), activations.numel(), activations_fp32->data())) {
+      !ConvertDeviceBf16ToFp32(
+          activations.data(),
+          activations.numel(),
+          activations_fp32->data(),
+          stream)) {
     return false;
   }
-  return Run(handle, heuristic_cache, *activations_fp32, output);
+  return Run(handle, heuristic_cache, *activations_fp32, output, stream);
 }
 
 bool ScaledFp8LinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& activations,
-    DeviceTensorBf16* output) const {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) const {
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
     return false;
   }
@@ -570,10 +581,14 @@ bool ScaledFp8LinearOp::Run(
   if (!output_fp32) {
     return false;
   }
-  if (!Run(handle, heuristic_cache, activations, output_fp32.get())) {
+  if (!Run(handle, heuristic_cache, activations, output_fp32.get(), stream)) {
     return false;
   }
-  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+  return ConvertDeviceFp32ToBf16(
+      output_fp32->data(),
+      output_fp32->numel(),
+      output->data(),
+      stream);
 }
 
 }  // namespace nemotron

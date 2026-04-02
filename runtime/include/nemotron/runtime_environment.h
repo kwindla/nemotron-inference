@@ -28,6 +28,7 @@ struct RuntimeBootstrapOptions {
   bool prefer_host_memory_snapshot = false;
   std::filesystem::path proc_meminfo_path = "/proc/meminfo";
   ArtifactLoadMode artifact_load_mode = ArtifactLoadMode::kMmap;
+  bool prefetch_mapped_artifacts = false;
   bool verify_manifest_files = true;
   bool materialize_weight_arena = true;
 };

@@ -157,7 +157,8 @@ bool HasCompatibleMatrixShape(
 bool ResidualAddFp32(
     const DeviceTensorFp32& lhs,
     const DeviceTensorFp32& rhs,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (output == nullptr || !lhs.valid() || !rhs.valid() || !output->valid() ||
       lhs.shape() != rhs.shape() || lhs.shape() != output->shape()) {
     return false;
@@ -166,14 +167,15 @@ bool ResidualAddFp32(
   const std::size_t count = lhs.numel();
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  ResidualAddKernel<<<grid, block>>>(lhs.data(), rhs.data(), output->data(), count);
+  ResidualAddKernel<<<grid, block, 0, stream>>>(lhs.data(), rhs.data(), output->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
 bool ResidualAddBf16(
     const DeviceTensorBf16& lhs,
     const DeviceTensorBf16& rhs,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (output == nullptr || !lhs.valid() || !rhs.valid() || !output->valid() ||
       lhs.shape() != rhs.shape() || lhs.shape() != output->shape()) {
     return false;
@@ -182,7 +184,7 @@ bool ResidualAddBf16(
   const std::size_t count = lhs.numel();
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  ResidualAddBf16Kernel<<<grid, block>>>(lhs.data(), rhs.data(), output->data(), count);
+  ResidualAddBf16Kernel<<<grid, block, 0, stream>>>(lhs.data(), rhs.data(), output->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
@@ -190,7 +192,8 @@ bool RmsNormFp32(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& weight,
     float epsilon,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   std::size_t rows = 0;
   std::size_t hidden_size = 0;
   if (output == nullptr || !HasCompatibleMatrixShape(input, *output, &rows, &hidden_size) ||
@@ -200,7 +203,13 @@ bool RmsNormFp32(
 
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>(rows));
-  RmsNormKernel<<<grid, block>>>(input.data(), weight.data(), output->data(), rows, hidden_size, epsilon);
+  RmsNormKernel<<<grid, block, 0, stream>>>(
+      input.data(),
+      weight.data(),
+      output->data(),
+      rows,
+      hidden_size,
+      epsilon);
   return CheckCuda(cudaGetLastError());
 }
 
@@ -208,7 +217,8 @@ bool RmsNormBf16(
     const DeviceTensorBf16& input,
     const DeviceTensorFp32& weight,
     float epsilon,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   std::size_t rows = 0;
   std::size_t hidden_size = 0;
   if (output == nullptr || !HasCompatibleMatrixShape(input, *output, &rows, &hidden_size) ||
@@ -218,7 +228,7 @@ bool RmsNormBf16(
 
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>(rows));
-  RmsNormTypedKernel<<<grid, block>>>(
+  RmsNormTypedKernel<<<grid, block, 0, stream>>>(
       input.data(),
       weight.data(),
       output->data(),

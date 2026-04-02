@@ -411,6 +411,9 @@ Latest decode-localization update:
   - the all-layer single-token decode oracle is now green on the real manifest
   - the remaining hidden-state drift is still visible and still useful for future precision/debug work
   - but it is no longer blocking the initial full-forward milestone
+- Follow-on work:
+  - the next focused sub-plan is [gpu_path_rollout_plan.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gpu_path_rollout_plan.md)
+  - that stage removes host roundtrips and CPU fallbacks from the serving hot path while preserving the oracle gates established here
 
 ## Definition Of Done For This Sub-Plan
 

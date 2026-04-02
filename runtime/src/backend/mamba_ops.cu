@@ -366,12 +366,13 @@ bool LaunchMambaDecodeCausalConv1dUpdate(
     const float* conv_weight,
     const float* conv_bias,
     float* conv_state,
-    OutputT* conv_output) {
+    OutputT* conv_output,
+    cudaStream_t stream) {
   const int grid_size =
       static_cast<int>((conv_dim + kDecodeConvThreads - 1u) / kDecodeConvThreads);
   switch (conv_kernel_size) {
     case 2:
-      MambaDecodeCausalConv1dUpdateKernel<2><<<grid_size, kDecodeConvThreads>>>(
+      MambaDecodeCausalConv1dUpdateKernel<2><<<grid_size, kDecodeConvThreads, 0, stream>>>(
           projected,
           intermediate_size,
           conv_dim,
@@ -381,7 +382,7 @@ bool LaunchMambaDecodeCausalConv1dUpdate(
           conv_output);
       break;
     case 3:
-      MambaDecodeCausalConv1dUpdateKernel<3><<<grid_size, kDecodeConvThreads>>>(
+      MambaDecodeCausalConv1dUpdateKernel<3><<<grid_size, kDecodeConvThreads, 0, stream>>>(
           projected,
           intermediate_size,
           conv_dim,
@@ -391,7 +392,7 @@ bool LaunchMambaDecodeCausalConv1dUpdate(
           conv_output);
       break;
     case 4:
-      MambaDecodeCausalConv1dUpdateKernel<4><<<grid_size, kDecodeConvThreads>>>(
+      MambaDecodeCausalConv1dUpdateKernel<4><<<grid_size, kDecodeConvThreads, 0, stream>>>(
           projected,
           intermediate_size,
           conv_dim,
@@ -401,7 +402,7 @@ bool LaunchMambaDecodeCausalConv1dUpdate(
           conv_output);
       break;
     case 5:
-      MambaDecodeCausalConv1dUpdateKernel<5><<<grid_size, kDecodeConvThreads>>>(
+      MambaDecodeCausalConv1dUpdateKernel<5><<<grid_size, kDecodeConvThreads, 0, stream>>>(
           projected,
           intermediate_size,
           conv_dim,
@@ -431,10 +432,12 @@ bool LaunchMambaSelectiveStateUpdateDecode(
     const float* d,
     const float* dt_bias,
     float* ssm_state,
-    OutputT* gated_output) {
+    OutputT* gated_output,
+    cudaStream_t stream) {
   MambaSelectiveStateUpdateDecodeKernel<<<static_cast<unsigned int>(num_heads),
                                           kDecodeSsmThreads,
-                                          (2 * state_size) * sizeof(float)>>>(
+                                          (2 * state_size) * sizeof(float),
+                                          stream>>>(
       projected,
       conv_output,
       intermediate_size,
@@ -606,7 +609,8 @@ bool MambaCausalConv1dUpdateDecodeFp32(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorFp32* conv_output) {
+    DeviceTensorFp32* conv_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_weight.valid() ||
       !conv_bias.valid() ||
@@ -636,7 +640,8 @@ bool MambaCausalConv1dUpdateDecodeFp32(
       conv_weight.data(),
       conv_bias.data(),
       conv_state->data() + conv_state_offset_elems,
-      conv_output->data());
+      conv_output->data(),
+      stream);
 }
 
 bool MambaCausalConv1dUpdateDecodeBf16(
@@ -648,7 +653,8 @@ bool MambaCausalConv1dUpdateDecodeBf16(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorBf16* conv_output) {
+    DeviceTensorBf16* conv_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_weight.valid() ||
       !conv_bias.valid() ||
@@ -678,7 +684,8 @@ bool MambaCausalConv1dUpdateDecodeBf16(
       conv_weight.data(),
       conv_bias.data(),
       conv_state->data() + conv_state_offset_elems,
-      conv_output->data());
+      conv_output->data(),
+      stream);
 }
 
 bool MambaConv1dSiluUpdateFp32(
@@ -690,7 +697,8 @@ bool MambaConv1dSiluUpdateFp32(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorFp32* conv_output) {
+    DeviceTensorFp32* conv_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_weight.valid() ||
       !conv_bias.valid() ||
@@ -713,7 +721,7 @@ bool MambaConv1dSiluUpdateFp32(
   const std::size_t projection_size = projected.shape()[1];
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((conv_dim + kBlockSize - 1u) / kBlockSize);
-  MambaConv1dSiluUpdateKernel<<<grid_size, kBlockSize>>>(
+  MambaConv1dSiluUpdateKernel<<<grid_size, kBlockSize, 0, stream>>>(
       projected.data(),
       projected.shape()[0],
       projection_size,
@@ -736,7 +744,8 @@ bool MambaConv1dSiluUpdateBf16(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorBf16* conv_output) {
+    DeviceTensorBf16* conv_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_weight.valid() ||
       !conv_bias.valid() ||
@@ -759,7 +768,7 @@ bool MambaConv1dSiluUpdateBf16(
   const std::size_t projection_size = projected.shape()[1];
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((conv_dim + kBlockSize - 1u) / kBlockSize);
-  MambaConv1dSiluUpdateKernel<<<grid_size, kBlockSize>>>(
+  MambaConv1dSiluUpdateKernel<<<grid_size, kBlockSize, 0, stream>>>(
       projected.data(),
       projected.shape()[0],
       projection_size,
@@ -788,7 +797,8 @@ bool MambaSsmUpdateFp32(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorFp32* y_output) {
+    DeviceTensorFp32* y_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_output.valid() ||
       !a_log.valid() ||
@@ -815,7 +825,7 @@ bool MambaSsmUpdateFp32(
 
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((intermediate_size + kBlockSize - 1u) / kBlockSize);
-  MambaSsmUpdateKernel<<<grid_size, kBlockSize>>>(
+  MambaSsmUpdateKernel<<<grid_size, kBlockSize, 0, stream>>>(
       projected.data(),
       conv_output.data(),
       projected.shape()[0],
@@ -850,7 +860,8 @@ bool MambaSsmUpdateBf16(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorBf16* y_output) {
+    DeviceTensorBf16* y_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_output.valid() ||
       !a_log.valid() ||
@@ -877,7 +888,7 @@ bool MambaSsmUpdateBf16(
 
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((intermediate_size + kBlockSize - 1u) / kBlockSize);
-  MambaSsmUpdateKernel<<<grid_size, kBlockSize>>>(
+  MambaSsmUpdateKernel<<<grid_size, kBlockSize, 0, stream>>>(
       projected.data(),
       conv_output.data(),
       projected.shape()[0],
@@ -912,7 +923,8 @@ bool MambaSelectiveStateUpdateDecodeFp32(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorFp32* gated_output) {
+    DeviceTensorFp32* gated_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_output.valid() ||
       !a_log.valid() ||
@@ -956,7 +968,8 @@ bool MambaSelectiveStateUpdateDecodeFp32(
       d.data(),
       dt_bias.data(),
       ssm_state->data() + ssm_state_offset_elems,
-      gated_output->data());
+      gated_output->data(),
+      stream);
 }
 
 bool MambaSelectiveStateUpdateDecodeBf16(
@@ -974,7 +987,8 @@ bool MambaSelectiveStateUpdateDecodeBf16(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorBf16* gated_output) {
+    DeviceTensorBf16* gated_output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_output.valid() ||
       !a_log.valid() ||
@@ -1018,7 +1032,8 @@ bool MambaSelectiveStateUpdateDecodeBf16(
       d.data(),
       dt_bias.data(),
       ssm_state->data() + ssm_state_offset_elems,
-      gated_output->data());
+      gated_output->data(),
+      stream);
 }
 
 bool MambaDecodeStepFusedFp32(
@@ -1042,7 +1057,8 @@ bool MambaDecodeStepFusedFp32(
     const DeviceTensorFp32& mixer_norm_weight,
     DeviceTensorFp32* conv_state,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_weight.valid() ||
       !conv_bias.valid() ||
@@ -1089,7 +1105,8 @@ bool MambaDecodeStepFusedFp32(
       (2 * state_size) + (intermediate_size / n_groups) + kThreadsPerBlock;
   MambaDecodeStepFusedKernel<<<static_cast<unsigned int>(n_groups),
                                kThreadsPerBlock,
-                               shared_floats * sizeof(float)>>>(
+                               shared_floats * sizeof(float),
+                               stream>>>(
       projected.data(),
       projection_size,
       intermediate_size,
@@ -1136,7 +1153,8 @@ bool MambaDecodeStepFusedBf16(
     const DeviceTensorFp32& mixer_norm_weight,
     DeviceTensorFp32* conv_state,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (!projected.valid() ||
       !conv_weight.valid() ||
       !conv_bias.valid() ||
@@ -1183,7 +1201,8 @@ bool MambaDecodeStepFusedBf16(
       (2 * state_size) + (intermediate_size / n_groups) + kThreadsPerBlock;
   MambaDecodeStepFusedKernel<<<static_cast<unsigned int>(n_groups),
                                kThreadsPerBlock,
-                               shared_floats * sizeof(float)>>>(
+                               shared_floats * sizeof(float),
+                               stream>>>(
       projected.data(),
       projection_size,
       intermediate_size,
@@ -1214,7 +1233,8 @@ bool GroupedRmsNormFp32(
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!input.valid() ||
       !mixer_norm_weight.valid() ||
       output == nullptr ||
@@ -1234,7 +1254,7 @@ bool GroupedRmsNormFp32(
   const std::size_t mixer_group_size = intermediate_size / n_groups;
   const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
   const dim3 block(kThreadsPerBlock);
-  GroupedRmsNormKernel<<<grid, block, sizeof(float) * kThreadsPerBlock>>>(
+  GroupedRmsNormKernel<<<grid, block, sizeof(float) * kThreadsPerBlock, stream>>>(
       input.data(),
       mixer_norm_weight.data(),
       rows,
@@ -1250,7 +1270,8 @@ bool GroupedRmsNormBf16(
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (!input.valid() ||
       !mixer_norm_weight.valid() ||
       output == nullptr ||
@@ -1270,7 +1291,7 @@ bool GroupedRmsNormBf16(
   const std::size_t mixer_group_size = intermediate_size / n_groups;
   const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
   const dim3 block(kThreadsPerBlock);
-  GroupedRmsNormKernel<<<grid, block, sizeof(float) * kThreadsPerBlock>>>(
+  GroupedRmsNormKernel<<<grid, block, sizeof(float) * kThreadsPerBlock, stream>>>(
       input.data(),
       mixer_norm_weight.data(),
       rows,
@@ -1287,7 +1308,8 @@ bool GroupedRmsNormGatedFp32(
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (!y_output.valid() ||
       !projected.valid() ||
       !mixer_norm_weight.valid() ||
@@ -1310,7 +1332,7 @@ bool GroupedRmsNormGatedFp32(
   const std::size_t mixer_group_size = intermediate_size / n_groups;
   const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
   const dim3 block(kThreadsPerBlock);
-  GroupedRmsNormGatedKernel<<<grid, block, sizeof(float) * kThreadsPerBlock>>>(
+  GroupedRmsNormGatedKernel<<<grid, block, sizeof(float) * kThreadsPerBlock, stream>>>(
       y_output.data(),
       projected.data(),
       mixer_norm_weight.data(),
@@ -1329,7 +1351,8 @@ bool GroupedRmsNormGatedBf16(
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (!y_output.valid() ||
       !projected.valid() ||
       !mixer_norm_weight.valid() ||
@@ -1352,7 +1375,7 @@ bool GroupedRmsNormGatedBf16(
   const std::size_t mixer_group_size = intermediate_size / n_groups;
   const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
   const dim3 block(kThreadsPerBlock);
-  GroupedRmsNormGatedKernel<<<grid, block, sizeof(float) * kThreadsPerBlock>>>(
+  GroupedRmsNormGatedKernel<<<grid, block, sizeof(float) * kThreadsPerBlock, stream>>>(
       y_output.data(),
       projected.data(),
       mixer_norm_weight.data(),

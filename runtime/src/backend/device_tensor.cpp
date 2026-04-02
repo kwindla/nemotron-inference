@@ -12,6 +12,7 @@ struct DeviceTensorFp32::Impl {
   std::size_t numel = 0;
   std::size_t bytes = 0;
   float* data = nullptr;
+  bool owns_memory = true;
 };
 
 struct DeviceTensorBf16::Impl {
@@ -19,6 +20,15 @@ struct DeviceTensorBf16::Impl {
   std::size_t numel = 0;
   std::size_t bytes = 0;
   __nv_bfloat16* data = nullptr;
+  bool owns_memory = true;
+};
+
+struct DeviceTensorFp8E4M3::Impl {
+  std::vector<std::size_t> shape;
+  std::size_t numel = 0;
+  std::size_t bytes = 0;
+  std::uint8_t* data = nullptr;
+  bool owns_memory = true;
 };
 
 namespace {
@@ -61,6 +71,23 @@ std::unique_ptr<DeviceTensorFp32> DeviceTensorFp32::Create(std::vector<std::size
   return std::unique_ptr<DeviceTensorFp32>(new DeviceTensorFp32(std::move(impl)));
 }
 
+std::unique_ptr<DeviceTensorFp32> DeviceTensorFp32::CreateView(
+    std::vector<std::size_t> shape,
+    float* data) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(float);
+  impl->data = data;
+  impl->owns_memory = false;
+  return std::unique_ptr<DeviceTensorFp32>(new DeviceTensorFp32(std::move(impl)));
+}
+
 DeviceTensorFp32::DeviceTensorFp32(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 DeviceTensorFp32::DeviceTensorFp32(DeviceTensorFp32&&) noexcept = default;
@@ -68,7 +95,7 @@ DeviceTensorFp32::DeviceTensorFp32(DeviceTensorFp32&&) noexcept = default;
 DeviceTensorFp32& DeviceTensorFp32::operator=(DeviceTensorFp32&&) noexcept = default;
 
 DeviceTensorFp32::~DeviceTensorFp32() {
-  if (impl_ && impl_->data != nullptr) {
+  if (impl_ && impl_->owns_memory && impl_->data != nullptr) {
     cudaFree(impl_->data);
   }
 }
@@ -111,8 +138,8 @@ bool DeviceTensorFp32::CopyToHost(float* host_data, std::size_t count) const {
          CheckCuda(cudaMemcpy(host_data, data(), bytes(), cudaMemcpyDeviceToHost));
 }
 
-bool DeviceTensorFp32::FillZero() {
-  return valid() && CheckCuda(cudaMemset(data(), 0, bytes()));
+bool DeviceTensorFp32::FillZero(cudaStream_t stream) {
+  return valid() && CheckCuda(cudaMemsetAsync(data(), 0, bytes(), stream));
 }
 
 std::unique_ptr<DeviceTensorBf16> DeviceTensorBf16::Create(std::vector<std::size_t> shape) {
@@ -136,6 +163,23 @@ std::unique_ptr<DeviceTensorBf16> DeviceTensorBf16::Create(std::vector<std::size
   return std::unique_ptr<DeviceTensorBf16>(new DeviceTensorBf16(std::move(impl)));
 }
 
+std::unique_ptr<DeviceTensorBf16> DeviceTensorBf16::CreateView(
+    std::vector<std::size_t> shape,
+    __nv_bfloat16* data) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(__nv_bfloat16);
+  impl->data = data;
+  impl->owns_memory = false;
+  return std::unique_ptr<DeviceTensorBf16>(new DeviceTensorBf16(std::move(impl)));
+}
+
 DeviceTensorBf16::DeviceTensorBf16(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 DeviceTensorBf16::DeviceTensorBf16(DeviceTensorBf16&&) noexcept = default;
@@ -143,7 +187,7 @@ DeviceTensorBf16::DeviceTensorBf16(DeviceTensorBf16&&) noexcept = default;
 DeviceTensorBf16& DeviceTensorBf16::operator=(DeviceTensorBf16&&) noexcept = default;
 
 DeviceTensorBf16::~DeviceTensorBf16() {
-  if (impl_ && impl_->data != nullptr) {
+  if (impl_ && impl_->owns_memory && impl_->data != nullptr) {
     cudaFree(impl_->data);
   }
 }
@@ -186,8 +230,100 @@ bool DeviceTensorBf16::CopyToHost(__nv_bfloat16* host_data, std::size_t count) c
          CheckCuda(cudaMemcpy(host_data, data(), bytes(), cudaMemcpyDeviceToHost));
 }
 
-bool DeviceTensorBf16::FillZero() {
-  return valid() && CheckCuda(cudaMemset(data(), 0, bytes()));
+bool DeviceTensorBf16::FillZero(cudaStream_t stream) {
+  return valid() && CheckCuda(cudaMemsetAsync(data(), 0, bytes(), stream));
+}
+
+std::unique_ptr<DeviceTensorFp8E4M3> DeviceTensorFp8E4M3::Create(std::vector<std::size_t> shape) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0) {
+    return nullptr;
+  }
+
+  int device_count = 0;
+  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(std::uint8_t);
+  if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->data), impl->bytes))) {
+    return nullptr;
+  }
+  return std::unique_ptr<DeviceTensorFp8E4M3>(new DeviceTensorFp8E4M3(std::move(impl)));
+}
+
+std::unique_ptr<DeviceTensorFp8E4M3> DeviceTensorFp8E4M3::CreateView(
+    std::vector<std::size_t> shape,
+    std::uint8_t* data) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(std::uint8_t);
+  impl->data = data;
+  impl->owns_memory = false;
+  return std::unique_ptr<DeviceTensorFp8E4M3>(new DeviceTensorFp8E4M3(std::move(impl)));
+}
+
+DeviceTensorFp8E4M3::DeviceTensorFp8E4M3(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+DeviceTensorFp8E4M3::DeviceTensorFp8E4M3(DeviceTensorFp8E4M3&&) noexcept = default;
+
+DeviceTensorFp8E4M3& DeviceTensorFp8E4M3::operator=(DeviceTensorFp8E4M3&&) noexcept = default;
+
+DeviceTensorFp8E4M3::~DeviceTensorFp8E4M3() {
+  if (impl_ && impl_->owns_memory && impl_->data != nullptr) {
+    cudaFree(impl_->data);
+  }
+}
+
+bool DeviceTensorFp8E4M3::valid() const {
+  return impl_ != nullptr && impl_->data != nullptr && impl_->numel > 0;
+}
+
+const std::vector<std::size_t>& DeviceTensorFp8E4M3::shape() const {
+  static const std::vector<std::size_t> kEmpty;
+  if (!impl_) {
+    return kEmpty;
+  }
+  return impl_->shape;
+}
+
+std::size_t DeviceTensorFp8E4M3::numel() const {
+  return impl_ ? impl_->numel : 0;
+}
+
+std::size_t DeviceTensorFp8E4M3::bytes() const {
+  return impl_ ? impl_->bytes : 0;
+}
+
+std::uint8_t* DeviceTensorFp8E4M3::data() const {
+  return impl_ ? impl_->data : nullptr;
+}
+
+bool DeviceTensorFp8E4M3::CopyFromHost(const std::uint8_t* host_data, std::size_t count) {
+  return valid() &&
+         host_data != nullptr &&
+         count == numel() &&
+         CheckCuda(cudaMemcpy(data(), host_data, bytes(), cudaMemcpyHostToDevice));
+}
+
+bool DeviceTensorFp8E4M3::CopyToHost(std::uint8_t* host_data, std::size_t count) const {
+  return valid() &&
+         host_data != nullptr &&
+         count == numel() &&
+         CheckCuda(cudaMemcpy(host_data, data(), bytes(), cudaMemcpyDeviceToHost));
+}
+
+bool DeviceTensorFp8E4M3::FillZero(cudaStream_t stream) {
+  return valid() && CheckCuda(cudaMemsetAsync(data(), 0, bytes(), stream));
 }
 
 }  // namespace nemotron

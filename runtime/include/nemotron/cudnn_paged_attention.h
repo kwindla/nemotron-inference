@@ -5,6 +5,8 @@
 #include <memory>
 #include <optional>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/cudnn_handle.h"
 #include "nemotron/paged_attention_plan.h"
 
@@ -62,7 +64,11 @@ class CudnnPagedAttentionPlan {
   bool valid() const;
   const CudnnPagedAttentionConfig& config() const;
   std::size_t workspace_bytes() const;
-  bool Execute(const CudnnHandle& handle, const CudnnPagedAttentionExecution& execution) const;
+  bool Execute(
+      const CudnnHandle& handle,
+      const CudnnPagedAttentionExecution& execution,
+      cudaStream_t stream = nullptr,
+      bool synchronize = true) const;
 
  private:
   struct Impl;

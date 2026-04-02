@@ -272,16 +272,17 @@ std::optional<DenseRowMajorDeviceStats> RunDenseNativeDispatch(
     const CublasLtGemmPlan& plan,
     const DeviceTensorBf16& weights,
     const ActivationTensorT& activations,
-    OutputTensorT* output) {
+    OutputTensorT* output,
+    cudaStream_t stream) {
   if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32> &&
                 std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
-    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output);
+    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output, stream);
   } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
                        std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
-    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output);
+    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output, stream);
   } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
                        std::is_same_v<OutputTensorT, DeviceTensorBf16>) {
-    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output);
+    return RunDenseRowMajorBf16ToDevice(handle, plan, weights, activations, output, stream);
   } else {
     return std::nullopt;
   }
@@ -293,16 +294,17 @@ std::optional<DenseRowMajorDeviceStats> RunDenseNativeDispatch(
     const CublasLtGemmPlan& plan,
     const DeviceDenseWeightFp32& weights,
     const ActivationTensorT& activations,
-    OutputTensorT* output) {
+    OutputTensorT* output,
+    cudaStream_t stream) {
   if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32> &&
                 std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
-    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output);
+    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output, stream);
   } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
                        std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
-    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output);
+    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output, stream);
   } else if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorBf16> &&
                        std::is_same_v<OutputTensorT, DeviceTensorBf16>) {
-    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output);
+    return RunDenseRowMajorFp32ToDevice(handle, plan, weights, activations, output, stream);
   } else {
     return std::nullopt;
   }
@@ -318,9 +320,11 @@ bool TryRunDenseNative(
     const ActivationTensorT& activations,
     OutputTensorT* output,
     DenseRuntimeOpFamily dense_family,
-    bool debug) {
+    bool debug,
+    cudaStream_t stream) {
   if (dense_weight_bf16 != nullptr && dense_weight_bf16->valid()) {
-    if (const auto stats = RunDenseNativeDispatch(handle, plan, *dense_weight_bf16, activations, output);
+    if (const auto stats = RunDenseNativeDispatch(
+            handle, plan, *dense_weight_bf16, activations, output, stream);
         stats.has_value()) {
       RecordDenseNativeSuccess(dense_family);
       return true;
@@ -333,7 +337,8 @@ bool TryRunDenseNative(
     return false;
   }
   if (dense_weight != nullptr && dense_weight->valid()) {
-    if (const auto stats = RunDenseNativeDispatch(handle, plan, *dense_weight, activations, output);
+    if (const auto stats =
+            RunDenseNativeDispatch(handle, plan, *dense_weight, activations, output, stream);
         stats.has_value()) {
       RecordDenseNativeSuccess(dense_family);
       return true;
@@ -352,7 +357,8 @@ bool RunDenseReferenceFallback(
     const GemmDescriptor& descriptor,
     std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
     const DeviceTensorFp32& activations,
-    OutputTensorT* output) {
+    OutputTensorT* output,
+    cudaStream_t stream) {
   if (!EnsureDenseWeightFp32(descriptor, dense_weight)) {
     return false;
   }
@@ -366,7 +372,11 @@ bool RunDenseReferenceFallback(
                activations,
                output_fp32.get())
                .has_value() &&
-           ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+           ConvertDeviceFp32ToBf16(
+               output_fp32->data(),
+               output_fp32->numel(),
+               output->data(),
+               stream);
   }
 }
 
@@ -375,13 +385,18 @@ bool RunDenseReferenceFallback(
     const GemmDescriptor& descriptor,
     std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
     const DeviceTensorBf16& activations,
-    OutputTensorT* output) {
+    OutputTensorT* output,
+    cudaStream_t stream) {
   auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
   if (!activations_fp32 ||
-      !ConvertDeviceBf16ToFp32(activations.data(), activations.numel(), activations_fp32->data())) {
+      !ConvertDeviceBf16ToFp32(
+          activations.data(),
+          activations.numel(),
+          activations_fp32->data(),
+          stream)) {
     return false;
   }
-  return RunDenseReferenceFallback(descriptor, dense_weight, *activations_fp32, output);
+  return RunDenseReferenceFallback(descriptor, dense_weight, *activations_fp32, output, stream);
 }
 
 }  // namespace
@@ -479,7 +494,8 @@ bool UploadedLinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& activations,
-    DeviceTensorFp32* output) const {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) const {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool debug = kDebug;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
@@ -511,7 +527,8 @@ bool UploadedLinearOp::Run(
               activations,
               output,
               dense_family,
-              debug)) {
+              debug,
+              stream)) {
         return true;
       }
       if (!plan.has_value() && debug) {
@@ -523,7 +540,12 @@ bool UploadedLinearOp::Run(
                   << ", falling back to device reference\n";
       }
       RecordDenseReferenceFallback(dense_family);
-      return RunDenseReferenceFallback(impl_->descriptor, &impl_->dense_weight, activations, output);
+      return RunDenseReferenceFallback(
+          impl_->descriptor,
+          &impl_->dense_weight,
+          activations,
+          output,
+          stream);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       {
@@ -540,7 +562,9 @@ bool UploadedLinearOp::Run(
                    *plan,
                    activations,
                    *impl_->nvfp4_weight,
-                   output)
+                   output,
+                   {},
+                   stream)
             .has_value();
       }
   }
@@ -551,7 +575,8 @@ bool UploadedLinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& activations,
-    DeviceTensorFp32* output) const {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) const {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool debug = kDebug;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
@@ -571,10 +596,11 @@ bool UploadedLinearOp::Run(
             !ConvertDeviceBf16ToFp32(
                 activations.data(),
                 activations.numel(),
-                activations_fp32->data())) {
+                activations_fp32->data(),
+                stream)) {
           return false;
         }
-        return Run(handle, heuristic_cache, *activations_fp32, output);
+        return Run(handle, heuristic_cache, *activations_fp32, output, stream);
       }
       const DenseRuntimeOpFamily dense_family = ClassifyDenseRuntimeOpFamily(impl_->descriptor);
       const auto plan = ResolveDensePlan(
@@ -597,7 +623,8 @@ bool UploadedLinearOp::Run(
               activations,
               output,
               dense_family,
-              debug)) {
+              debug,
+              stream)) {
         return true;
       }
       if (!plan.has_value() && debug) {
@@ -609,12 +636,21 @@ bool UploadedLinearOp::Run(
                   << ", falling back to device reference\n";
       }
       RecordDenseReferenceFallback(dense_family);
-      return RunDenseReferenceFallback(impl_->descriptor, &impl_->dense_weight, activations, output);
+      return RunDenseReferenceFallback(
+          impl_->descriptor,
+          &impl_->dense_weight,
+          activations,
+          output,
+          stream);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled: {
       auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
       if (!activations_fp32 ||
-          !ConvertDeviceBf16ToFp32(activations.data(), activations.numel(), activations_fp32->data())) {
+          !ConvertDeviceBf16ToFp32(
+              activations.data(),
+              activations.numel(),
+              activations_fp32->data(),
+              stream)) {
         return false;
       }
       const auto plan = BuildRuntimeGemmPlan(impl_->descriptor, activations.shape().at(0), heuristic_cache);
@@ -630,7 +666,9 @@ bool UploadedLinearOp::Run(
                  *plan,
                  *activations_fp32,
                  *impl_->nvfp4_weight,
-                 output)
+                 output,
+                 {},
+                 stream)
           .has_value();
     }
   }
@@ -641,7 +679,8 @@ bool UploadedLinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& activations,
-    DeviceTensorBf16* output) const {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) const {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool debug = kDebug;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
@@ -686,7 +725,8 @@ bool UploadedLinearOp::Run(
               activations,
               output,
               dense_family,
-              debug)) {
+              debug,
+              stream)) {
         return true;
       }
       if (!plan.has_value() && debug) {
@@ -698,17 +738,26 @@ bool UploadedLinearOp::Run(
                   << ", falling back to device reference\n";
       }
       RecordDenseReferenceFallback(dense_family);
-      return RunDenseReferenceFallback(impl_->descriptor, &impl_->dense_weight, activations, output);
+      return RunDenseReferenceFallback(
+          impl_->descriptor,
+          &impl_->dense_weight,
+          activations,
+          output,
+          stream);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled: {
       auto output_fp32 = DeviceTensorFp32::Create(output->shape());
       if (!output_fp32) {
         return false;
       }
-      if (!Run(handle, heuristic_cache, activations, output_fp32.get())) {
+      if (!Run(handle, heuristic_cache, activations, output_fp32.get(), stream)) {
         return false;
       }
-      return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+      return ConvertDeviceFp32ToBf16(
+          output_fp32->data(),
+          output_fp32->numel(),
+          output->data(),
+          stream);
     }
   }
   return false;

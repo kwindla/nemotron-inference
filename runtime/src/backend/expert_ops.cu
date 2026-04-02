@@ -898,7 +898,8 @@ bool HasSingleRowShape(const DeviceTensorBf16& tensor) {
 bool CopyRowFp32(
     const DeviceTensorFp32& input,
     std::size_t row_index,
-    DeviceTensorFp32* output_row) {
+    DeviceTensorFp32* output_row,
+    cudaStream_t stream) {
   if (!input.valid() || output_row == nullptr || !output_row->valid() || input.shape().size() != 2 ||
       row_index >= input.shape()[0] || !HasSingleRowShape(*output_row) ||
       output_row->shape()[1] != input.shape()[1]) {
@@ -907,14 +908,15 @@ bool CopyRowFp32(
   const std::size_t cols = input.shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
-  CopyRowKernel<<<grid, block>>>(input.data(), cols, row_index, output_row->data());
+  CopyRowKernel<<<grid, block, 0, stream>>>(input.data(), cols, row_index, output_row->data());
   return CheckCuda(cudaGetLastError());
 }
 
 bool CopyRowBf16(
     const DeviceTensorBf16& input,
     std::size_t row_index,
-    DeviceTensorBf16* output_row) {
+    DeviceTensorBf16* output_row,
+    cudaStream_t stream) {
   if (!input.valid() || output_row == nullptr || !output_row->valid() || input.shape().size() != 2 ||
       row_index >= input.shape()[0] || !HasSingleRowShape(*output_row) ||
       output_row->shape()[1] != input.shape()[1]) {
@@ -923,7 +925,7 @@ bool CopyRowBf16(
   const std::size_t cols = input.shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
-  CopyRowKernel<<<grid, block>>>(input.data(), cols, row_index, output_row->data());
+  CopyRowKernel<<<grid, block, 0, stream>>>(input.data(), cols, row_index, output_row->data());
   return CheckCuda(cudaGetLastError());
 }
 
@@ -942,53 +944,55 @@ bool WriteRowFp32(
   return CheckCuda(cudaGetLastError());
 }
 
-bool Relu2InPlaceFp32(DeviceTensorFp32* tensor) {
+bool Relu2InPlaceFp32(DeviceTensorFp32* tensor, cudaStream_t stream) {
   if (tensor == nullptr || !tensor->valid()) {
     return false;
   }
   const std::size_t count = tensor->numel();
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  Relu2InPlaceKernel<<<grid, block>>>(tensor->data(), count);
+  Relu2InPlaceKernel<<<grid, block, 0, stream>>>(tensor->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
-bool Relu2InPlaceBf16(DeviceTensorBf16* tensor) {
+bool Relu2InPlaceBf16(DeviceTensorBf16* tensor, cudaStream_t stream) {
   if (tensor == nullptr || !tensor->valid()) {
     return false;
   }
   const std::size_t count = tensor->numel();
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  Relu2InPlaceKernel<<<grid, block>>>(tensor->data(), count);
+  Relu2InPlaceKernel<<<grid, block, 0, stream>>>(tensor->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
 bool AddScaledFp32(
     const DeviceTensorFp32& input,
     float scale,
-    DeviceTensorFp32* accumulator) {
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream) {
   if (!input.valid() || accumulator == nullptr || !accumulator->valid() || input.shape() != accumulator->shape()) {
     return false;
   }
   const std::size_t count = input.numel();
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  AddScaledKernel<<<grid, block>>>(input.data(), scale, accumulator->data(), count);
+  AddScaledKernel<<<grid, block, 0, stream>>>(input.data(), scale, accumulator->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
 bool AddScaledBf16(
     const DeviceTensorBf16& input,
     float scale,
-    DeviceTensorBf16* accumulator) {
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream) {
   if (!input.valid() || accumulator == nullptr || !accumulator->valid() || input.shape() != accumulator->shape()) {
     return false;
   }
   const std::size_t count = input.numel();
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  AddScaledKernel<<<grid, block>>>(input.data(), scale, accumulator->data(), count);
+  AddScaledKernel<<<grid, block, 0, stream>>>(input.data(), scale, accumulator->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
@@ -996,7 +1000,8 @@ bool AddScaledRowFp32(
     const DeviceTensorFp32& input_row,
     float scale,
     std::size_t row_index,
-    DeviceTensorFp32* accumulator) {
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream) {
   if (!HasSingleRowShape(input_row) || accumulator == nullptr || !accumulator->valid() ||
       accumulator->shape().size() != 2 || row_index >= accumulator->shape()[0] ||
       input_row.shape()[1] != accumulator->shape()[1]) {
@@ -1005,7 +1010,12 @@ bool AddScaledRowFp32(
   const std::size_t cols = input_row.shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
-  AddScaledRowKernel<<<grid, block>>>(input_row.data(), scale, row_index, cols, accumulator->data());
+  AddScaledRowKernel<<<grid, block, 0, stream>>>(
+      input_row.data(),
+      scale,
+      row_index,
+      cols,
+      accumulator->data());
   return CheckCuda(cudaGetLastError());
 }
 
@@ -1013,7 +1023,8 @@ bool AddScaledRowBf16(
     const DeviceTensorBf16& input_row,
     float scale,
     std::size_t row_index,
-    DeviceTensorBf16* accumulator) {
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream) {
   if (!HasSingleRowShape(input_row) || accumulator == nullptr || !accumulator->valid() ||
       accumulator->shape().size() != 2 || row_index >= accumulator->shape()[0] ||
       input_row.shape()[1] != accumulator->shape()[1]) {
@@ -1022,7 +1033,12 @@ bool AddScaledRowBf16(
   const std::size_t cols = input_row.shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
-  AddScaledRowKernel<<<grid, block>>>(input_row.data(), scale, row_index, cols, accumulator->data());
+  AddScaledRowKernel<<<grid, block, 0, stream>>>(
+      input_row.data(),
+      scale,
+      row_index,
+      cols,
+      accumulator->data());
   return CheckCuda(cudaGetLastError());
 }
 
@@ -1035,7 +1051,8 @@ bool SelectTopExpertsFp32(
     bool norm_topk_prob,
     float routed_scaling_factor,
     std::int32_t* selected_indices_device,
-    float* selected_weights_device) {
+    float* selected_weights_device,
+    cudaStream_t stream) {
   if (!router_logits.valid() || !correction_bias.valid() || router_logits.shape().size() != 2 ||
       correction_bias.shape().size() != 1 || correction_bias.shape()[0] != router_logits.shape()[1] ||
       selected_indices_device == nullptr || selected_weights_device == nullptr) {
@@ -1043,7 +1060,7 @@ bool SelectTopExpertsFp32(
   }
   const std::size_t rows = router_logits.shape()[0];
   const std::size_t expert_count = router_logits.shape()[1];
-  SelectTopExpertsKernel<<<static_cast<unsigned int>(rows), 1>>>(
+  SelectTopExpertsKernel<<<static_cast<unsigned int>(rows), 1, 0, stream>>>(
       router_logits.data(),
       correction_bias.data(),
       rows,
@@ -2094,7 +2111,8 @@ bool ScaleWeightedAccumulateRowsFp32(
     const float* weight_tensor_scales_device,
     const float* routing_weights_device,
     std::size_t row_count,
-    DeviceTensorFp32* accumulator) {
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream) {
   if (!data.valid() || accumulator == nullptr || !accumulator->valid() ||
       act_tensor_scales_device == nullptr ||
       weight_tensor_scales_device == nullptr || routing_weights_device == nullptr ||
@@ -2106,7 +2124,7 @@ bool ScaleWeightedAccumulateRowsFp32(
   const std::size_t cols = data.shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
-  ScaleWeightedAccumulateRowsKernel<<<grid, block>>>(
+  ScaleWeightedAccumulateRowsKernel<<<grid, block, 0, stream>>>(
       data.data(), act_tensor_scales_device, weight_tensor_scales_device,
       routing_weights_device, cols, row_count, accumulator->data());
   return CheckCuda(cudaGetLastError());
@@ -2118,7 +2136,8 @@ bool ScaleWeightedAccumulateRowsBf16(
     const float* weight_tensor_scales_device,
     const float* routing_weights_device,
     std::size_t row_count,
-    DeviceTensorBf16* accumulator) {
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream) {
   if (!data.valid() || accumulator == nullptr || !accumulator->valid() ||
       act_tensor_scales_device == nullptr ||
       weight_tensor_scales_device == nullptr || routing_weights_device == nullptr ||
@@ -2131,7 +2150,7 @@ bool ScaleWeightedAccumulateRowsBf16(
   const std::size_t cols = data.shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
-  ScaleWeightedAccumulateRowsBf16Kernel<<<grid, block>>>(
+  ScaleWeightedAccumulateRowsBf16Kernel<<<grid, block, 0, stream>>>(
       data.data(), act_tensor_scales_device, weight_tensor_scales_device,
       routing_weights_device, cols, row_count, accumulator->data());
   return CheckCuda(cudaGetLastError());

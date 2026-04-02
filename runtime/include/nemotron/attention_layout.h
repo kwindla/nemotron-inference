@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/device_tensor.h"
 
 namespace nemotron {
@@ -12,7 +14,8 @@ bool ConvertRowMajorMatrixToAttentionBf16(
     std::size_t token_count,
     std::size_t head_count,
     std::size_t head_dim,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 bool ConvertRowMajorMatrixToAttentionFp8E4M3(
     const DeviceTensorFp32& matrix,
@@ -20,7 +23,8 @@ bool ConvertRowMajorMatrixToAttentionFp8E4M3(
     std::size_t head_count,
     std::size_t head_dim,
     float scale,
-    DeviceTensorFp8E4M3* output);
+    DeviceTensorFp8E4M3* output,
+    cudaStream_t stream = nullptr);
 
 bool ScatterRowMajorMatrixToPagedCacheBf16(
     const DeviceTensorFp32& matrix,
@@ -31,7 +35,8 @@ bool ScatterRowMajorMatrixToPagedCacheBf16(
     std::size_t tokens_per_page,
     const std::int32_t* page_ids,
     std::size_t page_count,
-    DeviceTensorBf16* cache);
+    DeviceTensorBf16* cache,
+    cudaStream_t stream = nullptr);
 
 bool ScatterKvRowMajorMatricesToPagedCacheBf16(
     const DeviceTensorFp32& key_matrix,
@@ -44,7 +49,8 @@ bool ScatterKvRowMajorMatricesToPagedCacheBf16(
     const std::int32_t* page_ids,
     std::size_t page_count,
     DeviceTensorBf16* key_cache,
-    DeviceTensorBf16* value_cache);
+    DeviceTensorBf16* value_cache,
+    cudaStream_t stream = nullptr);
 
 bool ScatterKvRowMajorMatricesToPagedCacheFp8E4M3(
     const DeviceTensorFp32& key_matrix,
@@ -59,13 +65,15 @@ bool ScatterKvRowMajorMatricesToPagedCacheFp8E4M3(
     const std::int32_t* page_ids,
     std::size_t page_count,
     DeviceTensorFp8E4M3* key_cache,
-    DeviceTensorFp8E4M3* value_cache);
+    DeviceTensorFp8E4M3* value_cache,
+    cudaStream_t stream = nullptr);
 
 bool ConvertAttentionBf16ToRowMajorMatrix(
     const DeviceTensorBf16& tensor,
     std::size_t token_count,
     std::size_t head_count,
     std::size_t head_dim,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 }  // namespace nemotron

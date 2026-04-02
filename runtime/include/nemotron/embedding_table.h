@@ -5,6 +5,8 @@
 #include <memory>
 #include <optional>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/device_tensor.h"
 #include "nemotron/embedding_catalog.h"
 
@@ -59,12 +61,14 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsDeviceIdsFp32(
     const DeviceEmbeddingTableFp32& table,
     const std::int32_t* device_token_ids,
     std::size_t token_count,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 std::optional<EmbeddingLookupStats> LookupEmbeddingRowsDeviceIdsBf16(
     const DeviceEmbeddingTableFp32& table,
     const std::int32_t* device_token_ids,
     std::size_t token_count,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 }  // namespace nemotron

@@ -257,7 +257,8 @@ bool ConvertRowMajorMatrixToAttentionBf16(
     std::size_t token_count,
     std::size_t head_count,
     std::size_t head_dim,
-    DeviceTensorBf16* output) {
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
   if (output == nullptr ||
       !ValidateAttentionMatrixShape(matrix, token_count, head_count, head_dim) ||
       !ValidateAttentionTensorShape(*output, token_count, head_count, head_dim)) {
@@ -267,7 +268,7 @@ bool ConvertRowMajorMatrixToAttentionBf16(
   const std::size_t total = token_count * head_count * head_dim;
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((total + kBlockSize - 1u) / kBlockSize);
-  RowMajorMatrixToAttentionBf16Kernel<<<grid_size, kBlockSize>>>(
+  RowMajorMatrixToAttentionBf16Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       matrix.data(),
       token_count,
       head_count,
@@ -282,7 +283,8 @@ bool ConvertRowMajorMatrixToAttentionFp8E4M3(
     std::size_t head_count,
     std::size_t head_dim,
     float scale,
-    DeviceTensorFp8E4M3* output) {
+    DeviceTensorFp8E4M3* output,
+    cudaStream_t stream) {
   if (output == nullptr ||
       !ValidateAttentionMatrixShape(matrix, token_count, head_count, head_dim) ||
       !ValidateAttentionTensorShape(*output, token_count, head_count, head_dim)) {
@@ -292,7 +294,7 @@ bool ConvertRowMajorMatrixToAttentionFp8E4M3(
   const std::size_t total = token_count * head_count * head_dim;
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((total + kBlockSize - 1u) / kBlockSize);
-  RowMajorMatrixToAttentionFp8E4M3Kernel<<<grid_size, kBlockSize>>>(
+  RowMajorMatrixToAttentionFp8E4M3Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       matrix.data(),
       token_count,
       head_count,
@@ -311,7 +313,8 @@ bool ScatterRowMajorMatrixToPagedCacheBf16(
     std::size_t tokens_per_page,
     const std::int32_t* page_ids,
     std::size_t page_count,
-    DeviceTensorBf16* cache) {
+    DeviceTensorBf16* cache,
+    cudaStream_t stream) {
   if (page_ids == nullptr ||
       cache == nullptr ||
       tokens_per_page == 0 ||
@@ -323,7 +326,7 @@ bool ScatterRowMajorMatrixToPagedCacheBf16(
   const std::size_t total = token_count * kv_head_count * head_dim;
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((total + kBlockSize - 1u) / kBlockSize);
-  ScatterRowMajorMatrixToPagedCacheBf16Kernel<<<grid_size, kBlockSize>>>(
+  ScatterRowMajorMatrixToPagedCacheBf16Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       matrix.data(),
       token_count,
       start_token_index,
@@ -347,7 +350,8 @@ bool ScatterKvRowMajorMatricesToPagedCacheBf16(
     const std::int32_t* page_ids,
     std::size_t page_count,
     DeviceTensorBf16* key_cache,
-    DeviceTensorBf16* value_cache) {
+    DeviceTensorBf16* value_cache,
+    cudaStream_t stream) {
   if (page_ids == nullptr ||
       key_cache == nullptr ||
       value_cache == nullptr ||
@@ -362,7 +366,7 @@ bool ScatterKvRowMajorMatricesToPagedCacheBf16(
   const std::size_t total = token_count * kv_head_count * head_dim;
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((total + kBlockSize - 1u) / kBlockSize);
-  ScatterKvRowMajorMatricesToPagedCacheBf16Kernel<<<grid_size, kBlockSize>>>(
+  ScatterKvRowMajorMatricesToPagedCacheBf16Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       key_matrix.data(),
       value_matrix.data(),
       token_count,
@@ -390,7 +394,8 @@ bool ScatterKvRowMajorMatricesToPagedCacheFp8E4M3(
     const std::int32_t* page_ids,
     std::size_t page_count,
     DeviceTensorFp8E4M3* key_cache,
-    DeviceTensorFp8E4M3* value_cache) {
+    DeviceTensorFp8E4M3* value_cache,
+    cudaStream_t stream) {
   if (page_ids == nullptr ||
       key_cache == nullptr ||
       value_cache == nullptr ||
@@ -405,7 +410,7 @@ bool ScatterKvRowMajorMatricesToPagedCacheFp8E4M3(
   const std::size_t total = token_count * kv_head_count * head_dim;
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((total + kBlockSize - 1u) / kBlockSize);
-  ScatterKvRowMajorMatricesToPagedCacheFp8E4M3Kernel<<<grid_size, kBlockSize>>>(
+  ScatterKvRowMajorMatricesToPagedCacheFp8E4M3Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       key_matrix.data(),
       value_matrix.data(),
       token_count,
@@ -427,7 +432,8 @@ bool ConvertAttentionBf16ToRowMajorMatrix(
     std::size_t token_count,
     std::size_t head_count,
     std::size_t head_dim,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
   if (output == nullptr ||
       !ValidateAttentionTensorShape(tensor, token_count, head_count, head_dim) ||
       !ValidateAttentionMatrixShape(*output, token_count, head_count, head_dim)) {
@@ -437,7 +443,7 @@ bool ConvertAttentionBf16ToRowMajorMatrix(
   const std::size_t total = token_count * head_count * head_dim;
   constexpr int kBlockSize = 256;
   const int grid_size = static_cast<int>((total + kBlockSize - 1u) / kBlockSize);
-  AttentionBf16ToRowMajorMatrixKernel<<<grid_size, kBlockSize>>>(
+  AttentionBf16ToRowMajorMatrixKernel<<<grid_size, kBlockSize, 0, stream>>>(
       tensor.data(),
       token_count,
       head_count,

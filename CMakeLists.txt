@@ -10,7 +10,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 include(CTest)
 
 if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 121)
+  # Must use 121a (not 121) to enable conditional MMA arch features
+  # required by CUTLASS block-scaled TensorOps on SM121.
+  set(CMAKE_CUDA_ARCHITECTURES 121a)
 endif()
 
 option(NEMOTRON_RUNTIME_ENABLE_PROBES "Build pre-implementation feasibility probes" ON)

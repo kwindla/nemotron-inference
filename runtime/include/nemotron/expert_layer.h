@@ -6,6 +6,8 @@
 #include <optional>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/cublaslt_handle.h"
 #include "nemotron/gemm_catalog.h"
 #include "nemotron/kernel_catalog.h"
@@ -139,13 +141,15 @@ class ExpertLayerSlice {
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
-      ExpertLayerRunTrace* trace = nullptr) const;
+      ExpertLayerRunTrace* trace = nullptr,
+      cudaStream_t stream = nullptr) const;
   bool Run(
       CublasLtHandle& cublas_handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorBf16& input,
       DeviceTensorBf16* output,
-      ExpertLayerRunTrace* trace = nullptr) const;
+      ExpertLayerRunTrace* trace = nullptr,
+      cudaStream_t stream = nullptr) const;
 
   bool RunWithRequestContext(
       CublasLtHandle& cublas_handle,
@@ -153,14 +157,16 @@ class ExpertLayerSlice {
       RequestExecutionContext& request_context,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
-      ExpertLayerRunTrace* trace = nullptr) const;
+      ExpertLayerRunTrace* trace = nullptr,
+      cudaStream_t stream = nullptr) const;
   bool RunWithRequestContext(
       CublasLtHandle& cublas_handle,
       GemmHeuristicCache* heuristic_cache,
       RequestExecutionContext& request_context,
       const DeviceTensorBf16& input,
       DeviceTensorBf16* output,
-      ExpertLayerRunTrace* trace = nullptr) const;
+      ExpertLayerRunTrace* trace = nullptr,
+      cudaStream_t stream = nullptr) const;
 
  private:
   struct Impl;

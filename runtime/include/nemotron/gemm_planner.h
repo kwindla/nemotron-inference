@@ -16,6 +16,9 @@ struct GemmLaunchPlan {
   std::size_t m = 0;
   std::size_t n = 0;
   std::size_t k = 0;
+  std::string tensor_name;
+  std::string storage_dtype;
+  std::string compute_dtype;
   bool uses_block_scales = false;
   ByteRangeView packed_bytes;
   ByteRangeView block_scales_bytes;

@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
+#include <filesystem>
 
 #include "nemotron/request_context.h"
 
@@ -81,6 +83,25 @@ struct SingleTokenForwardTrace {
   std::vector<float> logits;
 };
 
+struct SingleTokenForwardBuildPhaseTiming {
+  std::string name;
+  double milliseconds = 0.0;
+};
+
+struct SingleTokenForwardLayerBuildTiming {
+  std::size_t layer_index = 0;
+  ForwardLayerKind kind = ForwardLayerKind::kMamba;
+  double bindings_ms = 0.0;
+  double slice_create_ms = 0.0;
+  double total_ms = 0.0;
+  std::vector<SingleTokenForwardBuildPhaseTiming> details;
+};
+
+struct SingleTokenForwardBuildReport {
+  std::vector<SingleTokenForwardBuildPhaseTiming> phases;
+  std::vector<SingleTokenForwardLayerBuildTiming> layers;
+};
+
 SingleTokenForwardConfig KnownNemotron3Super120BA12BConfig();
 std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
     const ModelSchedule& schedule,
@@ -91,6 +112,10 @@ class SingleTokenForwardModel {
   static std::unique_ptr<SingleTokenForwardModel> Create(
       const RuntimeEnvironment& environment,
       const SingleTokenForwardConfig& config);
+  static std::unique_ptr<SingleTokenForwardModel> CreateFromCache(
+      const RuntimeEnvironment& environment,
+      const SingleTokenForwardConfig& config,
+      const std::filesystem::path& cache_path);
 
   SingleTokenForwardModel(SingleTokenForwardModel&&) noexcept;
   SingleTokenForwardModel& operator=(SingleTokenForwardModel&&) noexcept;
@@ -102,6 +127,7 @@ class SingleTokenForwardModel {
   bool valid() const;
   const SingleTokenForwardConfig& config() const;
   const SingleTokenForwardPlan& plan() const;
+  const SingleTokenForwardBuildReport& build_report() const;
   std::unique_ptr<RequestExecutionContext> CreateRequestContext() const;
 
   bool RunPrefill(
@@ -114,6 +140,14 @@ class SingleTokenForwardModel {
       std::optional<std::size_t> stop_layer_index = std::nullopt) const;
 
   bool RunSingleToken(
+      std::int32_t token_id,
+      RequestExecutionContext& request_context,
+      DeviceTensorFp32* logits,
+      const std::vector<std::size_t>& capture_layer_indices = {},
+      SingleTokenForwardTrace* trace = nullptr,
+      std::optional<std::size_t> stop_layer_index = std::nullopt) const;
+
+  bool RunDecodeStep(
       std::int32_t token_id,
       RequestExecutionContext& request_context,
       DeviceTensorFp32* logits,

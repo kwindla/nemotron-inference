@@ -15,6 +15,9 @@ std::optional<GemmLaunchPlan> BuildGemmLaunchPlan(
   plan.m = activation_rows;
   plan.n = descriptor.output_rows;
   plan.k = descriptor.input_cols;
+  plan.tensor_name = descriptor.tensor_name;
+  plan.storage_dtype = descriptor.storage_dtype;
+  plan.compute_dtype = descriptor.compute_dtype;
   plan.uses_block_scales = descriptor.is_scaled();
   plan.packed_bytes = descriptor.packed_bytes();
   plan.block_scales_bytes = descriptor.block_scales_bytes();

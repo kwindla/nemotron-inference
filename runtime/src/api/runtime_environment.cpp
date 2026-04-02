@@ -90,7 +90,8 @@ std::unique_ptr<RuntimeEnvironment> RuntimeEnvironment::BuildFromManifestFile(
   auto artifact_loader = ArtifactLoader::OpenVerifiedWithMode(
       load_result.manifest,
       manifest_path,
-      options.artifact_load_mode);
+      options.artifact_load_mode,
+      options.prefetch_mapped_artifacts);
   if (!artifact_loader) {
     return nullptr;
   }

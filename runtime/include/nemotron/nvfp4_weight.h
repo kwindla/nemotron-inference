@@ -11,6 +11,17 @@ namespace nemotron {
 class DeviceNvfp4Weight {
  public:
   static std::unique_ptr<DeviceNvfp4Weight> Upload(const GemmDescriptor& descriptor);
+  static std::unique_ptr<DeviceNvfp4Weight> CreateView(
+      std::size_t output_rows,
+      std::size_t input_cols,
+      std::uint8_t* packed_data,
+      std::size_t packed_nbytes,
+      std::uint8_t* block_scales_data,
+      std::size_t block_scales_nbytes,
+      std::uint8_t* matmul_block_scales_data,
+      std::size_t matmul_block_scales_nbytes,
+      std::uint8_t* tensor_scale_data,
+      std::size_t tensor_scale_nbytes);
 
   DeviceNvfp4Weight(DeviceNvfp4Weight&&) noexcept;
   DeviceNvfp4Weight& operator=(DeviceNvfp4Weight&&) noexcept;

@@ -23,6 +23,13 @@ std::optional<Nvfp4ExecutionScaleLayout> BuildNvfp4ExecutionScaleLayout(
 
 std::size_t ExecutionNvfp4ScaleBytes(std::size_t rows, std::size_t cols);
 
+bool SwizzleRowMajorNvfp4ScalesForExecutionInto(
+    const std::uint8_t* row_major_scales,
+    std::size_t rows,
+    std::size_t cols,
+    std::uint8_t* swizzled_scales,
+    std::size_t swizzled_nbytes);
+
 std::vector<std::uint8_t> SwizzleRowMajorNvfp4ScalesForExecution(
     const std::uint8_t* row_major_scales,
     std::size_t rows,

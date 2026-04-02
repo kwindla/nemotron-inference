@@ -114,14 +114,15 @@ std::optional<EmbeddingLookupStats> LaunchEmbeddingLookup(
     const std::int32_t* device_token_ids,
     std::size_t token_count,
     TensorT* output,
-    bool synchronize) {
+    bool synchronize,
+    cudaStream_t stream) {
   if (!ValidateLookupRequest(table, device_token_ids, token_count, output)) {
     return std::nullopt;
   }
   const std::size_t total = token_count * table.embedding_dim();
   const int block_size = 256;
   const int grid_size = static_cast<int>((total + block_size - 1) / block_size);
-  EmbeddingLookupKernel<<<grid_size, block_size>>>(
+  EmbeddingLookupKernel<<<grid_size, block_size, 0, stream>>>(
       table.data(),
       device_token_ids,
       output->data(),
@@ -301,7 +302,7 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsFp32(
 
   std::optional<EmbeddingLookupStats> stats;
   if (ok) {
-    stats = LaunchEmbeddingLookup(table, token_ids_dev, token_count, output, true);
+    stats = LaunchEmbeddingLookup(table, token_ids_dev, token_count, output, true, nullptr);
     ok &= stats.has_value();
   }
 
@@ -358,7 +359,7 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsBf16(
 
   std::optional<EmbeddingLookupStats> stats;
   if (ok) {
-    stats = LaunchEmbeddingLookup(table, token_ids_dev, token_count, output, true);
+    stats = LaunchEmbeddingLookup(table, token_ids_dev, token_count, output, true, nullptr);
     ok &= stats.has_value();
   }
 
@@ -377,16 +378,18 @@ std::optional<EmbeddingLookupStats> LookupEmbeddingRowsDeviceIdsFp32(
     const DeviceEmbeddingTableFp32& table,
     const std::int32_t* device_token_ids,
     std::size_t token_count,
-    DeviceTensorFp32* output) {
-  return LaunchEmbeddingLookup(table, device_token_ids, token_count, output, false);
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
+  return LaunchEmbeddingLookup(table, device_token_ids, token_count, output, false, stream);
 }
 
 std::optional<EmbeddingLookupStats> LookupEmbeddingRowsDeviceIdsBf16(
     const DeviceEmbeddingTableFp32& table,
     const std::int32_t* device_token_ids,
     std::size_t token_count,
-    DeviceTensorBf16* output) {
-  return LaunchEmbeddingLookup(table, device_token_ids, token_count, output, false);
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
+  return LaunchEmbeddingLookup(table, device_token_ids, token_count, output, false, stream);
 }
 
 }  // namespace nemotron

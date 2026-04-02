@@ -2,6 +2,8 @@
 
 #include <cstddef>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/device_tensor.h"
 
 namespace nemotron {
@@ -15,7 +17,8 @@ bool MambaCausalConv1dUpdateDecodeFp32(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorFp32* conv_output);
+    DeviceTensorFp32* conv_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaCausalConv1dUpdateDecodeBf16(
     const DeviceTensorBf16& projected,
@@ -26,7 +29,8 @@ bool MambaCausalConv1dUpdateDecodeBf16(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorBf16* conv_output);
+    DeviceTensorBf16* conv_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaConv1dSiluUpdateFp32(
     const DeviceTensorFp32& projected,
@@ -37,7 +41,8 @@ bool MambaConv1dSiluUpdateFp32(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorFp32* conv_output);
+    DeviceTensorFp32* conv_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaConv1dSiluUpdateBf16(
     const DeviceTensorBf16& projected,
@@ -48,7 +53,8 @@ bool MambaConv1dSiluUpdateBf16(
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
     DeviceTensorFp32* conv_state,
-    DeviceTensorBf16* conv_output);
+    DeviceTensorBf16* conv_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaSsmUpdateFp32(
     const DeviceTensorFp32& projected,
@@ -65,7 +71,8 @@ bool MambaSsmUpdateFp32(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorFp32* y_output);
+    DeviceTensorFp32* y_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaSsmUpdateBf16(
     const DeviceTensorBf16& projected,
@@ -82,7 +89,8 @@ bool MambaSsmUpdateBf16(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorBf16* y_output);
+    DeviceTensorBf16* y_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaSelectiveStateUpdateDecodeFp32(
     const DeviceTensorFp32& projected,
@@ -99,7 +107,8 @@ bool MambaSelectiveStateUpdateDecodeFp32(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorFp32* gated_output);
+    DeviceTensorFp32* gated_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaSelectiveStateUpdateDecodeBf16(
     const DeviceTensorBf16& projected,
@@ -116,7 +125,8 @@ bool MambaSelectiveStateUpdateDecodeBf16(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorBf16* gated_output);
+    DeviceTensorBf16* gated_output,
+    cudaStream_t stream = nullptr);
 
 bool MambaDecodeStepFusedFp32(
     const DeviceTensorFp32& projected,
@@ -139,7 +149,8 @@ bool MambaDecodeStepFusedFp32(
     const DeviceTensorFp32& mixer_norm_weight,
     DeviceTensorFp32* conv_state,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 bool MambaDecodeStepFusedBf16(
     const DeviceTensorBf16& projected,
@@ -162,7 +173,8 @@ bool MambaDecodeStepFusedBf16(
     const DeviceTensorFp32& mixer_norm_weight,
     DeviceTensorFp32* conv_state,
     DeviceTensorFp32* ssm_state,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 bool GroupedRmsNormGatedFp32(
     const DeviceTensorFp32& y_output,
@@ -170,7 +182,8 @@ bool GroupedRmsNormGatedFp32(
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 bool GroupedRmsNormGatedBf16(
     const DeviceTensorBf16& y_output,
@@ -178,20 +191,23 @@ bool GroupedRmsNormGatedBf16(
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 bool GroupedRmsNormFp32(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorFp32* output);
+    DeviceTensorFp32* output,
+    cudaStream_t stream = nullptr);
 
 bool GroupedRmsNormBf16(
     const DeviceTensorBf16& input,
     const DeviceTensorFp32& mixer_norm_weight,
     std::size_t n_groups,
     float epsilon,
-    DeviceTensorBf16* output);
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
 
 }  // namespace nemotron

@@ -282,7 +282,8 @@ bool UploadPackedFloatToDeviceBf16(
 bool ConvertDeviceFp32ToBf16(
     const float* device_input,
     std::size_t element_count,
-    __nv_bfloat16* device_output) {
+    __nv_bfloat16* device_output,
+    cudaStream_t stream) {
   if (device_input == nullptr || element_count == 0 || device_output == nullptr) {
     return false;
   }
@@ -291,7 +292,7 @@ bool ConvertDeviceFp32ToBf16(
   const int grid_size = static_cast<int>(
       (element_count + static_cast<std::size_t>(kBlockSize) - 1u) /
       static_cast<std::size_t>(kBlockSize));
-  ConvertFp32ToBf16Kernel<<<grid_size, kBlockSize>>>(
+  ConvertFp32ToBf16Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       device_input,
       element_count,
       device_output);
@@ -301,7 +302,8 @@ bool ConvertDeviceFp32ToBf16(
 bool ConvertDeviceBf16ToFp32(
     const __nv_bfloat16* device_input,
     std::size_t element_count,
-    float* device_output) {
+    float* device_output,
+    cudaStream_t stream) {
   if (device_input == nullptr || element_count == 0 || device_output == nullptr) {
     return false;
   }
@@ -310,7 +312,7 @@ bool ConvertDeviceBf16ToFp32(
   const int grid_size = static_cast<int>(
       (element_count + static_cast<std::size_t>(kBlockSize) - 1u) /
       static_cast<std::size_t>(kBlockSize));
-  ConvertBf16ToFp32Kernel<<<grid_size, kBlockSize>>>(
+  ConvertBf16ToFp32Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       device_input,
       element_count,
       1.0f,
@@ -322,7 +324,8 @@ bool QuantizeDeviceFp32ToScaledFp8RoundTripBf16(
     const float* device_input,
     std::size_t element_count,
     float input_scale,
-    __nv_bfloat16* device_output) {
+    __nv_bfloat16* device_output,
+    cudaStream_t stream) {
   if (device_input == nullptr || element_count == 0 || device_output == nullptr) {
     return false;
   }
@@ -335,7 +338,7 @@ bool QuantizeDeviceFp32ToScaledFp8RoundTripBf16(
   const int grid_size = static_cast<int>(
       (element_count + static_cast<std::size_t>(kBlockSize) - 1u) /
       static_cast<std::size_t>(kBlockSize));
-  QuantizeFp32ToScaledFp8RoundTripBf16Kernel<<<grid_size, kBlockSize>>>(
+  QuantizeFp32ToScaledFp8RoundTripBf16Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       device_input,
       element_count,
       scale,
@@ -347,7 +350,8 @@ bool QuantizeDeviceFp32ToFp8E4M3(
     const float* device_input,
     std::size_t element_count,
     float input_scale,
-    std::uint8_t* device_output) {
+    std::uint8_t* device_output,
+    cudaStream_t stream) {
   if (device_input == nullptr || element_count == 0 || device_output == nullptr) {
     return false;
   }
@@ -360,7 +364,7 @@ bool QuantizeDeviceFp32ToFp8E4M3(
   const int grid_size = static_cast<int>(
       (element_count + static_cast<std::size_t>(kBlockSize) - 1u) /
       static_cast<std::size_t>(kBlockSize));
-  QuantizeFp32ToFp8E4M3Kernel<<<grid_size, kBlockSize>>>(
+  QuantizeFp32ToFp8E4M3Kernel<<<grid_size, kBlockSize, 0, stream>>>(
       device_input,
       element_count,
       scale,

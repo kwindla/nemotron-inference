@@ -1,4 +1,5 @@
 #include "nemotron/artifact_loader.h"
+#include "nemotron/device_buffer.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/embedding_catalog.h"
 #include "nemotron/embedding_table.h"
@@ -28,11 +29,13 @@ using nemotron::BuildKernelCatalog;
 using nemotron::BuildTensorCatalog;
 using nemotron::BuildWeightArenaPlan;
 using nemotron::DeviceEmbeddingTableFp32;
+using nemotron::DeviceBuffer;
 using nemotron::DeviceTensorFp32;
 using nemotron::EmbeddingCatalog;
 using nemotron::KernelCatalog;
 using nemotron::LoadVerifiedManifestFromJsonFile;
 using nemotron::LookupEmbeddingRowsFp32;
+using nemotron::LookupEmbeddingRowsDeviceIdsFp32;
 using nemotron::ManifestLoadResult;
 using nemotron::TensorCatalog;
 using nemotron::WeightArena;
@@ -307,6 +310,70 @@ bool test_embedding_lookup_rejects_out_of_range_token() {
                 "embedding lookup should reject out-of-range tokens");
 }
 
+bool test_embedding_lookup_accepts_device_token_ids() {
+  if (!has_cuda_device()) {
+    std::cout << "embedding_lookup_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  TempDir temp_dir;
+  const std::vector<float> embedding_weights = {
+      1.0f, 2.0f, 3.0f,
+      4.0f, 5.0f, 6.0f,
+      7.0f, 8.0f, 9.0f,
+      10.0f, 11.0f, 12.0f,
+  };
+  const std::string embedding_bytes = bytes_from_vector(embedding_weights);
+  write_file(temp_dir.path() / "weights" / "embedding.bin", embedding_bytes);
+  write_file(
+      temp_dir.path() / "manifest.json",
+      make_manifest_json("weights/embedding.bin", fnv1a64_hex(embedding_bytes)));
+
+  const LoadedEmbeddingCatalog loaded = load_embedding_catalog(temp_dir.path() / "manifest.json");
+  if (!expect(loaded.embedding_catalog.valid(), "embedding catalog should load before device-token lookup")) {
+    return false;
+  }
+  const auto* descriptor = loaded.embedding_catalog.FindDescriptor("backbone.embeddings.weight");
+  if (!expect(descriptor != nullptr, "embedding descriptor should exist before device-token lookup")) {
+    return false;
+  }
+
+  auto table = DeviceEmbeddingTableFp32::Upload(*descriptor);
+  if (!expect(static_cast<bool>(table), "embedding table upload should succeed before device-token lookup")) {
+    return false;
+  }
+
+  const std::vector<std::int32_t> token_ids = {1, 3};
+  DeviceBuffer<std::int32_t> token_ids_device;
+  if (!expect(token_ids_device.Resize(token_ids.size()) && token_ids_device.CopyFromHost(token_ids),
+              "device token-id upload should succeed")) {
+    return false;
+  }
+  auto output = DeviceTensorFp32::Create({token_ids.size(), descriptor->embedding_dim});
+  if (!expect(output && output->valid(), "device output tensor should allocate for device-token lookup")) {
+    return false;
+  }
+
+  const auto stats =
+      LookupEmbeddingRowsDeviceIdsFp32(*table, token_ids_device.data(), token_ids.size(), output.get());
+  if (!expect(stats.has_value(), "device-token embedding lookup should execute successfully")) {
+    return false;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    std::cerr << "FAIL: device-token embedding lookup should synchronize cleanly after launch\n";
+    return false;
+  }
+
+  std::vector<float> host_output(output->numel(), 0.0f);
+  if (!expect(output->CopyToHost(host_output.data(), host_output.size()), "device-token lookup output should download")) {
+    return false;
+  }
+
+  const auto reference = cpu_reference(embedding_weights, token_ids, descriptor->embedding_dim);
+  return expect(nearly_equal(host_output, reference, 1e-6f),
+                "device-token lookup output should match the CPU reference");
+}
+
 bool test_embedding_lookup_accepts_bf16_weights() {
   if (!has_cuda_device()) {
     std::cout << "embedding_lookup_test: SKIP (no CUDA device available)\n";
@@ -376,6 +443,7 @@ int main() {
   const bool ok =
       test_embedding_lookup_matches_cpu_reference() &&
       test_embedding_lookup_rejects_out_of_range_token() &&
+      test_embedding_lookup_accepts_device_token_ids() &&
       test_embedding_lookup_accepts_bf16_weights();
 
   if (!ok) {

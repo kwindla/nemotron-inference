@@ -11,6 +11,8 @@ std::size_t KvCacheDataTypeBytes(KvCacheDataType dtype) {
     case KvCacheDataType::kFp16:
     case KvCacheDataType::kBf16:
       return 2;
+    case KvCacheDataType::kFp8E4M3:
+      return 1;
   }
   return 0;
 }

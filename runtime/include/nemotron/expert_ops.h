@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cuda_runtime.h>
+
 #include "nemotron/device_buffer.h"
 #include "nemotron/device_tensor.h"
 
@@ -11,42 +13,48 @@ namespace nemotron {
 bool CopyRowFp32(
     const DeviceTensorFp32& input,
     std::size_t row_index,
-    DeviceTensorFp32* output_row);
+    DeviceTensorFp32* output_row,
+    cudaStream_t stream = nullptr);
 
 bool CopyRowBf16(
     const DeviceTensorBf16& input,
     std::size_t row_index,
-    DeviceTensorBf16* output_row);
+    DeviceTensorBf16* output_row,
+    cudaStream_t stream = nullptr);
 
 bool WriteRowFp32(
     const DeviceTensorFp32& input_row,
     std::size_t row_index,
     DeviceTensorFp32* output);
 
-bool Relu2InPlaceFp32(DeviceTensorFp32* tensor);
-bool Relu2InPlaceBf16(DeviceTensorBf16* tensor);
+bool Relu2InPlaceFp32(DeviceTensorFp32* tensor, cudaStream_t stream = nullptr);
+bool Relu2InPlaceBf16(DeviceTensorBf16* tensor, cudaStream_t stream = nullptr);
 
 bool AddScaledFp32(
     const DeviceTensorFp32& input,
     float scale,
-    DeviceTensorFp32* accumulator);
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream = nullptr);
 
 bool AddScaledBf16(
     const DeviceTensorBf16& input,
     float scale,
-    DeviceTensorBf16* accumulator);
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream = nullptr);
 
 bool AddScaledRowFp32(
     const DeviceTensorFp32& input_row,
     float scale,
     std::size_t row_index,
-    DeviceTensorFp32* accumulator);
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream = nullptr);
 
 bool AddScaledRowBf16(
     const DeviceTensorBf16& input_row,
     float scale,
     std::size_t row_index,
-    DeviceTensorBf16* accumulator);
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream = nullptr);
 
 bool SelectTopExpertsFp32(
     const DeviceTensorFp32& router_logits,
@@ -57,7 +65,8 @@ bool SelectTopExpertsFp32(
     bool norm_topk_prob,
     float routed_scaling_factor,
     std::int32_t* selected_indices_device,
-    float* selected_weights_device);
+    float* selected_weights_device,
+    cudaStream_t stream = nullptr);
 
 bool GatherExpertSelectionLookups(
     const std::int32_t* selected_indices_device,
@@ -306,7 +315,8 @@ bool ScaleWeightedAccumulateRowsFp32(
     const float* weight_tensor_scales_device,
     const float* routing_weights_device,
     std::size_t row_count,
-    DeviceTensorFp32* accumulator);
+    DeviceTensorFp32* accumulator,
+    cudaStream_t stream = nullptr);
 
 bool ScaleWeightedAccumulateRowsBf16(
     const DeviceTensorFp32& data,
@@ -314,6 +324,7 @@ bool ScaleWeightedAccumulateRowsBf16(
     const float* weight_tensor_scales_device,
     const float* routing_weights_device,
     std::size_t row_count,
-    DeviceTensorBf16* accumulator);
+    DeviceTensorBf16* accumulator,
+    cudaStream_t stream = nullptr);
 
 }  // namespace nemotron

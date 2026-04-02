@@ -13,6 +13,8 @@
   "routed_scaling_factor": 5.0,
   "norm_topk_prob": true,
   "rms_epsilon": 1e-05,
+  "fc1_latent_family": "scaled_fp8",
+  "shared_up_family": "scaled_fp8",
   "shared_down_family": "scaled_fp8",
   "oracle_device": "cuda",
   "selected_expert_indices": [
@@ -125,7 +127,7 @@
   "notes": [
     "The input hidden state is deterministic unless --input-hidden-bin is provided.",
     "Router, latent projections, shared expert, and selected routed experts all use real checkpoint weights.",
-    "The routed and shared NVFP4 paths mirror the current correctness-first runtime contract: activations are dynamically packed to NVFP4, dequantized, then multiplied by dequantized weights.",
+    "The routed and shared expert paths mirror the current correctness-first runtime contract for the family actually present in the checkpoint.",
     "expected_final_output_fp32 includes the outer residual add."
   ]
 }
