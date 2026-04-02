@@ -2,6 +2,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
+#include <cstdlib>
+#include <iostream>
 #include <vector>
 
 #include "nemotron/nvfp4_scale_layout.h"
@@ -19,6 +22,7 @@ struct DeviceNvfp4Weight::Impl {
   std::size_t matmul_block_scales_nbytes = 0;
   std::uint8_t* tensor_scale_data = nullptr;
   std::size_t tensor_scale_nbytes = 0;
+  float host_tensor_scale = 0.0f;
 };
 
 namespace {
@@ -54,6 +58,14 @@ void ReleaseBuffer(std::uint8_t** data) {
 }  // namespace
 
 std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescriptor& descriptor) {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const auto debug_fail = [&](const char* reason) -> std::unique_ptr<DeviceNvfp4Weight> {
+    if (debug) {
+      std::cerr << "nvfp4_weight: upload failed for " << descriptor.tensor_name
+                << ": " << reason << "\n";
+    }
+    return nullptr;
+  };
   const std::size_t expected_block_scale_nbytes =
       descriptor.input_cols % kBlockWidth == 0 ? descriptor.output_rows * (descriptor.input_cols / kBlockWidth) : 0;
   if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
@@ -65,13 +77,14 @@ std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescripto
       !descriptor.packed_bytes().valid() ||
       descriptor.block_scales_nbytes != expected_block_scale_nbytes ||
       !descriptor.block_scales_bytes().valid() ||
+      descriptor.tensor_scale_nbytes < sizeof(float) ||
       !descriptor.tensor_scale_bytes().valid()) {
-    return nullptr;
+    return debug_fail("descriptor validation failed");
   }
 
   int device_count = 0;
   if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
-    return nullptr;
+    return debug_fail("no CUDA device available");
   }
 
   auto impl = std::make_unique<Impl>();
@@ -80,12 +93,13 @@ std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescripto
   impl->packed_nbytes = descriptor.packed_nbytes;
   impl->block_scales_nbytes = descriptor.block_scales_nbytes;
   impl->tensor_scale_nbytes = descriptor.tensor_scale_nbytes;
+  std::memcpy(&impl->host_tensor_scale, descriptor.tensor_scale_data, sizeof(float));
   const std::vector<std::uint8_t> matmul_block_scales = SwizzleRowMajorNvfp4ScalesForExecution(
       descriptor.block_scales_data,
       descriptor.output_rows,
       descriptor.input_cols);
   if (matmul_block_scales.empty()) {
-    return nullptr;
+    return debug_fail("scale swizzle failed");
   }
   impl->matmul_block_scales_nbytes = matmul_block_scales.size();
 
@@ -103,10 +117,10 @@ std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescripto
           descriptor.tensor_scale_nbytes,
           &impl->tensor_scale_data)) {
     ReleaseBuffer(&impl->tensor_scale_data);
-    ReleaseBuffer(&impl->matmul_block_scales_data);
-    ReleaseBuffer(&impl->block_scales_data);
-    ReleaseBuffer(&impl->packed_data);
-    return nullptr;
+      ReleaseBuffer(&impl->matmul_block_scales_data);
+      ReleaseBuffer(&impl->block_scales_data);
+      ReleaseBuffer(&impl->packed_data);
+    return debug_fail("device allocation/copy failed");
   }
 
   return std::unique_ptr<DeviceNvfp4Weight>(new DeviceNvfp4Weight(std::move(impl)));
@@ -164,6 +178,10 @@ std::size_t DeviceNvfp4Weight::matmul_block_scales_nbytes() const {
 
 std::size_t DeviceNvfp4Weight::tensor_scale_nbytes() const {
   return impl_ ? impl_->tensor_scale_nbytes : 0;
+}
+
+float DeviceNvfp4Weight::host_tensor_scale() const {
+  return impl_ ? impl_->host_tensor_scale : 0.0f;
 }
 
 const std::uint8_t* DeviceNvfp4Weight::packed_data() const {

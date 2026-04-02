@@ -792,6 +792,8 @@ bool RunMoeDirectDecodeViaCublaslt(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
     const std::vector<ExpertSelection>& selected_experts,
+    const std::vector<float>& routed_up_tensor_scales_host,
+    const std::vector<float>& routed_down_tensor_scales_host,
     const std::vector<FusedNvfp4WeightView>& routed_up_views,
     const std::vector<FusedNvfp4WeightView>& routed_down_views,
     DeviceTensorFp32* output,
@@ -815,6 +817,8 @@ bool RunMoeDirectDecodeViaCublaslt(
       !shared_up_weight.valid() ||
       !shared_down_weight.valid() ||
       selected_experts.empty() ||
+      selected_experts.size() != routed_up_tensor_scales_host.size() ||
+      selected_experts.size() != routed_down_tensor_scales_host.size() ||
       selected_experts.size() != routed_up_views.size() ||
       selected_experts.size() != routed_down_views.size() ||
       (scratch != nullptr &&
@@ -915,7 +919,9 @@ bool RunMoeDirectDecodeViaCublaslt(
              cublas_handle,
              *routed_up_plan,
              normalized_view,
+             normalized_packed->host_tensor_scale(),
              expert_up_view,
+             routed_up_tensor_scales_host[slot],
              routed_up_output)
              .has_value() ||
         !Relu2InPlaceFp32(routed_up_output)) {
@@ -930,7 +936,9 @@ bool RunMoeDirectDecodeViaCublaslt(
              cublas_handle,
              *routed_down_plan,
              MakeNvfp4PackedMatrixDeviceView(*routed_activated_packed),
+             routed_activated_packed->host_tensor_scale(),
              expert_down_view,
+             routed_down_tensor_scales_host[slot],
              output)
              .has_value() ||
         !AccumulateScaledFp32(
@@ -945,7 +953,9 @@ bool RunMoeDirectDecodeViaCublaslt(
            cublas_handle,
            *shared_up_plan,
            normalized_view,
+           normalized_packed->host_tensor_scale(),
            shared_up_weight_view,
+           shared_up_weight.host_tensor_scale(),
            shared_up_output)
            .has_value() ||
       !Relu2InPlaceFp32(shared_up_output)) {
@@ -960,7 +970,9 @@ bool RunMoeDirectDecodeViaCublaslt(
            cublas_handle,
            *shared_down_plan,
            MakeNvfp4PackedMatrixDeviceView(*shared_activated_packed),
+           shared_activated_packed->host_tensor_scale(),
            shared_down_weight_view,
+           shared_down_weight.host_tensor_scale(),
            output)
            .has_value() ||
       !ResidualAddFp32(*routed_output, *output, routed_output) ||
@@ -1815,10 +1827,14 @@ bool ExpertLayerSlice::Run(
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_down_weights;
       std::vector<const GemmDescriptor*> routed_up_descriptors;
       std::vector<const GemmDescriptor*> routed_down_descriptors;
+      std::vector<float> routed_up_tensor_scales_host;
+      std::vector<float> routed_down_tensor_scales_host;
       std::vector<FusedNvfp4WeightView> routed_up_views;
       std::vector<FusedNvfp4WeightView> routed_down_views;
       routed_up_descriptors.reserve(selected_experts.size());
       routed_down_descriptors.reserve(selected_experts.size());
+      routed_up_tensor_scales_host.reserve(selected_experts.size());
+      routed_down_tensor_scales_host.reserve(selected_experts.size());
       routed_up_views.reserve(selected_experts.size());
       routed_down_views.reserve(selected_experts.size());
 
@@ -1840,6 +1856,10 @@ bool ExpertLayerSlice::Run(
           }
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
+          routed_up_tensor_scales_host.push_back(
+              impl_->monolithic_up->host_tensor_scale(selection.expert_index));
+          routed_down_tensor_scales_host.push_back(
+              impl_->monolithic_down->host_tensor_scale(selection.expert_index));
           routed_up_views.push_back(impl_->monolithic_up->GetView(selection.expert_index));
           routed_down_views.push_back(impl_->monolithic_down->GetView(selection.expert_index));
         }
@@ -1860,6 +1880,8 @@ bool ExpertLayerSlice::Run(
           }
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
+          routed_up_tensor_scales_host.push_back(runtime_pair.up_proj_device->host_tensor_scale());
+          routed_down_tensor_scales_host.push_back(runtime_pair.down_proj_device->host_tensor_scale());
           routed_up_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.up_proj_device));
           routed_down_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.down_proj_device));
         }
@@ -1899,6 +1921,8 @@ bool ExpertLayerSlice::Run(
           staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
           routed_up_descriptors.push_back(runtime_pair.up_proj);
           routed_down_descriptors.push_back(runtime_pair.down_proj);
+          routed_up_tensor_scales_host.push_back(up_weight->host_tensor_scale());
+          routed_down_tensor_scales_host.push_back(down_weight->host_tensor_scale());
           routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
           routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
           staged_up_weights.push_back(std::move(up_weight));
@@ -1927,6 +1951,8 @@ bool ExpertLayerSlice::Run(
               input,
               *normalized,
               selected_experts,
+              routed_up_tensor_scales_host,
+              routed_down_tensor_scales_host,
               routed_up_views,
               routed_down_views,
               output,

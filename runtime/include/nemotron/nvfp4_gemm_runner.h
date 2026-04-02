@@ -40,6 +40,15 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const Nvfp4PackedMatrixDeviceView& activations,
+    float activation_tensor_scale_host,
+    const Nvfp4PackedMatrixDeviceView& weights,
+    float weight_tensor_scale_host,
+    DeviceTensorFp32* output);
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const Nvfp4PackedMatrixDeviceView& activations,
     const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output);
 

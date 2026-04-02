@@ -220,6 +220,7 @@ struct DeviceNvfp4Matrix::Impl {
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scale_data = nullptr;
+  float host_tensor_scale = 1.0f;
 };
 
 std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
@@ -319,6 +320,10 @@ std::size_t DeviceNvfp4Matrix::tensor_scale_nbytes() const {
   return impl_ ? impl_->tensor_scale_nbytes : 0;
 }
 
+float DeviceNvfp4Matrix::host_tensor_scale() const {
+  return impl_ ? impl_->host_tensor_scale : 0.0f;
+}
+
 const std::uint8_t* DeviceNvfp4Matrix::packed_data() const {
   return impl_ ? impl_->packed_data : nullptr;
 }
@@ -373,7 +378,8 @@ bool DeviceNvfp4Matrix::CopyTensorScaleToHost(float* output) const {
   if (!valid() || output == nullptr) {
     return false;
   }
-  return CheckCuda(cudaMemcpy(output, tensor_scale_data(), sizeof(float), cudaMemcpyDeviceToHost));
+  *output = impl_->host_tensor_scale;
+  return true;
 }
 
 std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
@@ -407,6 +413,7 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
                 cudaMemcpyHostToDevice))) {
       return nullptr;
     }
+    packed->impl_->host_tensor_scale = host_tensor_scale;
   } else {
     auto* tensor_scale_data =
         reinterpret_cast<float*>(const_cast<std::uint8_t*>(packed->tensor_scale_data()));
@@ -429,6 +436,13 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
         global_max_bits,
         tensor_scale_data);
     if (!CheckCuda(cudaGetLastError())) {
+      return nullptr;
+    }
+    if (!CheckCuda(cudaMemcpy(
+            &packed->impl_->host_tensor_scale,
+            packed->tensor_scale_data(),
+            sizeof(float),
+            cudaMemcpyDeviceToHost))) {
       return nullptr;
     }
   }

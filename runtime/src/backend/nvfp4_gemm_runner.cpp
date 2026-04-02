@@ -3,9 +3,13 @@
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <optional>
+#include <unordered_map>
 
 namespace nemotron {
 namespace {
@@ -67,26 +71,6 @@ void LogCublasFailure(
             << "\n";
 }
 
-void LogCudaFailure(
-    const char* op,
-    cudaError_t status,
-    std::size_t m,
-    std::size_t n,
-    std::size_t k) {
-  if (!DebugEnabled()) {
-    return;
-  }
-  std::cerr << "nvfp4_gemm_runner: " << op
-            << " failed"
-            << " status=" << cudaGetErrorName(status)
-            << "(" << static_cast<int>(status) << ")"
-            << " detail=" << cudaGetErrorString(status)
-            << " M=" << m
-            << " N=" << n
-            << " K=" << k
-            << "\n";
-}
-
 void LogHeuristicFailure(std::size_t m, std::size_t n, std::size_t k) {
   if (!DebugEnabled()) {
     return;
@@ -128,10 +112,332 @@ cublasLtMatmulMatrixScale_t ToCublasScaleMode(CublasLtScaleMode scale_mode) {
   return CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
 }
 
-bool ReadDeviceFloat(const float* device_ptr, float* host_value) {
-  return device_ptr != nullptr &&
-         host_value != nullptr &&
-         CheckCuda(cudaMemcpy(host_value, device_ptr, sizeof(float), cudaMemcpyDeviceToHost));
+std::optional<float> ReadTensorScaleHostFallback(const float* device_ptr) {
+  if (device_ptr == nullptr) {
+    return std::nullopt;
+  }
+  float host_value = 0.0f;
+  if (!CheckCuda(cudaMemcpy(&host_value, device_ptr, sizeof(host_value), cudaMemcpyDeviceToHost))) {
+    return std::nullopt;
+  }
+  return host_value;
+}
+
+struct CachedNvfp4MatmulKey {
+  std::uintptr_t handle = 0;
+  int device = -1;
+  std::size_t m = 0;
+  std::size_t n = 0;
+  std::size_t k = 0;
+  std::size_t lda = 0;
+  std::size_t ldb = 0;
+  std::size_t ldc = 0;
+  std::size_t workspace_bytes = 0;
+  CublasLtTransform transform_a = CublasLtTransform::kNone;
+  CublasLtTransform transform_b = CublasLtTransform::kTranspose;
+  CublasLtMatrixOrder order_a = CublasLtMatrixOrder::kRowMajor;
+  CublasLtMatrixOrder order_b = CublasLtMatrixOrder::kRowMajor;
+  CublasLtMatrixOrder order_c = CublasLtMatrixOrder::kRowMajor;
+  CublasLtScaleMode scale_mode = CublasLtScaleMode::kNone;
+
+  bool operator==(const CachedNvfp4MatmulKey& other) const {
+    return handle == other.handle &&
+           device == other.device &&
+           m == other.m &&
+           n == other.n &&
+           k == other.k &&
+           lda == other.lda &&
+           ldb == other.ldb &&
+           ldc == other.ldc &&
+           workspace_bytes == other.workspace_bytes &&
+           transform_a == other.transform_a &&
+           transform_b == other.transform_b &&
+           order_a == other.order_a &&
+           order_b == other.order_b &&
+           order_c == other.order_c &&
+           scale_mode == other.scale_mode;
+  }
+};
+
+struct CachedNvfp4MatmulKeyHash {
+  std::size_t operator()(const CachedNvfp4MatmulKey& key) const {
+    std::size_t hash = 0;
+    const auto mix = [&](std::size_t value) {
+      hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+    };
+    mix(static_cast<std::size_t>(key.handle));
+    mix(static_cast<std::size_t>(key.device));
+    mix(key.m);
+    mix(key.n);
+    mix(key.k);
+    mix(key.lda);
+    mix(key.ldb);
+    mix(key.ldc);
+    mix(key.workspace_bytes);
+    mix(static_cast<std::size_t>(key.transform_a));
+    mix(static_cast<std::size_t>(key.transform_b));
+    mix(static_cast<std::size_t>(key.order_a));
+    mix(static_cast<std::size_t>(key.order_b));
+    mix(static_cast<std::size_t>(key.order_c));
+    mix(static_cast<std::size_t>(key.scale_mode));
+    return hash;
+  }
+};
+
+struct CachedNvfp4MatmulResources {
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulHeuristicResult_t heuristic{};
+  int heuristic_count = 0;
+
+  ~CachedNvfp4MatmulResources() {
+    if (c_desc != nullptr) {
+      cublasLtMatrixLayoutDestroy(c_desc);
+    }
+    if (b_desc != nullptr) {
+      cublasLtMatrixLayoutDestroy(b_desc);
+    }
+    if (a_desc != nullptr) {
+      cublasLtMatrixLayoutDestroy(a_desc);
+    }
+    if (op_desc != nullptr) {
+      cublasLtMatmulDescDestroy(op_desc);
+    }
+  }
+};
+
+CachedNvfp4MatmulKey MakeCachedNvfp4MatmulKey(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k) {
+  int current_device = -1;
+  if (!CheckCuda(cudaGetDevice(&current_device))) {
+    current_device = -1;
+  }
+  return CachedNvfp4MatmulKey{
+      reinterpret_cast<std::uintptr_t>(handle.handle()),
+      current_device,
+      m,
+      n,
+      k,
+      plan.lda,
+      plan.ldb,
+      plan.ldc,
+      handle.workspace_bytes(),
+      plan.transform_a,
+      plan.transform_b,
+      plan.order_a,
+      plan.order_b,
+      plan.order_c,
+      plan.scale_mode,
+  };
+}
+
+bool InitializeCachedNvfp4MatmulResources(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k,
+    const void* activation_block_scales,
+    const void* weight_block_scales,
+    CachedNvfp4MatmulResources* resources) {
+  if (resources == nullptr) {
+    return false;
+  }
+
+  const auto check_cublas = [&](cublasStatus_t status, const char* op) {
+    if (CheckCublas(status)) {
+      return true;
+    }
+    LogCublasFailure(op, status, m, n, k);
+    return false;
+  };
+
+  const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
+  const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
+  const cublasLtMatmulMatrixScale_t scale_mode = ToCublasScaleMode(plan.scale_mode);
+  if (!check_cublas(
+          cublasLtMatmulDescCreate(&resources->op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "cublasLtMatmulDescCreate")) {
+    return false;
+  }
+  if (!check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_TRANSA,
+              &trans_a,
+              sizeof(trans_a)),
+          "cublasLtMatmulDescSetAttribute(TRANSA)") ||
+      !check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_TRANSB,
+              &trans_b,
+              sizeof(trans_b)),
+          "cublasLtMatmulDescSetAttribute(TRANSB)") ||
+      !check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+              &scale_mode,
+              sizeof(scale_mode)),
+          "cublasLtMatmulDescSetAttribute(A_SCALE_MODE)") ||
+      !check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+              &scale_mode,
+              sizeof(scale_mode)),
+          "cublasLtMatmulDescSetAttribute(B_SCALE_MODE)") ||
+      !check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+              &activation_block_scales,
+              sizeof(activation_block_scales)),
+          "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER)") ||
+      !check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+              &weight_block_scales,
+              sizeof(weight_block_scales)),
+          "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER)")) {
+    return false;
+  }
+
+  if (!check_cublas(
+          cublasLtMatrixLayoutCreate(
+              &resources->a_desc,
+              CUDA_R_4F_E2M1,
+              static_cast<std::uint64_t>(m),
+              static_cast<std::uint64_t>(k),
+              static_cast<std::int64_t>(plan.lda)),
+          "cublasLtMatrixLayoutCreate(A)") ||
+      !check_cublas(
+          cublasLtMatrixLayoutCreate(
+              &resources->b_desc,
+              CUDA_R_4F_E2M1,
+              static_cast<std::uint64_t>(n),
+              static_cast<std::uint64_t>(k),
+              static_cast<std::int64_t>(plan.ldb)),
+          "cublasLtMatrixLayoutCreate(B)") ||
+      !check_cublas(
+          cublasLtMatrixLayoutCreate(
+              &resources->c_desc,
+              CUDA_R_32F,
+              static_cast<std::uint64_t>(m),
+              static_cast<std::uint64_t>(n),
+              static_cast<std::int64_t>(plan.ldc)),
+          "cublasLtMatrixLayoutCreate(C)")) {
+    return false;
+  }
+
+  const cublasLtOrder_t order_a = ToCublasOrder(plan.order_a);
+  const cublasLtOrder_t order_b = ToCublasOrder(plan.order_b);
+  const cublasLtOrder_t order_c = ToCublasOrder(plan.order_c);
+  if (!check_cublas(
+          cublasLtMatrixLayoutSetAttribute(
+              resources->a_desc,
+              CUBLASLT_MATRIX_LAYOUT_ORDER,
+              &order_a,
+              sizeof(order_a)),
+          "cublasLtMatrixLayoutSetAttribute(A_ORDER)") ||
+      !check_cublas(
+          cublasLtMatrixLayoutSetAttribute(
+              resources->b_desc,
+              CUBLASLT_MATRIX_LAYOUT_ORDER,
+              &order_b,
+              sizeof(order_b)),
+          "cublasLtMatrixLayoutSetAttribute(B_ORDER)") ||
+      !check_cublas(
+          cublasLtMatrixLayoutSetAttribute(
+              resources->c_desc,
+              CUBLASLT_MATRIX_LAYOUT_ORDER,
+              &order_c,
+              sizeof(order_c)),
+          "cublasLtMatrixLayoutSetAttribute(C_ORDER)")) {
+    return false;
+  }
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  const std::size_t max_workspace = handle.workspace_bytes();
+  const bool preference_ok =
+      check_cublas(
+          cublasLtMatmulPreferenceCreate(&preference),
+          "cublasLtMatmulPreferenceCreate") &&
+      check_cublas(
+          cublasLtMatmulPreferenceSetAttribute(
+              preference,
+              CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+              &max_workspace,
+              sizeof(max_workspace)),
+          "cublasLtMatmulPreferenceSetAttribute(MAX_WORKSPACE_BYTES)") &&
+      check_cublas(
+          cublasLtMatmulAlgoGetHeuristic(
+              handle.handle(),
+              resources->op_desc,
+              resources->a_desc,
+              resources->b_desc,
+              resources->c_desc,
+              resources->c_desc,
+              preference,
+              1,
+              &resources->heuristic,
+              &resources->heuristic_count),
+          "cublasLtMatmulAlgoGetHeuristic") &&
+      resources->heuristic_count > 0;
+  if (preference != nullptr) {
+    cublasLtMatmulPreferenceDestroy(preference);
+  }
+  if (!preference_ok) {
+    if (resources->heuristic_count == 0) {
+      LogHeuristicFailure(m, n, k);
+    }
+    return false;
+  }
+  return true;
+}
+
+CachedNvfp4MatmulResources* GetCachedNvfp4MatmulResources(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k,
+    const void* activation_block_scales,
+    const void* weight_block_scales) {
+  thread_local std::unordered_map<
+      CachedNvfp4MatmulKey,
+      std::unique_ptr<CachedNvfp4MatmulResources>,
+      CachedNvfp4MatmulKeyHash>
+      cache;
+
+  const CachedNvfp4MatmulKey key = MakeCachedNvfp4MatmulKey(handle, plan, m, n, k);
+  if (auto it = cache.find(key); it != cache.end()) {
+    return it->second.get();
+  }
+
+  auto resources = std::make_unique<CachedNvfp4MatmulResources>();
+  if (!InitializeCachedNvfp4MatmulResources(
+          handle,
+          plan,
+          m,
+          n,
+          k,
+          activation_block_scales,
+          weight_block_scales,
+          resources.get())) {
+    return nullptr;
+  }
+  auto* resources_ptr = resources.get();
+  cache.emplace(key, std::move(resources));
+  return resources_ptr;
 }
 
 }  // namespace
@@ -177,8 +483,17 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const Nvfp4PackedMatrixDeviceView& activations,
+    float activation_tensor_scale_host,
     const Nvfp4PackedMatrixDeviceView& weights,
+    float weight_tensor_scale_host,
     DeviceTensorFp32* output) {
+  if (!std::isfinite(activation_tensor_scale_host) ||
+      activation_tensor_scale_host <= 0.0f ||
+      !std::isfinite(weight_tensor_scale_host) ||
+      weight_tensor_scale_host <= 0.0f) {
+    return std::nullopt;
+  }
+
   if (!handle.valid() ||
       !activations.valid() ||
       !weights.valid() ||
@@ -205,22 +520,6 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     return std::nullopt;
   }
 
-  float activation_tensor_scale = 0.0f;
-  float weight_tensor_scale = 0.0f;
-  if (!ReadDeviceFloat(activations.tensor_scale_data, &activation_tensor_scale) ||
-      !ReadDeviceFloat(weights.tensor_scale_data, &weight_tensor_scale)) {
-    return std::nullopt;
-  }
-
-  cublasLtMatmulDesc_t op_desc = nullptr;
-  cublasLtMatrixLayout_t a_desc = nullptr;
-  cublasLtMatrixLayout_t b_desc = nullptr;
-  cublasLtMatrixLayout_t c_desc = nullptr;
-  cublasLtMatmulPreference_t preference = nullptr;
-
-  cublasLtMatmulHeuristicResult_t heuristic{};
-  int returned_results = 0;
-  bool ok = true;
   const auto check_cublas = [&](cublasStatus_t status, const char* op) {
     if (CheckCublas(status)) {
       return true;
@@ -228,200 +527,92 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     LogCublasFailure(op, status, m, n, k);
     return false;
   };
-  const auto check_cuda = [&](cudaError_t status, const char* op) {
-    if (CheckCuda(status)) {
-      return true;
-    }
-    LogCudaFailure(op, status, m, n, k);
-    return false;
-  };
-
-  ok &= output->FillZero();
-
-  ok &= check_cublas(
-      cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
-      "cublasLtMatmulDescCreate");
-  const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
-  const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
-  const cublasLtMatmulMatrixScale_t scale_mode = ToCublasScaleMode(plan.scale_mode);
-  ok &= check_cublas(
-      cublasLtMatmulDescSetAttribute(
-          op_desc,
-          CUBLASLT_MATMUL_DESC_TRANSA,
-          &trans_a,
-          sizeof(trans_a)),
-      "cublasLtMatmulDescSetAttribute(TRANSA)");
-  ok &= check_cublas(
-      cublasLtMatmulDescSetAttribute(
-          op_desc,
-          CUBLASLT_MATMUL_DESC_TRANSB,
-          &trans_b,
-          sizeof(trans_b)),
-      "cublasLtMatmulDescSetAttribute(TRANSB)");
-  ok &= check_cublas(
-      cublasLtMatmulDescSetAttribute(
-          op_desc,
-          CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
-          &scale_mode,
-          sizeof(scale_mode)),
-      "cublasLtMatmulDescSetAttribute(A_SCALE_MODE)");
-  ok &= check_cublas(
-      cublasLtMatmulDescSetAttribute(
-          op_desc,
-          CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
-          &scale_mode,
-          sizeof(scale_mode)),
-      "cublasLtMatmulDescSetAttribute(B_SCALE_MODE)");
 
   const void* activation_block_scales = activations.block_scales_data;
   const void* weight_block_scales = weights.block_scales_data;
-  ok &= check_cublas(
-      cublasLtMatmulDescSetAttribute(
-          op_desc,
-          CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-          &activation_block_scales,
-          sizeof(activation_block_scales)),
-      "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER)");
-  ok &= check_cublas(
-      cublasLtMatmulDescSetAttribute(
-          op_desc,
-          CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-          &weight_block_scales,
-          sizeof(weight_block_scales)),
-      "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER)");
-
-  ok &= check_cublas(
-      cublasLtMatrixLayoutCreate(
-          &a_desc,
-          CUDA_R_4F_E2M1,
-          static_cast<std::uint64_t>(m),
-          static_cast<std::uint64_t>(k),
-          static_cast<std::int64_t>(plan.lda)),
-      "cublasLtMatrixLayoutCreate(A)");
-  ok &= check_cublas(
-      cublasLtMatrixLayoutCreate(
-          &b_desc,
-          CUDA_R_4F_E2M1,
-          static_cast<std::uint64_t>(n),
-          static_cast<std::uint64_t>(k),
-          static_cast<std::int64_t>(plan.ldb)),
-      "cublasLtMatrixLayoutCreate(B)");
-  ok &= check_cublas(
-      cublasLtMatrixLayoutCreate(
-          &c_desc,
-          CUDA_R_32F,
-          static_cast<std::uint64_t>(m),
-          static_cast<std::uint64_t>(n),
-          static_cast<std::int64_t>(plan.ldc)),
-      "cublasLtMatrixLayoutCreate(C)");
-
-  const cublasLtOrder_t order_a = ToCublasOrder(plan.order_a);
-  const cublasLtOrder_t order_b = ToCublasOrder(plan.order_b);
-  const cublasLtOrder_t order_c = ToCublasOrder(plan.order_c);
-  ok &= check_cublas(
-      cublasLtMatrixLayoutSetAttribute(
-          a_desc,
-          CUBLASLT_MATRIX_LAYOUT_ORDER,
-          &order_a,
-          sizeof(order_a)),
-      "cublasLtMatrixLayoutSetAttribute(A_ORDER)");
-  ok &= check_cublas(
-      cublasLtMatrixLayoutSetAttribute(
-          b_desc,
-          CUBLASLT_MATRIX_LAYOUT_ORDER,
-          &order_b,
-          sizeof(order_b)),
-      "cublasLtMatrixLayoutSetAttribute(B_ORDER)");
-  ok &= check_cublas(
-      cublasLtMatrixLayoutSetAttribute(
-          c_desc,
-          CUBLASLT_MATRIX_LAYOUT_ORDER,
-          &order_c,
-          sizeof(order_c)),
-      "cublasLtMatrixLayoutSetAttribute(C_ORDER)");
-
-  ok &= check_cublas(
-      cublasLtMatmulPreferenceCreate(&preference),
-      "cublasLtMatmulPreferenceCreate");
-  const std::size_t max_workspace = handle.workspace_bytes();
-  ok &= check_cublas(
-      cublasLtMatmulPreferenceSetAttribute(
-          preference,
-          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-          &max_workspace,
-          sizeof(max_workspace)),
-      "cublasLtMatmulPreferenceSetAttribute(MAX_WORKSPACE_BYTES)");
-
-  if (ok) {
-    ok &= check_cublas(
-        cublasLtMatmulAlgoGetHeuristic(
-            handle.handle(),
-            op_desc,
-            a_desc,
-            b_desc,
-            c_desc,
-            c_desc,
-            preference,
-            1,
-            &heuristic,
-            &returned_results),
-        "cublasLtMatmulAlgoGetHeuristic");
-    ok &= returned_results > 0;
-    if (!ok && returned_results == 0) {
-      LogHeuristicFailure(m, n, k);
-    }
+  CachedNvfp4MatmulResources* const resources = GetCachedNvfp4MatmulResources(
+      handle,
+      plan,
+      m,
+      n,
+      k,
+      activation_block_scales,
+      weight_block_scales);
+  if (resources == nullptr) {
+    return std::nullopt;
   }
 
-  if (ok) {
-    const float alpha = activation_tensor_scale * weight_tensor_scale;
-    const float beta = 0.0f;
-    ok &= check_cublas(
-        cublasLtMatmul(
-            handle.handle(),
-            op_desc,
-            &alpha,
-            activations.packed_data,
-            a_desc,
-            weights.packed_data,
-            b_desc,
-            &beta,
-            output->data(),
-            c_desc,
-            output->data(),
-            c_desc,
-            &heuristic.algo,
-            handle.workspace(),
-            handle.workspace_bytes(),
-            nullptr),
-        "cublasLtMatmul");
+  if (!check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+              &activation_block_scales,
+              sizeof(activation_block_scales)),
+          "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER)") ||
+      !check_cublas(
+          cublasLtMatmulDescSetAttribute(
+              resources->op_desc,
+              CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+              &weight_block_scales,
+              sizeof(weight_block_scales)),
+          "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER)")) {
+    return std::nullopt;
   }
 
-  if (preference != nullptr) {
-    cublasLtMatmulPreferenceDestroy(preference);
-  }
-  if (c_desc != nullptr) {
-    cublasLtMatrixLayoutDestroy(c_desc);
-  }
-  if (b_desc != nullptr) {
-    cublasLtMatrixLayoutDestroy(b_desc);
-  }
-  if (a_desc != nullptr) {
-    cublasLtMatrixLayoutDestroy(a_desc);
-  }
-  if (op_desc != nullptr) {
-    cublasLtMatmulDescDestroy(op_desc);
-  }
-
-  if (!ok) {
+  const float alpha = activation_tensor_scale_host * weight_tensor_scale_host;
+  const float beta = 0.0f;
+  if (!check_cublas(
+          cublasLtMatmul(
+              handle.handle(),
+              resources->op_desc,
+              &alpha,
+              activations.packed_data,
+              resources->a_desc,
+              weights.packed_data,
+              resources->b_desc,
+              &beta,
+              output->data(),
+              resources->c_desc,
+              output->data(),
+              resources->c_desc,
+              &resources->heuristic.algo,
+              handle.workspace(),
+              handle.workspace_bytes(),
+              nullptr),
+          "cublasLtMatmul")) {
     return std::nullopt;
   }
 
   return Nvfp4RowMajorDeviceStats{
       m,
       n,
-      heuristic.workspaceSize,
-      returned_results,
+      resources->heuristic.workspaceSize,
+      resources->heuristic_count,
   };
+}
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const Nvfp4PackedMatrixDeviceView& activations,
+    const Nvfp4PackedMatrixDeviceView& weights,
+    DeviceTensorFp32* output) {
+  const auto activation_tensor_scale_host =
+      ReadTensorScaleHostFallback(activations.tensor_scale_data);
+  const auto weight_tensor_scale_host =
+      ReadTensorScaleHostFallback(weights.tensor_scale_data);
+  if (!activation_tensor_scale_host.has_value() ||
+      !weight_tensor_scale_host.has_value()) {
+    return std::nullopt;
+  }
+  return RunNvfp4RowMajorFp32AccumToDevice(
+      handle,
+      plan,
+      activations,
+      *activation_tensor_scale_host,
+      weights,
+      *weight_tensor_scale_host,
+      output);
 }
 
 std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
@@ -430,11 +621,18 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     const Nvfp4PackedMatrixDeviceView& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output) {
+  const auto activation_tensor_scale_host =
+      ReadTensorScaleHostFallback(activations.tensor_scale_data);
+  if (!activation_tensor_scale_host.has_value()) {
+    return std::nullopt;
+  }
   return RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       activations,
+      *activation_tensor_scale_host,
       MakeNvfp4PackedMatrixDeviceView(weights),
+      weights.host_tensor_scale(),
       output);
 }
 
@@ -453,7 +651,9 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
       handle,
       plan,
       MakeNvfp4PackedMatrixDeviceView(*packed),
-      weights,
+      packed->host_tensor_scale(),
+      MakeNvfp4PackedMatrixDeviceView(weights),
+      weights.host_tensor_scale(),
       output);
 }
 

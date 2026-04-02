@@ -26,6 +26,7 @@ class DeviceNvfp4Weight {
   std::size_t block_scales_nbytes() const;
   std::size_t matmul_block_scales_nbytes() const;
   std::size_t tensor_scale_nbytes() const;
+  float host_tensor_scale() const;
   const std::uint8_t* packed_data() const;
   const std::uint8_t* block_scales_data() const;
   const std::uint8_t* matmul_block_scales_data() const;

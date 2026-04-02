@@ -96,6 +96,7 @@ struct MonolithicNvfp4ExpertWeights::Impl {
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scales_data = nullptr;
+  std::vector<float> host_tensor_scales;
 };
 
 std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Create(
@@ -126,6 +127,7 @@ std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Crea
   impl->num_experts = num_experts;
   impl->output_rows = output_rows;
   impl->input_cols = input_cols;
+  impl->host_tensor_scales.assign(num_experts, 0.0f);
 
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->packed_data), impl->total_packed_nbytes)) ||
       !CheckCuda(
@@ -217,8 +219,21 @@ bool MonolithicNvfp4ExpertWeights::UploadExpert(
               cudaMemcpyHostToDevice))) {
     return false;
   }
-  return CheckCuda(
-      cudaMemcpy(expert_tensor_scale, host_tensor_scale, sizeof(float), cudaMemcpyHostToDevice));
+  if (!CheckCuda(
+          cudaMemcpy(expert_tensor_scale, host_tensor_scale, sizeof(float), cudaMemcpyHostToDevice))) {
+    return false;
+  }
+  impl_->host_tensor_scales[expert_index] = *host_tensor_scale;
+  return true;
+}
+
+float MonolithicNvfp4ExpertWeights::host_tensor_scale(std::size_t expert_index) const {
+  if (!valid() ||
+      expert_index >= impl_->num_experts ||
+      expert_index >= impl_->host_tensor_scales.size()) {
+    return 0.0f;
+  }
+  return impl_->host_tensor_scales[expert_index];
 }
 
 FusedNvfp4WeightView MonolithicNvfp4ExpertWeights::GetView(std::size_t expert_index) const {
@@ -275,6 +290,7 @@ bool MonolithicNvfp4ExpertWeights::valid() const {
          impl_->total_block_scales_nbytes > 0 &&
          impl_->total_matmul_block_scales_nbytes > 0 &&
          impl_->total_tensor_scales_nbytes > 0 &&
+         impl_->host_tensor_scales.size() == impl_->num_experts &&
          impl_->packed_data != nullptr &&
          impl_->block_scales_data != nullptr &&
          impl_->matmul_block_scales_data != nullptr &&

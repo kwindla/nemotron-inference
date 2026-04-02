@@ -23,7 +23,7 @@ The host overhead comes from four categories:
 
 ## Steps
 
-- [ ] **1. Cache tensor scales and cuBLASLt GEMM plans for NVFP4**
+- [x] **1. Cache tensor scales and cuBLASLt GEMM plans for NVFP4**
   Goal: eliminate per-GEMM D2H reads and cuBLASLt descriptor/heuristic rebuild.
   Current: `RunNvfp4RowMajorFp32AccumToDevice()` does 2 `ReadDeviceFloat()` D2H copies + full cuBLASLt descriptor creation + heuristic query per call.
   Fix:
@@ -57,7 +57,7 @@ The host overhead comes from four categories:
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Cache tensor scales + cuBLASLt plans | pending | — | eliminate D2H reads + descriptor rebuild |
+| 1 | Cache tensor scales + cuBLASLt plans | done | — | host tensor scales + cuBLASLt cache + FillZero removed; smoke PASS |
 | 2 | Pre-allocate NVFP4 pack buffers | pending | — | ~200 alloc/free cycles → 0 |
 | 3 | Device-side expert selection | pending | — | eliminate router_logits D2H |
 | 4 | Benchmark and profile | pending | — | target ≤20ms |

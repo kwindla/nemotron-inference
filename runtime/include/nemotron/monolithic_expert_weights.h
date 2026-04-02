@@ -30,6 +30,7 @@ class MonolithicNvfp4ExpertWeights {
       const std::uint8_t* host_block_scales,
       std::size_t block_scales_nbytes,
       const float* host_tensor_scale);
+  float host_tensor_scale(std::size_t expert_index) const;
   FusedNvfp4WeightView GetView(std::size_t expert_index) const;
   std::vector<FusedNvfp4WeightView> BuildAllViews() const;
   std::size_t total_bytes() const;

@@ -32,6 +32,7 @@ class DeviceNvfp4Matrix {
   std::size_t block_scales_nbytes() const;
   std::size_t matmul_block_scales_nbytes() const;
   std::size_t tensor_scale_nbytes() const;
+  float host_tensor_scale() const;
   const std::uint8_t* packed_data() const;
   const std::uint8_t* block_scales_data() const;
   const std::uint8_t* matmul_block_scales_data() const;
@@ -45,6 +46,10 @@ class DeviceNvfp4Matrix {
 
  private:
   struct Impl;
+
+  friend std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
+      const DeviceTensorFp32& source,
+      const Nvfp4PackOptions& options);
 
   explicit DeviceNvfp4Matrix(std::unique_ptr<Impl> impl);
 
