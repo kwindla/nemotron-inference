@@ -346,6 +346,9 @@ struct ScaledFp8LinearOp::Impl {
   mutable std::mutex rows1_plan_mutex;
   mutable bool rows1_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_plan;
+  mutable std::unique_ptr<CachedCublasLtMatmulState> fp8_matmul_state_;
+  mutable std::mutex fp8_matmul_state_mutex_;
+  mutable bool fp8_matmul_state_attempted_ = false;
   mutable std::mutex rows1_dequantized_plan_mutex;
   mutable bool rows1_dequantized_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_dequantized_plan;
@@ -666,13 +669,22 @@ bool ScaledFp8LinearOp::Run(
       impl_->packed_weight &&
       impl_->packed_weight->valid()) {
     if (plan.has_value()) {
+      bool invalidate_fp8_matmul_state = false;
       if (!impl_->native_input_scale_ ||
           impl_->native_input_scale_->shape() != std::vector<std::size_t>{1}) {
         impl_->native_input_scale_ = DeviceTensorFp32::Create({1});
+        invalidate_fp8_matmul_state = true;
       }
       if (!impl_->native_weight_scale_ ||
           impl_->native_weight_scale_->shape() != std::vector<std::size_t>{1}) {
         impl_->native_weight_scale_ = DeviceTensorFp32::Create({1});
+        invalidate_fp8_matmul_state = true;
+      }
+      if (invalidate_fp8_matmul_state) {
+        impl_->native_scale_tensors_initialized = false;
+        std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
+        impl_->fp8_matmul_state_.reset();
+        impl_->fp8_matmul_state_attempted_ = false;
       }
       const float input_scale = ClampScale(impl_->config.input_scale);
       const float weight_scale = impl_->config.weight_scale;
@@ -696,6 +708,27 @@ bool ScaledFp8LinearOp::Run(
                 impl_->descriptor.tensor_name +
                 " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
       } else {
+        const CachedCublasLtMatmulState* cached_fp8_matmul_state = nullptr;
+        if (activations.shape()[0] == 1) {
+          std::lock_guard<std::mutex> lock(impl_->fp8_matmul_state_mutex_);
+          if (!impl_->fp8_matmul_state_attempted_) {
+            impl_->fp8_matmul_state_ = CreateDenseRowMajorFp8E4M3MatmulState(
+                handle,
+                *plan,
+                impl_->native_weight_scale_->data(),
+                impl_->native_input_scale_->data(),
+                CUDA_R_32F);
+            impl_->fp8_matmul_state_attempted_ = true;
+            if (!impl_->fp8_matmul_state_) {
+              LogScaledFp8NativeDiagnosticOnce(
+                  "matmul_state_build_failed:" + impl_->descriptor.tensor_name,
+                  "scaled_fp8_linear: native FP8 matmul-state cache build failed tensor=" +
+                      impl_->descriptor.tensor_name +
+                      " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
+            }
+          }
+          cached_fp8_matmul_state = impl_->fp8_matmul_state_.get();
+        }
         if (!impl_->fp8_activation_scratch_ ||
             impl_->fp8_activation_scratch_->shape() != activations.shape()) {
           impl_->fp8_activation_scratch_ = DeviceTensorFp8E4M3::Create(activations.shape());
@@ -717,6 +750,7 @@ bool ScaledFp8LinearOp::Run(
               input_scale,
               impl_->native_input_scale_->data(),
               output,
+              cached_fp8_matmul_state,
               fp8_activation_scratch,
               stream);
           if (native_stats.has_value()) {

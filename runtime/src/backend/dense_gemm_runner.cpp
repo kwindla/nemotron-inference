@@ -8,6 +8,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "storage_conversion.h"
@@ -227,6 +228,238 @@ MatrixLayoutShape OutputLayoutShape(
   return {};
 }
 
+bool BuildCachedCublasLtMatmulState(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    cudaDataType_t activations_type,
+    const void* activations_scale_data,
+    cudaDataType_t weights_type,
+    const void* weights_scale_data,
+    float alpha_scale,
+    bool fast_accum,
+    std::size_t m,
+    std::size_t n,
+    std::size_t k,
+    cudaDataType_t output_type,
+    CachedCublasLtMatmulState* state) {
+  if (!handle.valid() || state == nullptr) {
+    return false;
+  }
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  int returned_results = 0;
+  bool ok = true;
+  const MatrixLayoutShape a_shape = ActivationLayoutShape(plan, m, k);
+  const MatrixLayoutShape b_shape = WeightLayoutShape(plan, n, k);
+  const MatrixLayoutShape c_shape = OutputLayoutShape(plan, output_type, m, n);
+
+  const auto apply_cublas = [&](const char* step, cublasStatus_t status) {
+    if (!CheckCublas(status)) {
+      LogDenseGemmCublasFailure(
+          step,
+          status,
+          activations_type,
+          weights_type,
+          alpha_scale,
+          fast_accum,
+          m,
+          n,
+          k,
+          plan);
+      ok = false;
+      return false;
+    }
+    return true;
+  };
+
+  *state = CachedCublasLtMatmulState{};
+  state->activations_type = activations_type;
+  state->weights_type = weights_type;
+  state->output_type = output_type;
+  state->activations_scale_data = activations_scale_data;
+  state->weights_scale_data = weights_scale_data;
+  state->alpha_scale = alpha_scale;
+  state->fast_accum = fast_accum;
+  state->m = m;
+  state->n = n;
+  state->k = k;
+
+  apply_cublas(
+      "matmul_desc_create",
+      cublasLtMatmulDescCreate(&state->op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
+  const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
+  if (ok) {
+    apply_cublas(
+        "set_transa",
+        cublasLtMatmulDescSetAttribute(
+            state->op_desc,
+            CUBLASLT_MATMUL_DESC_TRANSA,
+            &trans_a,
+            sizeof(trans_a)));
+  }
+  if (ok) {
+    apply_cublas(
+        "set_transb",
+        cublasLtMatmulDescSetAttribute(
+            state->op_desc,
+            CUBLASLT_MATMUL_DESC_TRANSB,
+            &trans_b,
+            sizeof(trans_b)));
+  }
+  if (activations_scale_data != nullptr) {
+    if (ok) {
+      apply_cublas(
+          "set_a_scale_ptr",
+          cublasLtMatmulDescSetAttribute(
+              state->op_desc,
+              CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+              &activations_scale_data,
+              sizeof(activations_scale_data)));
+    }
+  }
+  if (weights_scale_data != nullptr) {
+    if (ok) {
+      apply_cublas(
+          "set_b_scale_ptr",
+          cublasLtMatmulDescSetAttribute(
+              state->op_desc,
+              CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+              &weights_scale_data,
+              sizeof(weights_scale_data)));
+    }
+  }
+  if (fast_accum) {
+    const int fast_accum_attr = 1;
+    if (ok) {
+      apply_cublas(
+          "set_fast_accum",
+          cublasLtMatmulDescSetAttribute(
+              state->op_desc,
+              CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+              &fast_accum_attr,
+              sizeof(fast_accum_attr)));
+    }
+  }
+
+  if (ok) {
+    apply_cublas(
+        "layout_a_create",
+        cublasLtMatrixLayoutCreate(
+            &state->a_desc,
+            activations_type,
+            a_shape.rows,
+            a_shape.cols,
+            a_shape.ld));
+  }
+  if (ok) {
+    apply_cublas(
+        "layout_b_create",
+        cublasLtMatrixLayoutCreate(
+            &state->b_desc,
+            weights_type,
+            b_shape.rows,
+            b_shape.cols,
+            b_shape.ld));
+  }
+  if (ok) {
+    apply_cublas(
+        "layout_c_create",
+        cublasLtMatrixLayoutCreate(
+            &state->c_desc,
+            output_type,
+            c_shape.rows,
+            c_shape.cols,
+            c_shape.ld));
+  }
+
+  const cublasLtOrder_t order_a = ToCublasOrder(plan.order_a);
+  const cublasLtOrder_t order_b = ToCublasOrder(plan.order_b);
+  const cublasLtOrder_t order_c = ToCublasOrder(plan.order_c);
+  if (ok) {
+    apply_cublas(
+        "layout_a_set_order",
+        cublasLtMatrixLayoutSetAttribute(
+            state->a_desc,
+            CUBLASLT_MATRIX_LAYOUT_ORDER,
+            &order_a,
+            sizeof(order_a)));
+  }
+  if (ok) {
+    apply_cublas(
+        "layout_b_set_order",
+        cublasLtMatrixLayoutSetAttribute(
+            state->b_desc,
+            CUBLASLT_MATRIX_LAYOUT_ORDER,
+            &order_b,
+            sizeof(order_b)));
+  }
+  if (ok) {
+    apply_cublas(
+        "layout_c_set_order",
+        cublasLtMatrixLayoutSetAttribute(
+            state->c_desc,
+            CUBLASLT_MATRIX_LAYOUT_ORDER,
+            &order_c,
+            sizeof(order_c)));
+  }
+
+  if (ok) {
+    apply_cublas("preference_create", cublasLtMatmulPreferenceCreate(&preference));
+  }
+  const std::size_t max_workspace = handle.workspace_bytes();
+  if (ok) {
+    apply_cublas(
+        "preference_set_workspace",
+        cublasLtMatmulPreferenceSetAttribute(
+            preference,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &max_workspace,
+            sizeof(max_workspace)));
+  }
+
+  if (ok) {
+    apply_cublas(
+        "algo_get_heuristic",
+        cublasLtMatmulAlgoGetHeuristic(
+            handle.handle(),
+            state->op_desc,
+            state->a_desc,
+            state->b_desc,
+            state->c_desc,
+            state->c_desc,
+            preference,
+            1,
+            &state->heuristic,
+            &returned_results));
+    if (ok && returned_results <= 0) {
+      if (DenseGemmDebugEnabled()) {
+        std::cerr << "dense_gemm_runner: algo_get_heuristic returned no results"
+                  << " activations_type=" << static_cast<int>(activations_type)
+                  << " weights_type=" << static_cast<int>(weights_type)
+                  << " alpha_scale=" << alpha_scale
+                  << " fast_accum=" << fast_accum
+                  << " m=" << m
+                  << " n=" << n
+                  << " k=" << k
+                  << "\n";
+      }
+      ok = false;
+    }
+  }
+
+  if (preference != nullptr) {
+    cublasLtMatmulPreferenceDestroy(preference);
+  }
+  if (!ok) {
+    *state = CachedCublasLtMatmulState{};
+    return false;
+  }
+
+  state->heuristic_count = returned_results;
+  return true;
+}
+
 template <typename OutputTensorT>
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
     CublasLtHandle& handle,
@@ -243,6 +476,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
     std::size_t n,
     std::size_t k,
     OutputTensorT* output,
+    const CachedCublasLtMatmulState* cached_matmul_state,
     cudaStream_t stream) {
   if (!handle.valid() ||
       activations_data == nullptr ||
@@ -255,18 +489,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
     return std::nullopt;
   }
 
-  cublasLtMatmulDesc_t op_desc = nullptr;
-  cublasLtMatrixLayout_t a_desc = nullptr;
-  cublasLtMatrixLayout_t b_desc = nullptr;
-  cublasLtMatrixLayout_t c_desc = nullptr;
-  cublasLtMatmulPreference_t preference = nullptr;
-
-  cublasLtMatmulHeuristicResult_t heuristic{};
-  int returned_results = 0;
   bool ok = true;
-  const MatrixLayoutShape a_shape = ActivationLayoutShape(plan, m, k);
-  const MatrixLayoutShape b_shape = WeightLayoutShape(plan, n, k);
-  const MatrixLayoutShape c_shape = OutputLayoutShape(plan, *output, m, n);
 
   const auto apply_cublas = [&](const char* step, cublasStatus_t status) {
     if (!CheckCublas(status)) {
@@ -295,181 +518,70 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
     return true;
   };
 
-  apply_cublas("matmul_desc_create", cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-  const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
-  const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
-  if (ok) {
-    apply_cublas("set_transa", cublasLtMatmulDescSetAttribute(
-      op_desc,
-      CUBLASLT_MATMUL_DESC_TRANSA,
-      &trans_a,
-      sizeof(trans_a)));
-  }
-  if (ok) {
-    apply_cublas("set_transb", cublasLtMatmulDescSetAttribute(
-      op_desc,
-      CUBLASLT_MATMUL_DESC_TRANSB,
-      &trans_b,
-      sizeof(trans_b)));
-  }
-  if (activations_scale_data != nullptr) {
-    if (ok) {
-      apply_cublas("set_a_scale_ptr", cublasLtMatmulDescSetAttribute(
-        op_desc,
-        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-        &activations_scale_data,
-        sizeof(activations_scale_data)));
+  CachedCublasLtMatmulState local_state;
+  const CachedCublasLtMatmulState* matmul_state = cached_matmul_state;
+  const cudaDataType_t output_type = OutputDataType(*output);
+  if (matmul_state != nullptr) {
+    if (matmul_state->op_desc == nullptr ||
+        matmul_state->a_desc == nullptr ||
+        matmul_state->b_desc == nullptr ||
+        matmul_state->c_desc == nullptr ||
+        matmul_state->m != m ||
+        matmul_state->n != n ||
+        matmul_state->k != k ||
+        matmul_state->activations_type != activations_type ||
+        matmul_state->weights_type != weights_type ||
+        matmul_state->output_type != output_type ||
+        matmul_state->activations_scale_data != activations_scale_data ||
+        matmul_state->weights_scale_data != weights_scale_data ||
+        matmul_state->alpha_scale != alpha_scale ||
+        matmul_state->fast_accum != fast_accum) {
+      return std::nullopt;
     }
-  }
-  if (weights_scale_data != nullptr) {
-    if (ok) {
-      apply_cublas("set_b_scale_ptr", cublasLtMatmulDescSetAttribute(
-        op_desc,
-        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-        &weights_scale_data,
-        sizeof(weights_scale_data)));
-    }
-  }
-  if (fast_accum) {
-    const int fast_accum_attr = 1;
-    if (ok) {
-      apply_cublas("set_fast_accum", cublasLtMatmulDescSetAttribute(
-        op_desc,
-        CUBLASLT_MATMUL_DESC_FAST_ACCUM,
-        &fast_accum_attr,
-        sizeof(fast_accum_attr)));
-    }
-  }
-
-  if (ok) {
-    apply_cublas("layout_a_create", cublasLtMatrixLayoutCreate(
-      &a_desc,
-      activations_type,
-      a_shape.rows,
-      a_shape.cols,
-      a_shape.ld));
-  }
-  if (ok) {
-    apply_cublas("layout_b_create", cublasLtMatrixLayoutCreate(
-      &b_desc,
-      weights_type,
-      b_shape.rows,
-      b_shape.cols,
-      b_shape.ld));
-  }
-  if (ok) {
-    apply_cublas("layout_c_create", cublasLtMatrixLayoutCreate(
-      &c_desc,
-      OutputDataType(*output),
-      c_shape.rows,
-      c_shape.cols,
-      c_shape.ld));
-  }
-
-  const cublasLtOrder_t order_a = ToCublasOrder(plan.order_a);
-  const cublasLtOrder_t order_b = ToCublasOrder(plan.order_b);
-  const cublasLtOrder_t order_c = ToCublasOrder(plan.order_c);
-  if (ok) {
-    apply_cublas("layout_a_set_order", cublasLtMatrixLayoutSetAttribute(
-      a_desc,
-      CUBLASLT_MATRIX_LAYOUT_ORDER,
-      &order_a,
-      sizeof(order_a)));
-  }
-  if (ok) {
-    apply_cublas("layout_b_set_order", cublasLtMatrixLayoutSetAttribute(
-      b_desc,
-      CUBLASLT_MATRIX_LAYOUT_ORDER,
-      &order_b,
-      sizeof(order_b)));
-  }
-  if (ok) {
-    apply_cublas("layout_c_set_order", cublasLtMatrixLayoutSetAttribute(
-      c_desc,
-      CUBLASLT_MATRIX_LAYOUT_ORDER,
-      &order_c,
-      sizeof(order_c)));
-  }
-
-  if (ok) {
-    apply_cublas("preference_create", cublasLtMatmulPreferenceCreate(&preference));
-  }
-  const std::size_t max_workspace = handle.workspace_bytes();
-  if (ok) {
-    apply_cublas("preference_set_workspace", cublasLtMatmulPreferenceSetAttribute(
-      preference,
-      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-      &max_workspace,
-      sizeof(max_workspace)));
-  }
-
-  if (ok) {
-    apply_cublas("algo_get_heuristic", cublasLtMatmulAlgoGetHeuristic(
-        handle.handle(),
-        op_desc,
-        a_desc,
-        b_desc,
-        c_desc,
-        c_desc,
-        preference,
-        1,
-        &heuristic,
-        &returned_results));
-    if (ok && returned_results <= 0) {
-      if (DenseGemmDebugEnabled()) {
-        std::cerr << "dense_gemm_runner: algo_get_heuristic returned no results"
-                  << " activations_type=" << static_cast<int>(activations_type)
-                  << " weights_type=" << static_cast<int>(weights_type)
-                  << " alpha_scale=" << alpha_scale
-                  << " fast_accum=" << fast_accum
-                  << " m=" << m
-                  << " n=" << n
-                  << " k=" << k
-                  << "\n";
-      }
-      ok = false;
-    }
+  } else if (!BuildCachedCublasLtMatmulState(
+                 handle,
+                 plan,
+                 activations_type,
+                 activations_scale_data,
+                 weights_type,
+                 weights_scale_data,
+                 alpha_scale,
+                 fast_accum,
+                 m,
+                 n,
+                 k,
+                 output_type,
+                 &local_state)) {
+    return std::nullopt;
+  } else {
+    matmul_state = &local_state;
   }
 
   if (ok) {
     const float alpha = alpha_scale;
     const float beta = 0.0f;
-    apply_cublas("matmul", cublasLtMatmul(
-        handle.handle(),
-        op_desc,
-        &alpha,
-        activations_data,
-        a_desc,
-        weights_data,
-        b_desc,
-        &beta,
-        output->data(),
-        c_desc,
-        output->data(),
-        c_desc,
-        &heuristic.algo,
-        handle.workspace(),
-        handle.workspace_bytes(),
-        stream));
+    apply_cublas(
+        "matmul",
+        cublasLtMatmul(
+            handle.handle(),
+            matmul_state->op_desc,
+            &alpha,
+            activations_data,
+            matmul_state->a_desc,
+            weights_data,
+            matmul_state->b_desc,
+            &beta,
+            output->data(),
+            matmul_state->c_desc,
+            output->data(),
+            matmul_state->c_desc,
+            &matmul_state->heuristic.algo,
+            handle.workspace(),
+            handle.workspace_bytes(),
+            stream));
     if (ok) {
       apply_cuda("matmul_cuda", cudaGetLastError());
     }
-  }
-
-  if (preference != nullptr) {
-    cublasLtMatmulPreferenceDestroy(preference);
-  }
-  if (c_desc != nullptr) {
-    cublasLtMatrixLayoutDestroy(c_desc);
-  }
-  if (b_desc != nullptr) {
-    cublasLtMatrixLayoutDestroy(b_desc);
-  }
-  if (a_desc != nullptr) {
-    cublasLtMatrixLayoutDestroy(a_desc);
-  }
-  if (op_desc != nullptr) {
-    cublasLtMatmulDescDestroy(op_desc);
   }
 
   if (!ok) {
@@ -479,12 +591,121 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
   return DenseRowMajorDeviceStats{
       m,
       n,
-      heuristic.workspaceSize,
-      returned_results,
+      matmul_state->heuristic.workspaceSize,
+      matmul_state->heuristic_count,
   };
 }
 
 }  // namespace
+
+void ResetCachedCublasLtMatmulState(CachedCublasLtMatmulState* state) {
+  if (state == nullptr) {
+    return;
+  }
+  if (state->c_desc != nullptr) {
+    cublasLtMatrixLayoutDestroy(state->c_desc);
+  }
+  if (state->b_desc != nullptr) {
+    cublasLtMatrixLayoutDestroy(state->b_desc);
+  }
+  if (state->a_desc != nullptr) {
+    cublasLtMatrixLayoutDestroy(state->a_desc);
+  }
+  if (state->op_desc != nullptr) {
+    cublasLtMatmulDescDestroy(state->op_desc);
+  }
+  state->op_desc = nullptr;
+  state->a_desc = nullptr;
+  state->b_desc = nullptr;
+  state->c_desc = nullptr;
+  state->heuristic = {};
+  state->activations_type = CUDA_R_32F;
+  state->weights_type = CUDA_R_32F;
+  state->output_type = CUDA_R_32F;
+  state->activations_scale_data = nullptr;
+  state->weights_scale_data = nullptr;
+  state->alpha_scale = 1.0f;
+  state->fast_accum = false;
+  state->m = 0;
+  state->n = 0;
+  state->k = 0;
+  state->heuristic_count = 0;
+}
+
+CachedCublasLtMatmulState::~CachedCublasLtMatmulState() {
+  ResetCachedCublasLtMatmulState(this);
+}
+
+CachedCublasLtMatmulState::CachedCublasLtMatmulState(
+    CachedCublasLtMatmulState&& other) noexcept
+    : op_desc(std::exchange(other.op_desc, nullptr)),
+      a_desc(std::exchange(other.a_desc, nullptr)),
+      b_desc(std::exchange(other.b_desc, nullptr)),
+      c_desc(std::exchange(other.c_desc, nullptr)),
+      heuristic(other.heuristic),
+      activations_type(other.activations_type),
+      weights_type(other.weights_type),
+      output_type(other.output_type),
+      activations_scale_data(other.activations_scale_data),
+      weights_scale_data(other.weights_scale_data),
+      alpha_scale(other.alpha_scale),
+      fast_accum(other.fast_accum),
+      m(other.m),
+      n(other.n),
+      k(other.k),
+      heuristic_count(other.heuristic_count) {}
+
+CachedCublasLtMatmulState& CachedCublasLtMatmulState::operator=(
+    CachedCublasLtMatmulState&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+
+  ResetCachedCublasLtMatmulState(this);
+  op_desc = std::exchange(other.op_desc, nullptr);
+  a_desc = std::exchange(other.a_desc, nullptr);
+  b_desc = std::exchange(other.b_desc, nullptr);
+  c_desc = std::exchange(other.c_desc, nullptr);
+  heuristic = other.heuristic;
+  activations_type = other.activations_type;
+  weights_type = other.weights_type;
+  output_type = other.output_type;
+  activations_scale_data = other.activations_scale_data;
+  weights_scale_data = other.weights_scale_data;
+  alpha_scale = other.alpha_scale;
+  fast_accum = other.fast_accum;
+  m = other.m;
+  n = other.n;
+  k = other.k;
+  heuristic_count = other.heuristic_count;
+  return *this;
+}
+
+std::unique_ptr<CachedCublasLtMatmulState> CreateDenseRowMajorFp8E4M3MatmulState(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const float* weight_scale_device,
+    const float* input_scale_device,
+    cudaDataType_t output_type) {
+  auto state = std::make_unique<CachedCublasLtMatmulState>();
+  if (!BuildCachedCublasLtMatmulState(
+          handle,
+          plan,
+          CUDA_R_8F_E4M3,
+          input_scale_device,
+          CUDA_R_8F_E4M3,
+          weight_scale_device,
+          1.0f,
+          Fp8FastAccumSupported(),
+          plan.execution.launch_plan.m,
+          plan.execution.launch_plan.n,
+          plan.execution.launch_plan.k,
+          output_type,
+          state.get())) {
+    return nullptr;
+  }
+  return state;
+}
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
@@ -533,6 +754,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       n,
       k,
       output,
+      nullptr,
       stream);
 }
 
@@ -583,6 +805,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       n,
       k,
       output,
+      nullptr,
       stream);
 }
 
@@ -633,6 +856,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
       n,
       k,
       output,
+      nullptr,
       stream);
 }
 
@@ -692,6 +916,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       n,
       k,
       output,
+      nullptr,
       stream);
 }
 
@@ -741,6 +966,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       n,
       k,
       output,
+      nullptr,
       stream);
 }
 
@@ -790,6 +1016,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
       n,
       k,
       output,
+      nullptr,
       stream);
 }
 
@@ -802,6 +1029,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     float input_scale,
     const float* input_scale_device,
     DeviceTensorFp32* output,
+    const CachedCublasLtMatmulState* cached_matmul_state,
     DeviceTensorFp8E4M3* activation_scratch,
     cudaStream_t stream) {
   if (!handle.valid() ||
@@ -860,6 +1088,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
       n,
       k,
       output,
+      cached_matmul_state,
       stream);
 }
 
