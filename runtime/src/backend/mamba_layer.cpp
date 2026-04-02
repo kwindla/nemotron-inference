@@ -176,6 +176,37 @@ std::unique_ptr<DeviceTensorFp32> UploadFlatTensorToDeviceFp32(
   return device;
 }
 
+std::unique_ptr<DeviceTensorBf16> CreateBf16ViewFromFp32Storage(
+    DeviceTensorFp32* storage,
+    std::vector<std::size_t> shape) {
+  if (storage == nullptr || !storage->valid()) {
+    return nullptr;
+  }
+  std::size_t count = 1;
+  for (const std::size_t dim : shape) {
+    count *= dim;
+  }
+  if ((storage->numel() * sizeof(float)) < (count * sizeof(__nv_bfloat16))) {
+    return nullptr;
+  }
+  return DeviceTensorBf16::CreateView(shape, reinterpret_cast<__nv_bfloat16*>(storage->data()));
+}
+
+bool CopyTensorToHost(const DeviceTensorBf16& tensor, std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->resize(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
+  }
+  return true;
+}
+
 }  // namespace
 
 struct MambaLayerSlice::Impl {
@@ -807,6 +838,10 @@ bool MambaLayerSlice::Run(
   if (!valid() ||
       !cublas_handle.valid() ||
       !request_context.valid() ||
+      request_context.mamba_conv_state() == nullptr ||
+      request_context.mamba_state() == nullptr ||
+      !request_context.mamba_conv_state()->valid() ||
+      !request_context.mamba_state()->valid() ||
       !input.valid() ||
       input.shape().size() != 2 ||
       input.shape()[1] != impl_->config.hidden_size ||
@@ -816,35 +851,193 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  DeviceTensorFp32* input_storage = request_context.hidden();
-  DeviceTensorFp32* output_storage = request_context.residual();
-  if (input_storage == nullptr ||
-      output_storage == nullptr ||
-      !input_storage->valid() ||
-      !output_storage->valid() ||
-      input_storage->numel() < input.numel() ||
-      output_storage->numel() < input.numel()) {
+  const std::size_t conv_dim =
+      impl_->config.intermediate_size + (2 * impl_->config.n_groups * impl_->config.state_size);
+  const std::size_t projection_size =
+      impl_->config.intermediate_size + conv_dim + impl_->config.num_heads;
+  const std::size_t conv_state_elems = conv_dim * impl_->config.conv_kernel_size;
+  const std::size_t ssm_state_elems =
+      impl_->config.num_heads * impl_->config.head_dim * impl_->config.state_size;
+  if (impl_->config.conv_state_offset_elems + conv_state_elems >
+          request_context.mamba_conv_state()->numel() ||
+      impl_->config.ssm_state_offset_elems + ssm_state_elems >
+          request_context.mamba_state()->numel()) {
     return false;
   }
 
-  auto input_fp32 = DeviceTensorFp32::CreateView(input.shape(), input_storage->data());
-  auto output_fp32 = DeviceTensorFp32::CreateView(input.shape(), output_storage->data());
-  if (!input_fp32 || !output_fp32) {
+  const std::size_t token_count = input.shape()[0];
+  if (token_count == 0) {
     return false;
   }
-  if (!ConvertDeviceBf16ToFp32(input.data(), input.numel(), input_fp32->data())) {
+
+  std::unique_ptr<DeviceTensorBf16> normalized_local;
+  std::unique_ptr<DeviceTensorBf16> projected_local;
+  std::unique_ptr<DeviceTensorBf16> scan_output_local;
+  std::unique_ptr<DeviceTensorBf16> projected_output_local;
+  std::unique_ptr<DeviceTensorBf16> conv_output;
+  std::unique_ptr<DeviceTensorBf16> y_output;
+
+  DeviceTensorBf16* normalized = nullptr;
+  DeviceTensorBf16* projected = nullptr;
+  DeviceTensorBf16* scan_output = nullptr;
+  DeviceTensorBf16* projected_output = nullptr;
+
+  if (token_count == 1 &&
+      request_context.mamba_normalized_decode() != nullptr &&
+      request_context.mamba_projected_decode() != nullptr &&
+      request_context.mamba_scan_output_decode() != nullptr &&
+      request_context.mamba_projected_output_decode() != nullptr) {
+    normalized = CreateBf16ViewFromFp32Storage(
+                     request_context.mamba_normalized_decode(),
+                     {1, impl_->config.hidden_size})
+                     .release();
+    projected = CreateBf16ViewFromFp32Storage(
+                    request_context.mamba_projected_decode(),
+                    {1, projection_size})
+                    .release();
+    scan_output = CreateBf16ViewFromFp32Storage(
+                      request_context.mamba_scan_output_decode(),
+                      {1, impl_->config.intermediate_size})
+                      .release();
+    projected_output = CreateBf16ViewFromFp32Storage(
+                           request_context.mamba_projected_output_decode(),
+                           {1, impl_->config.hidden_size})
+                           .release();
+    normalized_local.reset(normalized);
+    projected_local.reset(projected);
+    scan_output_local.reset(scan_output);
+    projected_output_local.reset(projected_output);
+  } else {
+    normalized_local = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    projected_local = DeviceTensorBf16::Create({token_count, projection_size});
+    scan_output_local = DeviceTensorBf16::Create({token_count, impl_->config.intermediate_size});
+    projected_output_local = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    normalized = normalized_local.get();
+    projected = projected_local.get();
+    scan_output = scan_output_local.get();
+    projected_output = projected_output_local.get();
+  }
+
+  if (token_count != 1) {
+    conv_output = DeviceTensorBf16::Create({token_count, conv_dim});
+    y_output = DeviceTensorBf16::Create({token_count, impl_->config.intermediate_size});
+  }
+
+  if (normalized == nullptr || projected == nullptr || scan_output == nullptr ||
+      projected_output == nullptr ||
+      (token_count != 1 && (!conv_output || !y_output))) {
     return false;
   }
-  if (!Run(
-          cublas_handle,
-          heuristic_cache,
-          request_context,
-          *input_fp32,
-          output_fp32.get(),
-          trace)) {
+
+  if (trace != nullptr) {
+    trace->norm_output.clear();
+    trace->in_proj_output.clear();
+    trace->scan_output.clear();
+    trace->projected_output.clear();
+  }
+
+  if (!RmsNormBf16(input, *impl_->input_norm_weight, impl_->config.input_rms_epsilon, normalized)) {
     return false;
   }
-  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+
+  if (trace != nullptr && !CopyTensorToHost(*normalized, &trace->norm_output)) {
+    return false;
+  }
+
+  const bool in_proj_ok =
+      (impl_->in_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+       impl_->in_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *normalized, projected)) ||
+      (impl_->in_proj_family == Impl::ProjectionFamily::kDense &&
+       impl_->in_proj_dense->Run(cublas_handle, heuristic_cache, *normalized, projected));
+  if (!in_proj_ok) {
+    return false;
+  }
+
+  if (trace != nullptr && !CopyTensorToHost(*projected, &trace->in_proj_output)) {
+    return false;
+  }
+
+  if (token_count == 1) {
+    if (!MambaDecodeStepFusedBf16(
+            *projected,
+            impl_->config.intermediate_size,
+            conv_dim,
+            impl_->config.num_heads,
+            impl_->config.head_dim,
+            impl_->config.state_size,
+            impl_->config.n_groups,
+            impl_->config.conv_kernel_size,
+            impl_->config.time_step_min,
+            impl_->config.mixer_rms_epsilon,
+            impl_->config.conv_state_offset_elems,
+            impl_->config.ssm_state_offset_elems,
+            *impl_->conv1d_weight,
+            *impl_->conv1d_bias,
+            *impl_->A_log,
+            *impl_->D,
+            *impl_->dt_bias,
+            *impl_->mixer_norm_weight,
+            request_context.mamba_conv_state(),
+            request_context.mamba_state(),
+            scan_output)) {
+      return false;
+    }
+  } else {
+    if (!MambaConv1dSiluUpdateBf16(
+            *projected,
+            impl_->config.intermediate_size,
+            conv_dim,
+            impl_->config.conv_kernel_size,
+            impl_->config.conv_state_offset_elems,
+            *impl_->conv1d_weight,
+            *impl_->conv1d_bias,
+            request_context.mamba_conv_state(),
+            conv_output.get()) ||
+        !MambaSsmUpdateBf16(
+            *projected,
+            *conv_output,
+            impl_->config.intermediate_size,
+            conv_dim,
+            impl_->config.num_heads,
+            impl_->config.head_dim,
+            impl_->config.state_size,
+            impl_->config.n_groups,
+            impl_->config.time_step_min,
+            impl_->config.ssm_state_offset_elems,
+            *impl_->A_log,
+            *impl_->D,
+            *impl_->dt_bias,
+            request_context.mamba_state(),
+            y_output.get()) ||
+        !GroupedRmsNormGatedBf16(
+            *y_output,
+            *projected,
+            *impl_->mixer_norm_weight,
+            impl_->config.n_groups,
+            impl_->config.mixer_rms_epsilon,
+            scan_output)) {
+      return false;
+    }
+  }
+
+  if (trace != nullptr && !CopyTensorToHost(*scan_output, &trace->scan_output)) {
+    return false;
+  }
+
+  const bool out_proj_ok =
+      (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+       impl_->out_proj_scaled_fp8->Run(cublas_handle, heuristic_cache, *scan_output, projected_output)) ||
+      (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
+       impl_->out_proj_dense->Run(cublas_handle, heuristic_cache, *scan_output, projected_output));
+  if (!out_proj_ok || !ResidualAddBf16(input, *projected_output, output)) {
+    return false;
+  }
+
+  if (trace != nullptr && !CopyTensorToHost(*projected_output, &trace->projected_output)) {
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace nemotron

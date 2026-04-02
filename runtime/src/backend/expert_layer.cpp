@@ -452,11 +452,42 @@ bool CopyToHost(const DeviceTensorFp32& tensor, std::vector<float>* output) {
   return tensor.CopyToHost(output->data(), output->size());
 }
 
+bool CopyToHost(const DeviceTensorBf16& tensor, std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->resize(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
+  }
+  return true;
+}
+
 bool UploadHostVector(const std::vector<float>& input, DeviceTensorFp32* output) {
   return output != nullptr &&
          output->valid() &&
          output->numel() == input.size() &&
          output->CopyFromHost(input.data(), input.size());
+}
+
+std::unique_ptr<DeviceTensorBf16> CreateBf16ViewFromFp32Storage(
+    DeviceTensorFp32* storage,
+    std::vector<std::size_t> shape) {
+  if (storage == nullptr || !storage->valid()) {
+    return nullptr;
+  }
+  std::size_t count = 1;
+  for (const std::size_t dim : shape) {
+    count *= dim;
+  }
+  if ((storage->numel() * sizeof(float)) < (count * sizeof(__nv_bfloat16))) {
+    return nullptr;
+  }
+  return DeviceTensorBf16::CreateView(shape, reinterpret_cast<__nv_bfloat16*>(storage->data()));
 }
 
 bool HasNonFinite(const std::vector<float>& values) {
@@ -810,6 +841,8 @@ struct ExpertLayerSlice::Impl {
   mutable cudaGraph_t moe_graph = nullptr;
   mutable cudaGraphExec_t moe_graph_exec = nullptr;
   mutable bool moe_graph_captured = false;
+  mutable cudaEvent_t moe_graph_input_ready = nullptr;
+  mutable cudaEvent_t moe_graph_output_ready = nullptr;
   mutable DeviceBuffer<std::int32_t> scratch_graph_indices;
   mutable DeviceBuffer<float> scratch_graph_weights;
   mutable DeviceBuffer<float> scratch_graph_latent_in;
@@ -822,6 +855,12 @@ struct ExpertLayerSlice::Impl {
     }
     if (moe_graph != nullptr) {
       cudaGraphDestroy(moe_graph);
+    }
+    if (moe_graph_input_ready != nullptr) {
+      cudaEventDestroy(moe_graph_input_ready);
+    }
+    if (moe_graph_output_ready != nullptr) {
+      cudaEventDestroy(moe_graph_output_ready);
     }
     if (dense_pool != nullptr) {
       cudaFree(dense_pool);
@@ -1971,6 +2010,20 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       impl->scratch_graph_latent_in.Resize(latent);
       impl->scratch_graph_output.Resize(latent);
       impl->scratch_graph_grouped_up.Resize(top_k * intermediate);
+      if (cudaEventCreateWithFlags(&impl->moe_graph_input_ready, cudaEventDisableTiming) !=
+              cudaSuccess ||
+          cudaEventCreateWithFlags(&impl->moe_graph_output_ready, cudaEventDisableTiming) !=
+              cudaSuccess) {
+        if (impl->moe_graph_input_ready != nullptr) {
+          cudaEventDestroy(impl->moe_graph_input_ready);
+          impl->moe_graph_input_ready = nullptr;
+        }
+        if (impl->moe_graph_output_ready != nullptr) {
+          cudaEventDestroy(impl->moe_graph_output_ready);
+          impl->moe_graph_output_ready = nullptr;
+        }
+        impl->moe_graph_enabled = false;
+      }
     }
   }
 
@@ -2435,6 +2488,20 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       impl->scratch_graph_latent_in.Resize(latent);
       impl->scratch_graph_output.Resize(latent);
       impl->scratch_graph_grouped_up.Resize(top_k * intermediate);
+      if (cudaEventCreateWithFlags(&impl->moe_graph_input_ready, cudaEventDisableTiming) !=
+              cudaSuccess ||
+          cudaEventCreateWithFlags(&impl->moe_graph_output_ready, cudaEventDisableTiming) !=
+              cudaSuccess) {
+        if (impl->moe_graph_input_ready != nullptr) {
+          cudaEventDestroy(impl->moe_graph_input_ready);
+          impl->moe_graph_input_ready = nullptr;
+        }
+        if (impl->moe_graph_output_ready != nullptr) {
+          cudaEventDestroy(impl->moe_graph_output_ready);
+          impl->moe_graph_output_ready = nullptr;
+        }
+        impl->moe_graph_enabled = false;
+      }
     }
   }
 
@@ -2531,15 +2598,101 @@ bool ExpertLayerSlice::routed_experts_contiguous() const {
 
 namespace {
 
-template <typename ImplT>
+bool RunExpertRmsNorm(
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& weight,
+    float epsilon,
+    DeviceTensorFp32* output) {
+  return RmsNormFp32(input, weight, epsilon, output);
+}
+
+bool RunExpertRmsNorm(
+    const DeviceTensorBf16& input,
+    const DeviceTensorFp32& weight,
+    float epsilon,
+    DeviceTensorBf16* output) {
+  return RmsNormBf16(input, weight, epsilon, output);
+}
+
+bool RunExpertResidualAdd(
+    const DeviceTensorFp32& lhs,
+    const DeviceTensorFp32& rhs,
+    DeviceTensorFp32* output) {
+  return ResidualAddFp32(lhs, rhs, output);
+}
+
+bool RunExpertResidualAdd(
+    const DeviceTensorBf16& lhs,
+    const DeviceTensorBf16& rhs,
+    DeviceTensorBf16* output) {
+  return ResidualAddBf16(lhs, rhs, output);
+}
+
+bool RunExpertRelu2(DeviceTensorFp32* tensor) {
+  return Relu2InPlaceFp32(tensor);
+}
+
+bool RunExpertRelu2(DeviceTensorBf16* tensor) {
+  return Relu2InPlaceBf16(tensor);
+}
+
+bool RunExpertAddScaled(
+    const DeviceTensorFp32& input,
+    float scale,
+    DeviceTensorFp32* accumulator) {
+  return AddScaledFp32(input, scale, accumulator);
+}
+
+bool RunExpertAddScaled(
+    const DeviceTensorBf16& input,
+    float scale,
+    DeviceTensorBf16* accumulator) {
+  return AddScaledBf16(input, scale, accumulator);
+}
+
+bool RunExpertAddScaledRow(
+    const DeviceTensorFp32& input_row,
+    float scale,
+    std::size_t row_index,
+    DeviceTensorFp32* accumulator) {
+  return AddScaledRowFp32(input_row, scale, row_index, accumulator);
+}
+
+bool RunExpertAddScaledRow(
+    const DeviceTensorBf16& input_row,
+    float scale,
+    std::size_t row_index,
+    DeviceTensorBf16* accumulator) {
+  return AddScaledRowBf16(input_row, scale, row_index, accumulator);
+}
+
+bool RunExpertCopyRow(
+    const DeviceTensorFp32& input,
+    std::size_t row_index,
+    DeviceTensorFp32* output_row) {
+  return CopyRowFp32(input, row_index, output_row);
+}
+
+bool RunExpertCopyRow(
+    const DeviceTensorBf16& input,
+    std::size_t row_index,
+    DeviceTensorBf16* output_row) {
+  return CopyRowBf16(input, row_index, output_row);
+}
+
+template <typename ImplT, typename ActivationTensorT>
 bool RunExpertLayerImpl(
     const ImplT& impl,
     CublasLtHandle& cublas_handle,
     GemmHeuristicCache* heuristic_cache,
     RequestExecutionContext* request_context,
-    const DeviceTensorFp32& input,
-    DeviceTensorFp32* output,
+    const ActivationTensorT& input,
+    ActivationTensorT* output,
     ExpertLayerRunTrace* trace) {
+  static_assert(
+      std::is_same_v<ActivationTensorT, DeviceTensorFp32> ||
+          std::is_same_v<ActivationTensorT, DeviceTensorBf16>,
+      "unsupported expert activation tensor type");
   const bool debug = ForwardDebugEnabled();
   const std::size_t routed_prefetch_topn = []() -> std::size_t {
     const char* env = RoutedLookupPrefetchTopnEnv();
@@ -2556,37 +2709,51 @@ bool RunExpertLayerImpl(
 
   const auto use_request_expert_aux_scratch =
       [&](std::size_t token_count,
-          std::unique_ptr<DeviceTensorFp32>* normalized_out,
+          std::unique_ptr<ActivationTensorT>* normalized_out,
           std::unique_ptr<DeviceTensorFp32>* router_logits_out,
-          std::unique_ptr<DeviceTensorFp32>* latent_out,
-          std::unique_ptr<DeviceTensorFp32>* routed_tensor_out,
-          std::unique_ptr<DeviceTensorFp32>* projected_routed_out,
-          std::unique_ptr<DeviceTensorFp32>* shared_up_out,
-          std::unique_ptr<DeviceTensorFp32>* shared_output_out,
-          std::unique_ptr<DeviceTensorFp32>* mixer_output_out,
-          std::unique_ptr<DeviceTensorFp32>* expert_down_out) -> bool {
+          std::unique_ptr<ActivationTensorT>* latent_out,
+          std::unique_ptr<ActivationTensorT>* routed_tensor_out,
+          std::unique_ptr<ActivationTensorT>* projected_routed_out,
+          std::unique_ptr<ActivationTensorT>* shared_up_out,
+          std::unique_ptr<ActivationTensorT>* shared_output_out,
+          std::unique_ptr<ActivationTensorT>* mixer_output_out,
+          std::unique_ptr<ActivationTensorT>* expert_down_out) -> bool {
     if (token_count != 1 ||
         request_context == nullptr ||
         request_context->expert_aux_scratch() == nullptr ||
         !request_context->expert_aux_scratch()->valid()) {
       return false;
     }
-    const std::size_t required_numel =
+    const std::size_t activation_numel =
         (4 * impl.config.hidden_size) +
         (3 * impl.config.moe_latent_size) +
-        impl.config.shared_expert_intermediate_size +
-        impl.config.n_routed_experts;
-    if (request_context->expert_aux_scratch()->numel() < required_numel) {
+        impl.config.shared_expert_intermediate_size;
+    const std::size_t required_bytes =
+        (activation_numel *
+         (std::is_same_v<ActivationTensorT, DeviceTensorFp32> ? sizeof(float)
+                                                              : sizeof(__nv_bfloat16))) +
+        (impl.config.n_routed_experts * sizeof(float));
+    if (request_context->expert_aux_scratch()->numel() * sizeof(float) < required_bytes) {
       return false;
     }
-    float* cursor = request_context->expert_aux_scratch()->data();
-    auto make_view = [&](std::size_t cols) -> std::unique_ptr<DeviceTensorFp32> {
-      auto view = DeviceTensorFp32::CreateView({1, cols}, cursor);
-      cursor += cols;
-      return view;
+    float* router_logits_ptr = request_context->expert_aux_scratch()->data();
+    *router_logits_out =
+        DeviceTensorFp32::CreateView({1, impl.config.n_routed_experts}, router_logits_ptr);
+    char* cursor = reinterpret_cast<char*>(router_logits_ptr + impl.config.n_routed_experts);
+    auto make_view = [&](std::size_t cols) -> std::unique_ptr<ActivationTensorT> {
+      if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+        auto view = DeviceTensorFp32::CreateView({1, cols}, reinterpret_cast<float*>(cursor));
+        cursor += cols * sizeof(float);
+        return view;
+      } else {
+        auto view = DeviceTensorBf16::CreateView(
+            {1, cols},
+            reinterpret_cast<__nv_bfloat16*>(cursor));
+        cursor += cols * sizeof(__nv_bfloat16);
+        return view;
+      }
     };
     *normalized_out = make_view(impl.config.hidden_size);
-    *router_logits_out = make_view(impl.config.n_routed_experts);
     *latent_out = make_view(impl.config.moe_latent_size);
     *routed_tensor_out = make_view(impl.config.moe_latent_size);
     *projected_routed_out = make_view(impl.config.hidden_size);
@@ -2621,15 +2788,15 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  std::unique_ptr<DeviceTensorFp32> normalized;
+  std::unique_ptr<ActivationTensorT> normalized;
   std::unique_ptr<DeviceTensorFp32> router_logits;
-  std::unique_ptr<DeviceTensorFp32> latent;
-  std::unique_ptr<DeviceTensorFp32> routed_tensor;
-  std::unique_ptr<DeviceTensorFp32> projected_routed;
-  std::unique_ptr<DeviceTensorFp32> shared_up;
-  std::unique_ptr<DeviceTensorFp32> shared_output_device;
-  std::unique_ptr<DeviceTensorFp32> mixer_output_device;
-  std::unique_ptr<DeviceTensorFp32> expert_down;
+  std::unique_ptr<ActivationTensorT> latent;
+  std::unique_ptr<ActivationTensorT> routed_tensor;
+  std::unique_ptr<ActivationTensorT> projected_routed;
+  std::unique_ptr<ActivationTensorT> shared_up;
+  std::unique_ptr<ActivationTensorT> shared_output_device;
+  std::unique_ptr<ActivationTensorT> mixer_output_device;
+  std::unique_ptr<ActivationTensorT> expert_down;
   if (!use_request_expert_aux_scratch(
           token_count,
           &normalized,
@@ -2641,15 +2808,15 @@ bool RunExpertLayerImpl(
           &shared_output_device,
           &mixer_output_device,
           &expert_down)) {
-    normalized = DeviceTensorFp32::Create({token_count, impl.config.hidden_size});
+    normalized = ActivationTensorT::Create({token_count, impl.config.hidden_size});
     router_logits = DeviceTensorFp32::Create({token_count, impl.config.n_routed_experts});
-    latent = DeviceTensorFp32::Create({token_count, impl.config.moe_latent_size});
-    routed_tensor = DeviceTensorFp32::Create({token_count, impl.config.moe_latent_size});
-    projected_routed = DeviceTensorFp32::Create({token_count, impl.config.hidden_size});
-    shared_up = DeviceTensorFp32::Create({token_count, impl.config.shared_expert_intermediate_size});
-    shared_output_device = DeviceTensorFp32::Create({token_count, impl.config.hidden_size});
-    mixer_output_device = DeviceTensorFp32::Create({token_count, impl.config.hidden_size});
-    expert_down = DeviceTensorFp32::Create({1, impl.config.moe_latent_size});
+    latent = ActivationTensorT::Create({token_count, impl.config.moe_latent_size});
+    routed_tensor = ActivationTensorT::Create({token_count, impl.config.moe_latent_size});
+    projected_routed = ActivationTensorT::Create({token_count, impl.config.hidden_size});
+    shared_up = ActivationTensorT::Create({token_count, impl.config.shared_expert_intermediate_size});
+    shared_output_device = ActivationTensorT::Create({token_count, impl.config.hidden_size});
+    mixer_output_device = ActivationTensorT::Create({token_count, impl.config.hidden_size});
+    expert_down = ActivationTensorT::Create({1, impl.config.moe_latent_size});
   }
   if (!normalized || !router_logits || !latent || !routed_tensor || !projected_routed ||
       !shared_up || !shared_output_device || !mixer_output_device || !expert_down) {
@@ -2660,7 +2827,7 @@ bool RunExpertLayerImpl(
   }
 
   const bool norm_ok =
-      RmsNormFp32(input, *impl.input_norm_weight, impl.config.rms_epsilon, normalized.get());
+      RunExpertRmsNorm(input, *impl.input_norm_weight, impl.config.rms_epsilon, normalized.get());
   const bool gate_ok =
       norm_ok &&
       impl.gate_weight->Run(cublas_handle, heuristic_cache, *normalized, router_logits.get());
@@ -2699,21 +2866,27 @@ bool RunExpertLayerImpl(
     return false;
   }
 
-  std::unique_ptr<DeviceTensorFp32> expert_up;
+  std::unique_ptr<ActivationTensorT> expert_up;
   if (request_context != nullptr &&
       request_context->expert_intermediate_scratch() != nullptr &&
       request_context->expert_intermediate_scratch()->valid() &&
       request_context->expert_intermediate_scratch()->numel() >=
           impl.config.routed_expert_intermediate_size) {
-    expert_up = DeviceTensorFp32::CreateView(
-        {1, impl.config.routed_expert_intermediate_size},
-        request_context->expert_intermediate_scratch()->data());
+    if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+      expert_up = DeviceTensorFp32::CreateView(
+          {1, impl.config.routed_expert_intermediate_size},
+          request_context->expert_intermediate_scratch()->data());
+    } else {
+      expert_up = CreateBf16ViewFromFp32Storage(
+          request_context->expert_intermediate_scratch(),
+          {1, impl.config.routed_expert_intermediate_size});
+    }
   } else {
-    expert_up = DeviceTensorFp32::Create({1, impl.config.routed_expert_intermediate_size});
+    expert_up = ActivationTensorT::Create({1, impl.config.routed_expert_intermediate_size});
   }
-  std::unique_ptr<DeviceTensorFp32> latent_row;
+  std::unique_ptr<ActivationTensorT> latent_row;
   if (token_count != 1) {
-    latent_row = DeviceTensorFp32::Create({1, impl.config.moe_latent_size});
+    latent_row = ActivationTensorT::Create({1, impl.config.moe_latent_size});
   }
   if (!expert_up ||
       (token_count != 1 && !latent_row)) {
@@ -3188,8 +3361,8 @@ bool RunExpertLayerImpl(
           const GemmDescriptor& descriptor,
           std::optional<float> tensor_scale_override,
           std::unique_ptr<UploadedLinearOp>& op_slot,
-          const DeviceTensorFp32& activation,
-          DeviceTensorFp32* output_tensor) -> bool {
+          const ActivationTensorT& activation,
+          ActivationTensorT* output_tensor) -> bool {
     if (op_slot == nullptr ||
         op_slot->kernel_family() != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
       return false;
@@ -3214,7 +3387,7 @@ bool RunExpertLayerImpl(
 
   const auto try_grouped_routed_single_token =
       [&](std::size_t token_index,
-          const DeviceTensorFp32& latent_input_row,
+          const ActivationTensorT& latent_input_row,
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
@@ -3240,28 +3413,47 @@ bool RunExpertLayerImpl(
     // CUDA graph replay fast path: when all experts are warm and graph is
     // captured, replay the entire MoE compute sequence in one graph launch.
     if (impl.moe_graph_enabled && impl.experts_contiguous &&
-        batch_count == static_cast<std::size_t>(impl.config.top_k)) {
-      cudaMemcpyAsync(impl.scratch_graph_indices.data(), selected_indices_device,
-                      batch_count * sizeof(std::int32_t), cudaMemcpyDeviceToDevice);
-      cudaMemcpyAsync(impl.scratch_graph_weights.data(), selected_weights_device,
-                      batch_count * sizeof(float), cudaMemcpyDeviceToDevice);
-      cudaMemcpyAsync(impl.scratch_graph_latent_in.data(), latent_input_row.data(),
-                      impl.config.moe_latent_size * sizeof(float), cudaMemcpyDeviceToDevice);
-
-      bool graph_ok = true;
+        batch_count == static_cast<std::size_t>(impl.config.top_k) &&
+        impl.moe_graph_input_ready != nullptr &&
+        impl.moe_graph_output_ready != nullptr) {
+      cudaStream_t graph_stream = cudaStreamPerThread;
+      const std::size_t latent_elements = impl.config.moe_latent_size;
+      bool graph_ok =
+          cudaMemcpyAsync(impl.scratch_graph_indices.data(), selected_indices_device,
+                          batch_count * sizeof(std::int32_t), cudaMemcpyDeviceToDevice) == cudaSuccess &&
+          cudaMemcpyAsync(impl.scratch_graph_weights.data(), selected_weights_device,
+                          batch_count * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+      if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+        graph_ok = graph_ok &&
+                   cudaMemcpyAsync(
+                       impl.scratch_graph_latent_in.data(),
+                       latent_input_row.data(),
+                       latent_elements * sizeof(float),
+                       cudaMemcpyDeviceToDevice) == cudaSuccess;
+      } else {
+        graph_ok = graph_ok &&
+                   ConvertDeviceBf16ToFp32(
+                       latent_input_row.data(),
+                       latent_elements,
+                       impl.scratch_graph_latent_in.data());
+      }
+      graph_ok = graph_ok &&
+          cudaEventRecord(impl.moe_graph_input_ready, nullptr) == cudaSuccess &&
+          cudaStreamWaitEvent(graph_stream, impl.moe_graph_input_ready, 0) == cudaSuccess;
       if (!impl.moe_graph_captured) {
         auto graph_latent_view = DeviceTensorFp32::CreateView(
-            {1, impl.config.moe_latent_size}, impl.scratch_graph_latent_in.data());
+            {1, impl.config.moe_latent_size},
+            reinterpret_cast<float*>(impl.scratch_graph_latent_in.data()));
+        auto graph_output = DeviceTensorFp32::CreateView(
+            {1, impl.config.moe_latent_size},
+            reinterpret_cast<float*>(impl.scratch_graph_output.data()));
         auto graph_grouped_up = DeviceTensorFp32::CreateView(
             {batch_count, impl.config.routed_expert_intermediate_size},
             impl.scratch_graph_grouped_up.data());
-        auto graph_output = DeviceTensorFp32::CreateView(
-            {1, impl.config.moe_latent_size}, impl.scratch_graph_output.data());
-        graph_ok = graph_latent_view && graph_grouped_up && graph_output;
+        graph_ok = graph_ok && graph_latent_view && graph_grouped_up && graph_output;
 
         if (graph_ok) {
-          cudaStream_t stream = cudaStreamPerThread;
-          graph_ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
+          graph_ok = cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
 
           if (graph_ok) {
             graph_ok = PackDeviceRowMajorFp32ToNvfp4InPlace(
@@ -3270,7 +3462,7 @@ bool RunExpertLayerImpl(
                 impl.scratch_latent_block_scales.data(),
                 impl.scratch_latent_matmul_scales.data(),
                 reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-                impl.scratch_global_max_bits.data(), stream);
+                impl.scratch_global_max_bits.data(), graph_stream);
 
             if (graph_ok) {
               graph_ok = FusedRoutedUpProjPackedNvfp4SingleToken(
@@ -3285,7 +3477,7 @@ bool RunExpertLayerImpl(
                   impl.contiguous_up_tensor_scales.data(),
                   impl.scratch_graph_indices.data(),
                   graph_grouped_up.get(),
-                  stream);
+                  graph_stream);
             }
 
             if (graph_ok) {
@@ -3295,7 +3487,7 @@ bool RunExpertLayerImpl(
                   nullptr,
                   impl.scratch_down_act_tensor_scales,
                   down_act_packed_row_stride,
-                  stream);
+                  graph_stream);
             }
 
             if (graph_ok) {
@@ -3313,11 +3505,11 @@ bool RunExpertLayerImpl(
                   impl.scratch_graph_indices.data(),
                   graph_output.get(),
                   down_act_packed_row_stride,
-                  stream);
+                  graph_stream);
             }
 
             if (graph_ok) {
-              graph_ok = cudaStreamEndCapture(stream, &impl.moe_graph) == cudaSuccess &&
+              graph_ok = cudaStreamEndCapture(graph_stream, &impl.moe_graph) == cudaSuccess &&
                          impl.moe_graph != nullptr;
             }
           }
@@ -3338,12 +3530,30 @@ bool RunExpertLayerImpl(
       }
 
       if (impl.moe_graph_captured) {
-        cudaGraphLaunch(impl.moe_graph_exec, nullptr);
-        RecordMoeGraphReplay();
-        cudaMemcpyAsync(routed_tensor->data(), impl.scratch_graph_output.data(),
-                        impl.config.moe_latent_size * sizeof(float), cudaMemcpyDeviceToDevice);
-        RecordGroupedRoutedExpertFastpathUse();
-        return GroupedRoutedResult::kUsed;
+        graph_ok =
+            cudaGraphLaunch(impl.moe_graph_exec, graph_stream) == cudaSuccess &&
+            cudaEventRecord(impl.moe_graph_output_ready, graph_stream) == cudaSuccess &&
+            cudaStreamWaitEvent(nullptr, impl.moe_graph_output_ready, 0) == cudaSuccess;
+        if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+          graph_ok = graph_ok &&
+                     cudaMemcpyAsync(
+                         routed_tensor->data(),
+                         impl.scratch_graph_output.data(),
+                         latent_elements * sizeof(float),
+                         cudaMemcpyDeviceToDevice) == cudaSuccess;
+        } else {
+          graph_ok = graph_ok &&
+                     ConvertDeviceFp32ToBf16(
+                         impl.scratch_graph_output.data(),
+                         latent_elements,
+                         routed_tensor->data());
+        }
+        if (graph_ok) {
+          RecordMoeGraphReplay();
+          RecordGroupedRoutedExpertFastpathUse();
+          return GroupedRoutedResult::kUsed;
+        }
+        impl.moe_graph_enabled = false;
       }
     }
 
@@ -3426,13 +3636,27 @@ bool RunExpertLayerImpl(
       }
     }
 
-    if (!PackDeviceRowMajorFp32ToNvfp4InPlace(
-            latent_input_row, {},
-            impl.scratch_latent_packed_data.data(),
-            impl.scratch_latent_block_scales.data(),
-            impl.scratch_latent_matmul_scales.data(),
-            reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
-            impl.scratch_global_max_bits.data())) {
+    const bool pack_ok =
+        [&]() {
+          if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+            return PackDeviceRowMajorFp32ToNvfp4InPlace(
+                latent_input_row, {},
+                impl.scratch_latent_packed_data.data(),
+                impl.scratch_latent_block_scales.data(),
+                impl.scratch_latent_matmul_scales.data(),
+                reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                impl.scratch_global_max_bits.data());
+          } else {
+            return PackDeviceRowMajorBf16ToNvfp4InPlace(
+                latent_input_row, {},
+                impl.scratch_latent_packed_data.data(),
+                impl.scratch_latent_block_scales.data(),
+                impl.scratch_latent_matmul_scales.data(),
+                reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                impl.scratch_global_max_bits.data());
+          }
+        }();
+    if (!pack_ok) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPackFallback();
       return GroupedRoutedResult::kFallback;
@@ -3608,13 +3832,23 @@ bool RunExpertLayerImpl(
             nullptr);
 
         if (cutlass_down_ok) {
-          cutlass_down_ok = ScaleWeightedAccumulateRowsFp32(
-              *down_output,
-              impl.scratch_row_scales.data(),
-              impl.scratch_row_scales.data(),
-              selected_weights_device,
-              batch_count,
-              routed_tensor.get());
+          if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+            cutlass_down_ok = ScaleWeightedAccumulateRowsFp32(
+                *down_output,
+                impl.scratch_row_scales.data(),
+                impl.scratch_row_scales.data(),
+                selected_weights_device,
+                batch_count,
+                routed_tensor.get());
+          } else {
+            cutlass_down_ok = ScaleWeightedAccumulateRowsBf16(
+                *down_output,
+                impl.scratch_row_scales.data(),
+                impl.scratch_row_scales.data(),
+                selected_weights_device,
+                batch_count,
+                routed_tensor.get());
+          }
         }
       }
       if (cutlass_down_ok && debug) {
@@ -3665,7 +3899,7 @@ bool RunExpertLayerImpl(
 
   const auto try_routed_fastpath_single_token =
       [&](std::size_t token_index,
-          const DeviceTensorFp32& latent_input_row,
+          const ActivationTensorT& latent_input_row,
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
@@ -3678,14 +3912,16 @@ bool RunExpertLayerImpl(
         RecordFlashInferRoutedExpertFallback();
         return GroupedRoutedResult::kFallback;
       }
-      if (impl.flashinfer_routed_backend->Run(
-              latent_input_row,
-              1,
-              selected_indices_device,
-              selected_weights_device,
-              routed_tensor.get())) {
-        RecordFlashInferRoutedExpertUse();
-        return GroupedRoutedResult::kUsed;
+      if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+        if (impl.flashinfer_routed_backend->Run(
+                latent_input_row,
+                1,
+                selected_indices_device,
+                selected_weights_device,
+                routed_tensor.get())) {
+          RecordFlashInferRoutedExpertUse();
+          return GroupedRoutedResult::kUsed;
+        }
       }
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -3709,9 +3945,9 @@ bool RunExpertLayerImpl(
     const float* latent_row_host =
         trace != nullptr ? (latent_host.data() + (token_index * impl.config.moe_latent_size)) : nullptr;
 
-    const DeviceTensorFp32* latent_input = latent.get();
+    const ActivationTensorT* latent_input = latent.get();
     if (token_count != 1) {
-      if (!CopyRowFp32(*latent, token_index, latent_row.get())) {
+      if (!RunExpertCopyRow(*latent, token_index, latent_row.get())) {
         if (debug) {
           std::cout << "expert_layer: latent row copy failed\n";
         }
@@ -3799,7 +4035,7 @@ bool RunExpertLayerImpl(
         }
         return false;
       }
-      if (!Relu2InPlaceFp32(expert_up.get())) {
+      if (!RunExpertRelu2(expert_up.get())) {
         if (debug) {
           std::cout << "expert_layer: routed relu2 failed for expert "
                     << selection.expert_index << "\n";
@@ -3824,8 +4060,8 @@ bool RunExpertLayerImpl(
         return false;
       }
       const bool add_ok = token_count == 1
-          ? AddScaledFp32(*expert_down, selection.weight, routed_tensor.get())
-          : AddScaledRowFp32(*expert_down, selection.weight, token_index, routed_tensor.get());
+          ? RunExpertAddScaled(*expert_down, selection.weight, routed_tensor.get())
+          : RunExpertAddScaledRow(*expert_down, selection.weight, token_index, routed_tensor.get());
       if (!add_ok) {
         if (debug) {
           std::cout << "expert_layer: routed weighted accumulation failed for expert "
@@ -3836,8 +4072,8 @@ bool RunExpertLayerImpl(
       if (trace != nullptr && token_index == 0) {
         std::vector<float> activated_up_host(impl.config.routed_expert_intermediate_size, 0.0f);
         std::vector<float> expert_down_host(impl.config.moe_latent_size, 0.0f);
-        if (!expert_up->CopyToHost(activated_up_host.data(), activated_up_host.size()) ||
-            !expert_down->CopyToHost(expert_down_host.data(), expert_down_host.size())) {
+        if (!CopyToHost(*expert_up, &activated_up_host) ||
+            !CopyToHost(*expert_down, &expert_down_host)) {
           if (debug) {
             std::cout << "expert_layer: routed trace download failed\n";
           }
@@ -3883,7 +4119,7 @@ bool RunExpertLayerImpl(
     }
   }
 
-  if (!Relu2InPlaceFp32(shared_up.get())) {
+  if (!RunExpertRelu2(shared_up.get())) {
     if (debug) {
       std::cout << "expert_layer: shared relu2 failed\n";
     }
@@ -3914,8 +4150,8 @@ bool RunExpertLayerImpl(
     }
     return false;
   }
-  if (!ResidualAddFp32(*projected_routed, *shared_output_device, mixer_output_device.get()) ||
-      !ResidualAddFp32(input, *mixer_output_device, output)) {
+  if (!RunExpertResidualAdd(*projected_routed, *shared_output_device, mixer_output_device.get()) ||
+      !RunExpertResidualAdd(input, *mixer_output_device, output)) {
     if (debug) {
       std::cout << "expert_layer: residual merge failed\n";
     }
@@ -3976,16 +4212,14 @@ bool ExpertLayerSlice::Run(
       output->shape() != input.shape()) {
     return false;
   }
-  auto input_fp32 = DeviceTensorFp32::Create(input.shape());
-  auto output_fp32 = DeviceTensorFp32::Create(input.shape());
-  if (!input_fp32 || !output_fp32 ||
-      !ConvertDeviceBf16ToFp32(input.data(), input.numel(), input_fp32->data())) {
-    return false;
-  }
-  if (!Run(cublas_handle, heuristic_cache, *input_fp32, output_fp32.get(), trace)) {
-    return false;
-  }
-  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+  return RunExpertLayerImpl(
+      *impl_,
+      cublas_handle,
+      heuristic_cache,
+      nullptr,
+      input,
+      output,
+      trace);
 }
 
 bool ExpertLayerSlice::RunWithRequestContext(
@@ -4024,36 +4258,14 @@ bool ExpertLayerSlice::RunWithRequestContext(
       output->shape() != input.shape()) {
     return false;
   }
-
-  DeviceTensorFp32* input_storage = request_context.hidden();
-  DeviceTensorFp32* output_storage = request_context.residual();
-  if (input_storage == nullptr ||
-      output_storage == nullptr ||
-      !input_storage->valid() ||
-      !output_storage->valid() ||
-      input_storage->numel() < input.numel() ||
-      output_storage->numel() < input.numel()) {
-    return false;
-  }
-
-  auto input_fp32 = DeviceTensorFp32::CreateView(input.shape(), input_storage->data());
-  auto output_fp32 = DeviceTensorFp32::CreateView(input.shape(), output_storage->data());
-  if (!input_fp32 || !output_fp32) {
-    return false;
-  }
-  if (!ConvertDeviceBf16ToFp32(input.data(), input.numel(), input_fp32->data())) {
-    return false;
-  }
-  if (!RunWithRequestContext(
-          cublas_handle,
-          heuristic_cache,
-          request_context,
-          *input_fp32,
-          output_fp32.get(),
-          trace)) {
-    return false;
-  }
-  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+  return RunExpertLayerImpl(
+      *impl_,
+      cublas_handle,
+      heuristic_cache,
+      &request_context,
+      input,
+      output,
+      trace);
 }
 
 }  // namespace nemotron

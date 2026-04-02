@@ -1,5 +1,6 @@
 #include "nemotron/expert_ops.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -54,16 +55,33 @@ __device__ float DecodeFp8E4M3(std::uint8_t code) {
   return __half2float(raw);
 }
 
+__device__ float LoadExpertValue(const float* input, std::size_t index) {
+  return input[index];
+}
+
+__device__ float LoadExpertValue(const __nv_bfloat16* input, std::size_t index) {
+  return __bfloat162float(input[index]);
+}
+
+__device__ void StoreExpertValue(float* output, std::size_t index, float value) {
+  output[index] = value;
+}
+
+__device__ void StoreExpertValue(__nv_bfloat16* output, std::size_t index, float value) {
+  output[index] = __float2bfloat16(value);
+}
+
+template <typename InputT, typename OutputT>
 __global__ void CopyRowKernel(
-    const float* input,
+    const InputT* input,
     std::size_t input_cols,
     std::size_t row_index,
-    float* output_row) {
+    OutputT* output_row) {
   const std::size_t column = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (column >= input_cols) {
     return;
   }
-  output_row[column] = input[row_index * input_cols + column];
+  StoreExpertValue(output_row, column, LoadExpertValue(input, row_index * input_cols + column));
 }
 
 __global__ void WriteRowKernel(
@@ -78,38 +96,44 @@ __global__ void WriteRowKernel(
   output[row_index * output_cols + column] = input_row[column];
 }
 
-__global__ void Relu2InPlaceKernel(float* data, std::size_t count) {
+template <typename TensorT>
+__global__ void Relu2InPlaceKernel(TensorT* data, std::size_t count) {
   const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count) {
     return;
   }
-  const float value = data[index];
-  data[index] = value > 0.0f ? (value * value) : 0.0f;
+  const float value = LoadExpertValue(data, index);
+  StoreExpertValue(data, index, value > 0.0f ? (value * value) : 0.0f);
 }
 
+template <typename TensorT>
 __global__ void AddScaledKernel(
-    const float* input,
+    const TensorT* input,
     float scale,
-    float* accumulator,
+    TensorT* accumulator,
     std::size_t count) {
   const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count) {
     return;
   }
-  accumulator[index] += input[index] * scale;
+  const float accum = LoadExpertValue(accumulator, index) + (LoadExpertValue(input, index) * scale);
+  StoreExpertValue(accumulator, index, accum);
 }
 
+template <typename TensorT>
 __global__ void AddScaledRowKernel(
-    const float* input_row,
+    const TensorT* input_row,
     float scale,
     std::size_t row_index,
     std::size_t accumulator_cols,
-    float* accumulator) {
+    TensorT* accumulator) {
   const std::size_t column = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (column >= accumulator_cols) {
     return;
   }
-  accumulator[row_index * accumulator_cols + column] += input_row[column] * scale;
+  const std::size_t index = row_index * accumulator_cols + column;
+  const float accum = LoadExpertValue(accumulator, index) + (LoadExpertValue(input_row, column) * scale);
+  StoreExpertValue(accumulator, index, accum);
 }
 
 __global__ void SelectTopExpertsKernel(
@@ -770,7 +794,7 @@ __global__ void FusedRoutedUpProjPackedNvfp4SingleTokenKernel(
   output_rows_data[expert_row * output_rows + output_row] = accum;
 }
 
-template <bool kDirectStridedWeights>
+template <bool kDirectStridedWeights, typename OutputT>
 __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     const std::uint8_t* activation_rows_packed,
     const std::uint8_t* activation_rows_block_scales,
@@ -788,7 +812,7 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     std::size_t weight_scale_stride_bytes,
     const std::int32_t* selected_expert_indices,
     std::size_t output_rows,
-    float* output_row_data) {
+    OutputT* output_row_data) {
   const std::size_t output_row = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
   if (output_row >= output_rows) {
     return;
@@ -858,10 +882,14 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     }
   }
 
-  output_row_data[output_row] = accum;
+  StoreExpertValue(output_row_data, output_row, accum);
 }
 
 bool HasSingleRowShape(const DeviceTensorFp32& tensor) {
+  return tensor.valid() && tensor.shape().size() == 2 && tensor.shape()[0] == 1 && tensor.shape()[1] != 0;
+}
+
+bool HasSingleRowShape(const DeviceTensorBf16& tensor) {
   return tensor.valid() && tensor.shape().size() == 2 && tensor.shape()[0] == 1 && tensor.shape()[1] != 0;
 }
 
@@ -871,6 +899,22 @@ bool CopyRowFp32(
     const DeviceTensorFp32& input,
     std::size_t row_index,
     DeviceTensorFp32* output_row) {
+  if (!input.valid() || output_row == nullptr || !output_row->valid() || input.shape().size() != 2 ||
+      row_index >= input.shape()[0] || !HasSingleRowShape(*output_row) ||
+      output_row->shape()[1] != input.shape()[1]) {
+    return false;
+  }
+  const std::size_t cols = input.shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
+  CopyRowKernel<<<grid, block>>>(input.data(), cols, row_index, output_row->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool CopyRowBf16(
+    const DeviceTensorBf16& input,
+    std::size_t row_index,
+    DeviceTensorBf16* output_row) {
   if (!input.valid() || output_row == nullptr || !output_row->valid() || input.shape().size() != 2 ||
       row_index >= input.shape()[0] || !HasSingleRowShape(*output_row) ||
       output_row->shape()[1] != input.shape()[1]) {
@@ -909,10 +953,35 @@ bool Relu2InPlaceFp32(DeviceTensorFp32* tensor) {
   return CheckCuda(cudaGetLastError());
 }
 
+bool Relu2InPlaceBf16(DeviceTensorBf16* tensor) {
+  if (tensor == nullptr || !tensor->valid()) {
+    return false;
+  }
+  const std::size_t count = tensor->numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  Relu2InPlaceKernel<<<grid, block>>>(tensor->data(), count);
+  return CheckCuda(cudaGetLastError());
+}
+
 bool AddScaledFp32(
     const DeviceTensorFp32& input,
     float scale,
     DeviceTensorFp32* accumulator) {
+  if (!input.valid() || accumulator == nullptr || !accumulator->valid() || input.shape() != accumulator->shape()) {
+    return false;
+  }
+  const std::size_t count = input.numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  AddScaledKernel<<<grid, block>>>(input.data(), scale, accumulator->data(), count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool AddScaledBf16(
+    const DeviceTensorBf16& input,
+    float scale,
+    DeviceTensorBf16* accumulator) {
   if (!input.valid() || accumulator == nullptr || !accumulator->valid() || input.shape() != accumulator->shape()) {
     return false;
   }
@@ -928,6 +997,23 @@ bool AddScaledRowFp32(
     float scale,
     std::size_t row_index,
     DeviceTensorFp32* accumulator) {
+  if (!HasSingleRowShape(input_row) || accumulator == nullptr || !accumulator->valid() ||
+      accumulator->shape().size() != 2 || row_index >= accumulator->shape()[0] ||
+      input_row.shape()[1] != accumulator->shape()[1]) {
+    return false;
+  }
+  const std::size_t cols = input_row.shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
+  AddScaledRowKernel<<<grid, block>>>(input_row.data(), scale, row_index, cols, accumulator->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool AddScaledRowBf16(
+    const DeviceTensorBf16& input_row,
+    float scale,
+    std::size_t row_index,
+    DeviceTensorBf16* accumulator) {
   if (!HasSingleRowShape(input_row) || accumulator == nullptr || !accumulator->valid() ||
       accumulator->shape().size() != 2 || row_index >= accumulator->shape()[0] ||
       input_row.shape()[1] != accumulator->shape()[1]) {
@@ -1601,7 +1687,8 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
   const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
-  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<false><<<grid, block, shared_bytes, stream>>>(
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<false, float>
+      <<<grid, block, shared_bytes, stream>>>(
       activation_rows_packed,
       activation_rows_block_scales,
       activation_row_tensor_scales.data(),
@@ -1619,6 +1706,67 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
       nullptr,
       output_row_count,
       output_row->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+    const std::uint8_t* activation_rows_packed,
+    const std::uint8_t* activation_rows_block_scales,
+    const DeviceBuffer<float>& activation_row_tensor_scales,
+    const float* selection_weights_device,
+    std::size_t input_cols,
+    const DeviceBuffer<const void*>& weight_packed_ptrs,
+    const DeviceBuffer<const void*>& weight_block_scale_ptrs,
+    const DeviceBuffer<float>& weight_tensor_scales,
+    DeviceTensorBf16* output_row,
+    std::size_t activation_rows_packed_row_stride_bytes,
+    cudaStream_t stream) {
+  if (activation_rows_packed == nullptr ||
+      activation_rows_block_scales == nullptr ||
+      selection_weights_device == nullptr ||
+      input_cols == 0 ||
+      input_cols % kNvfp4BlockWidth != 0 ||
+      !activation_row_tensor_scales.valid() ||
+      !weight_packed_ptrs.valid() ||
+      !weight_block_scale_ptrs.valid() ||
+      !weight_tensor_scales.valid() ||
+      activation_row_tensor_scales.count() == 0 ||
+      activation_row_tensor_scales.count() != weight_packed_ptrs.count() ||
+      weight_packed_ptrs.count() != weight_block_scale_ptrs.count() ||
+      weight_packed_ptrs.count() != weight_tensor_scales.count() ||
+      output_row == nullptr ||
+      !output_row->valid() ||
+      !HasSingleRowShape(*output_row)) {
+    return false;
+  }
+  const std::size_t tight_packed_row_stride_bytes = input_cols / 2u;
+  if (activation_rows_packed_row_stride_bytes != 0 &&
+      activation_rows_packed_row_stride_bytes < tight_packed_row_stride_bytes) {
+    return false;
+  }
+  const std::size_t output_row_count = output_row->shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
+  const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<false, __nv_bfloat16>
+      <<<grid, block, shared_bytes, stream>>>(
+          activation_rows_packed,
+          activation_rows_block_scales,
+          activation_row_tensor_scales.data(),
+          selection_weights_device,
+          weight_packed_ptrs.count(),
+          input_cols,
+          activation_rows_packed_row_stride_bytes,
+          weight_packed_ptrs.data(),
+          weight_block_scale_ptrs.data(),
+          weight_tensor_scales.data(),
+          nullptr,
+          0,
+          nullptr,
+          0,
+          nullptr,
+          output_row_count,
+          output_row->data());
   return CheckCuda(cudaGetLastError());
 }
 
@@ -1664,7 +1812,8 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
   const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
-  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<true><<<grid, block, shared_bytes, stream>>>(
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<true, float>
+      <<<grid, block, shared_bytes, stream>>>(
       activation_rows_packed,
       activation_rows_block_scales,
       activation_row_tensor_scales.data(),
@@ -1682,6 +1831,70 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
       selected_expert_indices,
       output_row_count,
       output_row->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+    const std::uint8_t* activation_rows_packed,
+    const std::uint8_t* activation_rows_block_scales,
+    const DeviceBuffer<float>& activation_row_tensor_scales,
+    const float* selection_weights_device,
+    std::size_t input_cols,
+    const std::uint8_t* contiguous_weight_packed_base,
+    std::size_t weight_packed_stride_bytes,
+    const std::uint8_t* contiguous_weight_scale_base,
+    std::size_t weight_scale_stride_bytes,
+    const float* contiguous_tensor_scales,
+    const std::int32_t* selected_expert_indices,
+    DeviceTensorBf16* output_row,
+    std::size_t activation_rows_packed_row_stride_bytes,
+    cudaStream_t stream) {
+  if (activation_rows_packed == nullptr ||
+      activation_rows_block_scales == nullptr ||
+      selection_weights_device == nullptr ||
+      input_cols == 0 ||
+      input_cols % kNvfp4BlockWidth != 0 ||
+      !activation_row_tensor_scales.valid() ||
+      activation_row_tensor_scales.count() == 0 ||
+      contiguous_weight_packed_base == nullptr ||
+      weight_packed_stride_bytes == 0 ||
+      contiguous_weight_scale_base == nullptr ||
+      weight_scale_stride_bytes == 0 ||
+      contiguous_tensor_scales == nullptr ||
+      selected_expert_indices == nullptr ||
+      output_row == nullptr ||
+      !output_row->valid() ||
+      !HasSingleRowShape(*output_row)) {
+    return false;
+  }
+  const std::size_t tight_packed_row_stride_bytes = input_cols / 2u;
+  if (activation_rows_packed_row_stride_bytes != 0 &&
+      activation_rows_packed_row_stride_bytes < tight_packed_row_stride_bytes) {
+    return false;
+  }
+  const std::size_t output_row_count = output_row->shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
+  const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<true, __nv_bfloat16>
+      <<<grid, block, shared_bytes, stream>>>(
+          activation_rows_packed,
+          activation_rows_block_scales,
+          activation_row_tensor_scales.data(),
+          selection_weights_device,
+          activation_row_tensor_scales.count(),
+          input_cols,
+          activation_rows_packed_row_stride_bytes,
+          nullptr,
+          nullptr,
+          contiguous_tensor_scales,
+          contiguous_weight_packed_base,
+          weight_packed_stride_bytes,
+          contiguous_weight_scale_base,
+          weight_scale_stride_bytes,
+          selected_expert_indices,
+          output_row_count,
+          output_row->data());
   return CheckCuda(cudaGetLastError());
 }
 
@@ -1855,6 +2068,26 @@ __global__ void ScaleWeightedAccumulateRowsKernel(
   accumulator[col] += sum;
 }
 
+__global__ void ScaleWeightedAccumulateRowsBf16Kernel(
+    const float* data,
+    const float* act_tensor_scales,
+    const float* weight_tensor_scales,
+    const float* routing_weights,
+    std::size_t cols,
+    std::size_t row_count,
+    __nv_bfloat16* accumulator) {
+  const std::size_t col = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (col >= cols) {
+    return;
+  }
+  float sum = __bfloat162float(accumulator[col]);
+  for (std::size_t row = 0; row < row_count; ++row) {
+    const float scale = act_tensor_scales[row] * weight_tensor_scales[row] * routing_weights[row];
+    sum += data[row * cols + col] * scale;
+  }
+  accumulator[col] = __float2bfloat16(sum);
+}
+
 bool ScaleWeightedAccumulateRowsFp32(
     const DeviceTensorFp32& data,
     const float* act_tensor_scales_device,
@@ -1874,6 +2107,31 @@ bool ScaleWeightedAccumulateRowsFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
   ScaleWeightedAccumulateRowsKernel<<<grid, block>>>(
+      data.data(), act_tensor_scales_device, weight_tensor_scales_device,
+      routing_weights_device, cols, row_count, accumulator->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool ScaleWeightedAccumulateRowsBf16(
+    const DeviceTensorFp32& data,
+    const float* act_tensor_scales_device,
+    const float* weight_tensor_scales_device,
+    const float* routing_weights_device,
+    std::size_t row_count,
+    DeviceTensorBf16* accumulator) {
+  if (!data.valid() || accumulator == nullptr || !accumulator->valid() ||
+      act_tensor_scales_device == nullptr ||
+      weight_tensor_scales_device == nullptr || routing_weights_device == nullptr ||
+      data.shape().size() != 2 || accumulator->shape().size() != 2 ||
+      data.shape()[0] < row_count || row_count == 0 ||
+      accumulator->shape()[0] != 1 ||
+      data.shape()[1] != accumulator->shape()[1]) {
+    return false;
+  }
+  const std::size_t cols = data.shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((cols + block.x - 1) / block.x));
+  ScaleWeightedAccumulateRowsBf16Kernel<<<grid, block>>>(
       data.data(), act_tensor_scales_device, weight_tensor_scales_device,
       routing_weights_device, cols, row_count, accumulator->data());
   return CheckCuda(cudaGetLastError());

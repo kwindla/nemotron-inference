@@ -24,6 +24,20 @@ __global__ void ResidualAddKernel(
   output[index] = lhs[index] + rhs[index];
 }
 
+__global__ void ResidualAddBf16Kernel(
+    const __nv_bfloat16* lhs,
+    const __nv_bfloat16* rhs,
+    __nv_bfloat16* output,
+    std::size_t count) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const float lhs_value = __bfloat162float(lhs[index]);
+  const float rhs_value = __bfloat162float(rhs[index]);
+  output[index] = __float2bfloat16(lhs_value + rhs_value);
+}
+
 __global__ void RmsNormKernel(
     const float* input,
     const float* weight,
@@ -153,6 +167,22 @@ bool ResidualAddFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   ResidualAddKernel<<<grid, block>>>(lhs.data(), rhs.data(), output->data(), count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool ResidualAddBf16(
+    const DeviceTensorBf16& lhs,
+    const DeviceTensorBf16& rhs,
+    DeviceTensorBf16* output) {
+  if (output == nullptr || !lhs.valid() || !rhs.valid() || !output->valid() ||
+      lhs.shape() != rhs.shape() || lhs.shape() != output->shape()) {
+    return false;
+  }
+
+  const std::size_t count = lhs.numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  ResidualAddBf16Kernel<<<grid, block>>>(lhs.data(), rhs.data(), output->data(), count);
   return CheckCuda(cudaGetLastError());
 }
 
