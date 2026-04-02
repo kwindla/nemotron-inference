@@ -370,6 +370,7 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
     float* tensor_scales,
     std::uint8_t* packed,
     std::uint8_t* block_scales,
+    std::size_t packed_row_stride_bytes,
     std::size_t padded_blocks_per_row,
     std::size_t matmul_bytes_per_row,
     std::uint8_t* matmul_scales) {
@@ -381,6 +382,10 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
   const float row_scale = row_scales[row];
   const std::size_t row_offset = row * cols;
   const std::size_t blocks_per_row = cols / kNvfp4BlockWidth;
+  const std::size_t packed_bytes_per_row = cols / 2u;
+  std::uint8_t* row_packed = packed + row * packed_row_stride_bytes;
+  std::uint8_t* row_matmul =
+      matmul_scales != nullptr ? (matmul_scales + row * matmul_bytes_per_row) : nullptr;
 
   float local_max = 0.0f;
   for (std::size_t col = tid; col < cols; col += blockDim.x) {
@@ -409,8 +414,13 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
   __syncthreads();
   tensor_scale = smem[0];
 
-  if (matmul_scales != nullptr) {
-    std::uint8_t* row_matmul = matmul_scales + row * matmul_bytes_per_row;
+  if (packed_row_stride_bytes > packed_bytes_per_row) {
+    for (std::size_t i = packed_bytes_per_row + tid; i < packed_row_stride_bytes; i += blockDim.x) {
+      row_packed[i] = 0;
+    }
+  }
+
+  if (row_matmul != nullptr) {
     for (std::size_t i = tid; i < matmul_bytes_per_row; i += blockDim.x) {
       row_matmul[i] = 0;
     }
@@ -420,8 +430,7 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
   for (std::size_t block_index = tid; block_index < blocks_per_row;
        block_index += blockDim.x) {
     const std::size_t input_offset = row_offset + block_index * kNvfp4BlockWidth;
-    const std::size_t packed_offset =
-        row * (cols / 2u) + block_index * (kNvfp4BlockWidth / 2u);
+    const std::size_t packed_offset = block_index * (kNvfp4BlockWidth / 2u);
     const std::size_t scale_offset = row * blocks_per_row + block_index;
 
     float block_max_abs = 0.0f;
@@ -454,11 +463,10 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
       const std::uint8_t rhs_fp4 = static_cast<std::uint8_t>(
                                        __nv_cvt_float_to_fp4(rhs, __NV_E2M1, cudaRoundNearest)) &
                                    0x0fu;
-      packed[packed_offset + (i / 2u)] = static_cast<std::uint8_t>(lhs_fp4 | (rhs_fp4 << 4));
+      row_packed[packed_offset + (i / 2u)] = static_cast<std::uint8_t>(lhs_fp4 | (rhs_fp4 << 4));
     }
 
-    if (matmul_scales != nullptr) {
-      std::uint8_t* row_matmul = matmul_scales + row * matmul_bytes_per_row;
+    if (row_matmul != nullptr) {
       const std::size_t dest = ExecutionScaleOffset(0, block_index, padded_blocks_per_row);
       row_matmul[dest] = block_scale_fp8;
     }
@@ -749,6 +757,7 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     const float* selection_weights,
     std::size_t selection_count,
     std::size_t input_cols,
+    std::size_t activation_rows_packed_row_stride_bytes,
     const void* const* weight_packed_ptrs,
     const void* const* weight_block_scale_ptrs,
     const float* weight_tensor_scales,
@@ -761,7 +770,11 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
 
   extern __shared__ float shared_activation[];
   const std::size_t blocks_per_row = input_cols / kNvfp4BlockWidth;
-  const std::size_t packed_row_stride = input_cols / 2u;
+  const std::size_t activation_packed_row_stride =
+      activation_rows_packed_row_stride_bytes == 0
+          ? (input_cols / 2u)
+          : activation_rows_packed_row_stride_bytes;
+  const std::size_t weight_packed_row_stride = input_cols / 2u;
   const std::size_t scale_row_stride = blocks_per_row;
   float accum = 0.0f;
 
@@ -777,7 +790,9 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     for (std::size_t block = 0; block < blocks_per_row; ++block) {
       if (threadIdx.x < kNvfp4BlockWidth) {
         const std::size_t packed_index =
-            expert_row * packed_row_stride + block * (kNvfp4BlockWidth / 2u) + (threadIdx.x / 2u);
+            expert_row * activation_packed_row_stride +
+            block * (kNvfp4BlockWidth / 2u) +
+            (threadIdx.x / 2u);
         const std::uint8_t packed_pair = activation_rows_packed[packed_index];
         const std::uint8_t nibble =
             (threadIdx.x & 1u) != 0u ? (packed_pair >> 4u) : (packed_pair & 0x0fu);
@@ -791,7 +806,7 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
           DecodeFp8E4M3(weight_block_scales[output_row * scale_row_stride + block]) *
           weight_tensor_scale;
       const std::size_t packed_offset =
-          output_row * packed_row_stride + block * (kNvfp4BlockWidth / 2u);
+          output_row * weight_packed_row_stride + block * (kNvfp4BlockWidth / 2u);
       #pragma unroll
       for (std::size_t inner = 0; inner < kNvfp4BlockWidth; inner += 2u) {
         const std::uint8_t packed_pair = weight_packed[packed_offset + (inner / 2u)];
@@ -1266,7 +1281,8 @@ bool ScaleRelu2PackRowsToNvfp4(
   }
 
   const std::size_t blocks_per_row = cols / kNvfp4BlockWidth;
-  const std::size_t packed_bytes = rows * (cols / 2u);
+  const std::size_t packed_row_stride_bytes = cols / 2u;
+  const std::size_t packed_bytes = rows * packed_row_stride_bytes;
   const std::size_t block_scale_bytes = rows * blocks_per_row;
   std::size_t matmul_bytes_per_row = 0;
   std::optional<Nvfp4ExecutionScaleLayout> layout;
@@ -1287,8 +1303,7 @@ bool ScaleRelu2PackRowsToNvfp4(
     return false;
   }
   if (matmul_block_scales != nullptr &&
-      (!matmul_block_scales->Resize(rows * matmul_bytes_per_row) ||
-       !matmul_block_scales->FillZero())) {
+      !matmul_block_scales->Resize(rows * matmul_bytes_per_row)) {
     return false;
   }
 
@@ -1301,6 +1316,7 @@ bool ScaleRelu2PackRowsToNvfp4(
       tensor_scales->data(),
       packed->data(),
       block_scales->data(),
+      packed_row_stride_bytes,
       layout.has_value() ? layout->padded_blocks_per_row : 0,
       matmul_bytes_per_row,
       matmul_block_scales != nullptr ? matmul_block_scales->data() : nullptr);
@@ -1314,6 +1330,7 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
     DeviceBuffer<std::uint8_t>& block_scales,
     DeviceBuffer<std::uint8_t>* matmul_block_scales,
     DeviceBuffer<float>& tensor_scales,
+    std::size_t packed_row_stride_bytes,
     cudaStream_t stream) {
   if (!input_rows.valid() ||
       input_rows.shape().size() != 2 ||
@@ -1327,7 +1344,14 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
   }
 
   const std::size_t blocks_per_row = cols / kNvfp4BlockWidth;
-  const std::size_t packed_bytes = rows * (cols / 2u);
+  const std::size_t packed_bytes_per_row = cols / 2u;
+  if (packed_row_stride_bytes == 0) {
+    packed_row_stride_bytes = packed_bytes_per_row;
+  }
+  if (packed_row_stride_bytes < packed_bytes_per_row) {
+    return false;
+  }
+  const std::size_t packed_bytes = rows * packed_row_stride_bytes;
   const std::size_t block_scale_bytes = rows * blocks_per_row;
   std::size_t matmul_bytes_per_row = 0;
   std::optional<Nvfp4ExecutionScaleLayout> layout;
@@ -1349,8 +1373,7 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
   }
   if (matmul_block_scales != nullptr &&
       (!matmul_block_scales->valid() ||
-       matmul_block_scales->count() < rows * matmul_bytes_per_row ||
-       !matmul_block_scales->FillZeroAsync(stream))) {
+       matmul_block_scales->count() < rows * matmul_bytes_per_row)) {
     return false;
   }
 
@@ -1363,6 +1386,7 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
       tensor_scales.data(),
       packed.data(),
       block_scales.data(),
+      packed_row_stride_bytes,
       layout.has_value() ? layout->padded_blocks_per_row : 0,
       matmul_bytes_per_row,
       matmul_block_scales != nullptr ? matmul_block_scales->data() : nullptr);
@@ -1450,6 +1474,7 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
     DeviceTensorFp32* output_row,
+    std::size_t activation_rows_packed_row_stride_bytes,
     cudaStream_t stream) {
   if (activation_rows_packed == nullptr ||
       activation_rows_block_scales == nullptr ||
@@ -1469,6 +1494,11 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
       !HasSingleRowShape(*output_row)) {
     return false;
   }
+  const std::size_t tight_packed_row_stride_bytes = input_cols / 2u;
+  if (activation_rows_packed_row_stride_bytes != 0 &&
+      activation_rows_packed_row_stride_bytes < tight_packed_row_stride_bytes) {
+    return false;
+  }
   const std::size_t output_row_count = output_row->shape()[1];
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
@@ -1480,6 +1510,7 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
       selection_weights_device,
       weight_packed_ptrs.count(),
       input_cols,
+      activation_rows_packed_row_stride_bytes,
       weight_packed_ptrs.data(),
       weight_block_scale_ptrs.data(),
       weight_tensor_scales.data(),

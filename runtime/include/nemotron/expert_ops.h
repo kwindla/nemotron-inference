@@ -153,6 +153,7 @@ bool ScaleRelu2PackRowsToNvfp4InPlace(
     DeviceBuffer<std::uint8_t>& block_scales,
     DeviceBuffer<std::uint8_t>* matmul_block_scales,
     DeviceBuffer<float>& tensor_scales,
+    std::size_t packed_row_stride_bytes = 0,
     cudaStream_t stream = nullptr);
 
 bool WeightedSumRowsFp32(
@@ -181,6 +182,7 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
     DeviceTensorFp32* output_row,
+    std::size_t activation_rows_packed_row_stride_bytes = 0,
     cudaStream_t stream = nullptr);
 
 // Fill a device array with the same pointer value. Used to build CUTLASS A pointer arrays

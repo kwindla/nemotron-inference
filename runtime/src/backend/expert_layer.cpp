@@ -72,6 +72,21 @@ bool CutlassMoeEnabled() {
   return kEnabled;
 }
 
+constexpr std::size_t kNvfp4BlockWidth = 16;
+constexpr std::size_t kCutlassAlign = 256;
+
+std::size_t RoundUp(std::size_t value, std::size_t alignment) {
+  return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
+}
+
+std::size_t Nvfp4PackedRowBytes(std::size_t cols) {
+  return cols / 2u;
+}
+
+std::size_t Nvfp4AlignedPackedRowBytes(std::size_t cols) {
+  return RoundUp(Nvfp4PackedRowBytes(cols), kCutlassAlign);
+}
+
 std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
   if (descriptor.tensor_scale_data == nullptr || descriptor.tensor_scale_nbytes != sizeof(float)) {
     return std::nullopt;
@@ -752,9 +767,7 @@ struct ExpertLayerSlice::Impl {
   mutable DeviceBuffer<float> scratch_down_act_tensor_scales;
   // -- Pre-filled row scales (constant 1.0f, avoids per-token H→D copy) --
   mutable DeviceBuffer<float> scratch_row_scales;
-  // -- CUTLASS path aligned/output buffers --
-  mutable DeviceBuffer<std::uint8_t> scratch_aligned_act_packed;
-  mutable DeviceBuffer<std::uint8_t> scratch_aligned_act_scales;
+  // -- CUTLASS path output buffers --
   mutable DeviceBuffer<float> scratch_cutlass_up_alphas;
   mutable DeviceBuffer<float> scratch_cutlass_down_alphas;
   mutable DeviceBuffer<float> scratch_cutlass_down_output;
@@ -1519,12 +1532,6 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   // Pre-allocate scratch buffers for try_grouped_routed_single_token.
   // All sizes derive from config and are stable for the lifetime of this layer.
   {
-    constexpr std::size_t kNvfp4BlockWidth = 16;
-    constexpr std::size_t kCutlassAlign = 256;
-    const auto round_up = [](std::size_t value, std::size_t alignment) -> std::size_t {
-      return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
-    };
-
     const std::size_t top_k = config.top_k;
     const std::size_t latent = config.moe_latent_size;
     const std::size_t intermediate = config.routed_expert_intermediate_size;
@@ -1551,7 +1558,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     impl->scratch_global_max_bits.Resize(1);
 
     // -- ScaleRelu2 output buffers (top_k rows, intermediate cols) --
-    impl->scratch_down_act_packed.Resize((top_k * intermediate + 1u) / 2u);
+    impl->scratch_down_act_packed.Resize(top_k * Nvfp4AlignedPackedRowBytes(intermediate));
     impl->scratch_down_act_block_scales.Resize(top_k * (intermediate / kNvfp4BlockWidth));
     impl->scratch_down_act_matmul_scales.Resize(
         top_k * ExecutionNvfp4ScaleBytes(1, intermediate));
@@ -1563,10 +1570,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       impl->scratch_row_scales.CopyFromHost(ones);
     }
 
-    // -- CUTLASS path aligned buffers --
-    const std::size_t act_packed_row_bytes = intermediate / 2;
-    const std::size_t aligned_packed_row = round_up(act_packed_row_bytes, kCutlassAlign);
-    impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
+    // -- CUTLASS path output buffer --
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
 
     // CUDA graph scratch buffers (fixed-address copies of variable inputs)
@@ -1973,12 +1977,6 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
   // (Mirrors the allocation in Create(); must also be done here in
   // CreatePrepared so the model-cache path has usable scratch buffers.)
   {
-    constexpr std::size_t kNvfp4BlockWidth = 16;
-    constexpr std::size_t kCutlassAlign = 256;
-    const auto round_up = [](std::size_t value, std::size_t alignment) -> std::size_t {
-      return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
-    };
-
     const std::size_t top_k = config.top_k;
     const std::size_t latent = config.moe_latent_size;
     const std::size_t intermediate = config.routed_expert_intermediate_size;
@@ -2002,7 +2000,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     impl->scratch_latent_tensor_scale.Resize(sizeof(float));
     impl->scratch_global_max_bits.Resize(1);
 
-    impl->scratch_down_act_packed.Resize((top_k * intermediate + 1u) / 2u);
+    impl->scratch_down_act_packed.Resize(top_k * Nvfp4AlignedPackedRowBytes(intermediate));
     impl->scratch_down_act_block_scales.Resize(top_k * (intermediate / kNvfp4BlockWidth));
     impl->scratch_down_act_matmul_scales.Resize(
         top_k * ExecutionNvfp4ScaleBytes(1, intermediate));
@@ -2013,9 +2011,6 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       impl->scratch_row_scales.CopyFromHost(ones);
     }
 
-    const std::size_t act_packed_row_bytes = intermediate / 2;
-    const std::size_t aligned_packed_row = round_up(act_packed_row_bytes, kCutlassAlign);
-    impl->scratch_aligned_act_packed.Resize(top_k * aligned_packed_row);
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
 
     static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
@@ -2752,6 +2747,9 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
+    const std::size_t down_act_packed_row_stride =
+        Nvfp4AlignedPackedRowBytes(impl.config.routed_expert_intermediate_size);
+
     // CUDA graph replay fast path: when all experts are warm and graph is
     // captured, replay the entire MoE compute sequence in one graph launch.
     if (impl.moe_graph_enabled && impl.all_routed_lookups_ready &&
@@ -2815,7 +2813,9 @@ bool RunExpertLayerImpl(
                 *graph_grouped_up, impl.scratch_row_scales.data(),
                 impl.scratch_down_act_packed, impl.scratch_down_act_block_scales,
                 nullptr,
-                impl.scratch_down_act_tensor_scales, stream);
+                impl.scratch_down_act_tensor_scales,
+                down_act_packed_row_stride,
+                stream);
 
             cudaMemsetAsync(impl.scratch_graph_output.data(), 0,
                             impl.config.moe_latent_size * sizeof(float), stream);
@@ -2827,7 +2827,10 @@ bool RunExpertLayerImpl(
                 impl.scratch_graph_weights.data(),
                 impl.config.routed_expert_intermediate_size,
                 impl.scratch_down_packed_ptrs, impl.scratch_down_raw_scale_ptrs,
-                impl.scratch_selected_down_tensor_scales, graph_output.get(), stream);
+                impl.scratch_selected_down_tensor_scales,
+                graph_output.get(),
+                down_act_packed_row_stride,
+                stream);
 
             graph_ok = cudaStreamEndCapture(stream, &impl.moe_graph) == cudaSuccess &&
                        impl.moe_graph != nullptr;
@@ -3039,7 +3042,8 @@ bool RunExpertLayerImpl(
             impl.scratch_down_act_packed,
             impl.scratch_down_act_block_scales,
             &impl.scratch_down_act_matmul_scales,
-            impl.scratch_down_act_tensor_scales)) {
+            impl.scratch_down_act_tensor_scales,
+            down_act_packed_row_stride)) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertMergeFallback();
       return GroupedRoutedResult::kFallback;
@@ -3055,20 +3059,16 @@ bool RunExpertLayerImpl(
             impl.scratch_down_act_tensor_scales,
             impl.scratch_selected_down_tensor_scales,
             &impl.scratch_cutlass_down_alphas)) {
-      constexpr std::size_t kCutlassAlign = 256;
-      const std::size_t act_packed_row_bytes = impl.config.routed_expert_intermediate_size / 2;
       const std::size_t act_scale_row_bytes =
           ExecutionNvfp4ScaleBytes(1, impl.config.routed_expert_intermediate_size);
-      const std::size_t aligned_packed_row =
-          ((act_packed_row_bytes + kCutlassAlign - 1) / kCutlassAlign) * kCutlassAlign;
       const std::size_t down_output_count = batch_count * impl.config.moe_latent_size;
 
       auto down_output = DeviceTensorFp32::CreateView(
           {batch_count, impl.config.moe_latent_size},
           impl.scratch_cutlass_down_output.data());
 
-      if (impl.scratch_aligned_act_packed.valid() &&
-          impl.scratch_aligned_act_packed.count() >= batch_count * aligned_packed_row &&
+      if (impl.scratch_down_act_packed.valid() &&
+          impl.scratch_down_act_packed.count() >= batch_count * down_act_packed_row_stride &&
           impl.scratch_down_act_matmul_scales.valid() &&
           impl.scratch_down_act_matmul_scales.count() >= batch_count * act_scale_row_bytes &&
           impl.scratch_cutlass_down_output.valid() &&
@@ -3078,19 +3078,10 @@ bool RunExpertLayerImpl(
               impl.scratch_cutlass_down_output.data(),
               0,
               down_output_count * sizeof(float)) == cudaSuccess) {
-        // Copy activation rows to aligned offsets (D→D, no host).
-        cudaMemsetAsync(impl.scratch_aligned_act_packed.data(), 0, batch_count * aligned_packed_row);
-        for (std::size_t i = 0; i < batch_count; ++i) {
-          cudaMemcpyAsync(
-              impl.scratch_aligned_act_packed.data() + i * aligned_packed_row,
-              impl.scratch_down_act_packed.data() + i * act_packed_row_bytes,
-              act_packed_row_bytes, cudaMemcpyDeviceToDevice);
-        }
-
         // Build all pointer arrays on device — zero host involvement.
         BuildStridedDevicePointerArray(
             const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_ptrs.data())),
-            impl.scratch_aligned_act_packed.data(), aligned_packed_row, batch_count);
+            impl.scratch_down_act_packed.data(), down_act_packed_row_stride, batch_count);
         BuildStridedDevicePointerArray(
             const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_sf_ptrs.data())),
             impl.scratch_down_act_matmul_scales.data(), act_scale_row_bytes, batch_count);
@@ -3139,7 +3130,8 @@ bool RunExpertLayerImpl(
             impl.scratch_down_packed_ptrs,
             impl.scratch_down_raw_scale_ptrs,
             impl.scratch_selected_down_tensor_scales,
-            routed_tensor.get())) {
+            routed_tensor.get(),
+            down_act_packed_row_stride)) {
       if (debug) {
         std::cerr << "expert_layer: layer " << impl.config.layer_index
                   << " routed fastpath down kernel launch failed\n";
