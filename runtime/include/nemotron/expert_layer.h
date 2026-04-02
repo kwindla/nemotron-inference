@@ -132,6 +132,7 @@ class ExpertLayerSlice {
 
   bool valid() const;
   const ExpertLayerConfig& config() const;
+  bool routed_experts_contiguous() const;
 
   bool Run(
       CublasLtHandle& cublas_handle,

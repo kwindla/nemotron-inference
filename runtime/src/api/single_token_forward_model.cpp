@@ -959,7 +959,15 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
               ReadOptionalScalarTensorToHostFp32(pair.up_input_scale);
           prepared.routed_experts[expert_index].down_input_scale =
               ReadOptionalScalarTensorToHostFp32(pair.down_input_scale);
-          if (pair.up_proj->kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+          if (pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+            auto up_proj = impl->model_cache->CreateNvfp4LinearView(*pair.up_proj);
+            auto down_proj = impl->model_cache->CreateNvfp4LinearView(*pair.down_proj);
+            if ((up_proj == nullptr) != (down_proj == nullptr)) {
+              return nullptr;
+            }
+            prepared.routed_experts[expert_index].up_proj = std::move(up_proj);
+            prepared.routed_experts[expert_index].down_proj = std::move(down_proj);
+          } else {
             prepared.routed_experts[expert_index].up_proj =
                 impl->model_cache->CreateDenseLinearView(*pair.up_proj);
             prepared.routed_experts[expert_index].down_proj =
@@ -994,6 +1002,15 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
         if (!layer_entry.expert_slice || !layer_entry.expert_slice->valid()) {
           return nullptr;
         }
+        if (layer_entry.expert_slice->routed_experts_contiguous()) {
+          for (const ExpertWeightPair& pair : bindings->routed_experts) {
+            if (pair.up_proj == nullptr || pair.down_proj == nullptr) {
+              return nullptr;
+            }
+            impl->model_cache->ReleaseEntry(pair.up_proj->tensor_name);
+            impl->model_cache->ReleaseEntry(pair.down_proj->tensor_name);
+          }
+        }
         break;
       }
     }
@@ -1001,6 +1018,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
   }
   const auto layer_loop_end = std::chrono::steady_clock::now();
   add_phase("layer_loop_total", layer_loop_begin, layer_loop_end);
+  impl->model_cache->ReleaseFilePages();
   impl->build_report = std::move(build_report);
   return std::unique_ptr<SingleTokenForwardModel>(new SingleTokenForwardModel(std::move(impl)));
 }

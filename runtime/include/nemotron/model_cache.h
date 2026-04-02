@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -89,6 +90,8 @@ class LoadedModelCache {
       std::size_t output_rows,
       std::size_t input_cols) const;
   std::unique_ptr<UploadedLinearOp> CreateNvfp4LinearView(const GemmDescriptor& descriptor) const;
+  bool ReleaseEntry(const std::string& tensor_name);
+  void ReleaseFilePages() const;
 
  private:
   struct DeviceEntryStorage {
@@ -101,6 +104,7 @@ class LoadedModelCache {
 
   LoadedModelCache() = default;
 
+  bool EnsureEntryResident(const ModelCacheEntry* entry) const;
   std::size_t EntryIndex(const ModelCacheEntry* entry) const;
   std::uint8_t* PayloadPtr(const ModelCacheEntry* entry) const;
   std::uint8_t* Aux0Ptr(const ModelCacheEntry* entry) const;
@@ -108,8 +112,11 @@ class LoadedModelCache {
   std::uint8_t* Aux2Ptr(const ModelCacheEntry* entry) const;
 
   ModelCacheHeader header_;
+  std::filesystem::path cache_path_;
+  std::streamoff payload_base_offset_ = 0;
   std::unordered_map<std::string, std::size_t> indices_by_name_;
-  std::vector<DeviceEntryStorage> device_entries_;
+  mutable std::mutex resident_mutex_;
+  mutable std::vector<DeviceEntryStorage> device_entries_;
 };
 
 }  // namespace nemotron

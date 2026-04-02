@@ -1,7 +1,9 @@
 #include "nemotron/model_cache.h"
 
+#include <fcntl.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
@@ -183,17 +185,17 @@ bool ShouldPreloadCacheEntry(const ModelCacheEntry& entry) {
 }
 
 bool ReadSectionToDevice(
-    std::ifstream& input,
+    int fd,
     std::streamoff absolute_offset,
     std::size_t nbytes,
     DeviceBuffer<std::uint8_t>* output) {
-  if (output == nullptr) {
+  if (fd < 0 || output == nullptr) {
     return false;
   }
   if (nbytes == 0) {
     return true;
   }
-  if (!output->Resize(nbytes) || !input.seekg(absolute_offset)) {
+  if (!output->Resize(nbytes)) {
     return false;
   }
   static constexpr std::size_t kChunkBytes = 64u << 20u;
@@ -201,8 +203,12 @@ bool ReadSectionToDevice(
   std::size_t copied = 0;
   while (copied < nbytes) {
     const std::size_t chunk = std::min(nbytes - copied, host_chunk.size());
-    input.read(reinterpret_cast<char*>(host_chunk.data()), static_cast<std::streamsize>(chunk));
-    if (!input ||
+    const ssize_t read_nbytes = pread(
+        fd,
+        host_chunk.data(),
+        chunk,
+        absolute_offset + static_cast<std::streamoff>(copied));
+    if (read_nbytes != static_cast<ssize_t>(chunk) ||
         cudaMemcpy(
             output->data() + copied,
             host_chunk.data(),
@@ -210,6 +216,13 @@ bool ReadSectionToDevice(
             cudaMemcpyHostToDevice) != cudaSuccess) {
       return false;
     }
+#ifdef POSIX_FADV_DONTNEED
+    posix_fadvise(
+        fd,
+        absolute_offset + static_cast<std::streamoff>(copied),
+        static_cast<off_t>(chunk),
+        POSIX_FADV_DONTNEED);
+#endif
     copied += chunk;
   }
   return true;
@@ -893,11 +906,17 @@ std::unique_ptr<LoadedModelCache> LoadedModelCache::Load(const std::filesystem::
   if (!ReadHeader(input, &cache->header_)) {
     return nullptr;
   }
+  cache->cache_path_ = cache_path;
   for (const ModelCacheEntry& entry : cache->header_.entries) {
     cache->indices_by_name_.emplace(entry.tensor_name, cache->indices_by_name_.size());
   }
   cache->device_entries_.resize(cache->header_.entries.size());
   const std::streamoff payload_base_offset = input.tellg();
+  cache->payload_base_offset_ = payload_base_offset;
+  const int fd = open(cache_path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return nullptr;
+  }
   for (std::size_t entry_index = 0; entry_index < cache->header_.entries.size(); ++entry_index) {
     const ModelCacheEntry& entry = cache->header_.entries[entry_index];
     if (!ShouldPreloadCacheEntry(entry)) {
@@ -905,34 +924,55 @@ std::unique_ptr<LoadedModelCache> LoadedModelCache::Load(const std::filesystem::
     }
     auto& device_entry = cache->device_entries_[entry_index];
     if (!ReadSectionToDevice(
-            input,
+            fd,
             payload_base_offset + static_cast<std::streamoff>(entry.payload_offset),
             entry.payload_nbytes,
             &device_entry.payload) ||
         !ReadSectionToDevice(
-            input,
+            fd,
             payload_base_offset + static_cast<std::streamoff>(entry.aux0_offset),
             entry.aux0_nbytes,
             &device_entry.aux0) ||
         !ReadSectionToDevice(
-            input,
+            fd,
             payload_base_offset + static_cast<std::streamoff>(entry.aux1_offset),
             entry.aux1_nbytes,
             &device_entry.aux1) ||
         !ReadSectionToDevice(
-            input,
+            fd,
             payload_base_offset + static_cast<std::streamoff>(entry.aux2_offset),
             entry.aux2_nbytes,
             &device_entry.aux2)) {
+      close(fd);
       return nullptr;
     }
     device_entry.resident = true;
   }
+  close(fd);
   return cache;
 }
 
-LoadedModelCache::LoadedModelCache(LoadedModelCache&&) noexcept = default;
-LoadedModelCache& LoadedModelCache::operator=(LoadedModelCache&&) noexcept = default;
+LoadedModelCache::LoadedModelCache(LoadedModelCache&& other) noexcept
+    : header_(std::move(other.header_)),
+      cache_path_(std::move(other.cache_path_)),
+      payload_base_offset_(other.payload_base_offset_),
+      indices_by_name_(std::move(other.indices_by_name_)),
+      device_entries_(std::move(other.device_entries_)) {
+  other.payload_base_offset_ = 0;
+}
+
+LoadedModelCache& LoadedModelCache::operator=(LoadedModelCache&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  header_ = std::move(other.header_);
+  cache_path_ = std::move(other.cache_path_);
+  payload_base_offset_ = other.payload_base_offset_;
+  indices_by_name_ = std::move(other.indices_by_name_);
+  device_entries_ = std::move(other.device_entries_);
+  other.payload_base_offset_ = 0;
+  return *this;
+}
 LoadedModelCache::~LoadedModelCache() = default;
 
 bool LoadedModelCache::valid() const {
@@ -950,6 +990,61 @@ const ModelCacheEntry* LoadedModelCache::FindEntry(const std::string& tensor_nam
     return nullptr;
   }
   return &header_.entries[it->second];
+}
+
+bool LoadedModelCache::EnsureEntryResident(const ModelCacheEntry* entry) const {
+  const std::size_t index = EntryIndex(entry);
+  if (index >= device_entries_.size()) {
+    return false;
+  }
+  {
+    const std::lock_guard<std::mutex> lock(resident_mutex_);
+    if (device_entries_[index].resident) {
+      return true;
+    }
+  }
+
+  if (cache_path_.empty()) {
+    return false;
+  }
+
+  const int fd = open(cache_path_.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return false;
+  }
+
+  DeviceEntryStorage staged;
+  if (!ReadSectionToDevice(
+          fd,
+          payload_base_offset_ + static_cast<std::streamoff>(entry->payload_offset),
+          entry->payload_nbytes,
+          &staged.payload) ||
+      !ReadSectionToDevice(
+          fd,
+          payload_base_offset_ + static_cast<std::streamoff>(entry->aux0_offset),
+          entry->aux0_nbytes,
+          &staged.aux0) ||
+      !ReadSectionToDevice(
+          fd,
+          payload_base_offset_ + static_cast<std::streamoff>(entry->aux1_offset),
+          entry->aux1_nbytes,
+          &staged.aux1) ||
+      !ReadSectionToDevice(
+          fd,
+          payload_base_offset_ + static_cast<std::streamoff>(entry->aux2_offset),
+          entry->aux2_nbytes,
+          &staged.aux2)) {
+    close(fd);
+    return false;
+  }
+  close(fd);
+  staged.resident = true;
+
+  const std::lock_guard<std::mutex> lock(resident_mutex_);
+  if (!device_entries_[index].resident) {
+    device_entries_[index] = std::move(staged);
+  }
+  return device_entries_[index].resident;
 }
 
 std::size_t LoadedModelCache::EntryIndex(const ModelCacheEntry* entry) const {
@@ -991,7 +1086,9 @@ std::uint8_t* LoadedModelCache::Aux2Ptr(const ModelCacheEntry* entry) const {
 std::unique_ptr<DeviceTensorFp32> LoadedModelCache::CreateTensorView(
     const std::string& tensor_name) const {
   const ModelCacheEntry* entry = FindEntry(tensor_name);
-  if (entry == nullptr || entry->kind != ModelCacheEntryKind::kTensorFp32) {
+  if (entry == nullptr ||
+      entry->kind != ModelCacheEntryKind::kTensorFp32 ||
+      !EnsureEntryResident(entry)) {
     return nullptr;
   }
   const std::size_t numel = entry->payload_nbytes / sizeof(float);
@@ -1006,7 +1103,10 @@ std::unique_ptr<DeviceTensorFp32> LoadedModelCache::CreateTensorView(
 std::unique_ptr<DeviceEmbeddingTableFp32> LoadedModelCache::CreateEmbeddingView(
     const std::string& tensor_name) const {
   const ModelCacheEntry* entry = FindEntry(tensor_name);
-  if (entry == nullptr || entry->kind != ModelCacheEntryKind::kEmbeddingFp32 || entry->shape.size() != 2) {
+  if (entry == nullptr ||
+      entry->kind != ModelCacheEntryKind::kEmbeddingFp32 ||
+      entry->shape.size() != 2 ||
+      !EnsureEntryResident(entry)) {
     return nullptr;
   }
   return DeviceEmbeddingTableFp32::CreateView(
@@ -1018,7 +1118,9 @@ std::unique_ptr<DeviceEmbeddingTableFp32> LoadedModelCache::CreateEmbeddingView(
 std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateDenseLinearView(
     const GemmDescriptor& descriptor) const {
   const ModelCacheEntry* entry = FindEntry(descriptor.tensor_name);
-  if (entry == nullptr || entry->kind != ModelCacheEntryKind::kDenseWeightFp32) {
+  if (entry == nullptr ||
+      entry->kind != ModelCacheEntryKind::kDenseWeightFp32 ||
+      !EnsureEntryResident(entry)) {
     return nullptr;
   }
   auto weight = DeviceDenseWeightFp32::CreateView(
@@ -1043,7 +1145,9 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
     std::size_t output_rows,
     std::size_t input_cols) const {
   const ModelCacheEntry* entry = FindEntry(tensor_name);
-  if (entry == nullptr || entry->kind != ModelCacheEntryKind::kScaledFp8WeightFp32) {
+  if (entry == nullptr ||
+      entry->kind != ModelCacheEntryKind::kScaledFp8WeightFp32 ||
+      !EnsureEntryResident(entry)) {
     return nullptr;
   }
   auto weight = DeviceDenseWeightFp32::CreateView(
@@ -1065,7 +1169,9 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
 std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(
     const GemmDescriptor& descriptor) const {
   const ModelCacheEntry* entry = FindEntry(descriptor.tensor_name);
-  if (entry == nullptr || entry->kind != ModelCacheEntryKind::kNvfp4Aligned) {
+  if (entry == nullptr ||
+      entry->kind != ModelCacheEntryKind::kNvfp4Aligned ||
+      !EnsureEntryResident(entry)) {
     return nullptr;
   }
   auto weight = DeviceNvfp4Weight::CreateView(
@@ -1090,6 +1196,35 @@ std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(
   cached_descriptor.tensor_scale_data = Aux2Ptr(entry);
   cached_descriptor.tensor_scale_nbytes = entry->aux2_nbytes;
   return UploadedLinearOp::CreateNvfp4View(cached_descriptor, std::move(weight));
+}
+
+bool LoadedModelCache::ReleaseEntry(const std::string& tensor_name) {
+  const auto it = indices_by_name_.find(tensor_name);
+  if (it == indices_by_name_.end()) {
+    return false;
+  }
+  const std::lock_guard<std::mutex> lock(resident_mutex_);
+  auto& device_entry = device_entries_[it->second];
+  device_entry.payload = DeviceBuffer<std::uint8_t>{};
+  device_entry.aux0 = DeviceBuffer<std::uint8_t>{};
+  device_entry.aux1 = DeviceBuffer<std::uint8_t>{};
+  device_entry.aux2 = DeviceBuffer<std::uint8_t>{};
+  device_entry.resident = false;
+  return true;
+}
+
+void LoadedModelCache::ReleaseFilePages() const {
+  if (cache_path_.empty()) {
+    return;
+  }
+  const int fd = open(cache_path_.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return;
+  }
+#ifdef POSIX_FADV_DONTNEED
+  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+  close(fd);
 }
 
 }  // namespace nemotron

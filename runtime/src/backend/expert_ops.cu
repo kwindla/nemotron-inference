@@ -693,6 +693,7 @@ __global__ void ComputeWeightedMergeScalesKernel(
       activation_tensor_scales[index] * weight_tensor_scales[index];
 }
 
+template <bool kDirectStridedWeights>
 __global__ void FusedRoutedUpProjPackedNvfp4SingleTokenKernel(
     const std::uint8_t* activation_packed,
     const std::uint8_t* activation_block_scales,
@@ -701,6 +702,11 @@ __global__ void FusedRoutedUpProjPackedNvfp4SingleTokenKernel(
     const void* const* weight_packed_ptrs,
     const void* const* weight_block_scale_ptrs,
     const float* weight_tensor_scales,
+    const std::uint8_t* contiguous_weight_packed_base,
+    std::size_t weight_packed_stride_bytes,
+    const std::uint8_t* contiguous_weight_scale_base,
+    std::size_t weight_scale_stride_bytes,
+    const std::int32_t* selected_expert_indices,
     std::size_t output_rows,
     float* output_rows_data) {
   const std::size_t output_row = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
@@ -711,12 +717,26 @@ __global__ void FusedRoutedUpProjPackedNvfp4SingleTokenKernel(
 
   extern __shared__ float shared_activation[];
   const std::size_t blocks_per_row = input_cols / kNvfp4BlockWidth;
-  const auto* weight_packed =
-      reinterpret_cast<const std::uint8_t*>(weight_packed_ptrs[expert_row]);
-  const auto* weight_block_scales =
-      reinterpret_cast<const std::uint8_t*>(weight_block_scale_ptrs[expert_row]);
   const float act_tensor_scale = *activation_tensor_scale;
-  const float weight_tensor_scale = weight_tensor_scales[expert_row];
+  const std::uint8_t* weight_packed = nullptr;
+  const std::uint8_t* weight_block_scales = nullptr;
+  float weight_tensor_scale = 0.0f;
+  if constexpr (kDirectStridedWeights) {
+    const std::int32_t expert_id = selected_expert_indices[expert_row];
+    if (expert_id < 0) {
+      output_rows_data[expert_row * output_rows + output_row] = 0.0f;
+      return;
+    }
+    const std::size_t expert_offset = static_cast<std::size_t>(expert_id);
+    weight_packed = contiguous_weight_packed_base + (expert_offset * weight_packed_stride_bytes);
+    weight_block_scales = contiguous_weight_scale_base + (expert_offset * weight_scale_stride_bytes);
+    weight_tensor_scale = weight_tensor_scales[expert_offset];
+  } else {
+    weight_packed = reinterpret_cast<const std::uint8_t*>(weight_packed_ptrs[expert_row]);
+    weight_block_scales =
+        reinterpret_cast<const std::uint8_t*>(weight_block_scale_ptrs[expert_row]);
+    weight_tensor_scale = weight_tensor_scales[expert_row];
+  }
   const std::size_t packed_row_stride = input_cols / 2u;
   const std::size_t scale_row_stride = blocks_per_row;
   float accum = 0.0f;
@@ -750,6 +770,7 @@ __global__ void FusedRoutedUpProjPackedNvfp4SingleTokenKernel(
   output_rows_data[expert_row * output_rows + output_row] = accum;
 }
 
+template <bool kDirectStridedWeights>
 __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     const std::uint8_t* activation_rows_packed,
     const std::uint8_t* activation_rows_block_scales,
@@ -761,6 +782,11 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
     const void* const* weight_packed_ptrs,
     const void* const* weight_block_scale_ptrs,
     const float* weight_tensor_scales,
+    const std::uint8_t* contiguous_weight_packed_base,
+    std::size_t weight_packed_stride_bytes,
+    const std::uint8_t* contiguous_weight_scale_base,
+    std::size_t weight_scale_stride_bytes,
+    const std::int32_t* selected_expert_indices,
     std::size_t output_rows,
     float* output_row_data) {
   const std::size_t output_row = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
@@ -779,12 +805,25 @@ __global__ void FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel(
   float accum = 0.0f;
 
   for (std::size_t expert_row = 0; expert_row < selection_count; ++expert_row) {
-    const auto* weight_packed =
-        reinterpret_cast<const std::uint8_t*>(weight_packed_ptrs[expert_row]);
-    const auto* weight_block_scales =
-        reinterpret_cast<const std::uint8_t*>(weight_block_scale_ptrs[expert_row]);
+    const std::uint8_t* weight_packed = nullptr;
+    const std::uint8_t* weight_block_scales = nullptr;
     const float act_tensor_scale = activation_row_tensor_scales[expert_row];
-    const float weight_tensor_scale = weight_tensor_scales[expert_row];
+    float weight_tensor_scale = 0.0f;
+    if constexpr (kDirectStridedWeights) {
+      const std::int32_t expert_id = selected_expert_indices[expert_row];
+      if (expert_id < 0) {
+        continue;
+      }
+      const std::size_t expert_offset = static_cast<std::size_t>(expert_id);
+      weight_packed = contiguous_weight_packed_base + (expert_offset * weight_packed_stride_bytes);
+      weight_block_scales = contiguous_weight_scale_base + (expert_offset * weight_scale_stride_bytes);
+      weight_tensor_scale = weight_tensor_scales[expert_offset];
+    } else {
+      weight_packed = reinterpret_cast<const std::uint8_t*>(weight_packed_ptrs[expert_row]);
+      weight_block_scales =
+          reinterpret_cast<const std::uint8_t*>(weight_block_scale_ptrs[expert_row]);
+      weight_tensor_scale = weight_tensor_scales[expert_row];
+    }
     const float expert_weight = selection_weights[expert_row];
 
     for (std::size_t block = 0; block < blocks_per_row; ++block) {
@@ -1451,7 +1490,7 @@ bool FusedRoutedUpProjPackedNvfp4SingleToken(
       static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x),
       static_cast<unsigned int>(weight_packed_ptrs.count()));
   const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
-  FusedRoutedUpProjPackedNvfp4SingleTokenKernel<<<grid, block, shared_bytes, stream>>>(
+  FusedRoutedUpProjPackedNvfp4SingleTokenKernel<false><<<grid, block, shared_bytes, stream>>>(
       activation_packed,
       activation_block_scales,
       activation_tensor_scale,
@@ -1459,6 +1498,65 @@ bool FusedRoutedUpProjPackedNvfp4SingleToken(
       weight_packed_ptrs.data(),
       weight_block_scale_ptrs.data(),
       weight_tensor_scales.data(),
+      nullptr,
+      0,
+      nullptr,
+      0,
+      nullptr,
+      output_row_count,
+      output_rows->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool FusedRoutedUpProjPackedNvfp4SingleToken(
+    const std::uint8_t* activation_packed,
+    const std::uint8_t* activation_block_scales,
+    const float* activation_tensor_scale,
+    std::size_t input_cols,
+    const std::uint8_t* contiguous_weight_packed_base,
+    std::size_t weight_packed_stride_bytes,
+    const std::uint8_t* contiguous_weight_scale_base,
+    std::size_t weight_scale_stride_bytes,
+    const float* contiguous_tensor_scales,
+    const std::int32_t* selected_expert_indices,
+    DeviceTensorFp32* output_rows,
+    cudaStream_t stream) {
+  if (activation_packed == nullptr ||
+      activation_block_scales == nullptr ||
+      activation_tensor_scale == nullptr ||
+      input_cols == 0 ||
+      input_cols % kNvfp4BlockWidth != 0 ||
+      contiguous_weight_packed_base == nullptr ||
+      weight_packed_stride_bytes == 0 ||
+      contiguous_weight_scale_base == nullptr ||
+      weight_scale_stride_bytes == 0 ||
+      contiguous_tensor_scales == nullptr ||
+      selected_expert_indices == nullptr ||
+      output_rows == nullptr ||
+      !output_rows->valid() ||
+      output_rows->shape().size() != 2 ||
+      output_rows->shape()[0] == 0) {
+    return false;
+  }
+  const std::size_t output_row_count = output_rows->shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(
+      static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x),
+      static_cast<unsigned int>(output_rows->shape()[0]));
+  const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
+  FusedRoutedUpProjPackedNvfp4SingleTokenKernel<true><<<grid, block, shared_bytes, stream>>>(
+      activation_packed,
+      activation_block_scales,
+      activation_tensor_scale,
+      input_cols,
+      nullptr,
+      nullptr,
+      contiguous_tensor_scales,
+      contiguous_weight_packed_base,
+      weight_packed_stride_bytes,
+      contiguous_weight_scale_base,
+      weight_scale_stride_bytes,
+      selected_expert_indices,
       output_row_count,
       output_rows->data());
   return CheckCuda(cudaGetLastError());
@@ -1503,7 +1601,7 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
   const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
-  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<<<grid, block, shared_bytes, stream>>>(
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<false><<<grid, block, shared_bytes, stream>>>(
       activation_rows_packed,
       activation_rows_block_scales,
       activation_row_tensor_scales.data(),
@@ -1514,6 +1612,74 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
       weight_packed_ptrs.data(),
       weight_block_scale_ptrs.data(),
       weight_tensor_scales.data(),
+      nullptr,
+      0,
+      nullptr,
+      0,
+      nullptr,
+      output_row_count,
+      output_row->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+    const std::uint8_t* activation_rows_packed,
+    const std::uint8_t* activation_rows_block_scales,
+    const DeviceBuffer<float>& activation_row_tensor_scales,
+    const float* selection_weights_device,
+    std::size_t input_cols,
+    const std::uint8_t* contiguous_weight_packed_base,
+    std::size_t weight_packed_stride_bytes,
+    const std::uint8_t* contiguous_weight_scale_base,
+    std::size_t weight_scale_stride_bytes,
+    const float* contiguous_tensor_scales,
+    const std::int32_t* selected_expert_indices,
+    DeviceTensorFp32* output_row,
+    std::size_t activation_rows_packed_row_stride_bytes,
+    cudaStream_t stream) {
+  if (activation_rows_packed == nullptr ||
+      activation_rows_block_scales == nullptr ||
+      selection_weights_device == nullptr ||
+      input_cols == 0 ||
+      input_cols % kNvfp4BlockWidth != 0 ||
+      !activation_row_tensor_scales.valid() ||
+      activation_row_tensor_scales.count() == 0 ||
+      contiguous_weight_packed_base == nullptr ||
+      weight_packed_stride_bytes == 0 ||
+      contiguous_weight_scale_base == nullptr ||
+      weight_scale_stride_bytes == 0 ||
+      contiguous_tensor_scales == nullptr ||
+      selected_expert_indices == nullptr ||
+      output_row == nullptr ||
+      !output_row->valid() ||
+      !HasSingleRowShape(*output_row)) {
+    return false;
+  }
+  const std::size_t tight_packed_row_stride_bytes = input_cols / 2u;
+  if (activation_rows_packed_row_stride_bytes != 0 &&
+      activation_rows_packed_row_stride_bytes < tight_packed_row_stride_bytes) {
+    return false;
+  }
+  const std::size_t output_row_count = output_row->shape()[1];
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((output_row_count + block.x - 1u) / block.x));
+  const std::size_t shared_bytes = kNvfp4BlockWidth * sizeof(float);
+  FusedRoutedDownProjWeightedPackedNvfp4SingleTokenKernel<true><<<grid, block, shared_bytes, stream>>>(
+      activation_rows_packed,
+      activation_rows_block_scales,
+      activation_row_tensor_scales.data(),
+      selection_weights_device,
+      activation_row_tensor_scales.count(),
+      input_cols,
+      activation_rows_packed_row_stride_bytes,
+      nullptr,
+      nullptr,
+      contiguous_tensor_scales,
+      contiguous_weight_packed_base,
+      weight_packed_stride_bytes,
+      contiguous_weight_scale_base,
+      weight_scale_stride_bytes,
+      selected_expert_indices,
       output_row_count,
       output_row->data());
   return CheckCuda(cudaGetLastError());
