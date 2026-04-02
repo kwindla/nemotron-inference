@@ -677,6 +677,21 @@ target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_17)
 nemotron_add_test(full_forward_manifest_smoke_test)
 
 add_executable(
+  nano_loader_budget_test
+  api/nano_loader_budget_test.cpp
+)
+
+target_link_libraries(nano_loader_budget_test PRIVATE nemotron_runtime_api)
+target_compile_features(nano_loader_budget_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  nano_loader_budget_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+nemotron_add_test(nano_loader_budget_test)
+
+add_executable(
   nano_16_token_correctness_test
   api/nano_16_token_correctness_test.cpp
 )

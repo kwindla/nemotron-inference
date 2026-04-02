@@ -14,10 +14,27 @@ DEFAULT_SOURCE_REVISION = "b1ffe4992d7db6d768453a551a656b8d12c638fb"
 DEFAULT_TOKENIZER_REVISION = DEFAULT_SOURCE_REVISION
 CHECKSUM_PLACEHOLDER = "fnv1a64:0000000000000000"
 
-RUNTIME_PROFILE = {
-    "kv_bytes_per_token": 4096,
-    "mamba_state_bytes_fp16": 87162880,
-    "mamba_state_bytes_fp32": 174325760,
+MODEL_RUNTIME_CONFIGS = {
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
+        "attention_kv_head_count": 2,
+        "attention_head_dim": 128,
+        "mamba_intermediate_size": 8192,
+        "mamba_num_heads": 128,
+        "mamba_head_dim": 64,
+        "mamba_state_size": 128,
+        "mamba_n_groups": 8,
+        "mamba_conv_kernel_size": 4,
+    },
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {
+        "attention_kv_head_count": 2,
+        "attention_head_dim": 128,
+        "mamba_intermediate_size": 64 * 64,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "mamba_state_size": 128,
+        "mamba_n_groups": 8,
+        "mamba_conv_kernel_size": 4,
+    },
 }
 
 GLOBAL_TENSORS = {
@@ -216,6 +233,17 @@ def layer_suffix(name: str) -> str:
     if not dot or not layer_index.isdigit():
         return ""
     return suffix
+
+
+def layer_index(name: str) -> int | None:
+    if not is_layer_tensor(name):
+        return None
+    prefix = "backbone.layers."
+    rest = name[len(prefix) :]
+    layer_index_text, dot, _ = rest.partition(".")
+    if not dot or not layer_index_text.isdigit():
+        return None
+    return int(layer_index_text)
 
 
 def is_routed_expert_nvfp4_weight(suffix: str) -> bool:
@@ -420,6 +448,52 @@ def build_nvfp4_entry(
     }
 
 
+def count_runtime_layers(tensors: list[dict[str, Any]]) -> dict[str, int]:
+    attention_layers: set[int] = set()
+    mamba_layers: set[int] = set()
+    for tensor in tensors:
+        index = layer_index(tensor["name"])
+        if index is None:
+            continue
+        if tensor["op_class"] == "attention":
+            attention_layers.add(index)
+        if tensor["op_class"] in {"mamba_linear", "mamba_param"}:
+            mamba_layers.add(index)
+    return {
+        "attention": len(attention_layers),
+        "mamba": len(mamba_layers),
+    }
+
+
+def build_runtime_profile(model_id: str, tensors: list[dict[str, Any]]) -> dict[str, int]:
+    config = MODEL_RUNTIME_CONFIGS.get(model_id)
+    if config is None:
+        raise ValueError(f"unsupported model_id for runtime-profile derivation: {model_id!r}")
+
+    layer_counts = count_runtime_layers(tensors)
+    kv_bytes_per_attention_layer = (
+        2 * config["attention_kv_head_count"] * config["attention_head_dim"] * 2
+    )
+    conv_dim = (
+        config["mamba_intermediate_size"]
+        + (2 * config["mamba_n_groups"] * config["mamba_state_size"])
+    )
+    conv_state_elems_per_layer = conv_dim * config["mamba_conv_kernel_size"]
+    ssm_state_elems_per_layer = (
+        config["mamba_num_heads"]
+        * config["mamba_head_dim"]
+        * config["mamba_state_size"]
+    )
+    mamba_state_elems_per_layer = (
+        conv_state_elems_per_layer + ssm_state_elems_per_layer
+    )
+    return {
+        "kv_bytes_per_token": layer_counts["attention"] * kv_bytes_per_attention_layer,
+        "mamba_state_bytes_fp16": layer_counts["mamba"] * mamba_state_elems_per_layer * 2,
+        "mamba_state_bytes_fp32": layer_counts["mamba"] * mamba_state_elems_per_layer * 4,
+    }
+
+
 def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     model_dir = Path(args.model_dir).resolve()
     weight_map, shard_headers = load_checkpoint_index(model_dir)
@@ -467,6 +541,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                     model_dir, weight_map, shard_headers, tensor_name, args.compute_checksums
                 )
             )
+    runtime_profile = build_runtime_profile(args.model_id, tensors)
 
     return {
         "schema_version": 1,
@@ -478,7 +553,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "gpu_family": args.gpu_family,
             "compute_capability": args.compute_capability,
         },
-        "runtime_profile": dict(RUNTIME_PROFILE),
+        "runtime_profile": runtime_profile,
         "tensors": tensors,
     }
 
@@ -497,6 +572,7 @@ def main() -> int:
                 "tensor_count": len(manifest["tensors"]),
                 "compute_checksums": args.compute_checksums,
                 "source_revision": manifest["source_revision"],
+                "runtime_profile": manifest["runtime_profile"],
             },
             indent=2,
         )
