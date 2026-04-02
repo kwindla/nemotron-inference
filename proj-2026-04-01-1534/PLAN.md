@@ -8,15 +8,17 @@ Get correct steady-state single-token decode as close as practical to roofline o
 
 Working target: `~20 ms/token`.
 
-Current measured state (2026-04-02, post monolithic expert refactor):
+Current measured state (2026-04-02, post cuBLASLt MoE):
 
-- hot steady-state mean: `1805.328 ms/token`
-- steady-state generated tokens/sec: `0.554`
+- hot steady-state mean: `57.190 ms/token`
+- steady-state generated tokens/sec: `17.486`
 - expert staging bytes uploaded per run: `0` (all 23 layers monolithic-resident)
 - linear reference fallbacks: `0` (all cuBLASLt fastpath)
-- artifact: `artifacts/benchmarks/nano_fused_decode_16tok_steady_state_20260402T031714Z_cuda130.json`
+- artifact: `artifacts/benchmarks/nano_fused_decode_16tok_steady_state_20260402T043508Z_cuda130.json`
+- profile: `artifacts/profiles/decode_cublaslt_moe_20260402.nsys-rep`
 
-Original baseline: `22859 ms/token` → current `1805 ms/token` = **12.7x speedup so far**.
+Original baseline: `22859 ms/token` → current `57 ms/token` = **400x speedup so far**.
+Remaining gap to 20ms target: **2.85x**.
 
 This plan is only about steady-state decode throughput, but no throughput checkpoint counts unless the affected path is still correct.
 
@@ -149,34 +151,68 @@ Translate from these upstream designs, not from generic intuition:
   - post-cleanup artifact and profile saved
   - next target chosen from evidence
 
-- [ ] **8. Production decode attention (if step 7 says so)**
+- [ ] **8a. Remove explicit cudaDeviceSynchronize from hot-path ops**
   Goal:
-  - replace the scalar attention fallback with a production decode kernel
-  Precondition:
-  - only execute if step 7 confirms attention is a significant remaining cost
-  Reference design to translate:
-  - `vllm/vllm/v1/attention/ops/chunked_prefill_paged_decode.py`
-  - `TensorRT-LLM/cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h`
-  Local constraints:
-  - `tokens_per_page == 16`, `head_dim == 128`, GQA ratio `32 / 2 = 16`
-  Implementation:
-  - explicit decode-vs-prefill dispatcher
-  - production decode: paged KV, online softmax, cooperative warp reduction
-  - keep scalar fallback behind env gate
-  - preserve device-vs-host compare hook
-  Accept when:
-  - decode attention materially faster, correctness preserved
-  Key files: `runtime/src/backend/attention_device_fallback.cu`, `runtime/include/nemotron/attention_device_fallback.h`, `runtime/src/backend/attention_layer.cpp`
+  - remove unconditional `cudaDeviceSynchronize()` from all hot-path operators
+  - partial win expected — cudaFree implicit barriers limit the benefit until alloc reuse lands in 8b
+  Scope:
+  - sync removal + cudaGetDeviceCount removal + dead expert alloc move
+  Sites to fix:
+  - `primitive_ops.cu:111,143` — RmsNorm, ResidualAdd
+  - `dense_gemm_runner.cpp:325` — dense GEMM
+  - `nvfp4_gemm_runner.cpp:397` — NVFP4 GEMM
+  - `device_nvfp4_matrix.cu:424,432,449,470` — NVFP4 activation pack
+  - `embedding_table.cu:183,190,218` — embedding lookup
+  - `device_argmax.cu:90` — argmax
+  - `scaled_fp8_linear.cu:213,296` — FP8 path
+  - `device_tensor.cpp:50,125` — remove per-alloc `cudaGetDeviceCount()`
+  - `expert_layer.cpp:1690+` — move dead tensor allocs after fused early return
+  Safety: all ops on default stream; stream ordering sufficient; keep sync before D2H copies.
+  Key files: `primitive_ops.cu`, `dense_gemm_runner.cpp`, `nvfp4_gemm_runner.cpp`, `device_nvfp4_matrix.cu`, `embedding_table.cu`, `device_argmax.cu`, `scaled_fp8_linear.cu`, `device_tensor.cpp`, `expert_layer.cpp`
 
-- [ ] **9. Repeat the measure → choose → translate loop**
+- [ ] **8b. Replace per-token temp allocations with decode scratch buffers**
   Goal:
-  - continue evidence-driven optimization until 20ms target or architectural limit
-  Implementation:
-  - save artifact + profile after each checkpoint
-  - compare with `compare_artifacts.py`
-  - choose one next bottleneck from evidence
+  - eliminate per-token cudaMalloc/cudaFree that cause implicit sync barriers
+  - this is where the bulk of the host overhead improvement comes from
+  Key insight from review:
+  - `RunTokens()` allocates fresh `[token_count, hidden_size]` tensors every call despite request context owning persistent `hidden`, `residual`, `scratch` buffers
+  - for `token_count==1` decode, all shapes are deterministic from layer config
+  Approach:
+  - add a decode scratch pool to `RequestExecutionContext` with pre-allocated buffers for all per-token temporaries
+  - shapes needed (Nano): attention q/output `[1,4096]`, k/v `[1,256]`, BF16 `[1,32,1,128]`; Mamba projected `[1,10304]`, scan_output `[1,4096]`; MoE router `[1,128]`, routed-up `[1,1856]`, shared-up `[1,3712]`; plus NVFP4 activation pack buffers
+  - `RunTokens()` should use request-context buffers instead of allocating fresh ones
+  - layer slice `Run()` methods take scratch pointers instead of allocating internally
+  Key files: `request_context.cpp`, `single_token_forward_model.cpp`, `mamba_layer.cpp`, `expert_layer.cpp`, `attention_layer.cpp`, `device_nvfp4_matrix.cu`
+
+- [ ] **8c. Pre-allocate attention activation buffers**
+  Goal:
+  - eliminate per-call FP32/BF16 attention activation allocations
+  Sites: `attention_layer.cpp:557-563` (FP32 q/k/v/output), `attention_layer.cpp:664-667` (BF16 buffers)
+  Approach: move to AttentionLayerSlice::Impl, sized for max token count
+  Key files: `attention_layer.cpp`
+
+- [ ] **9. Re-profile after sync/alloc cleanup**
+  Goal:
+  - measure the improvement from step 8 and identify the new bottleneck
+  Expected: kernel compute floor ~33ms/token (Mamba ~22ms, attention ~3ms, GEMMs ~4ms, other ~4ms)
+  Host overhead should be near-zero after 8a+8b+8c
+
+- [ ] **10. Optimize Mamba decode kernel**
+  Goal:
+  - the FusedMambaDecodeKernel at 0.94ms × 23 layers = ~22ms/token is the hard blocker for 20ms
+  - this is a single-CTA kernel (grid=1) like the old MoE kernel was
+  Approach (TBD based on step 9 profile):
+  - option A: replace conv/SSM/gating with cuBLASLt for the linear portions (Mamba projections already use cuBLASLt; the kernel handles conv update + SSM update + gated RMSNorm)
+  - option B: multi-CTA kernel that parallelizes across Mamba heads
+  - option C: this may be near-roofline for the recurrent state update — need to check arithmetic intensity
   Accept when:
-  - artifacts saved, next bottleneck chosen from evidence
+  - per-layer Mamba time drops materially
+  - correctness preserved
+
+- [ ] **11. Evidence-driven loop to 20ms target**
+  Goal:
+  - continue measure → choose → translate until 20ms or architectural limit
+  - each iteration: save artifact + profile, compare, choose one bottleneck, implement, verify
 
 ## Progress
 
@@ -189,8 +225,12 @@ Translate from these upstream designs, not from generic intuition:
 | 5 | Profile next bottleneck | done | — | FusedMoeDirectDecode = 98.4% of GPU time (77ms/call × 23 layers = 1771ms/token) |
 | 6 | Replace MoE scalar matmuls with cuBLASLt | done | — | 57.2 ms/token (was 1805ms); 400x total speedup from baseline; smoke PASS |
 | 7 | Re-measure and decide | done | — | Mamba=66% GPU, sync/alloc=42% wall; both need fixing for 20ms |
-| 8 | Production decode attention | pending | — | contingent on step 7 evidence |
-| 9 | Evidence-driven loop | pending | — | |
+| 8a | Remove explicit syncs + dead allocs | pending | — | partial win; cudaFree still barriers |
+| 8b | Decode scratch buffer reuse | pending | — | bulk of host overhead improvement |
+| 8c | Attention activation pre-alloc | pending | — | attention-specific alloc cleanup |
+| 9 | Re-profile after cleanup | pending | — | kernel floor ~33ms; host should be near-zero |
+| 10 | Optimize Mamba decode kernel | pending | — | 0.94ms × 23 = 22ms/token; hard blocker for 20ms |
+| 11 | Evidence-driven loop to 20ms | pending | — | |
 
 ## Progress Log
 
