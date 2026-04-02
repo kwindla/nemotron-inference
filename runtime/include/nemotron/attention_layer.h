@@ -58,6 +58,8 @@ class AttentionLayerSlice {
       const CudnnHandle& cudnn_handle,
       GemmHeuristicCache* heuristic_cache,
       RequestExecutionContext& request_context,
+      std::size_t sequence_start,
+      std::size_t total_sequence_length,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output) const;
 

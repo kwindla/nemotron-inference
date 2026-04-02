@@ -165,7 +165,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - `benchmarks/nano_fused_decode/compare_artifacts.py`
   - `docs/blackwell_inference_progress.md`
 
-- [ ] **3. Remove unconditional hot-path synchronization and transient attention metadata churn**
+- [x] **3. Remove unconditional hot-path synchronization and transient attention metadata churn**
   Goal:
   - eliminate obvious host-side overhead that is already visible in the current code without changing attention math
   Scope:
@@ -325,7 +325,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 |---|------|--------|--------|-------|
 | 1 | Linear fastpath correctness + layout translation | done | b31feb4 | smoke PASS with NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1; 128x4 activation layout; 8x4 deferred |
 | 2 | Re-baseline with counters and Nsight | done | — | expert staging = 92% of runtime; 588GB uploaded per run; expert residency is #1 priority |
-| 3 | Attention metadata/workspace ownership + sync cleanup | pending | — | no new attention math in this step |
+| 3 | Attention metadata/workspace ownership + sync cleanup | done | — | persistent buffers, removed 6 cudaDeviceSynchronize calls; smoke PASS |
 | 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
 | 5 | Production decode attention translation | pending | — | explicit decode-vs-prefill dispatcher required |
 | 6 | Repeat evidence-driven roofline loop | pending | — | save artifacts and justify each next move |
