@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -55,6 +56,22 @@ std::size_t NumelFromShape(const std::vector<std::size_t>& shape) {
     total *= dim;
   }
   return total;
+}
+
+bool OptimizedMambaDecodeKernelsEnabled() {
+  static const bool kEnabled = std::getenv("NEMOTRON_DISABLE_MAMBA_SSM_KERNELS") == nullptr;
+  return kEnabled;
+}
+
+bool CanUseOptimizedMambaDecode(const MambaLayerConfig& config, std::size_t token_count) {
+  return token_count == 1 &&
+         OptimizedMambaDecodeKernelsEnabled() &&
+         config.n_groups != 0 &&
+         config.num_heads != 0 &&
+         config.num_heads % config.n_groups == 0 &&
+         config.intermediate_size == (config.num_heads * config.head_dim) &&
+         config.conv_kernel_size >= 2 &&
+         config.conv_kernel_size <= 5;
 }
 
 bool IsFp32Storage(const std::string& storage_dtype) {
@@ -190,6 +207,34 @@ std::unique_ptr<DeviceTensorBf16> CreateBf16ViewFromFp32Storage(
     return nullptr;
   }
   return DeviceTensorBf16::CreateView(shape, reinterpret_cast<__nv_bfloat16*>(storage->data()));
+}
+
+std::unique_ptr<DeviceTensorFp32> CreateFp32SliceView(
+    DeviceTensorFp32* storage,
+    std::size_t offset_elems,
+    std::vector<std::size_t> shape) {
+  if (storage == nullptr || !storage->valid()) {
+    return nullptr;
+  }
+  const std::size_t count = NumelFromShape(shape);
+  if (count == 0 || offset_elems + count > storage->numel()) {
+    return nullptr;
+  }
+  return DeviceTensorFp32::CreateView(std::move(shape), storage->data() + offset_elems);
+}
+
+std::unique_ptr<DeviceTensorBf16> CreateBf16SliceView(
+    DeviceTensorBf16* storage,
+    std::size_t offset_elems,
+    std::vector<std::size_t> shape) {
+  if (storage == nullptr || !storage->valid()) {
+    return nullptr;
+  }
+  const std::size_t count = NumelFromShape(shape);
+  if (count == 0 || offset_elems + count > storage->numel()) {
+    return nullptr;
+  }
+  return DeviceTensorBf16::CreateView(std::move(shape), storage->data() + offset_elems);
 }
 
 bool CopyTensorToHost(const DeviceTensorBf16& tensor, std::vector<float>* output) {
@@ -675,6 +720,8 @@ bool MambaLayerSlice::Run(
   DeviceTensorFp32* projected = nullptr;
   DeviceTensorFp32* scan_output = nullptr;
   DeviceTensorFp32* projected_output = nullptr;
+  std::unique_ptr<DeviceTensorFp32> decode_conv_output_view;
+  std::unique_ptr<DeviceTensorFp32> decode_gated_output_view;
 
   if (token_count == 1 &&
       request_context.mamba_normalized_decode() != nullptr &&
@@ -703,6 +750,17 @@ bool MambaLayerSlice::Run(
       projected_output == nullptr ||
       (token_count != 1 && (!conv_output || !y_output))) {
     return false;
+  }
+
+  const bool use_optimized_decode = CanUseOptimizedMambaDecode(impl_->config, token_count);
+  if (use_optimized_decode) {
+    decode_conv_output_view =
+        CreateFp32SliceView(projected, impl_->config.intermediate_size, {1, conv_dim});
+    decode_gated_output_view =
+        CreateFp32SliceView(projected, 0, {1, impl_->config.intermediate_size});
+    if (!decode_conv_output_view || !decode_gated_output_view) {
+      return false;
+    }
   }
 
   if (trace != nullptr) {
@@ -740,28 +798,63 @@ bool MambaLayerSlice::Run(
   }
 
   if (token_count == 1) {
-    if (!MambaDecodeStepFusedFp32(
-            *projected,
-            impl_->config.intermediate_size,
-            conv_dim,
-            impl_->config.num_heads,
-            impl_->config.head_dim,
-            impl_->config.state_size,
-            impl_->config.n_groups,
-            impl_->config.conv_kernel_size,
-            impl_->config.time_step_min,
-            impl_->config.mixer_rms_epsilon,
-            impl_->config.conv_state_offset_elems,
-            impl_->config.ssm_state_offset_elems,
-            *impl_->conv1d_weight,
-            *impl_->conv1d_bias,
-            *impl_->A_log,
-            *impl_->D,
-            *impl_->dt_bias,
-            *impl_->mixer_norm_weight,
-            request_context.mamba_conv_state(),
-            request_context.mamba_state(),
-            scan_output)) {
+    if (use_optimized_decode) {
+      if (!MambaCausalConv1dUpdateDecodeFp32(
+              *projected,
+              impl_->config.intermediate_size,
+              conv_dim,
+              impl_->config.conv_kernel_size,
+              impl_->config.conv_state_offset_elems,
+              *impl_->conv1d_weight,
+              *impl_->conv1d_bias,
+              request_context.mamba_conv_state(),
+              decode_conv_output_view.get()) ||
+          !MambaSelectiveStateUpdateDecodeFp32(
+              *projected,
+              *decode_conv_output_view,
+              impl_->config.intermediate_size,
+              conv_dim,
+              impl_->config.num_heads,
+              impl_->config.head_dim,
+              impl_->config.state_size,
+              impl_->config.n_groups,
+              impl_->config.time_step_min,
+              impl_->config.ssm_state_offset_elems,
+              *impl_->A_log,
+              *impl_->D,
+              *impl_->dt_bias,
+              request_context.mamba_state(),
+              decode_gated_output_view.get()) ||
+          !GroupedRmsNormFp32(
+              *decode_gated_output_view,
+              *impl_->mixer_norm_weight,
+              impl_->config.n_groups,
+              impl_->config.mixer_rms_epsilon,
+              scan_output)) {
+        return false;
+      }
+    } else if (!MambaDecodeStepFusedFp32(
+                   *projected,
+                   impl_->config.intermediate_size,
+                   conv_dim,
+                   impl_->config.num_heads,
+                   impl_->config.head_dim,
+                   impl_->config.state_size,
+                   impl_->config.n_groups,
+                   impl_->config.conv_kernel_size,
+                   impl_->config.time_step_min,
+                   impl_->config.mixer_rms_epsilon,
+                   impl_->config.conv_state_offset_elems,
+                   impl_->config.ssm_state_offset_elems,
+                   *impl_->conv1d_weight,
+                   *impl_->conv1d_bias,
+                   *impl_->A_log,
+                   *impl_->D,
+                   *impl_->dt_bias,
+                   *impl_->mixer_norm_weight,
+                   request_context.mamba_conv_state(),
+                   request_context.mamba_state(),
+                   scan_output)) {
       return false;
     }
   } else {
@@ -881,6 +974,8 @@ bool MambaLayerSlice::Run(
   DeviceTensorBf16* projected = nullptr;
   DeviceTensorBf16* scan_output = nullptr;
   DeviceTensorBf16* projected_output = nullptr;
+  std::unique_ptr<DeviceTensorBf16> decode_conv_output_view;
+  std::unique_ptr<DeviceTensorBf16> decode_gated_output_view;
 
   if (token_count == 1 &&
       request_context.mamba_normalized_decode() != nullptr &&
@@ -929,6 +1024,17 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
+  const bool use_optimized_decode = CanUseOptimizedMambaDecode(impl_->config, token_count);
+  if (use_optimized_decode) {
+    decode_conv_output_view =
+        CreateBf16SliceView(projected, impl_->config.intermediate_size, {1, conv_dim});
+    decode_gated_output_view =
+        CreateBf16SliceView(projected, 0, {1, impl_->config.intermediate_size});
+    if (!decode_conv_output_view || !decode_gated_output_view) {
+      return false;
+    }
+  }
+
   if (trace != nullptr) {
     trace->norm_output.clear();
     trace->in_proj_output.clear();
@@ -958,28 +1064,63 @@ bool MambaLayerSlice::Run(
   }
 
   if (token_count == 1) {
-    if (!MambaDecodeStepFusedBf16(
-            *projected,
-            impl_->config.intermediate_size,
-            conv_dim,
-            impl_->config.num_heads,
-            impl_->config.head_dim,
-            impl_->config.state_size,
-            impl_->config.n_groups,
-            impl_->config.conv_kernel_size,
-            impl_->config.time_step_min,
-            impl_->config.mixer_rms_epsilon,
-            impl_->config.conv_state_offset_elems,
-            impl_->config.ssm_state_offset_elems,
-            *impl_->conv1d_weight,
-            *impl_->conv1d_bias,
-            *impl_->A_log,
-            *impl_->D,
-            *impl_->dt_bias,
-            *impl_->mixer_norm_weight,
-            request_context.mamba_conv_state(),
-            request_context.mamba_state(),
-            scan_output)) {
+    if (use_optimized_decode) {
+      if (!MambaCausalConv1dUpdateDecodeBf16(
+              *projected,
+              impl_->config.intermediate_size,
+              conv_dim,
+              impl_->config.conv_kernel_size,
+              impl_->config.conv_state_offset_elems,
+              *impl_->conv1d_weight,
+              *impl_->conv1d_bias,
+              request_context.mamba_conv_state(),
+              decode_conv_output_view.get()) ||
+          !MambaSelectiveStateUpdateDecodeBf16(
+              *projected,
+              *decode_conv_output_view,
+              impl_->config.intermediate_size,
+              conv_dim,
+              impl_->config.num_heads,
+              impl_->config.head_dim,
+              impl_->config.state_size,
+              impl_->config.n_groups,
+              impl_->config.time_step_min,
+              impl_->config.ssm_state_offset_elems,
+              *impl_->A_log,
+              *impl_->D,
+              *impl_->dt_bias,
+              request_context.mamba_state(),
+              decode_gated_output_view.get()) ||
+          !GroupedRmsNormBf16(
+              *decode_gated_output_view,
+              *impl_->mixer_norm_weight,
+              impl_->config.n_groups,
+              impl_->config.mixer_rms_epsilon,
+              scan_output)) {
+        return false;
+      }
+    } else if (!MambaDecodeStepFusedBf16(
+                   *projected,
+                   impl_->config.intermediate_size,
+                   conv_dim,
+                   impl_->config.num_heads,
+                   impl_->config.head_dim,
+                   impl_->config.state_size,
+                   impl_->config.n_groups,
+                   impl_->config.conv_kernel_size,
+                   impl_->config.time_step_min,
+                   impl_->config.mixer_rms_epsilon,
+                   impl_->config.conv_state_offset_elems,
+                   impl_->config.ssm_state_offset_elems,
+                   *impl_->conv1d_weight,
+                   *impl_->conv1d_bias,
+                   *impl_->A_log,
+                   *impl_->D,
+                   *impl_->dt_bias,
+                   *impl_->mixer_norm_weight,
+                   request_context.mamba_conv_state(),
+                   request_context.mamba_state(),
+                   scan_output)) {
       return false;
     }
   } else {

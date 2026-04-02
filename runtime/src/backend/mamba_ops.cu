@@ -9,6 +9,8 @@ namespace nemotron {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+constexpr int kDecodeConvThreads = 128;
+constexpr int kDecodeSsmThreads = 64;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -54,6 +56,118 @@ __device__ __forceinline__ void StoreMambaValue(
     std::size_t index,
     float value) {
   output[index] = __float2bfloat16(value);
+}
+
+template <int kWidth, typename ProjectedT, typename OutputT>
+__global__ __launch_bounds__(kDecodeConvThreads) void MambaDecodeCausalConv1dUpdateKernel(
+    const ProjectedT* projected,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    const float* conv_weight,
+    const float* conv_bias,
+    float* conv_state,
+    OutputT* conv_output) {
+  const std::size_t channel = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (channel >= conv_dim) {
+    return;
+  }
+
+  const float x_value = LoadMambaValue(projected, intermediate_size + channel);
+  float* state_row = conv_state + channel * kWidth;
+  const float* weight_row = conv_weight + channel * kWidth;
+
+  float state_values[kWidth];
+#pragma unroll
+  for (int tap = 0; tap < kWidth; ++tap) {
+    state_values[tap] = state_row[tap];
+  }
+#pragma unroll
+  for (int tap = 0; tap + 1 < kWidth; ++tap) {
+    state_values[tap] = state_values[tap + 1];
+    state_row[tap] = state_values[tap];
+  }
+  state_values[kWidth - 1] = x_value;
+  state_row[kWidth - 1] = x_value;
+
+  float accum = conv_bias[channel];
+#pragma unroll
+  for (int tap = 0; tap < kWidth; ++tap) {
+    accum += state_values[tap] * weight_row[tap];
+  }
+  StoreMambaValue(conv_output, channel, SiLUDevice(accum));
+}
+
+template <typename ProjectedT, typename ConvOutputT, typename OutputT>
+__global__ __launch_bounds__(kDecodeSsmThreads) void MambaSelectiveStateUpdateDecodeKernel(
+    const ProjectedT* projected,
+    const ConvOutputT* conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    float time_step_min,
+    const float* a_log,
+    const float* d,
+    const float* dt_bias,
+    float* ssm_state,
+    OutputT* gated_output) {
+  const std::size_t head = static_cast<std::size_t>(blockIdx.x);
+  if (head >= num_heads) {
+    return;
+  }
+
+  const std::size_t group_width = num_heads / n_groups;
+  const std::size_t group = head / group_width;
+  const std::size_t b_offset = intermediate_size + group * state_size;
+  const std::size_t c_offset =
+      intermediate_size + (n_groups * state_size) + group * state_size;
+  const std::size_t hidden_begin = head * head_dim;
+
+  extern __shared__ float shared_state[];
+  float* shared_b = shared_state;
+  float* shared_c = shared_state + state_size;
+  __shared__ float shared_dt;
+  __shared__ float shared_decay;
+  __shared__ float shared_d;
+
+  for (std::size_t state = threadIdx.x; state < state_size; state += blockDim.x) {
+    shared_b[state] = LoadMambaValue(conv_output, b_offset + state);
+    shared_c[state] = LoadMambaValue(conv_output, c_offset + state);
+  }
+  if (threadIdx.x == 0) {
+    const float dt_base =
+        LoadMambaValue(projected, intermediate_size + conv_dim + head) + dt_bias[head];
+    shared_dt = fmaxf(SoftplusDevice(dt_base), time_step_min);
+    shared_decay = expf(shared_dt * (-expf(a_log[head])));
+    shared_d = d[head];
+  }
+  __syncthreads();
+
+  const float dt = shared_dt;
+  const float decay = shared_decay;
+  const float d_value = shared_d;
+  for (std::size_t local_hidden = threadIdx.x; local_hidden < head_dim; local_hidden += blockDim.x) {
+    const std::size_t hidden_index = hidden_begin + local_hidden;
+    if (hidden_index >= intermediate_size) {
+      continue;
+    }
+
+    const float hidden_value = LoadMambaValue(conv_output, hidden_index);
+    const float gate_value = SiLUDevice(LoadMambaValue(projected, hidden_index));
+    const float dt_hidden = dt * hidden_value;
+    float* state_row = ssm_state + hidden_index * state_size;
+    float accum = 0.0f;
+#pragma unroll 4
+    for (std::size_t state = 0; state < state_size; ++state) {
+      const float next = state_row[state] * decay + (shared_b[state] * dt_hidden);
+      state_row[state] = next;
+      accum += next * shared_c[state];
+    }
+    const float y_value = accum + (hidden_value * d_value);
+    StoreMambaValue(gated_output, hidden_index, y_value * gate_value);
+  }
 }
 
 template <typename ProjectedT, typename OutputT>
@@ -200,6 +314,144 @@ __global__ void GroupedRmsNormGatedKernel(
   }
 }
 
+template <typename InputT, typename OutputT>
+__global__ void GroupedRmsNormKernel(
+    const InputT* input,
+    const float* mixer_norm_weight,
+    std::size_t rows,
+    std::size_t intermediate_size,
+    std::size_t mixer_group_size,
+    float epsilon,
+    OutputT* output) {
+  const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+  const std::size_t group = static_cast<std::size_t>(blockIdx.y);
+  if (row >= rows) {
+    return;
+  }
+
+  extern __shared__ float shared_sum[];
+  const std::size_t begin = group * mixer_group_size;
+  const std::size_t end = begin + mixer_group_size;
+  const std::size_t row_offset = row * intermediate_size;
+
+  float local_sum = 0.0f;
+  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    const float value = LoadMambaValue(input, row_offset + i);
+    local_sum += value * value;
+  }
+  shared_sum[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv_rms =
+      rsqrtf((shared_sum[0] / static_cast<float>(mixer_group_size)) + epsilon);
+  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    const float value = LoadMambaValue(input, row_offset + i);
+    StoreMambaValue(output, row_offset + i, value * inv_rms * mixer_norm_weight[i]);
+  }
+}
+
+template <typename ProjectedT, typename OutputT>
+bool LaunchMambaDecodeCausalConv1dUpdate(
+    const ProjectedT* projected,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t conv_kernel_size,
+    const float* conv_weight,
+    const float* conv_bias,
+    float* conv_state,
+    OutputT* conv_output) {
+  const int grid_size =
+      static_cast<int>((conv_dim + kDecodeConvThreads - 1u) / kDecodeConvThreads);
+  switch (conv_kernel_size) {
+    case 2:
+      MambaDecodeCausalConv1dUpdateKernel<2><<<grid_size, kDecodeConvThreads>>>(
+          projected,
+          intermediate_size,
+          conv_dim,
+          conv_weight,
+          conv_bias,
+          conv_state,
+          conv_output);
+      break;
+    case 3:
+      MambaDecodeCausalConv1dUpdateKernel<3><<<grid_size, kDecodeConvThreads>>>(
+          projected,
+          intermediate_size,
+          conv_dim,
+          conv_weight,
+          conv_bias,
+          conv_state,
+          conv_output);
+      break;
+    case 4:
+      MambaDecodeCausalConv1dUpdateKernel<4><<<grid_size, kDecodeConvThreads>>>(
+          projected,
+          intermediate_size,
+          conv_dim,
+          conv_weight,
+          conv_bias,
+          conv_state,
+          conv_output);
+      break;
+    case 5:
+      MambaDecodeCausalConv1dUpdateKernel<5><<<grid_size, kDecodeConvThreads>>>(
+          projected,
+          intermediate_size,
+          conv_dim,
+          conv_weight,
+          conv_bias,
+          conv_state,
+          conv_output);
+      break;
+    default:
+      return false;
+  }
+  return CheckCuda(cudaGetLastError());
+}
+
+template <typename ProjectedT, typename ConvOutputT, typename OutputT>
+bool LaunchMambaSelectiveStateUpdateDecode(
+    const ProjectedT* projected,
+    const ConvOutputT* conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    float time_step_min,
+    const float* a_log,
+    const float* d,
+    const float* dt_bias,
+    float* ssm_state,
+    OutputT* gated_output) {
+  MambaSelectiveStateUpdateDecodeKernel<<<static_cast<unsigned int>(num_heads),
+                                          kDecodeSsmThreads,
+                                          (2 * state_size) * sizeof(float)>>>(
+      projected,
+      conv_output,
+      intermediate_size,
+      conv_dim,
+      num_heads,
+      head_dim,
+      state_size,
+      n_groups,
+      time_step_min,
+      a_log,
+      d,
+      dt_bias,
+      ssm_state,
+      gated_output);
+  return CheckCuda(cudaGetLastError());
+}
+
 template <typename ProjectedT, typename OutputT>
 __global__ void MambaDecodeStepFusedKernel(
     const ProjectedT* projected,
@@ -344,6 +596,90 @@ __global__ void MambaDecodeStepFusedKernel(
 }
 
 }  // namespace
+
+bool MambaCausalConv1dUpdateDecodeFp32(
+    const DeviceTensorFp32& projected,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t conv_kernel_size,
+    std::size_t conv_state_offset_elems,
+    const DeviceTensorFp32& conv_weight,
+    const DeviceTensorFp32& conv_bias,
+    DeviceTensorFp32* conv_state,
+    DeviceTensorFp32* conv_output) {
+  if (!projected.valid() ||
+      !conv_weight.valid() ||
+      !conv_bias.valid() ||
+      conv_state == nullptr ||
+      !conv_state->valid() ||
+      conv_output == nullptr ||
+      !conv_output->valid() ||
+      projected.shape().size() != 2 ||
+      projected.shape()[0] != 1 ||
+      conv_output->shape().size() != 2 ||
+      conv_output->shape()[0] != 1 ||
+      conv_output->shape()[1] != conv_dim ||
+      conv_bias.shape().size() != 1 ||
+      conv_weight.shape().size() != 1 ||
+      conv_weight.numel() != conv_dim * conv_kernel_size ||
+      conv_bias.numel() != conv_dim ||
+      conv_kernel_size < 2 ||
+      conv_state_offset_elems + (conv_dim * conv_kernel_size) > conv_state->numel()) {
+    return false;
+  }
+
+  return LaunchMambaDecodeCausalConv1dUpdate(
+      projected.data(),
+      intermediate_size,
+      conv_dim,
+      conv_kernel_size,
+      conv_weight.data(),
+      conv_bias.data(),
+      conv_state->data() + conv_state_offset_elems,
+      conv_output->data());
+}
+
+bool MambaCausalConv1dUpdateDecodeBf16(
+    const DeviceTensorBf16& projected,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t conv_kernel_size,
+    std::size_t conv_state_offset_elems,
+    const DeviceTensorFp32& conv_weight,
+    const DeviceTensorFp32& conv_bias,
+    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_output) {
+  if (!projected.valid() ||
+      !conv_weight.valid() ||
+      !conv_bias.valid() ||
+      conv_state == nullptr ||
+      !conv_state->valid() ||
+      conv_output == nullptr ||
+      !conv_output->valid() ||
+      projected.shape().size() != 2 ||
+      projected.shape()[0] != 1 ||
+      conv_output->shape().size() != 2 ||
+      conv_output->shape()[0] != 1 ||
+      conv_output->shape()[1] != conv_dim ||
+      conv_bias.shape().size() != 1 ||
+      conv_weight.shape().size() != 1 ||
+      conv_weight.numel() != conv_dim * conv_kernel_size ||
+      conv_bias.numel() != conv_dim ||
+      conv_kernel_size < 2 ||
+      conv_state_offset_elems + (conv_dim * conv_kernel_size) > conv_state->numel()) {
+    return false;
+  }
+
+  return LaunchMambaDecodeCausalConv1dUpdate(
+      projected.data(),
+      intermediate_size,
+      conv_dim,
+      conv_kernel_size,
+      conv_weight.data(),
+      conv_bias.data(),
+      conv_state->data() + conv_state_offset_elems,
+      conv_output->data());
+}
 
 bool MambaConv1dSiluUpdateFp32(
     const DeviceTensorFp32& projected,
@@ -561,6 +897,130 @@ bool MambaSsmUpdateBf16(
   return CheckCuda(cudaGetLastError());
 }
 
+bool MambaSelectiveStateUpdateDecodeFp32(
+    const DeviceTensorFp32& projected,
+    const DeviceTensorFp32& conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    float time_step_min,
+    std::size_t ssm_state_offset_elems,
+    const DeviceTensorFp32& a_log,
+    const DeviceTensorFp32& d,
+    const DeviceTensorFp32& dt_bias,
+    DeviceTensorFp32* ssm_state,
+    DeviceTensorFp32* gated_output) {
+  if (!projected.valid() ||
+      !conv_output.valid() ||
+      !a_log.valid() ||
+      !d.valid() ||
+      !dt_bias.valid() ||
+      ssm_state == nullptr ||
+      !ssm_state->valid() ||
+      gated_output == nullptr ||
+      !gated_output->valid() ||
+      projected.shape().size() != 2 ||
+      projected.shape()[0] != 1 ||
+      conv_output.shape().size() != 2 ||
+      conv_output.shape()[0] != 1 ||
+      conv_output.shape()[1] != conv_dim ||
+      gated_output->shape().size() != 2 ||
+      gated_output->shape()[0] != 1 ||
+      gated_output->shape()[1] != intermediate_size ||
+      num_heads == 0 ||
+      n_groups == 0 ||
+      num_heads % n_groups != 0 ||
+      intermediate_size != num_heads * head_dim ||
+      a_log.numel() != num_heads ||
+      d.numel() != num_heads ||
+      dt_bias.numel() != num_heads ||
+      time_step_min <= 0.0f ||
+      ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
+    return false;
+  }
+
+  return LaunchMambaSelectiveStateUpdateDecode(
+      projected.data(),
+      conv_output.data(),
+      intermediate_size,
+      conv_dim,
+      num_heads,
+      head_dim,
+      state_size,
+      n_groups,
+      time_step_min,
+      a_log.data(),
+      d.data(),
+      dt_bias.data(),
+      ssm_state->data() + ssm_state_offset_elems,
+      gated_output->data());
+}
+
+bool MambaSelectiveStateUpdateDecodeBf16(
+    const DeviceTensorBf16& projected,
+    const DeviceTensorBf16& conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    float time_step_min,
+    std::size_t ssm_state_offset_elems,
+    const DeviceTensorFp32& a_log,
+    const DeviceTensorFp32& d,
+    const DeviceTensorFp32& dt_bias,
+    DeviceTensorFp32* ssm_state,
+    DeviceTensorBf16* gated_output) {
+  if (!projected.valid() ||
+      !conv_output.valid() ||
+      !a_log.valid() ||
+      !d.valid() ||
+      !dt_bias.valid() ||
+      ssm_state == nullptr ||
+      !ssm_state->valid() ||
+      gated_output == nullptr ||
+      !gated_output->valid() ||
+      projected.shape().size() != 2 ||
+      projected.shape()[0] != 1 ||
+      conv_output.shape().size() != 2 ||
+      conv_output.shape()[0] != 1 ||
+      conv_output.shape()[1] != conv_dim ||
+      gated_output->shape().size() != 2 ||
+      gated_output->shape()[0] != 1 ||
+      gated_output->shape()[1] != intermediate_size ||
+      num_heads == 0 ||
+      n_groups == 0 ||
+      num_heads % n_groups != 0 ||
+      intermediate_size != num_heads * head_dim ||
+      a_log.numel() != num_heads ||
+      d.numel() != num_heads ||
+      dt_bias.numel() != num_heads ||
+      time_step_min <= 0.0f ||
+      ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
+    return false;
+  }
+
+  return LaunchMambaSelectiveStateUpdateDecode(
+      projected.data(),
+      conv_output.data(),
+      intermediate_size,
+      conv_dim,
+      num_heads,
+      head_dim,
+      state_size,
+      n_groups,
+      time_step_min,
+      a_log.data(),
+      d.data(),
+      dt_bias.data(),
+      ssm_state->data() + ssm_state_offset_elems,
+      gated_output->data());
+}
+
 bool MambaDecodeStepFusedFp32(
     const DeviceTensorFp32& projected,
     std::size_t intermediate_size,
@@ -745,6 +1205,78 @@ bool MambaDecodeStepFusedBf16(
       mixer_norm_weight.data(),
       conv_state->data(),
       ssm_state->data(),
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool GroupedRmsNormFp32(
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& mixer_norm_weight,
+    std::size_t n_groups,
+    float epsilon,
+    DeviceTensorFp32* output) {
+  if (!input.valid() ||
+      !mixer_norm_weight.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      input.shape().size() != 2 ||
+      output->shape() != input.shape() ||
+      mixer_norm_weight.shape().size() != 1 ||
+      mixer_norm_weight.shape()[0] != input.shape()[1] ||
+      n_groups == 0 ||
+      input.shape()[1] % n_groups != 0 ||
+      epsilon <= 0.0f) {
+    return false;
+  }
+
+  const std::size_t rows = input.shape()[0];
+  const std::size_t intermediate_size = input.shape()[1];
+  const std::size_t mixer_group_size = intermediate_size / n_groups;
+  const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
+  const dim3 block(kThreadsPerBlock);
+  GroupedRmsNormKernel<<<grid, block, sizeof(float) * kThreadsPerBlock>>>(
+      input.data(),
+      mixer_norm_weight.data(),
+      rows,
+      intermediate_size,
+      mixer_group_size,
+      epsilon,
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool GroupedRmsNormBf16(
+    const DeviceTensorBf16& input,
+    const DeviceTensorFp32& mixer_norm_weight,
+    std::size_t n_groups,
+    float epsilon,
+    DeviceTensorBf16* output) {
+  if (!input.valid() ||
+      !mixer_norm_weight.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      input.shape().size() != 2 ||
+      output->shape() != input.shape() ||
+      mixer_norm_weight.shape().size() != 1 ||
+      mixer_norm_weight.shape()[0] != input.shape()[1] ||
+      n_groups == 0 ||
+      input.shape()[1] % n_groups != 0 ||
+      epsilon <= 0.0f) {
+    return false;
+  }
+
+  const std::size_t rows = input.shape()[0];
+  const std::size_t intermediate_size = input.shape()[1];
+  const std::size_t mixer_group_size = intermediate_size / n_groups;
+  const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
+  const dim3 block(kThreadsPerBlock);
+  GroupedRmsNormKernel<<<grid, block, sizeof(float) * kThreadsPerBlock>>>(
+      input.data(),
+      mixer_norm_weight.data(),
+      rows,
+      intermediate_size,
+      mixer_group_size,
+      epsilon,
       output->data());
   return CheckCuda(cudaGetLastError());
 }
