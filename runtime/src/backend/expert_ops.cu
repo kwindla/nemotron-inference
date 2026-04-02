@@ -1534,6 +1534,38 @@ __global__ void BuildStridedPointerArrayKernel(
   }
 }
 
+__global__ void BuildIndexedStridedPointerArrayKernel(
+    void** array,
+    char* base,
+    const std::int32_t* selected_indices,
+    std::size_t stride_bytes,
+    std::size_t count) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const std::int32_t expert_index = selected_indices[i];
+  array[i] = expert_index < 0 ? nullptr : (base + static_cast<std::size_t>(expert_index) * stride_bytes);
+}
+
+__global__ void GatherIndexedFloatsKernel(
+    const float* values,
+    std::size_t value_count,
+    const std::int32_t* selected_indices,
+    std::size_t count,
+    float* output) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  const std::int32_t expert_index = selected_indices[i];
+  if (expert_index < 0 || static_cast<std::size_t>(expert_index) >= value_count) {
+    output[i] = 0.0f;
+    return;
+  }
+  output[i] = values[static_cast<std::size_t>(expert_index)];
+}
+
 bool FillDevicePointerArray(void** device_array, void* value, std::size_t count) {
   if (device_array == nullptr || count == 0) return false;
   const dim3 block(kThreadsPerBlock);
@@ -1547,6 +1579,55 @@ bool BuildStridedDevicePointerArray(void** device_array, void* base, std::size_t
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   BuildStridedPointerArrayKernel<<<grid, block>>>(device_array, reinterpret_cast<char*>(base), stride_bytes, count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool BuildStridedDevicePointerArray(
+    void** device_array,
+    void* base,
+    const std::int32_t* selected_indices_device,
+    std::size_t stride_bytes,
+    std::size_t count,
+    cudaStream_t stream) {
+  if (device_array == nullptr ||
+      base == nullptr ||
+      selected_indices_device == nullptr ||
+      count == 0) {
+    return false;
+  }
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  BuildIndexedStridedPointerArrayKernel<<<grid, block, 0, stream>>>(
+      device_array,
+      reinterpret_cast<char*>(base),
+      selected_indices_device,
+      stride_bytes,
+      count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool GatherIndexedFloatsInPlace(
+    const float* values_device,
+    std::size_t value_count,
+    const std::int32_t* selected_indices_device,
+    std::size_t count,
+    DeviceBuffer<float>& output,
+    cudaStream_t stream) {
+  if (values_device == nullptr ||
+      selected_indices_device == nullptr ||
+      count == 0 ||
+      !output.valid() ||
+      output.count() < count) {
+    return false;
+  }
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  GatherIndexedFloatsKernel<<<grid, block, 0, stream>>>(
+      values_device,
+      value_count,
+      selected_indices_device,
+      count,
+      output.data());
   return CheckCuda(cudaGetLastError());
 }
 

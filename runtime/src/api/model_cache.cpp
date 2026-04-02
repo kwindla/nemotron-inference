@@ -174,6 +174,47 @@ std::vector<std::uint8_t> CopyFloatBytes(const std::vector<float>& values) {
   return bytes;
 }
 
+bool IsRoutedExpertCacheEntry(const ModelCacheEntry& entry) {
+  return entry.tensor_name.find(".mixer.experts.") != std::string::npos;
+}
+
+bool ShouldPreloadCacheEntry(const ModelCacheEntry& entry) {
+  return !IsRoutedExpertCacheEntry(entry);
+}
+
+bool ReadSectionToDevice(
+    std::ifstream& input,
+    std::streamoff absolute_offset,
+    std::size_t nbytes,
+    DeviceBuffer<std::uint8_t>* output) {
+  if (output == nullptr) {
+    return false;
+  }
+  if (nbytes == 0) {
+    return true;
+  }
+  if (!output->Resize(nbytes) || !input.seekg(absolute_offset)) {
+    return false;
+  }
+  static constexpr std::size_t kChunkBytes = 64u << 20u;
+  std::vector<std::uint8_t> host_chunk(std::min(nbytes, kChunkBytes), 0u);
+  std::size_t copied = 0;
+  while (copied < nbytes) {
+    const std::size_t chunk = std::min(nbytes - copied, host_chunk.size());
+    input.read(reinterpret_cast<char*>(host_chunk.data()), static_cast<std::streamsize>(chunk));
+    if (!input ||
+        cudaMemcpy(
+            output->data() + copied,
+            host_chunk.data(),
+            chunk,
+            cudaMemcpyHostToDevice) != cudaSuccess) {
+      return false;
+    }
+    copied += chunk;
+  }
+  return true;
+}
+
 void FinalizeOffsets(
     std::vector<ModelCacheEntry>* entries,
     std::size_t* payload_nbytes) {
@@ -855,31 +896,37 @@ std::unique_ptr<LoadedModelCache> LoadedModelCache::Load(const std::filesystem::
   for (const ModelCacheEntry& entry : cache->header_.entries) {
     cache->indices_by_name_.emplace(entry.tensor_name, cache->indices_by_name_.size());
   }
-  if (cache->header_.payload_nbytes != 0) {
-    if (!cache->payload_.Resize(cache->header_.payload_nbytes)) {
+  cache->device_entries_.resize(cache->header_.entries.size());
+  const std::streamoff payload_base_offset = input.tellg();
+  for (std::size_t entry_index = 0; entry_index < cache->header_.entries.size(); ++entry_index) {
+    const ModelCacheEntry& entry = cache->header_.entries[entry_index];
+    if (!ShouldPreloadCacheEntry(entry)) {
+      continue;
+    }
+    auto& device_entry = cache->device_entries_[entry_index];
+    if (!ReadSectionToDevice(
+            input,
+            payload_base_offset + static_cast<std::streamoff>(entry.payload_offset),
+            entry.payload_nbytes,
+            &device_entry.payload) ||
+        !ReadSectionToDevice(
+            input,
+            payload_base_offset + static_cast<std::streamoff>(entry.aux0_offset),
+            entry.aux0_nbytes,
+            &device_entry.aux0) ||
+        !ReadSectionToDevice(
+            input,
+            payload_base_offset + static_cast<std::streamoff>(entry.aux1_offset),
+            entry.aux1_nbytes,
+            &device_entry.aux1) ||
+        !ReadSectionToDevice(
+            input,
+            payload_base_offset + static_cast<std::streamoff>(entry.aux2_offset),
+            entry.aux2_nbytes,
+            &device_entry.aux2)) {
       return nullptr;
     }
-    static constexpr std::size_t kChunkBytes = 64u << 20u;
-    std::vector<std::uint8_t> host_chunk(std::min(cache->header_.payload_nbytes, kChunkBytes), 0u);
-    std::size_t copied = 0;
-    while (copied < cache->header_.payload_nbytes) {
-      const std::size_t chunk = std::min(cache->header_.payload_nbytes - copied, host_chunk.size());
-      input.read(reinterpret_cast<char*>(host_chunk.data()), static_cast<std::streamsize>(chunk));
-      if (!input) {
-        return nullptr;
-      }
-      if (cudaMemcpy(
-              cache->payload_.data() + copied,
-              host_chunk.data(),
-              chunk,
-              cudaMemcpyHostToDevice) != cudaSuccess) {
-        return nullptr;
-      }
-      copied += chunk;
-    }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      return nullptr;
-    }
+    device_entry.resident = true;
   }
   return cache;
 }
@@ -889,7 +936,8 @@ LoadedModelCache& LoadedModelCache::operator=(LoadedModelCache&&) noexcept = def
 LoadedModelCache::~LoadedModelCache() = default;
 
 bool LoadedModelCache::valid() const {
-  return !header_.entries.empty() && payload_.valid();
+  return !header_.entries.empty() &&
+         device_entries_.size() == header_.entries.size();
 }
 
 const ModelCacheHeader& LoadedModelCache::header() const {
@@ -904,11 +952,40 @@ const ModelCacheEntry* LoadedModelCache::FindEntry(const std::string& tensor_nam
   return &header_.entries[it->second];
 }
 
-std::uint8_t* LoadedModelCache::PayloadPtr(std::size_t offset) const {
-  if (!payload_.valid() || offset >= payload_.count()) {
+std::size_t LoadedModelCache::EntryIndex(const ModelCacheEntry* entry) const {
+  return entry == nullptr ? header_.entries.size() : static_cast<std::size_t>(entry - header_.entries.data());
+}
+
+std::uint8_t* LoadedModelCache::PayloadPtr(const ModelCacheEntry* entry) const {
+  const std::size_t index = EntryIndex(entry);
+  if (index >= device_entries_.size() || !device_entries_[index].resident) {
     return nullptr;
   }
-  return payload_.data() + offset;
+  return device_entries_[index].payload.data();
+}
+
+std::uint8_t* LoadedModelCache::Aux0Ptr(const ModelCacheEntry* entry) const {
+  const std::size_t index = EntryIndex(entry);
+  if (index >= device_entries_.size() || !device_entries_[index].resident) {
+    return nullptr;
+  }
+  return device_entries_[index].aux0.data();
+}
+
+std::uint8_t* LoadedModelCache::Aux1Ptr(const ModelCacheEntry* entry) const {
+  const std::size_t index = EntryIndex(entry);
+  if (index >= device_entries_.size() || !device_entries_[index].resident) {
+    return nullptr;
+  }
+  return device_entries_[index].aux1.data();
+}
+
+std::uint8_t* LoadedModelCache::Aux2Ptr(const ModelCacheEntry* entry) const {
+  const std::size_t index = EntryIndex(entry);
+  if (index >= device_entries_.size() || !device_entries_[index].resident) {
+    return nullptr;
+  }
+  return device_entries_[index].aux2.data();
 }
 
 std::unique_ptr<DeviceTensorFp32> LoadedModelCache::CreateTensorView(
@@ -923,7 +1000,7 @@ std::unique_ptr<DeviceTensorFp32> LoadedModelCache::CreateTensorView(
   }
   return DeviceTensorFp32::CreateView(
       {numel},
-      reinterpret_cast<float*>(PayloadPtr(entry->payload_offset)));
+      reinterpret_cast<float*>(PayloadPtr(entry)));
 }
 
 std::unique_ptr<DeviceEmbeddingTableFp32> LoadedModelCache::CreateEmbeddingView(
@@ -935,7 +1012,7 @@ std::unique_ptr<DeviceEmbeddingTableFp32> LoadedModelCache::CreateEmbeddingView(
   return DeviceEmbeddingTableFp32::CreateView(
       entry->shape[0],
       entry->shape[1],
-      reinterpret_cast<float*>(PayloadPtr(entry->payload_offset)));
+      reinterpret_cast<float*>(PayloadPtr(entry)));
 }
 
 std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateDenseLinearView(
@@ -947,7 +1024,7 @@ std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateDenseLinearView(
   auto weight = DeviceDenseWeightFp32::CreateView(
       entry->output_rows,
       entry->input_cols,
-      reinterpret_cast<float*>(PayloadPtr(entry->payload_offset)));
+      reinterpret_cast<float*>(PayloadPtr(entry)));
   if (!weight || !weight->valid()) {
     return nullptr;
   }
@@ -972,7 +1049,7 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
   auto weight = DeviceDenseWeightFp32::CreateView(
       entry->output_rows,
       entry->input_cols,
-      reinterpret_cast<float*>(PayloadPtr(entry->payload_offset)));
+      reinterpret_cast<float*>(PayloadPtr(entry)));
   if (!weight || !weight->valid()) {
     return nullptr;
   }
@@ -994,23 +1071,23 @@ std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(
   auto weight = DeviceNvfp4Weight::CreateView(
       entry->output_rows,
       entry->input_cols,
-      PayloadPtr(entry->payload_offset),
+      PayloadPtr(entry),
       entry->payload_nbytes,
-      PayloadPtr(entry->aux0_offset),
+      Aux0Ptr(entry),
       entry->aux0_nbytes,
-      PayloadPtr(entry->aux1_offset),
+      Aux1Ptr(entry),
       entry->aux1_nbytes,
-      PayloadPtr(entry->aux2_offset),
+      Aux2Ptr(entry),
       entry->aux2_nbytes);
   if (!weight || !weight->valid()) {
     return nullptr;
   }
   GemmDescriptor cached_descriptor = descriptor;
-  cached_descriptor.packed_data = PayloadPtr(entry->payload_offset);
+  cached_descriptor.packed_data = PayloadPtr(entry);
   cached_descriptor.packed_nbytes = entry->payload_nbytes;
-  cached_descriptor.block_scales_data = PayloadPtr(entry->aux1_offset);
+  cached_descriptor.block_scales_data = Aux1Ptr(entry);
   cached_descriptor.block_scales_nbytes = entry->aux1_nbytes;
-  cached_descriptor.tensor_scale_data = PayloadPtr(entry->aux2_offset);
+  cached_descriptor.tensor_scale_data = Aux2Ptr(entry);
   cached_descriptor.tensor_scale_nbytes = entry->aux2_nbytes;
   return UploadedLinearOp::CreateNvfp4View(cached_descriptor, std::move(weight));
 }

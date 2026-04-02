@@ -193,6 +193,25 @@ bool FillDevicePointerArray(void** device_array, void* value, std::size_t count)
 // Used to build CUTLASS C/D pointer arrays where each group's output is at a different row offset.
 bool BuildStridedDevicePointerArray(void** device_array, void* base, std::size_t stride_bytes, std::size_t count);
 
+// Indexed variant: device_array[i] = base + selected_indices_device[i] * stride_bytes.
+// Used for contiguous expert-major weight stacks where each group selects a routed expert id.
+bool BuildStridedDevicePointerArray(
+    void** device_array,
+    void* base,
+    const std::int32_t* selected_indices_device,
+    std::size_t stride_bytes,
+    std::size_t count,
+    cudaStream_t stream = nullptr);
+
+// Gather FP32 values by selected expert id into a pre-allocated output buffer.
+bool GatherIndexedFloatsInPlace(
+    const float* values_device,
+    std::size_t value_count,
+    const std::int32_t* selected_indices_device,
+    std::size_t count,
+    DeviceBuffer<float>& output,
+    cudaStream_t stream = nullptr);
+
 // Post-GEMM per-row scaling: output[row][col] *= act_tensor_scale * weight_tensor_scales[row]
 // All pointers are device-resident. Zero host involvement.
 bool ScaleRowsByTensorScaleFp32(

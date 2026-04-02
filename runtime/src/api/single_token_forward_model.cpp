@@ -47,6 +47,21 @@ std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
   return value;
 }
 
+std::optional<float> ReadScalarTensorToHostFp32(const KernelTensorDescriptor& descriptor) {
+  if (descriptor.storage_dtype != "fp32" ||
+      descriptor.packed_data == nullptr ||
+      descriptor.packed_nbytes != sizeof(float)) {
+    return std::nullopt;
+  }
+  float value = 0.0f;
+  std::memcpy(&value, descriptor.packed_data, sizeof(float));
+  return value;
+}
+
+std::optional<float> ReadOptionalScalarTensorToHostFp32(const KernelTensorDescriptor* descriptor) {
+  return descriptor == nullptr ? std::nullopt : ReadScalarTensorToHostFp32(*descriptor);
+}
+
 bool ContainsName(
     const std::vector<GlobalTensorBinding>& bindings,
     ModelGlobalRole role,
@@ -890,6 +905,10 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
         if (!bindings.has_value()) {
           return nullptr;
         }
+        std::vector<SingleTokenForwardBuildPhaseTiming> detail_timings;
+        const auto add_detail = [&](const char* name, double milliseconds) {
+          detail_timings.push_back({name, milliseconds});
+        };
         ExpertLayerPreparedBindings prepared;
         prepared.input_norm_weight = impl->model_cache->CreateTensorView(bindings->input_norm_weight->tensor_name);
         prepared.gate_score_correction_bias_device =
@@ -936,15 +955,17 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
           prepared.routed_experts[expert_index].down_descriptor = *pair.down_proj;
           prepared.routed_experts[expert_index].up_tensor_scale = ReadTensorScaleHost(*pair.up_proj);
           prepared.routed_experts[expert_index].down_tensor_scale = ReadTensorScaleHost(*pair.down_proj);
-          if (pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-            prepared.routed_experts[expert_index].up_proj = impl->model_cache->CreateNvfp4LinearView(*pair.up_proj);
-            prepared.routed_experts[expert_index].down_proj = impl->model_cache->CreateNvfp4LinearView(*pair.down_proj);
-          } else {
-            prepared.routed_experts[expert_index].up_proj = impl->model_cache->CreateDenseLinearView(*pair.up_proj);
-            prepared.routed_experts[expert_index].down_proj = impl->model_cache->CreateDenseLinearView(*pair.down_proj);
+          prepared.routed_experts[expert_index].up_input_scale =
+              ReadOptionalScalarTensorToHostFp32(pair.up_input_scale);
+          prepared.routed_experts[expert_index].down_input_scale =
+              ReadOptionalScalarTensorToHostFp32(pair.down_input_scale);
+          if (pair.up_proj->kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+            prepared.routed_experts[expert_index].up_proj =
+                impl->model_cache->CreateDenseLinearView(*pair.up_proj);
+            prepared.routed_experts[expert_index].down_proj =
+                impl->model_cache->CreateDenseLinearView(*pair.down_proj);
           }
         }
-        const auto slice_begin = std::chrono::steady_clock::now();
         ExpertLayerConfig expert_config;
         expert_config.layer_index = plan_entry.layer_index;
         expert_config.hidden_size = config.hidden_size;
@@ -958,7 +979,10 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
         expert_config.rms_epsilon = config.layer_norm_epsilon;
         expert_config.routed_scaling_factor = config.routed_scaling_factor;
         expert_config.norm_topk_prob = config.norm_topk_prob;
-        layer_entry.expert_slice = ExpertLayerSlice::CreatePrepared(expert_config, std::move(prepared));
+        const auto slice_begin = std::chrono::steady_clock::now();
+        layer_entry.expert_slice = ExpertLayerSlice::CreatePrepared(
+            expert_config,
+            std::move(prepared));
         const auto slice_end = std::chrono::steady_clock::now();
         build_report.layers[layer_idx] = {
             plan_entry.layer_index,
@@ -966,7 +990,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
             ToMilliseconds(bindings_end - bindings_begin),
             ToMilliseconds(slice_end - slice_begin),
             ToMilliseconds(slice_end - layer_begin),
-            {}};
+            std::move(detail_timings)};
         if (!layer_entry.expert_slice || !layer_entry.expert_slice->valid()) {
           return nullptr;
         }
