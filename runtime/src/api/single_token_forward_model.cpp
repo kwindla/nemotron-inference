@@ -190,9 +190,101 @@ bool ForwardDebugEnabled() {
   return kDebug;
 }
 
+int ForwardProfileMode() {
+  static const int kMode = []() {
+    const char* value = std::getenv("NEMOTRON_FORWARD_PROFILE");
+    if (value == nullptr) {
+      return 0;
+    }
+    if (std::strcmp(value, "1") == 0) {
+      return 1;
+    }
+    if (std::strcmp(value, "2") == 0) {
+      return 2;
+    }
+    return 0;
+  }();
+  return kMode;
+}
+
 bool ForwardProfileEnabled() {
-  static const bool kProfile = std::getenv("NEMOTRON_FORWARD_PROFILE") != nullptr;
-  return kProfile;
+  return ForwardProfileMode() != 0;
+}
+
+void LogCudaFailure(const char* caller, cudaError_t error) {
+  std::cerr << caller << ": " << cudaGetErrorString(error) << "\n";
+}
+
+struct ForwardProfileSpan {
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+};
+
+bool CreateForwardProfileSpan(ForwardProfileSpan* span, const char* name) {
+  if (span == nullptr) {
+    return false;
+  }
+  cudaError_t status = cudaEventCreateWithFlags(&span->start, cudaEventBlockingSync);
+  if (status != cudaSuccess) {
+    LogCudaFailure(name, status);
+    return false;
+  }
+  status = cudaEventCreateWithFlags(&span->stop, cudaEventBlockingSync);
+  if (status != cudaSuccess) {
+    LogCudaFailure(name, status);
+    cudaEventDestroy(span->start);
+    span->start = nullptr;
+    return false;
+  }
+  return true;
+}
+
+void DestroyForwardProfileSpan(ForwardProfileSpan* span) {
+  if (span == nullptr) {
+    return;
+  }
+  if (span->start != nullptr) {
+    cudaEventDestroy(span->start);
+    span->start = nullptr;
+  }
+  if (span->stop != nullptr) {
+    cudaEventDestroy(span->stop);
+    span->stop = nullptr;
+  }
+}
+
+bool RecordForwardProfileEvent(cudaEvent_t event, const char* name, cudaStream_t stream = nullptr) {
+  const cudaError_t status = cudaEventRecord(event, stream);
+  if (status != cudaSuccess) {
+    LogCudaFailure(name, status);
+    return false;
+  }
+  return true;
+}
+
+bool SynchronizeForwardProfileEvent(cudaEvent_t event, const char* name) {
+  const cudaError_t status = cudaEventSynchronize(event);
+  if (status != cudaSuccess) {
+    LogCudaFailure(name, status);
+    return false;
+  }
+  return true;
+}
+
+bool ForwardProfileElapsedMs(
+    cudaEvent_t start,
+    cudaEvent_t stop,
+    float* milliseconds,
+    const char* name) {
+  if (milliseconds == nullptr) {
+    return false;
+  }
+  const cudaError_t status = cudaEventElapsedTime(milliseconds, start, stop);
+  if (status != cudaSuccess) {
+    LogCudaFailure(name, status);
+    return false;
+  }
+  return true;
 }
 
 bool ParseEnabledEnvVar(const char* name) {
@@ -403,6 +495,71 @@ struct SingleTokenForwardModel::Impl {
     std::unique_ptr<ExpertLayerSlice> expert_slice;
   };
 
+  struct ForwardProfileState {
+    int mode = 0;
+    ForwardProfileSpan embedding;
+    std::vector<ForwardProfileSpan> layer_spans;
+    ForwardProfileSpan final_norm;
+    ForwardProfileSpan lm_head;
+    std::vector<double> layer_total_ms;
+    double embedding_total_ms = 0.0;
+    double attention_total_ms = 0.0;
+    double mamba_total_ms = 0.0;
+    double expert_total_ms = 0.0;
+    double final_norm_total_ms = 0.0;
+    double lm_head_total_ms = 0.0;
+    double other_total_ms = 0.0;
+    std::size_t tokens = 0;
+
+    ~ForwardProfileState() {
+      DestroyEvents();
+    }
+
+    bool Initialize(
+        int profile_mode,
+        const SingleTokenForwardConfig& config,
+        const SingleTokenForwardPlan& plan) {
+      mode = profile_mode;
+      layer_spans.resize(plan.layers.size());
+      layer_total_ms.assign(config.total_layer_count, 0.0);
+      if (!CreateForwardProfileSpan(&embedding, "single_token_forward_model: embedding profile event create") ||
+          !CreateForwardProfileSpan(&final_norm, "single_token_forward_model: final_norm profile event create") ||
+          !CreateForwardProfileSpan(&lm_head, "single_token_forward_model: lm_head profile event create")) {
+        return false;
+      }
+      for (std::size_t layer_slot = 0; layer_slot < layer_spans.size(); ++layer_slot) {
+        if (!CreateForwardProfileSpan(
+                &layer_spans[layer_slot],
+                "single_token_forward_model: layer profile event create")) {
+          return false;
+        }
+      }
+      ResetAccumulators();
+      return true;
+    }
+
+    void ResetAccumulators() {
+      std::fill(layer_total_ms.begin(), layer_total_ms.end(), 0.0);
+      embedding_total_ms = 0.0;
+      attention_total_ms = 0.0;
+      mamba_total_ms = 0.0;
+      expert_total_ms = 0.0;
+      final_norm_total_ms = 0.0;
+      lm_head_total_ms = 0.0;
+      other_total_ms = 0.0;
+      tokens = 0;
+    }
+
+    void DestroyEvents() {
+      DestroyForwardProfileSpan(&embedding);
+      for (ForwardProfileSpan& span : layer_spans) {
+        DestroyForwardProfileSpan(&span);
+      }
+      DestroyForwardProfileSpan(&final_norm);
+      DestroyForwardProfileSpan(&lm_head);
+    }
+  };
+
   SingleTokenForwardConfig config;
   SingleTokenForwardPlan plan;
   const EmbeddingDescriptor* embedding = nullptr;
@@ -417,6 +574,22 @@ struct SingleTokenForwardModel::Impl {
   std::unique_ptr<LoadedModelCache> model_cache;
   std::vector<LayerEntry> layers;
   SingleTokenForwardBuildReport build_report;
+  std::unique_ptr<ForwardProfileState> forward_profile;
+
+  bool EnsureForwardProfileState(int profile_mode) {
+    if (profile_mode == 0) {
+      return true;
+    }
+    if (forward_profile != nullptr) {
+      return true;
+    }
+    auto state = std::make_unique<ForwardProfileState>();
+    if (!state->Initialize(profile_mode, config, plan)) {
+      return false;
+    }
+    forward_profile = std::move(state);
+    return true;
+  }
 };
 
 std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
@@ -1284,9 +1457,23 @@ bool SingleTokenForwardModel::RunPrefill(
       token_count == 1 &&
       continuing_decode &&
       request_context.sequence_length() > 1;
-  if (!continuing_decode && !request_context.ResetForNewRequest()) {
-    std::cerr << "single_token_forward_model: request context reset failed\n";
-    return false;
+  const int profile_mode = ForwardProfileMode();
+  Impl::ForwardProfileState* forward_profile = nullptr;
+  if (profile_mode != 0) {
+    if (!impl_->EnsureForwardProfileState(profile_mode)) {
+      std::cerr << "single_token_forward_model: forward profiling initialization failed\n";
+      return false;
+    }
+    forward_profile = impl_->forward_profile.get();
+  }
+  if (!continuing_decode) {
+    if (!request_context.ResetForNewRequest()) {
+      std::cerr << "single_token_forward_model: request context reset failed\n";
+      return false;
+    }
+    if (forward_profile != nullptr) {
+      forward_profile->ResetAccumulators();
+    }
   }
 
   DeviceTensorFp32* hidden_storage = request_context.hidden();
@@ -1325,27 +1512,180 @@ bool SingleTokenForwardModel::RunPrefill(
   const std::unordered_set<std::size_t> capture_set(
       capture_layer_indices.begin(),
       capture_layer_indices.end());
+  const auto accumulate_profile =
+      [&](std::size_t executed_layer_count, bool final_norm_executed) -> bool {
+        if (forward_profile == nullptr) {
+          return true;
+        }
+        if (!SynchronizeForwardProfileEvent(
+                forward_profile->lm_head.stop,
+                "single_token_forward_model: forward_profile lm_head stop sync")) {
+          return false;
+        }
 
-  const bool profile = ForwardProfileEnabled();
-  cudaEvent_t profile_start = nullptr;
-  cudaEvent_t profile_end = nullptr;
-  if (profile) {
-    cudaEventCreate(&profile_start);
-    cudaEventCreate(&profile_end);
-  }
-  const auto destroy_profile_events = [&]() {
-    if (!profile) {
-      return;
-    }
-    if (profile_start != nullptr) {
-      cudaEventDestroy(profile_start);
-      profile_start = nullptr;
-    }
-    if (profile_end != nullptr) {
-      cudaEventDestroy(profile_end);
-      profile_end = nullptr;
-    }
-  };
+        float elapsed_ms = 0.0f;
+        if (!ForwardProfileElapsedMs(
+                forward_profile->embedding.start,
+                forward_profile->embedding.stop,
+                &elapsed_ms,
+                "single_token_forward_model: forward_profile embedding elapsed")) {
+          return false;
+        }
+        forward_profile->embedding_total_ms += elapsed_ms;
+
+        for (std::size_t layer_slot = 0; layer_slot < executed_layer_count; ++layer_slot) {
+          const Impl::LayerEntry& layer = impl_->layers[layer_slot];
+          if (!ForwardProfileElapsedMs(
+                  forward_profile->layer_spans[layer_slot].start,
+                  forward_profile->layer_spans[layer_slot].stop,
+                  &elapsed_ms,
+                  "single_token_forward_model: forward_profile layer elapsed")) {
+            return false;
+          }
+          forward_profile->layer_total_ms[layer.plan.layer_index] += elapsed_ms;
+          switch (layer.plan.kind) {
+            case ForwardLayerKind::kAttention:
+              forward_profile->attention_total_ms += elapsed_ms;
+              break;
+            case ForwardLayerKind::kMamba:
+              forward_profile->mamba_total_ms += elapsed_ms;
+              break;
+            case ForwardLayerKind::kExpert:
+              forward_profile->expert_total_ms += elapsed_ms;
+              break;
+          }
+        }
+
+        if (final_norm_executed) {
+          if (!ForwardProfileElapsedMs(
+                  forward_profile->final_norm.start,
+                  forward_profile->final_norm.stop,
+                  &elapsed_ms,
+                  "single_token_forward_model: forward_profile final_norm elapsed")) {
+            return false;
+          }
+          forward_profile->final_norm_total_ms += elapsed_ms;
+        }
+
+        if (!ForwardProfileElapsedMs(
+                forward_profile->lm_head.start,
+                forward_profile->lm_head.stop,
+                &elapsed_ms,
+                "single_token_forward_model: forward_profile lm_head elapsed")) {
+          return false;
+        }
+        forward_profile->lm_head_total_ms += elapsed_ms;
+
+        if (executed_layer_count != 0) {
+          if (!ForwardProfileElapsedMs(
+                  forward_profile->embedding.stop,
+                  forward_profile->layer_spans.front().start,
+                  &elapsed_ms,
+                  "single_token_forward_model: forward_profile gap elapsed")) {
+            return false;
+          }
+          forward_profile->other_total_ms += elapsed_ms;
+          for (std::size_t layer_slot = 0; layer_slot + 1 < executed_layer_count; ++layer_slot) {
+            if (!ForwardProfileElapsedMs(
+                    forward_profile->layer_spans[layer_slot].stop,
+                    forward_profile->layer_spans[layer_slot + 1].start,
+                    &elapsed_ms,
+                    "single_token_forward_model: forward_profile gap elapsed")) {
+              return false;
+            }
+            forward_profile->other_total_ms += elapsed_ms;
+          }
+          const ForwardProfileSpan& last_layer_span =
+              forward_profile->layer_spans[executed_layer_count - 1];
+          if (final_norm_executed) {
+            if (!ForwardProfileElapsedMs(
+                    last_layer_span.stop,
+                    forward_profile->final_norm.start,
+                    &elapsed_ms,
+                    "single_token_forward_model: forward_profile gap elapsed")) {
+              return false;
+            }
+            forward_profile->other_total_ms += elapsed_ms;
+            if (!ForwardProfileElapsedMs(
+                    forward_profile->final_norm.stop,
+                    forward_profile->lm_head.start,
+                    &elapsed_ms,
+                    "single_token_forward_model: forward_profile gap elapsed")) {
+              return false;
+            }
+            forward_profile->other_total_ms += elapsed_ms;
+          } else {
+            if (!ForwardProfileElapsedMs(
+                    last_layer_span.stop,
+                    forward_profile->lm_head.start,
+                    &elapsed_ms,
+                    "single_token_forward_model: forward_profile gap elapsed")) {
+              return false;
+            }
+            forward_profile->other_total_ms += elapsed_ms;
+          }
+        } else if (final_norm_executed) {
+          if (!ForwardProfileElapsedMs(
+                  forward_profile->embedding.stop,
+                  forward_profile->final_norm.start,
+                  &elapsed_ms,
+                  "single_token_forward_model: forward_profile gap elapsed")) {
+            return false;
+          }
+          forward_profile->other_total_ms += elapsed_ms;
+          if (!ForwardProfileElapsedMs(
+                  forward_profile->final_norm.stop,
+                  forward_profile->lm_head.start,
+                  &elapsed_ms,
+                  "single_token_forward_model: forward_profile gap elapsed")) {
+            return false;
+          }
+          forward_profile->other_total_ms += elapsed_ms;
+        } else {
+          if (!ForwardProfileElapsedMs(
+                  forward_profile->embedding.stop,
+                  forward_profile->lm_head.start,
+                  &elapsed_ms,
+                  "single_token_forward_model: forward_profile gap elapsed")) {
+            return false;
+          }
+          forward_profile->other_total_ms += elapsed_ms;
+        }
+
+        forward_profile->tokens += token_count;
+        if (request_context.sequence_length() >= request_context.config().max_tokens) {
+          const double total_ms =
+              forward_profile->embedding_total_ms +
+              forward_profile->mamba_total_ms +
+              forward_profile->expert_total_ms +
+              forward_profile->attention_total_ms +
+              forward_profile->final_norm_total_ms +
+              forward_profile->lm_head_total_ms +
+              forward_profile->other_total_ms;
+          std::cerr << std::fixed << std::setprecision(3)
+                    << "forward_profile: embedding_ms=" << forward_profile->embedding_total_ms << "\n"
+                    << "forward_profile: mamba_total_ms=" << forward_profile->mamba_total_ms
+                    << " (" << impl_->plan.mamba_layer_count << " layers)\n"
+                    << "forward_profile: expert_total_ms=" << forward_profile->expert_total_ms
+                    << " (" << impl_->plan.expert_layer_count << " layers)\n"
+                    << "forward_profile: attention_total_ms=" << forward_profile->attention_total_ms
+                    << " (" << impl_->plan.attention_layer_count << " layers)\n"
+                    << "forward_profile: final_norm_ms=" << forward_profile->final_norm_total_ms << "\n"
+                    << "forward_profile: lm_head_ms=" << forward_profile->lm_head_total_ms << "\n"
+                    << "forward_profile: other_ms=" << forward_profile->other_total_ms << "\n"
+                    << "forward_profile: total_ms=" << total_ms << "\n"
+                    << "forward_profile: tokens=" << forward_profile->tokens << "\n";
+          if (forward_profile->mode == 2) {
+            for (const ForwardLayerPlanEntry& layer : impl_->plan.layers) {
+              std::cerr << "forward_profile: layer_" << layer.layer_index
+                        << "_" << LayerKindName(layer.kind)
+                        << "_ms=" << forward_profile->layer_total_ms[layer.layer_index] << "\n";
+            }
+          }
+          std::cerr << std::flush;
+        }
+        return true;
+      };
 
   if (use_bf16_decode_storage) {
     DeviceTensorBf16* hidden_decode_storage = request_context.hidden_decode_bf16();
@@ -1355,7 +1695,6 @@ bool SingleTokenForwardModel::RunPrefill(
         residual_decode_storage == nullptr ||
         scratch_decode_storage == nullptr) {
       std::cerr << "single_token_forward_model: BF16 decode storage unavailable\n";
-      destroy_profile_events();
       return false;
     }
 
@@ -1370,7 +1709,6 @@ bool SingleTokenForwardModel::RunPrefill(
         scratch_decode_storage->data());
     if (!current_view_bf16 || !next_view_bf16 || !scratch_view_bf16) {
       std::cerr << "single_token_forward_model: BF16 decode views unavailable\n";
-      destroy_profile_events();
       return false;
     }
     DeviceTensorBf16* current = current_view_bf16.get();
@@ -1382,7 +1720,7 @@ bool SingleTokenForwardModel::RunPrefill(
         capture_layer_indices.empty() &&
         trace == nullptr &&
         !stop_layer_index.has_value() &&
-        !profile;
+        profile_mode == 0;
     const std::size_t decode_token_index = request_context.current_decode_token_index();
     const auto clear_cuda_error = []() {
       static_cast<void>(cudaGetLastError());
@@ -1472,7 +1810,6 @@ bool SingleTokenForwardModel::RunPrefill(
       if (token_ids_device->CopyFromHostAsync(token_ids, token_count) &&
           request_context.LaunchForwardGraph(nullptr)) {
         RecordForwardGraphReplay();
-        destroy_profile_events();
         return true;
       }
       request_context.DisableForwardGraph();
@@ -1526,7 +1863,6 @@ bool SingleTokenForwardModel::RunPrefill(
       }
       if (capture_ok) {
         RecordForwardGraphReplay();
-        destroy_profile_events();
         return true;
       }
       destroy_forward_graph();
@@ -1534,15 +1870,29 @@ bool SingleTokenForwardModel::RunPrefill(
       clear_cuda_error();
     }
 
-    if (!token_ids_device->CopyFromHostAsync(token_ids, token_count) ||
-        !LookupEmbeddingRowsDeviceIdsBf16(
+    if (!token_ids_device->CopyFromHostAsync(token_ids, token_count)) {
+      std::cerr << "single_token_forward_model: embedding lookup failed\n";
+      return false;
+    }
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->embedding.start,
+            "single_token_forward_model: forward_profile embedding start")) {
+      return false;
+    }
+    if (!LookupEmbeddingRowsDeviceIdsBf16(
              *impl_->embedding_table,
              token_ids_device->data(),
              token_count,
              current)
              .has_value()) {
       std::cerr << "single_token_forward_model: embedding lookup failed\n";
-      destroy_profile_events();
+      return false;
+    }
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->embedding.stop,
+            "single_token_forward_model: forward_profile embedding stop")) {
       return false;
     }
     if (debug) {
@@ -1552,7 +1902,6 @@ bool SingleTokenForwardModel::RunPrefill(
     if (trace != nullptr) {
       trace->embedding_output = CopyTensorToHost(*current);
       if (trace->embedding_output.empty()) {
-        destroy_profile_events();
         return false;
       }
       trace->captured_layers.clear();
@@ -1561,14 +1910,19 @@ bool SingleTokenForwardModel::RunPrefill(
       trace->logits.clear();
     }
 
-    for (const Impl::LayerEntry& layer : impl_->layers) {
+    std::size_t executed_layer_count = 0;
+    for (std::size_t layer_slot = 0; layer_slot < impl_->layers.size(); ++layer_slot) {
+      const Impl::LayerEntry& layer = impl_->layers[layer_slot];
       if (debug) {
         std::cout << "single_token_forward_model: running layer "
                   << layer.plan.layer_index
                   << " kind=" << static_cast<int>(layer.plan.kind) << "\n";
       }
-      if (profile) {
-        cudaEventRecord(profile_start);
+      if (forward_profile != nullptr &&
+          !RecordForwardProfileEvent(
+              forward_profile->layer_spans[layer_slot].start,
+              "single_token_forward_model: forward_profile layer start")) {
+        return false;
       }
       bool ok = false;
       switch (layer.plan.kind) {
@@ -1635,27 +1989,20 @@ bool SingleTokenForwardModel::RunPrefill(
           break;
         }
       }
-      if (profile) {
-        cudaEventRecord(profile_end);
-        cudaEventSynchronize(profile_end);
-        float layer_ms = 0.0f;
-        cudaEventElapsedTime(&layer_ms, profile_start, profile_end);
-        const char* kind_name =
-            layer.plan.kind == ForwardLayerKind::kAttention ? "attention" :
-            layer.plan.kind == ForwardLayerKind::kMamba ? "mamba" :
-            layer.plan.kind == ForwardLayerKind::kExpert ? "expert" : "unknown";
-        std::cerr << "profile layer=" << layer.plan.layer_index
-                  << " kind=" << kind_name
-                  << " ms=" << std::fixed << std::setprecision(3) << layer_ms << "\n";
-      }
       if (!ok) {
         std::cerr << "single_token_forward_model: layer "
                   << layer.plan.layer_index
                   << " kind=" << static_cast<int>(layer.plan.kind)
                   << " execution failed\n";
-        destroy_profile_events();
         return false;
       }
+      if (forward_profile != nullptr &&
+          !RecordForwardProfileEvent(
+              forward_profile->layer_spans[layer_slot].stop,
+              "single_token_forward_model: forward_profile layer stop")) {
+        return false;
+      }
+      ++executed_layer_count;
       std::swap(current, next);
       if (debug) {
         std::cout << "single_token_forward_model: layer "
@@ -1669,7 +2016,6 @@ bool SingleTokenForwardModel::RunPrefill(
         if (captured.hidden.empty()) {
           std::cerr << "single_token_forward_model: failed to capture layer "
                     << layer.plan.layer_index << "\n";
-          destroy_profile_events();
           return false;
         }
         trace->captured_layers.push_back(std::move(captured));
@@ -1684,41 +2030,63 @@ bool SingleTokenForwardModel::RunPrefill(
       trace->final_hidden = CopyTensorToHost(*current);
       if (trace->final_hidden.empty()) {
         std::cerr << "single_token_forward_model: failed to capture final hidden state\n";
-        destroy_profile_events();
         return false;
       }
     }
 
+    bool final_norm_executed = false;
     const DeviceTensorBf16* logits_input = current;
     if (impl_->final_norm_weight != nullptr) {
+      if (forward_profile != nullptr &&
+          !RecordForwardProfileEvent(
+              forward_profile->final_norm.start,
+              "single_token_forward_model: forward_profile final_norm start")) {
+        return false;
+      }
       if (!RmsNormBf16(
               *current,
               *impl_->final_norm_weight,
               impl_->config.layer_norm_epsilon,
               scratch_bf16)) {
         std::cerr << "single_token_forward_model: final RMSNorm failed\n";
-        destroy_profile_events();
+        return false;
+      }
+      if (forward_profile != nullptr &&
+          !RecordForwardProfileEvent(
+              forward_profile->final_norm.stop,
+              "single_token_forward_model: forward_profile final_norm stop")) {
         return false;
       }
       logits_input = scratch_bf16;
+      final_norm_executed = true;
     }
 
     if (trace != nullptr) {
       trace->final_hidden_normed = CopyTensorToHost(*logits_input);
       if (trace->final_hidden_normed.empty()) {
         std::cerr << "single_token_forward_model: failed to capture final normalized hidden state\n";
-        destroy_profile_events();
         return false;
       }
     }
 
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->lm_head.start,
+            "single_token_forward_model: forward_profile lm_head start")) {
+      return false;
+    }
     if (!impl_->lm_head_op->Run(
             *impl_->cublas,
             impl_->heuristic_cache.get(),
             *logits_input,
             logits)) {
       std::cerr << "single_token_forward_model: lm_head projection failed\n";
-      destroy_profile_events();
+      return false;
+    }
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->lm_head.stop,
+            "single_token_forward_model: forward_profile lm_head stop")) {
       return false;
     }
     if (debug) {
@@ -1729,11 +2097,12 @@ bool SingleTokenForwardModel::RunPrefill(
       trace->logits = CopyTensorToHost(*logits);
       if (trace->logits.empty()) {
         std::cerr << "single_token_forward_model: failed to capture logits\n";
-        destroy_profile_events();
         return false;
       }
     }
-    destroy_profile_events();
+    if (!accumulate_profile(executed_layer_count, final_norm_executed)) {
+      return false;
+    }
     return true;
   }
 
@@ -1748,22 +2117,35 @@ bool SingleTokenForwardModel::RunPrefill(
       scratch_storage->data());
   if (!current_view || !next_view || !scratch_view) {
     std::cerr << "single_token_forward_model: request context token views unavailable\n";
-    destroy_profile_events();
     return false;
   }
   DeviceTensorFp32* current = current_view.get();
   DeviceTensorFp32* next = next_view.get();
   DeviceTensorFp32* scratch = scratch_view.get();
 
-  if (!token_ids_device->CopyFromHostAsync(token_ids, token_count) ||
-      !LookupEmbeddingRowsDeviceIdsFp32(
+  if (!token_ids_device->CopyFromHostAsync(token_ids, token_count)) {
+    std::cerr << "single_token_forward_model: embedding lookup failed\n";
+    return false;
+  }
+  if (forward_profile != nullptr &&
+      !RecordForwardProfileEvent(
+          forward_profile->embedding.start,
+          "single_token_forward_model: forward_profile embedding start")) {
+    return false;
+  }
+  if (!LookupEmbeddingRowsDeviceIdsFp32(
            *impl_->embedding_table,
            token_ids_device->data(),
            token_count,
            current)
            .has_value()) {
     std::cerr << "single_token_forward_model: embedding lookup failed\n";
-    destroy_profile_events();
+    return false;
+  }
+  if (forward_profile != nullptr &&
+      !RecordForwardProfileEvent(
+          forward_profile->embedding.stop,
+          "single_token_forward_model: forward_profile embedding stop")) {
     return false;
   }
   if (debug) {
@@ -1773,7 +2155,6 @@ bool SingleTokenForwardModel::RunPrefill(
   if (trace != nullptr) {
     trace->embedding_output = CopyTensorToHost(*current);
     if (trace->embedding_output.empty()) {
-      destroy_profile_events();
       return false;
     }
     trace->captured_layers.clear();
@@ -1782,14 +2163,19 @@ bool SingleTokenForwardModel::RunPrefill(
     trace->logits.clear();
   }
 
-  for (const Impl::LayerEntry& layer : impl_->layers) {
+  std::size_t executed_layer_count = 0;
+  for (std::size_t layer_slot = 0; layer_slot < impl_->layers.size(); ++layer_slot) {
+    const Impl::LayerEntry& layer = impl_->layers[layer_slot];
     if (debug) {
       std::cout << "single_token_forward_model: running layer "
                 << layer.plan.layer_index
                 << " kind=" << static_cast<int>(layer.plan.kind) << "\n";
     }
-    if (profile) {
-      cudaEventRecord(profile_start);
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->layer_spans[layer_slot].start,
+            "single_token_forward_model: forward_profile layer start")) {
+      return false;
     }
     bool ok = false;
     switch (layer.plan.kind) {
@@ -1856,27 +2242,20 @@ bool SingleTokenForwardModel::RunPrefill(
         break;
       }
     }
-    if (profile) {
-      cudaEventRecord(profile_end);
-      cudaEventSynchronize(profile_end);
-      float layer_ms = 0.0f;
-      cudaEventElapsedTime(&layer_ms, profile_start, profile_end);
-      const char* kind_name =
-          layer.plan.kind == ForwardLayerKind::kAttention ? "attention" :
-          layer.plan.kind == ForwardLayerKind::kMamba ? "mamba" :
-          layer.plan.kind == ForwardLayerKind::kExpert ? "expert" : "unknown";
-      std::cerr << "profile layer=" << layer.plan.layer_index
-                << " kind=" << kind_name
-                << " ms=" << std::fixed << std::setprecision(3) << layer_ms << "\n";
-    }
     if (!ok) {
       std::cerr << "single_token_forward_model: layer "
                 << layer.plan.layer_index
                 << " kind=" << static_cast<int>(layer.plan.kind)
                 << " execution failed\n";
-      destroy_profile_events();
       return false;
     }
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->layer_spans[layer_slot].stop,
+            "single_token_forward_model: forward_profile layer stop")) {
+      return false;
+    }
+    ++executed_layer_count;
     std::swap(current, next);
     if (debug) {
       std::cout << "single_token_forward_model: layer "
@@ -1889,7 +2268,6 @@ bool SingleTokenForwardModel::RunPrefill(
       captured.hidden = CopyTensorToHost(*current);
       if (captured.hidden.empty()) {
         std::cerr << "single_token_forward_model: failed to capture layer " << layer.plan.layer_index << "\n";
-        destroy_profile_events();
         return false;
       }
       trace->captured_layers.push_back(std::move(captured));
@@ -1904,41 +2282,63 @@ bool SingleTokenForwardModel::RunPrefill(
     trace->final_hidden = CopyTensorToHost(*current);
     if (trace->final_hidden.empty()) {
       std::cerr << "single_token_forward_model: failed to capture final hidden state\n";
-      destroy_profile_events();
       return false;
     }
   }
 
+  bool final_norm_executed = false;
   const DeviceTensorFp32* logits_input = current;
   if (impl_->final_norm_weight != nullptr) {
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->final_norm.start,
+            "single_token_forward_model: forward_profile final_norm start")) {
+      return false;
+    }
     if (!RmsNormFp32(
             *current,
             *impl_->final_norm_weight,
             impl_->config.layer_norm_epsilon,
             scratch)) {
       std::cerr << "single_token_forward_model: final RMSNorm failed\n";
-      destroy_profile_events();
+      return false;
+    }
+    if (forward_profile != nullptr &&
+        !RecordForwardProfileEvent(
+            forward_profile->final_norm.stop,
+            "single_token_forward_model: forward_profile final_norm stop")) {
       return false;
     }
     logits_input = scratch;
+    final_norm_executed = true;
   }
 
   if (trace != nullptr) {
     trace->final_hidden_normed = CopyTensorToHost(*logits_input);
     if (trace->final_hidden_normed.empty()) {
       std::cerr << "single_token_forward_model: failed to capture final normalized hidden state\n";
-      destroy_profile_events();
       return false;
     }
   }
 
+  if (forward_profile != nullptr &&
+      !RecordForwardProfileEvent(
+          forward_profile->lm_head.start,
+          "single_token_forward_model: forward_profile lm_head start")) {
+    return false;
+  }
   if (!impl_->lm_head_op->Run(
           *impl_->cublas,
           impl_->heuristic_cache.get(),
           *logits_input,
           logits)) {
     std::cerr << "single_token_forward_model: lm_head projection failed\n";
-    destroy_profile_events();
+    return false;
+  }
+  if (forward_profile != nullptr &&
+      !RecordForwardProfileEvent(
+          forward_profile->lm_head.stop,
+          "single_token_forward_model: forward_profile lm_head stop")) {
     return false;
   }
   if (debug) {
@@ -1949,11 +2349,12 @@ bool SingleTokenForwardModel::RunPrefill(
     trace->logits = CopyTensorToHost(*logits);
     if (trace->logits.empty()) {
       std::cerr << "single_token_forward_model: failed to capture logits\n";
-      destroy_profile_events();
       return false;
     }
   }
-  destroy_profile_events();
+  if (!accumulate_profile(executed_layer_count, final_norm_executed)) {
+    return false;
+  }
   return true;
 }
 
