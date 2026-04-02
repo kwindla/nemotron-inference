@@ -5,10 +5,13 @@
 #include <limits>
 #include <utility>
 
+#include "nemotron/nvfp4_scale_layout.h"
+
 namespace nemotron {
 namespace {
 
 constexpr std::size_t kNvfp4BlockWidth = 16;
+constexpr std::size_t kRequiredAlignmentBytes = 16;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -33,14 +36,25 @@ bool TryMultiply(std::size_t lhs, std::size_t rhs, std::size_t* result) {
   return true;
 }
 
+std::size_t RoundUp(std::size_t value, std::size_t alignment) {
+  if (alignment == 0) {
+    return value;
+  }
+  const std::size_t remainder = value % alignment;
+  return remainder == 0 ? value : value + (alignment - remainder);
+}
+
 bool ComputeLayoutSizes(
     std::size_t num_experts,
     std::size_t output_rows,
     std::size_t input_cols,
     std::size_t* expert_packed_nbytes,
     std::size_t* expert_block_scales_nbytes,
+    std::size_t* expert_matmul_block_scales_nbytes,
+    std::size_t* expert_tensor_scale_stride_nbytes,
     std::size_t* total_packed_nbytes,
     std::size_t* total_block_scales_nbytes,
+    std::size_t* total_matmul_block_scales_nbytes,
     std::size_t* total_tensor_scales_nbytes) {
   if (num_experts == 0 || output_rows == 0 || input_cols == 0 || input_cols % kNvfp4BlockWidth != 0) {
     return false;
@@ -48,11 +62,20 @@ bool ComputeLayoutSizes(
 
   const std::size_t packed_cols = input_cols / 2u;
   const std::size_t block_cols = input_cols / kNvfp4BlockWidth;
+  const std::size_t tensor_scale_stride_nbytes =
+      RoundUp(sizeof(float), kRequiredAlignmentBytes);
+  if (expert_matmul_block_scales_nbytes == nullptr ||
+      expert_tensor_scale_stride_nbytes == nullptr) {
+    return false;
+  }
+  *expert_matmul_block_scales_nbytes = ExecutionNvfp4ScaleBytes(output_rows, input_cols);
+  *expert_tensor_scale_stride_nbytes = tensor_scale_stride_nbytes;
   return TryMultiply(output_rows, packed_cols, expert_packed_nbytes) &&
          TryMultiply(output_rows, block_cols, expert_block_scales_nbytes) &&
+         TryMultiply(num_experts, *expert_matmul_block_scales_nbytes, total_matmul_block_scales_nbytes) &&
          TryMultiply(num_experts, *expert_packed_nbytes, total_packed_nbytes) &&
          TryMultiply(num_experts, *expert_block_scales_nbytes, total_block_scales_nbytes) &&
-         TryMultiply(num_experts, sizeof(float), total_tensor_scales_nbytes);
+         TryMultiply(num_experts, *expert_tensor_scale_stride_nbytes, total_tensor_scales_nbytes);
 }
 
 }  // namespace
@@ -63,12 +86,16 @@ struct MonolithicNvfp4ExpertWeights::Impl {
   std::size_t input_cols = 0;
   std::size_t expert_packed_nbytes = 0;
   std::size_t expert_block_scales_nbytes = 0;
+  std::size_t expert_matmul_block_scales_nbytes = 0;
+  std::size_t expert_tensor_scale_stride_nbytes = 0;
   std::size_t total_packed_nbytes = 0;
   std::size_t total_block_scales_nbytes = 0;
+  std::size_t total_matmul_block_scales_nbytes = 0;
   std::size_t total_tensor_scales_nbytes = 0;
   std::uint8_t* packed_data = nullptr;
   std::uint8_t* block_scales_data = nullptr;
-  float* tensor_scales_data = nullptr;
+  std::uint8_t* matmul_block_scales_data = nullptr;
+  std::uint8_t* tensor_scales_data = nullptr;
 };
 
 std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Create(
@@ -82,8 +109,11 @@ std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Crea
           input_cols,
           &impl->expert_packed_nbytes,
           &impl->expert_block_scales_nbytes,
+          &impl->expert_matmul_block_scales_nbytes,
+          &impl->expert_tensor_scale_stride_nbytes,
           &impl->total_packed_nbytes,
           &impl->total_block_scales_nbytes,
+          &impl->total_matmul_block_scales_nbytes,
           &impl->total_tensor_scales_nbytes)) {
     return nullptr;
   }
@@ -101,8 +131,13 @@ std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Crea
       !CheckCuda(
           cudaMalloc(reinterpret_cast<void**>(&impl->block_scales_data), impl->total_block_scales_nbytes)) ||
       !CheckCuda(
+          cudaMalloc(
+              reinterpret_cast<void**>(&impl->matmul_block_scales_data),
+              impl->total_matmul_block_scales_nbytes)) ||
+      !CheckCuda(
           cudaMalloc(reinterpret_cast<void**>(&impl->tensor_scales_data), impl->total_tensor_scales_nbytes))) {
     ReleaseBuffer(&impl->tensor_scales_data);
+    ReleaseBuffer(&impl->matmul_block_scales_data);
     ReleaseBuffer(&impl->block_scales_data);
     ReleaseBuffer(&impl->packed_data);
     return nullptr;
@@ -126,6 +161,7 @@ MonolithicNvfp4ExpertWeights::~MonolithicNvfp4ExpertWeights() {
     return;
   }
   ReleaseBuffer(&impl_->tensor_scales_data);
+  ReleaseBuffer(&impl_->matmul_block_scales_data);
   ReleaseBuffer(&impl_->block_scales_data);
   ReleaseBuffer(&impl_->packed_data);
 }
@@ -150,7 +186,17 @@ bool MonolithicNvfp4ExpertWeights::UploadExpert(
   std::uint8_t* expert_packed_data = impl_->packed_data + (expert_index * impl_->expert_packed_nbytes);
   std::uint8_t* expert_block_scales =
       impl_->block_scales_data + (expert_index * impl_->expert_block_scales_nbytes);
-  float* expert_tensor_scale = impl_->tensor_scales_data + expert_index;
+  std::uint8_t* expert_matmul_block_scales =
+      impl_->matmul_block_scales_data + (expert_index * impl_->expert_matmul_block_scales_nbytes);
+  std::uint8_t* expert_tensor_scale =
+      impl_->tensor_scales_data + (expert_index * impl_->expert_tensor_scale_stride_nbytes);
+  const std::vector<std::uint8_t> matmul_block_scales = SwizzleRowMajorNvfp4ScalesForExecution(
+      host_block_scales,
+      impl_->output_rows,
+      impl_->input_cols);
+  if (matmul_block_scales.size() != impl_->expert_matmul_block_scales_nbytes) {
+    return false;
+  }
 
   if (!CheckCuda(cudaMemcpy(expert_packed_data, host_packed, packed_nbytes, cudaMemcpyHostToDevice))) {
     return false;
@@ -160,6 +206,14 @@ bool MonolithicNvfp4ExpertWeights::UploadExpert(
               expert_block_scales,
               host_block_scales,
               block_scales_nbytes,
+              cudaMemcpyHostToDevice))) {
+    return false;
+  }
+  if (!CheckCuda(
+          cudaMemcpy(
+              expert_matmul_block_scales,
+              matmul_block_scales.data(),
+              matmul_block_scales.size(),
               cudaMemcpyHostToDevice))) {
     return false;
   }
@@ -175,7 +229,10 @@ FusedNvfp4WeightView MonolithicNvfp4ExpertWeights::GetView(std::size_t expert_in
 
   view.packed_data = impl_->packed_data + (expert_index * impl_->expert_packed_nbytes);
   view.block_scales_data = impl_->block_scales_data + (expert_index * impl_->expert_block_scales_nbytes);
-  view.tensor_scale_data = impl_->tensor_scales_data + expert_index;
+  view.matmul_block_scales_data =
+      impl_->matmul_block_scales_data + (expert_index * impl_->expert_matmul_block_scales_nbytes);
+  view.tensor_scale_data = reinterpret_cast<const float*>(
+      impl_->tensor_scales_data + (expert_index * impl_->expert_tensor_scale_stride_nbytes));
   view.output_rows = impl_->output_rows;
   view.input_cols = impl_->input_cols;
   return view;
@@ -196,6 +253,7 @@ std::vector<FusedNvfp4WeightView> MonolithicNvfp4ExpertWeights::BuildAllViews() 
 
 std::size_t MonolithicNvfp4ExpertWeights::total_bytes() const {
   return impl_ ? (impl_->total_packed_nbytes + impl_->total_block_scales_nbytes +
+                  impl_->total_matmul_block_scales_nbytes +
                   impl_->total_tensor_scales_nbytes)
                : 0;
 }
@@ -211,11 +269,15 @@ bool MonolithicNvfp4ExpertWeights::valid() const {
          impl_->input_cols > 0 &&
          impl_->expert_packed_nbytes > 0 &&
          impl_->expert_block_scales_nbytes > 0 &&
+         impl_->expert_matmul_block_scales_nbytes > 0 &&
+         impl_->expert_tensor_scale_stride_nbytes >= sizeof(float) &&
          impl_->total_packed_nbytes > 0 &&
          impl_->total_block_scales_nbytes > 0 &&
+         impl_->total_matmul_block_scales_nbytes > 0 &&
          impl_->total_tensor_scales_nbytes > 0 &&
          impl_->packed_data != nullptr &&
          impl_->block_scales_data != nullptr &&
+         impl_->matmul_block_scales_data != nullptr &&
          impl_->tensor_scales_data != nullptr;
 }
 

@@ -445,10 +445,52 @@ FusedNvfp4WeightView MakeFusedNvfp4WeightView(const DeviceNvfp4Weight& weight) {
   return FusedNvfp4WeightView{
       weight.packed_data(),
       weight.block_scales_data(),
+      weight.matmul_block_scales_data(),
       reinterpret_cast<const float*>(weight.tensor_scale_data()),
       weight.output_rows(),
       weight.input_cols(),
   };
+}
+
+Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const FusedNvfp4WeightView& weight) {
+  return Nvfp4PackedMatrixDeviceView{
+      weight.packed_data,
+      PackedFp4Bytes(weight.output_rows, weight.input_cols),
+      weight.matmul_block_scales_data,
+      ExecutionNvfp4ScaleBytes(weight.output_rows, weight.input_cols),
+      weight.tensor_scale_data,
+      sizeof(float),
+      weight.output_rows,
+      weight.input_cols,
+  };
+}
+
+std::optional<CublasLtGemmPlan> BuildRuntimeNvfp4GemmPlan(
+    const GemmDescriptor& descriptor,
+    const Nvfp4PackedMatrixDeviceView& weight_view,
+    std::size_t rows,
+    GemmHeuristicCache* heuristic_cache) {
+  auto runtime_launch_plan = BuildGemmLaunchPlan(descriptor, rows);
+  if (!runtime_launch_plan.has_value()) {
+    return std::nullopt;
+  }
+  runtime_launch_plan->packed_bytes = ByteRangeView{
+      weight_view.packed_data,
+      weight_view.packed_nbytes,
+  };
+  runtime_launch_plan->block_scales_bytes = ByteRangeView{
+      weight_view.block_scales_data,
+      weight_view.block_scales_nbytes,
+  };
+  runtime_launch_plan->tensor_scale_bytes = ByteRangeView{
+      reinterpret_cast<const std::uint8_t*>(weight_view.tensor_scale_data),
+      weight_view.tensor_scale_nbytes,
+  };
+  const auto execution = PrepareGemmExecution(*runtime_launch_plan, heuristic_cache);
+  if (!execution.has_value()) {
+    return std::nullopt;
+  }
+  return BuildCublasLtGemmPlan(*execution);
 }
 
 std::uint64_t TotalUploadedBytes(const DeviceNvfp4Weight& weight) {
@@ -472,6 +514,8 @@ std::uint64_t EstimatedUploadedBytes(const GemmDescriptor& descriptor) {
 constexpr std::uint64_t kBytesPerMiB = 1024ull * 1024ull;
 constexpr std::uint64_t kDefaultForwardVramReserveMiB = 512ull;
 constexpr std::uint64_t kExpertRuntimeHeadroomMiB = 2048ull;
+constexpr const char* kNvfp4ActivationTensorScaleEnvVar =
+    "NEMOTRON_FORWARD_NVFP4_ACTIVATION_TENSOR_SCALE";
 
 std::uint64_t ParseEnvMiB(const char* name, std::uint64_t default_value_mib) {
   const char* value = std::getenv(name);
@@ -488,6 +532,22 @@ std::uint64_t ParseEnvMiB(const char* name, std::uint64_t default_value_mib) {
   return static_cast<std::uint64_t>(parsed_mib);
 }
 
+std::optional<float> ParsePositiveFloatEnv(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const float parsed = std::strtof(value, &end);
+  if (end == value || (end != nullptr && *end != '\0') || errno == ERANGE ||
+      !std::isfinite(parsed) || parsed <= 0.0f) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
 bool ExpertFullResidencyEnabled() {
   const char* value = std::getenv("NEMOTRON_EXPERT_FULL_RESIDENCY");
   return value == nullptr || std::strcmp(value, "0") != 0;
@@ -496,6 +556,21 @@ bool ExpertFullResidencyEnabled() {
 bool ExpertMonolithicEnabled() {
   const char* value = std::getenv("NEMOTRON_EXPERT_MONOLITHIC");
   return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+bool MoeCublasLtEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_MOE_CUBLASLT");
+  return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+Nvfp4PackOptions RuntimeMoeNvfp4PackOptions() {
+  Nvfp4PackOptions options;
+  options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
+  if (const auto fixed_tensor_scale = ParsePositiveFloatEnv(kNvfp4ActivationTensorScaleEnvVar);
+      fixed_tensor_scale.has_value()) {
+    options.fixed_tensor_scale = *fixed_tensor_scale;
+  }
+  return options;
 }
 
 const float* RawNvfp4TensorScalePtr(const GemmDescriptor& descriptor) {
@@ -687,6 +762,181 @@ struct ExpertLayerSlice::Impl {
   bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
 };
+
+bool RunMoeDirectDecodeViaCublaslt(
+    const ExpertLayerConfig& config,
+    const std::vector<const GemmDescriptor*>& routed_up_descriptors,
+    const std::vector<const GemmDescriptor*>& routed_down_descriptors,
+    const GemmDescriptor& shared_up_descriptor,
+    const DeviceNvfp4Weight& shared_up_weight,
+    const GemmDescriptor& shared_down_descriptor,
+    const DeviceNvfp4Weight& shared_down_weight,
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& normalized,
+    const std::vector<ExpertSelection>& selected_experts,
+    const std::vector<FusedNvfp4WeightView>& routed_up_views,
+    const std::vector<FusedNvfp4WeightView>& routed_down_views,
+    DeviceTensorFp32* output) {
+  if (!cublas_handle.valid() ||
+      !input.valid() ||
+      !normalized.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      input.shape() != normalized.shape() ||
+      input.shape() != output->shape() ||
+      input.shape().size() != 2 ||
+      input.shape()[0] != 1 ||
+      input.shape()[1] != config.hidden_size ||
+      routed_up_descriptors.empty() ||
+      routed_down_descriptors.empty() ||
+      routed_up_descriptors.size() != selected_experts.size() ||
+      routed_down_descriptors.size() != selected_experts.size() ||
+      routed_up_descriptors.front() == nullptr ||
+      routed_down_descriptors.front() == nullptr ||
+      !shared_up_weight.valid() ||
+      !shared_down_weight.valid() ||
+      selected_experts.empty() ||
+      selected_experts.size() != routed_up_views.size() ||
+      selected_experts.size() != routed_down_views.size()) {
+    return false;
+  }
+
+  const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
+  auto normalized_packed = PackDeviceRowMajorFp32ToNvfp4(normalized, pack_options);
+  auto routed_output = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto shared_output = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto routed_up_output =
+      DeviceTensorFp32::Create({1, config.routed_expert_intermediate_size});
+  auto routed_down_output = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto shared_up_output =
+      DeviceTensorFp32::Create({1, config.shared_expert_intermediate_size});
+  auto mixer_output = DeviceTensorFp32::Create({1, config.hidden_size});
+  if (!normalized_packed ||
+      !normalized_packed->valid() ||
+      !routed_output ||
+      !shared_output ||
+      !routed_up_output ||
+      !routed_down_output ||
+      !shared_up_output ||
+      !mixer_output ||
+      !routed_output->FillZero()) {
+    return false;
+  }
+
+  const Nvfp4PackedMatrixDeviceView normalized_view =
+      MakeNvfp4PackedMatrixDeviceView(*normalized_packed);
+  const Nvfp4PackedMatrixDeviceView routed_up_weight_view =
+      MakeNvfp4PackedMatrixDeviceView(routed_up_views.front());
+  const Nvfp4PackedMatrixDeviceView routed_down_weight_view =
+      MakeNvfp4PackedMatrixDeviceView(routed_down_views.front());
+  const Nvfp4PackedMatrixDeviceView shared_up_weight_view =
+      MakeNvfp4PackedMatrixDeviceView(shared_up_weight);
+  const Nvfp4PackedMatrixDeviceView shared_down_weight_view =
+      MakeNvfp4PackedMatrixDeviceView(shared_down_weight);
+  if (!normalized_view.valid() ||
+      !routed_up_weight_view.valid() ||
+      !routed_down_weight_view.valid() ||
+      !shared_up_weight_view.valid() ||
+      !shared_down_weight_view.valid()) {
+    return false;
+  }
+
+  const std::size_t rows = normalized.shape()[0];
+  const auto routed_up_plan = BuildRuntimeNvfp4GemmPlan(
+      *routed_up_descriptors.front(),
+      routed_up_weight_view,
+      rows,
+      heuristic_cache);
+  const auto routed_down_plan = BuildRuntimeNvfp4GemmPlan(
+      *routed_down_descriptors.front(),
+      routed_down_weight_view,
+      rows,
+      heuristic_cache);
+  const auto shared_up_plan = BuildRuntimeNvfp4GemmPlan(
+      shared_up_descriptor,
+      shared_up_weight_view,
+      rows,
+      heuristic_cache);
+  const auto shared_down_plan = BuildRuntimeNvfp4GemmPlan(
+      shared_down_descriptor,
+      shared_down_weight_view,
+      rows,
+      heuristic_cache);
+  if (!routed_up_plan.has_value() ||
+      !routed_down_plan.has_value() ||
+      !shared_up_plan.has_value() ||
+      !shared_down_plan.has_value()) {
+    return false;
+  }
+
+  for (std::size_t slot = 0; slot < selected_experts.size(); ++slot) {
+    const Nvfp4PackedMatrixDeviceView expert_up_view =
+        MakeNvfp4PackedMatrixDeviceView(routed_up_views[slot]);
+    const Nvfp4PackedMatrixDeviceView expert_down_view =
+        MakeNvfp4PackedMatrixDeviceView(routed_down_views[slot]);
+    if (!expert_up_view.valid() ||
+        !expert_down_view.valid() ||
+        !RunNvfp4RowMajorFp32AccumToDevice(
+             cublas_handle,
+             *routed_up_plan,
+             normalized_view,
+             expert_up_view,
+             routed_up_output.get())
+             .has_value() ||
+        !Relu2InPlaceFp32(routed_up_output.get())) {
+      return false;
+    }
+
+    auto routed_activated_packed =
+        PackDeviceRowMajorFp32ToNvfp4(*routed_up_output, pack_options);
+    if (!routed_activated_packed ||
+        !routed_activated_packed->valid() ||
+        !RunNvfp4RowMajorFp32AccumToDevice(
+             cublas_handle,
+             *routed_down_plan,
+             MakeNvfp4PackedMatrixDeviceView(*routed_activated_packed),
+             expert_down_view,
+             routed_down_output.get())
+             .has_value() ||
+        !AccumulateScaledFp32(
+             *routed_down_output,
+             selected_experts[slot].weight,
+             routed_output.get())) {
+      return false;
+    }
+  }
+
+  if (!RunNvfp4RowMajorFp32AccumToDevice(
+           cublas_handle,
+           *shared_up_plan,
+           normalized_view,
+           shared_up_weight_view,
+           shared_up_output.get())
+           .has_value() ||
+      !Relu2InPlaceFp32(shared_up_output.get())) {
+    return false;
+  }
+
+  auto shared_activated_packed =
+      PackDeviceRowMajorFp32ToNvfp4(*shared_up_output, pack_options);
+  if (!shared_activated_packed ||
+      !shared_activated_packed->valid() ||
+      !RunNvfp4RowMajorFp32AccumToDevice(
+           cublas_handle,
+           *shared_down_plan,
+           MakeNvfp4PackedMatrixDeviceView(*shared_activated_packed),
+           shared_down_weight_view,
+           shared_output.get())
+           .has_value() ||
+      !ResidualAddFp32(*routed_output, *shared_output, mixer_output.get()) ||
+      !ResidualAddFp32(input, *mixer_output, output)) {
+    return false;
+  }
+
+  return true;
+}
 
 std::optional<ExpertLayerBindings> BuildExpertLayerBindings(
     const LayerScheduleEntry& layer,
@@ -1439,11 +1689,7 @@ bool ExpertLayerSlice::Run(
 
   auto normalized = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
   auto router_logits = DeviceTensorFp32::Create({token_count, impl_->config.n_routed_experts});
-  auto latent = DeviceTensorFp32::Create({token_count, impl_->config.moe_latent_size});
-  auto routed_tensor = DeviceTensorFp32::Create({token_count, impl_->config.moe_latent_size});
-  auto projected_routed = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto shared_up = DeviceTensorFp32::Create({token_count, impl_->config.shared_expert_intermediate_size});
-  if (!normalized || !router_logits || !latent || !routed_tensor || !projected_routed || !shared_up) {
+  if (!normalized || !router_logits) {
     if (debug) {
       std::cout << "expert_layer: scratch allocation failed\n";
     }
@@ -1470,6 +1716,147 @@ bool ExpertLayerSlice::Run(
     std::vector<float> fused_debug_shared_host;
     bool collected_fused_debug = false;
     bool live_fused_output_written = false;
+    const bool use_moe_cublaslt =
+        trace == nullptr &&
+        token_count == 1 &&
+        !compare_fused_debug &&
+        impl_->fused_direct_moe_supported &&
+        FusedMoeDecodeEnabled() &&
+        MoeCublasLtEnabled();
+    if (use_moe_cublaslt) {
+      std::vector<float> router_logits_host;
+      if (!CopyToHost(*router_logits, &router_logits_host) ||
+          router_logits_host.size() != impl_->config.n_routed_experts) {
+        return false;
+      }
+
+      std::vector<ExpertSelection> selected_experts = SelectTopExperts(
+          impl_->config,
+          router_logits_host,
+          impl_->gate_score_correction_bias);
+      if (selected_experts.size() != impl_->config.top_k) {
+        return false;
+      }
+
+      std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_up_weights;
+      std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_down_weights;
+      std::vector<const GemmDescriptor*> routed_up_descriptors;
+      std::vector<const GemmDescriptor*> routed_down_descriptors;
+      std::vector<FusedNvfp4WeightView> routed_up_views;
+      std::vector<FusedNvfp4WeightView> routed_down_views;
+      routed_up_descriptors.reserve(selected_experts.size());
+      routed_down_descriptors.reserve(selected_experts.size());
+      routed_up_views.reserve(selected_experts.size());
+      routed_down_views.reserve(selected_experts.size());
+
+      auto& staging_counters = GetExpertStagingCounters();
+      if (impl_->monolithic_resident) {
+        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+        staging_counters.monolithic_layers.fetch_add(1, std::memory_order_relaxed);
+        if (impl_->monolithic_up == nullptr || impl_->monolithic_down == nullptr) {
+          return false;
+        }
+        for (const ExpertSelection& selection : selected_experts) {
+          if (selection.expert_index >= impl_->routed_experts.size()) {
+            return false;
+          }
+          const Impl::RoutedExpertRuntime& runtime_pair =
+              impl_->routed_experts[selection.expert_index];
+          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+            return false;
+          }
+          routed_up_descriptors.push_back(runtime_pair.up_proj);
+          routed_down_descriptors.push_back(runtime_pair.down_proj);
+          routed_up_views.push_back(impl_->monolithic_up->GetView(selection.expert_index));
+          routed_down_views.push_back(impl_->monolithic_down->GetView(selection.expert_index));
+        }
+      } else if (impl_->full_residency_enabled) {
+        for (const ExpertSelection& selection : selected_experts) {
+          if (selection.expert_index >= impl_->routed_experts.size()) {
+            return false;
+          }
+          const Impl::RoutedExpertRuntime& runtime_pair =
+              impl_->routed_experts[selection.expert_index];
+          if (runtime_pair.up_proj == nullptr ||
+              runtime_pair.down_proj == nullptr ||
+              runtime_pair.up_proj_device == nullptr ||
+              runtime_pair.down_proj_device == nullptr ||
+              !runtime_pair.up_proj_device->valid() ||
+              !runtime_pair.down_proj_device->valid()) {
+            return false;
+          }
+          routed_up_descriptors.push_back(runtime_pair.up_proj);
+          routed_down_descriptors.push_back(runtime_pair.down_proj);
+          routed_up_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.up_proj_device));
+          routed_down_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.down_proj_device));
+        }
+      } else {
+        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+        staged_up_weights.reserve(selected_experts.size());
+        staged_down_weights.reserve(selected_experts.size());
+        for (const ExpertSelection& selection : selected_experts) {
+          if (selection.expert_index >= impl_->routed_experts.size()) {
+            return false;
+          }
+          const Impl::RoutedExpertRuntime& runtime_pair =
+              impl_->routed_experts[selection.expert_index];
+          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+            return false;
+          }
+          const auto up_upload_started = std::chrono::steady_clock::now();
+          auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
+          const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - up_upload_started)
+                  .count());
+          staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
+          const auto down_upload_started = std::chrono::steady_clock::now();
+          auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
+          const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - down_upload_started)
+                  .count());
+          staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
+          if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
+            return false;
+          }
+          const std::uint64_t upload_bytes =
+              TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
+          staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
+          staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
+          routed_up_descriptors.push_back(runtime_pair.up_proj);
+          routed_down_descriptors.push_back(runtime_pair.down_proj);
+          routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
+          routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
+          staged_up_weights.push_back(std::move(up_weight));
+          staged_down_weights.push_back(std::move(down_weight));
+        }
+      }
+
+      if (RunMoeDirectDecodeViaCublaslt(
+              impl_->config,
+              routed_up_descriptors,
+              routed_down_descriptors,
+              *impl_->shared_up_nvfp4,
+              *impl_->shared_up_nvfp4_device,
+              *impl_->shared_down_nvfp4,
+              *impl_->shared_down_nvfp4_device,
+              cublas_handle,
+              heuristic_cache,
+              input,
+              *normalized,
+              selected_experts,
+              routed_up_views,
+              routed_down_views,
+              output)) {
+        return true;
+      }
+
+      if (debug) {
+        std::cout << "expert_layer: cuBLASLt direct MoE fastpath failed, falling back\n";
+      }
+    }
+
     const bool use_fused_direct_decode =
         trace == nullptr &&
         token_count == 1 &&
@@ -1924,6 +2311,17 @@ bool ExpertLayerSlice::Run(
                 << "\n";
     }
     return true;
+  }
+
+  auto latent = DeviceTensorFp32::Create({token_count, impl_->config.moe_latent_size});
+  auto routed_tensor = DeviceTensorFp32::Create({token_count, impl_->config.moe_latent_size});
+  auto projected_routed = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+  auto shared_up = DeviceTensorFp32::Create({token_count, impl_->config.shared_expert_intermediate_size});
+  if (!latent || !routed_tensor || !projected_routed || !shared_up) {
+    if (debug) {
+      std::cout << "expert_layer: latent scratch allocation failed\n";
+    }
+    return false;
   }
 
   const bool fc1_ok =
