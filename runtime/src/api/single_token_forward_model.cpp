@@ -38,8 +38,38 @@
 #include "nemotron/runtime_stats.h"
 #include "../backend/storage_conversion.h"
 
+#include <cuda_runtime.h>
+
 namespace nemotron {
 namespace {
+
+constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+constexpr double kMinFreeCudaGiB = 8.0;
+
+bool CheckCudaMemoryBudget(const char* caller) {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+    std::cerr << caller << ": cudaMemGetInfo failed, skipping memory budget check\n";
+    return true;
+  }
+  const double free_gib = static_cast<double>(free_bytes) / kGiB;
+  const double total_gib = static_cast<double>(total_bytes) / kGiB;
+  if (free_gib < kMinFreeCudaGiB) {
+    std::cerr << caller << ": ABORT — insufficient GPU memory for model construction.\n"
+              << "  cuda_free_gib=" << std::fixed << std::setprecision(1) << free_gib
+              << "  cuda_total_gib=" << total_gib
+              << "  minimum_required_gib=" << kMinFreeCudaGiB << "\n"
+              << "  This usually means a previous model is still loaded.\n"
+              << "  On DGX Spark (128 GB UMA), only one model instance can be resident.\n"
+              << "  Set NEMOTRON_SKIP_MEMORY_CHECK=1 to override.\n";
+    if (std::getenv("NEMOTRON_SKIP_MEMORY_CHECK") == nullptr) {
+      return false;
+    }
+    std::cerr << caller << ": NEMOTRON_SKIP_MEMORY_CHECK is set, proceeding anyway.\n";
+  }
+  return true;
+}
 
 std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
   if (descriptor.tensor_scale_data == nullptr || descriptor.tensor_scale_nbytes != sizeof(float)) {
@@ -392,6 +422,9 @@ struct SingleTokenForwardModel::Impl {
 std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
     const RuntimeEnvironment& environment,
     const SingleTokenForwardConfig& config) {
+  if (!CheckCudaMemoryBudget("SingleTokenForwardModel::Create")) {
+    return nullptr;
+  }
   const bool build_debug = std::getenv("NEMOTRON_FORWARD_BUILD_DEBUG") != nullptr;
   const auto log_phase = [&](const std::string& name, double ms) {
     if (build_debug) {
@@ -719,6 +752,9 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
     const RuntimeEnvironment& environment,
     const SingleTokenForwardConfig& config,
     const std::filesystem::path& cache_path) {
+  if (!CheckCudaMemoryBudget("SingleTokenForwardModel::CreateFromCache")) {
+    return nullptr;
+  }
   SingleTokenForwardBuildReport build_report;
   const auto add_phase =
       [&](const std::string& name, const std::chrono::steady_clock::time_point& begin,
