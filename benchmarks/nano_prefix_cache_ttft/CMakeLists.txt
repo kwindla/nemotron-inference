@@ -1,0 +1,7 @@
+add_executable(
+  nano_prefix_cache_ttft_bench
+  nano_prefix_cache_ttft_bench.cpp
+)
+
+target_link_libraries(nano_prefix_cache_ttft_bench PRIVATE nemotron_runtime_api)
+target_compile_features(nano_prefix_cache_ttft_bench PRIVATE cxx_std_17)

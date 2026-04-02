@@ -19,7 +19,7 @@ Minimize time-to-first-token (TTFT) for multi-turn conversations by caching atte
   Keep the existing `full_forward_manifest_smoke_test.cpp` as the committed-head integration test (removing only prompt-head assertions per step 1). Create a new `testing/api/nano_global_root_prefix_cache_test.cpp` that validates global-root reuse across conversations: prefill system tokens, publish a global root, run two different conversations (A and B) that share the system prefix, verify matched_token_count equals system token count for both, verify generated tokens match an uncached reference run. Use argmax equality with max_abs_diff <= 1e-3f for logit comparisons (matching existing smoke test standard). Register in CMakeLists.txt using the `nemotron_add_test()` pattern.
   Key files: `testing/api/nano_global_root_prefix_cache_test.cpp` (new), `testing/api/full_forward_manifest_smoke_test.cpp`, `testing/CMakeLists.txt`
 
-- [ ] **4. TTFT benchmark**
+- [x] **4. TTFT benchmark**
   Create `benchmarks/nano_prefix_cache_ttft/` following the `benchmarks/nano_fused_decode/` pattern (CMakeLists.txt, .cpp, optional .sh). Benchmark cases: (a) cold prefill + first token decode at 256, 1K, 4K tokens, (b) cached committed-head resume with 32-token user tail, (c) cached global-root resume across conversations. Run 5+ iterations per case, report median and p95. Metrics: cold TTFT, restore latency, tail prefill latency, first-token decode latency, commit/snapshot latency, hot-prefix TTFT, speedup factor, snapshot size bytes, matched prefix token count. Register in `benchmarks/CMakeLists.txt`.
   Key files: `benchmarks/nano_prefix_cache_ttft/CMakeLists.txt` (new), `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp` (new), `benchmarks/CMakeLists.txt`
 
@@ -28,5 +28,5 @@ Minimize time-to-first-token (TTFT) for multi-turn conversations by caching atte
 |---|------|--------|--------|-------|
 | 1 | Remove prompt heads from multi-turn runtime path | done | 836c0d4 | |
 | 2 | Fix Nano manifest runtime_profile and validate budget | done | f3b3cd9 | |
-| 3 | Add global-root integration test | done | — | |
-| 4 | TTFT benchmark | pending | — | |
+| 3 | Add global-root integration test | done | e904711 | |
+| 4 | TTFT benchmark | done | — | |
