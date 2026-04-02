@@ -52,6 +52,12 @@ class RequestExecutionContext {
   const DeviceTensorFp32* residual() const;
   DeviceTensorFp32* scratch();
   const DeviceTensorFp32* scratch() const;
+  DeviceTensorBf16* hidden_decode_bf16();
+  const DeviceTensorBf16* hidden_decode_bf16() const;
+  DeviceTensorBf16* residual_decode_bf16();
+  const DeviceTensorBf16* residual_decode_bf16() const;
+  DeviceTensorBf16* scratch_decode_bf16();
+  const DeviceTensorBf16* scratch_decode_bf16() const;
   DeviceTensorFp32* mamba_state();
   const DeviceTensorFp32* mamba_state() const;
   DeviceTensorFp32* mamba_conv_state();
@@ -132,6 +138,9 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorFp32> hidden,
       std::unique_ptr<DeviceTensorFp32> residual,
       std::unique_ptr<DeviceTensorFp32> scratch,
+      std::unique_ptr<DeviceTensorBf16> hidden_decode_bf16,
+      std::unique_ptr<DeviceTensorBf16> residual_decode_bf16,
+      std::unique_ptr<DeviceTensorBf16> scratch_decode_bf16,
       std::unique_ptr<DeviceTensorFp32> mamba_conv_state,
       std::unique_ptr<DeviceTensorFp32> mamba_state,
       std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode,
@@ -160,6 +169,9 @@ class RequestExecutionContext {
   std::unique_ptr<DeviceTensorFp32> hidden_;
   std::unique_ptr<DeviceTensorFp32> residual_;
   std::unique_ptr<DeviceTensorFp32> scratch_;
+  std::unique_ptr<DeviceTensorBf16> hidden_decode_bf16_;
+  std::unique_ptr<DeviceTensorBf16> residual_decode_bf16_;
+  std::unique_ptr<DeviceTensorBf16> scratch_decode_bf16_;
   std::unique_ptr<DeviceTensorFp32> mamba_conv_state_;
   std::unique_ptr<DeviceTensorFp32> mamba_state_;
   std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode_;

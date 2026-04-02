@@ -42,10 +42,16 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   auto hidden = DeviceTensorFp32::Create({config.max_tokens, config.hidden_size});
   auto residual = DeviceTensorFp32::Create({config.max_tokens, config.hidden_size});
   auto scratch = DeviceTensorFp32::Create({scratch_tokens, config.hidden_size});
-  if (!hidden || !residual || !scratch) {
+  auto hidden_decode_bf16 = DeviceTensorBf16::Create({1, config.hidden_size});
+  auto residual_decode_bf16 = DeviceTensorBf16::Create({1, config.hidden_size});
+  auto scratch_decode_bf16 = DeviceTensorBf16::Create({1, config.hidden_size});
+  if (!hidden || !residual || !scratch ||
+      !hidden_decode_bf16 || !residual_decode_bf16 || !scratch_decode_bf16) {
     return nullptr;
   }
-  if (!hidden->FillZero() || !residual->FillZero() || !scratch->FillZero()) {
+  if (!hidden->FillZero() || !residual->FillZero() || !scratch->FillZero() ||
+      !hidden_decode_bf16->FillZero() || !residual_decode_bf16->FillZero() ||
+      !scratch_decode_bf16->FillZero()) {
     return nullptr;
   }
 
@@ -168,6 +174,9 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
       std::move(hidden),
       std::move(residual),
       std::move(scratch),
+      std::move(hidden_decode_bf16),
+      std::move(residual_decode_bf16),
+      std::move(scratch_decode_bf16),
       std::move(mamba_conv_state),
       std::move(mamba_state),
       std::move(mamba_normalized_decode),
@@ -204,6 +213,9 @@ RequestExecutionContext::RequestExecutionContext(
     std::unique_ptr<DeviceTensorFp32> hidden,
     std::unique_ptr<DeviceTensorFp32> residual,
     std::unique_ptr<DeviceTensorFp32> scratch,
+    std::unique_ptr<DeviceTensorBf16> hidden_decode_bf16,
+    std::unique_ptr<DeviceTensorBf16> residual_decode_bf16,
+    std::unique_ptr<DeviceTensorBf16> scratch_decode_bf16,
     std::unique_ptr<DeviceTensorFp32> mamba_conv_state,
     std::unique_ptr<DeviceTensorFp32> mamba_state,
     std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode,
@@ -227,6 +239,9 @@ RequestExecutionContext::RequestExecutionContext(
       hidden_(std::move(hidden)),
       residual_(std::move(residual)),
       scratch_(std::move(scratch)),
+      hidden_decode_bf16_(std::move(hidden_decode_bf16)),
+      residual_decode_bf16_(std::move(residual_decode_bf16)),
+      scratch_decode_bf16_(std::move(scratch_decode_bf16)),
       mamba_conv_state_(std::move(mamba_conv_state)),
       mamba_state_(std::move(mamba_state)),
       mamba_normalized_decode_(std::move(mamba_normalized_decode)),
@@ -256,7 +271,12 @@ RequestExecutionContext& RequestExecutionContext::operator=(RequestExecutionCont
 RequestExecutionContext::~RequestExecutionContext() = default;
 
 bool RequestExecutionContext::valid() const {
-  if (!hidden_ || !hidden_->valid() || !residual_ || !residual_->valid() || !scratch_ || !scratch_->valid()) {
+  if (!hidden_ || !hidden_->valid() ||
+      !residual_ || !residual_->valid() ||
+      !scratch_ || !scratch_->valid() ||
+      !hidden_decode_bf16_ || !hidden_decode_bf16_->valid() ||
+      !residual_decode_bf16_ || !residual_decode_bf16_->valid() ||
+      !scratch_decode_bf16_ || !scratch_decode_bf16_->valid()) {
     return false;
   }
   if (!token_ids_device_.valid()) {
@@ -356,6 +376,30 @@ DeviceTensorFp32* RequestExecutionContext::scratch() {
 
 const DeviceTensorFp32* RequestExecutionContext::scratch() const {
   return scratch_.get();
+}
+
+DeviceTensorBf16* RequestExecutionContext::hidden_decode_bf16() {
+  return hidden_decode_bf16_.get();
+}
+
+const DeviceTensorBf16* RequestExecutionContext::hidden_decode_bf16() const {
+  return hidden_decode_bf16_.get();
+}
+
+DeviceTensorBf16* RequestExecutionContext::residual_decode_bf16() {
+  return residual_decode_bf16_.get();
+}
+
+const DeviceTensorBf16* RequestExecutionContext::residual_decode_bf16() const {
+  return residual_decode_bf16_.get();
+}
+
+DeviceTensorBf16* RequestExecutionContext::scratch_decode_bf16() {
+  return scratch_decode_bf16_.get();
+}
+
+const DeviceTensorBf16* RequestExecutionContext::scratch_decode_bf16() const {
+  return scratch_decode_bf16_.get();
 }
 
 DeviceTensorFp32* RequestExecutionContext::mamba_state() {
@@ -773,6 +817,15 @@ bool RequestExecutionContext::AdvanceDecodePosition(std::size_t token_count) {
 
 bool RequestExecutionContext::ResetForNewRequest() {
   bool ok = hidden_->FillZero() && residual_->FillZero() && scratch_->FillZero();
+  if (hidden_decode_bf16_) {
+    ok = ok && hidden_decode_bf16_->FillZero();
+  }
+  if (residual_decode_bf16_) {
+    ok = ok && residual_decode_bf16_->FillZero();
+  }
+  if (scratch_decode_bf16_) {
+    ok = ok && scratch_decode_bf16_->FillZero();
+  }
   if (mamba_conv_state_) {
     ok = ok && mamba_conv_state_->FillZero();
   }

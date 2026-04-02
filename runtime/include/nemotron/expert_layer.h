@@ -140,6 +140,12 @@ class ExpertLayerSlice {
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace = nullptr) const;
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& input,
+      DeviceTensorBf16* output,
+      ExpertLayerRunTrace* trace = nullptr) const;
 
   bool RunWithRequestContext(
       CublasLtHandle& cublas_handle,
@@ -147,6 +153,13 @@ class ExpertLayerSlice {
       RequestExecutionContext& request_context,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
+      ExpertLayerRunTrace* trace = nullptr) const;
+  bool RunWithRequestContext(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      RequestExecutionContext& request_context,
+      const DeviceTensorBf16& input,
+      DeviceTensorBf16* output,
       ExpertLayerRunTrace* trace = nullptr) const;
 
  private:

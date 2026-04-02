@@ -32,6 +32,14 @@ struct AttentionLayerBindings {
   const GemmDescriptor* o_proj = nullptr;
 };
 
+struct AttentionLayerPreparedBindings {
+  std::unique_ptr<DeviceTensorFp32> norm_weight;
+  std::unique_ptr<UploadedLinearOp> q_proj;
+  std::unique_ptr<UploadedLinearOp> k_proj;
+  std::unique_ptr<UploadedLinearOp> v_proj;
+  std::unique_ptr<UploadedLinearOp> o_proj;
+};
+
 std::optional<AttentionLayerBindings> BuildAttentionLayerBindings(
     const LayerScheduleEntry& layer,
     const KernelCatalog& kernel_catalog,
@@ -42,6 +50,9 @@ class AttentionLayerSlice {
   static std::unique_ptr<AttentionLayerSlice> Create(
       const AttentionLayerConfig& config,
       const AttentionLayerBindings& bindings);
+  static std::unique_ptr<AttentionLayerSlice> CreatePrepared(
+      const AttentionLayerConfig& config,
+      AttentionLayerPreparedBindings bindings);
 
   AttentionLayerSlice(AttentionLayerSlice&&) noexcept;
   AttentionLayerSlice& operator=(AttentionLayerSlice&&) noexcept;
@@ -60,6 +71,13 @@ class AttentionLayerSlice {
       RequestExecutionContext& request_context,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output) const;
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      const CudnnHandle& cudnn_handle,
+      GemmHeuristicCache* heuristic_cache,
+      RequestExecutionContext& request_context,
+      const DeviceTensorBf16& input,
+      DeviceTensorBf16* output) const;
 
  private:
   struct Impl;

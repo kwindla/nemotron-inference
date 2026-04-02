@@ -1,11 +1,13 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 
 #include "nemotron/cublaslt_handle.h"
 #include "nemotron/gemm_catalog.h"
 #include "nemotron/kernel_catalog.h"
+#include "nemotron/linear_op.h"
 #include "nemotron/model_schedule.h"
 #include "nemotron/primitive_ops.h"
 #include "nemotron/request_context.h"
@@ -47,12 +49,28 @@ struct MambaLayerBindings {
   const KernelTensorDescriptor* out_proj_input_scale = nullptr;
 };
 
+struct MambaLayerPreparedBindings {
+  std::unique_ptr<DeviceTensorFp32> input_norm_weight;
+  std::unique_ptr<DeviceTensorFp32> mixer_norm_weight;
+  std::unique_ptr<DeviceTensorFp32> conv1d_weight;
+  std::unique_ptr<DeviceTensorFp32> conv1d_bias;
+  std::unique_ptr<DeviceTensorFp32> A_log;
+  std::unique_ptr<DeviceTensorFp32> D;
+  std::unique_ptr<DeviceTensorFp32> dt_bias;
+  std::unique_ptr<UploadedLinearOp> in_proj_dense;
+  std::unique_ptr<UploadedLinearOp> out_proj_dense;
+  std::unique_ptr<ScaledFp8LinearOp> in_proj_scaled_fp8;
+  std::unique_ptr<ScaledFp8LinearOp> out_proj_scaled_fp8;
+};
+
 struct MambaLayerRunTrace {
   std::vector<float> norm_output;
   std::vector<float> in_proj_output;
   std::vector<float> scan_output;
   std::vector<float> projected_output;
 };
+
+using MambaLayerBuildTimingSink = std::function<void(const char*, double)>;
 
 std::optional<MambaLayerBindings> BuildMambaLayerBindings(
     const LayerScheduleEntry& layer,
@@ -63,7 +81,11 @@ class MambaLayerSlice {
  public:
   static std::unique_ptr<MambaLayerSlice> Create(
       const MambaLayerConfig& config,
-      const MambaLayerBindings& bindings);
+      const MambaLayerBindings& bindings,
+      MambaLayerBuildTimingSink timing_sink = {});
+  static std::unique_ptr<MambaLayerSlice> CreatePrepared(
+      const MambaLayerConfig& config,
+      MambaLayerPreparedBindings bindings);
 
   MambaLayerSlice(MambaLayerSlice&&) noexcept;
   MambaLayerSlice& operator=(MambaLayerSlice&&) noexcept;
@@ -81,6 +103,13 @@ class MambaLayerSlice {
       RequestExecutionContext& request_context,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
+      MambaLayerRunTrace* trace = nullptr) const;
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      RequestExecutionContext& request_context,
+      const DeviceTensorBf16& input,
+      DeviceTensorBf16* output,
       MambaLayerRunTrace* trace = nullptr) const;
 
  private:

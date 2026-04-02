@@ -797,4 +797,54 @@ bool MambaLayerSlice::Run(
   return true;
 }
 
+bool MambaLayerSlice::Run(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    RequestExecutionContext& request_context,
+    const DeviceTensorBf16& input,
+    DeviceTensorBf16* output,
+    MambaLayerRunTrace* trace) const {
+  if (!valid() ||
+      !cublas_handle.valid() ||
+      !request_context.valid() ||
+      !input.valid() ||
+      input.shape().size() != 2 ||
+      input.shape()[1] != impl_->config.hidden_size ||
+      output == nullptr ||
+      !output->valid() ||
+      output->shape() != input.shape()) {
+    return false;
+  }
+
+  DeviceTensorFp32* input_storage = request_context.hidden();
+  DeviceTensorFp32* output_storage = request_context.residual();
+  if (input_storage == nullptr ||
+      output_storage == nullptr ||
+      !input_storage->valid() ||
+      !output_storage->valid() ||
+      input_storage->numel() < input.numel() ||
+      output_storage->numel() < input.numel()) {
+    return false;
+  }
+
+  auto input_fp32 = DeviceTensorFp32::CreateView(input.shape(), input_storage->data());
+  auto output_fp32 = DeviceTensorFp32::CreateView(input.shape(), output_storage->data());
+  if (!input_fp32 || !output_fp32) {
+    return false;
+  }
+  if (!ConvertDeviceBf16ToFp32(input.data(), input.numel(), input_fp32->data())) {
+    return false;
+  }
+  if (!Run(
+          cublas_handle,
+          heuristic_cache,
+          request_context,
+          *input_fp32,
+          output_fp32.get(),
+          trace)) {
+    return false;
+  }
+  return ConvertDeviceFp32ToBf16(output_fp32->data(), output_fp32->numel(), output->data());
+}
+
 }  // namespace nemotron
