@@ -8,79 +8,21 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "nemotron/attention_layout.h"
 #include "nemotron/cudnn_paged_attention.h"
+#include "nemotron/device_buffer.h"
 #include "nemotron/paged_attention_plan.h"
+#include "nemotron/runtime_stats.h"
 
 namespace nemotron {
 namespace {
-
-template <typename T>
-class DeviceBuffer {
- public:
-  static std::optional<DeviceBuffer> Create(std::size_t count) {
-    if (count == 0) {
-      return std::nullopt;
-    }
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-      return std::nullopt;
-    }
-    DeviceBuffer buffer;
-    buffer.count_ = count;
-    if (cudaMalloc(reinterpret_cast<void**>(&buffer.data_), count * sizeof(T)) != cudaSuccess) {
-      return std::nullopt;
-    }
-    return buffer;
-  }
-
-  DeviceBuffer(DeviceBuffer&& other) noexcept : data_(other.data_), count_(other.count_) {
-    other.data_ = nullptr;
-    other.count_ = 0;
-  }
-
-  DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
-    if (this == &other) {
-      return *this;
-    }
-    if (data_ != nullptr) {
-      cudaFree(data_);
-    }
-    data_ = other.data_;
-    count_ = other.count_;
-    other.data_ = nullptr;
-    other.count_ = 0;
-    return *this;
-  }
-
-  ~DeviceBuffer() {
-    if (data_ != nullptr) {
-      cudaFree(data_);
-    }
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  T* data() const { return data_; }
-  std::size_t count() const { return count_; }
-
-  bool CopyFromHost(const std::vector<T>& host_values) {
-    return host_values.size() == count_ &&
-           cudaMemcpy(data_, host_values.data(), count_ * sizeof(T), cudaMemcpyHostToDevice) == cudaSuccess &&
-           cudaDeviceSynchronize() == cudaSuccess;
-  }
-
- private:
-  DeviceBuffer() = default;
-  T* data_ = nullptr;
-  std::size_t count_ = 0;
-};
 
 bool ends_with(const std::string& value, const std::string& suffix) {
   return value.size() >= suffix.size() &&
@@ -115,72 +57,6 @@ const GemmDescriptor* FindGemmBinding(
   return nullptr;
 }
 
-std::vector<__nv_bfloat16> MatrixToAttentionQueryBf16(
-    const std::vector<float>& matrix,
-    std::size_t token_count,
-    std::size_t query_head_count,
-    std::size_t head_dim) {
-  std::vector<__nv_bfloat16> output(token_count * query_head_count * head_dim);
-  for (std::size_t token = 0; token < token_count; ++token) {
-    for (std::size_t head = 0; head < query_head_count; ++head) {
-      for (std::size_t dim = 0; dim < head_dim; ++dim) {
-        const std::size_t src = token * (query_head_count * head_dim) + head * head_dim + dim;
-        const std::size_t dst = ((head * token_count) + token) * head_dim + dim;
-        output[dst] = __float2bfloat16(matrix[src]);
-      }
-    }
-  }
-  return output;
-}
-
-std::vector<float> AttentionOutputBf16ToMatrix(
-    const std::vector<__nv_bfloat16>& tensor,
-    std::size_t token_count,
-    std::size_t query_head_count,
-    std::size_t head_dim) {
-  std::vector<float> output(token_count * query_head_count * head_dim, 0.0f);
-  for (std::size_t token = 0; token < token_count; ++token) {
-    for (std::size_t head = 0; head < query_head_count; ++head) {
-      for (std::size_t dim = 0; dim < head_dim; ++dim) {
-        const std::size_t dst = token * (query_head_count * head_dim) + head * head_dim + dim;
-        const std::size_t src = ((head * token_count) + token) * head_dim + dim;
-        output[dst] = __bfloat162float(tensor[src]);
-      }
-    }
-  }
-  return output;
-}
-
-bool ScatterMatrixIntoPagedCache(
-    const std::vector<float>& matrix,
-    std::size_t token_count,
-    std::size_t kv_head_count,
-    std::size_t head_dim,
-    std::size_t tokens_per_page,
-    const std::vector<KvPageHandle>& pages,
-    std::vector<__nv_bfloat16>* cache_values) {
-  if (cache_values == nullptr) {
-    return false;
-  }
-  for (std::size_t token = 0; token < token_count; ++token) {
-    const std::size_t page_slot = token / tokens_per_page;
-    const std::size_t page_offset = token % tokens_per_page;
-    if (page_slot >= pages.size()) {
-      return false;
-    }
-    const std::size_t page_id = pages[page_slot].page_id;
-    for (std::size_t head = 0; head < kv_head_count; ++head) {
-      for (std::size_t dim = 0; dim < head_dim; ++dim) {
-        const std::size_t src = token * (kv_head_count * head_dim) + head * head_dim + dim;
-        const std::size_t dst =
-            (((page_id * kv_head_count) + head) * tokens_per_page + page_offset) * head_dim + dim;
-        (*cache_values)[dst] = __float2bfloat16(matrix[src]);
-      }
-    }
-  }
-  return true;
-}
-
 }  // namespace
 
 struct AttentionLayerSlice::Impl {
@@ -190,6 +66,11 @@ struct AttentionLayerSlice::Impl {
   std::unique_ptr<UploadedLinearOp> k_proj;
   std::unique_ptr<UploadedLinearOp> v_proj;
   std::unique_ptr<UploadedLinearOp> o_proj;
+  mutable std::mutex decode_plan_mutex;
+  mutable bool decode_plan_attempted = false;
+  mutable std::size_t decode_plan_max_kv_tokens = 0;
+  mutable std::size_t decode_plan_page_table_entries = 0;
+  mutable std::unique_ptr<CudnnPagedAttentionPlan> decode_plan;
 };
 
 std::optional<AttentionLayerBindings> BuildAttentionLayerBindings(
@@ -237,17 +118,39 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   auto k_proj = UploadedLinearOp::Create(*bindings.k_proj);
   auto v_proj = UploadedLinearOp::Create(*bindings.v_proj);
   auto o_proj = UploadedLinearOp::Create(*bindings.o_proj);
-  if (!norm_weight || !q_proj || !k_proj || !v_proj || !o_proj) {
+  AttentionLayerPreparedBindings prepared;
+  prepared.norm_weight = std::move(norm_weight);
+  prepared.q_proj = std::move(q_proj);
+  prepared.k_proj = std::move(k_proj);
+  prepared.v_proj = std::move(v_proj);
+  prepared.o_proj = std::move(o_proj);
+  return CreatePrepared(config, std::move(prepared));
+}
+
+std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::CreatePrepared(
+    const AttentionLayerConfig& config,
+    AttentionLayerPreparedBindings bindings) {
+  if (config.hidden_size == 0 ||
+      config.query_head_count == 0 ||
+      config.kv_head_count == 0 ||
+      config.head_dim == 0 ||
+      config.hidden_size != config.query_head_count * config.head_dim ||
+      config.rms_epsilon <= 0.0f ||
+      !bindings.norm_weight || !bindings.norm_weight->valid() ||
+      !bindings.q_proj || !bindings.q_proj->valid() ||
+      !bindings.k_proj || !bindings.k_proj->valid() ||
+      !bindings.v_proj || !bindings.v_proj->valid() ||
+      !bindings.o_proj || !bindings.o_proj->valid()) {
     return nullptr;
   }
 
   auto impl = std::make_unique<Impl>();
   impl->config = config;
-  impl->norm_weight = std::move(norm_weight);
-  impl->q_proj = std::move(q_proj);
-  impl->k_proj = std::move(k_proj);
-  impl->v_proj = std::move(v_proj);
-  impl->o_proj = std::move(o_proj);
+  impl->norm_weight = std::move(bindings.norm_weight);
+  impl->q_proj = std::move(bindings.q_proj);
+  impl->k_proj = std::move(bindings.k_proj);
+  impl->v_proj = std::move(bindings.v_proj);
+  impl->o_proj = std::move(bindings.o_proj);
   return std::unique_ptr<AttentionLayerSlice>(new AttentionLayerSlice(std::move(impl)));
 }
 
@@ -308,22 +211,94 @@ bool AttentionLayerSlice::Run(
     }
     return false;
   }
-  if (!request_context.SetSequenceLength(token_count)) {
-    if (debug) {
-      std::cout << "attention_layer: failed to set sequence length\n";
+  const bool new_request = request_context.sequence_length() == 0;
+  std::size_t cache_start_token = 0;
+  std::size_t total_sequence_tokens = token_count;
+  if (new_request) {
+    if (!request_context.SetSequenceLength(token_count)) {
+      if (debug) {
+        std::cout << "attention_layer: failed to set sequence length\n";
+      }
+      return false;
     }
-    return false;
+  } else {
+    total_sequence_tokens = request_context.sequence_length();
+    if (total_sequence_tokens < token_count) {
+      if (debug) {
+        std::cout << "attention_layer: decode sequence length smaller than token count\n";
+      }
+      return false;
+    }
+    cache_start_token = total_sequence_tokens - token_count;
+    if (!request_context.EnsureAttentionTokens(total_sequence_tokens)) {
+      if (debug) {
+        std::cout << "attention_layer: failed to ensure attention tokens for decode append\n";
+      }
+      return false;
+    }
   }
 
-  auto normed = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto q = DeviceTensorFp32::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
-  auto k = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-  auto v = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-  auto attn_output_fp32 = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto projected = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-  auto query_bf16 = DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
-  auto output_bf16 = DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
-  if (!normed || !q || !k || !v || !attn_output_fp32 || !projected || !query_bf16 || !output_bf16) {
+  std::unique_ptr<DeviceTensorFp32> normed_local;
+  std::unique_ptr<DeviceTensorFp32> q_local;
+  std::unique_ptr<DeviceTensorFp32> k_local;
+  std::unique_ptr<DeviceTensorFp32> v_local;
+  std::unique_ptr<DeviceTensorFp32> attn_output_fp32_local;
+  std::unique_ptr<DeviceTensorFp32> projected_local;
+  std::unique_ptr<DeviceTensorBf16> query_bf16_local;
+  std::unique_ptr<DeviceTensorBf16> output_bf16_local;
+
+  DeviceTensorFp32* normed = nullptr;
+  DeviceTensorFp32* q = nullptr;
+  DeviceTensorFp32* k = nullptr;
+  DeviceTensorFp32* v = nullptr;
+  DeviceTensorFp32* attn_output_fp32 = nullptr;
+  DeviceTensorFp32* projected = nullptr;
+  DeviceTensorBf16* query_bf16 = nullptr;
+  DeviceTensorBf16* output_bf16 = nullptr;
+
+  if (token_count == 1 &&
+      request_context.attention_normed_decode() != nullptr &&
+      request_context.attention_q_decode() != nullptr &&
+      request_context.attention_k_decode() != nullptr &&
+      request_context.attention_v_decode() != nullptr &&
+      request_context.attention_output_fp32_decode() != nullptr &&
+      request_context.attention_projected_decode() != nullptr &&
+      request_context.attention_query_bf16_decode() != nullptr &&
+      request_context.attention_output_bf16_decode() != nullptr) {
+    normed = request_context.attention_normed_decode();
+    q = request_context.attention_q_decode();
+    k = request_context.attention_k_decode();
+    v = request_context.attention_v_decode();
+    attn_output_fp32 = request_context.attention_output_fp32_decode();
+    projected = request_context.attention_projected_decode();
+    query_bf16 = request_context.attention_query_bf16_decode();
+    output_bf16 = request_context.attention_output_bf16_decode();
+  } else {
+    normed_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    q_local = DeviceTensorFp32::Create(
+        {token_count, impl_->config.query_head_count * impl_->config.head_dim});
+    k_local = DeviceTensorFp32::Create(
+        {token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    v_local = DeviceTensorFp32::Create(
+        {token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    attn_output_fp32_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    projected_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    query_bf16_local = DeviceTensorBf16::Create(
+        {1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
+    output_bf16_local = DeviceTensorBf16::Create(
+        {1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
+    normed = normed_local.get();
+    q = q_local.get();
+    k = k_local.get();
+    v = v_local.get();
+    attn_output_fp32 = attn_output_fp32_local.get();
+    projected = projected_local.get();
+    query_bf16 = query_bf16_local.get();
+    output_bf16 = output_bf16_local.get();
+  }
+  if (normed == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+      attn_output_fp32 == nullptr || projected == nullptr ||
+      query_bf16 == nullptr || output_bf16 == nullptr) {
     if (debug) {
       std::cout << "attention_layer: scratch allocation failed\n";
     }
@@ -331,10 +306,10 @@ bool AttentionLayerSlice::Run(
   }
 
   const bool norm_ok =
-      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed.get());
-  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q.get());
-  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k.get());
-  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v.get());
+      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed);
+  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q);
+  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k);
+  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v);
   if (!norm_ok || !q_ok || !k_ok || !v_ok) {
     if (debug) {
       std::cout << "attention_layer: norm/qkv failed"
@@ -342,18 +317,6 @@ bool AttentionLayerSlice::Run(
                 << " q_ok=" << q_ok
                 << " k_ok=" << k_ok
                 << " v_ok=" << v_ok << "\n";
-    }
-    return false;
-  }
-
-  std::vector<float> q_host(q->numel(), 0.0f);
-  std::vector<float> k_host(k->numel(), 0.0f);
-  std::vector<float> v_host(v->numel(), 0.0f);
-  if (!q->CopyToHost(q_host.data(), q_host.size()) ||
-      !k->CopyToHost(k_host.data(), k_host.size()) ||
-      !v->CopyToHost(v_host.data(), v_host.size())) {
-    if (debug) {
-      std::cout << "attention_layer: failed to copy qkv to host\n";
     }
     return false;
   }
@@ -366,55 +329,159 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  std::vector<__nv_bfloat16> key_cache_host(request_context.key_cache()->numel());
-  std::vector<__nv_bfloat16> value_cache_host(request_context.value_cache()->numel());
-  if (!request_context.key_cache()->CopyToHost(key_cache_host.data(), key_cache_host.size()) ||
-      !request_context.value_cache()->CopyToHost(value_cache_host.data(), value_cache_host.size())) {
+  const DeviceBuffer<std::int32_t>* layer_page_ids_device =
+      request_context.kv_page_ids_device(impl_->config.layer_index);
+  if (layer_page_ids_device == nullptr ||
+      layer_page_ids_device->count() < layer_pages->size()) {
     if (debug) {
-      std::cout << "attention_layer: failed to copy KV cache to host\n";
+      std::cout << "attention_layer: missing request-local layer page ids\n";
     }
     return false;
   }
-  if (!ScatterMatrixIntoPagedCache(
-          k_host,
-          token_count,
-          impl_->config.kv_head_count,
-          impl_->config.head_dim,
-          request_context.config().attention_kv_cache.tokens_per_page,
-          *layer_pages,
-          &key_cache_host) ||
-      !ScatterMatrixIntoPagedCache(
-          v_host,
-          token_count,
-          impl_->config.kv_head_count,
-          impl_->config.head_dim,
-          request_context.config().attention_kv_cache.tokens_per_page,
-          *layer_pages,
-          &value_cache_host)) {
+  const std::size_t layer_page_id_count = layer_pages->size();
+  const DeviceBuffer<std::int32_t>* decode_page_table_device = nullptr;
+  if (token_count == 1) {
+    const auto* fixed_decode_page_table =
+        request_context.attention_decode_page_table_device(impl_->config.layer_index);
+    if (fixed_decode_page_table != nullptr &&
+        fixed_decode_page_table->count() >= layer_page_id_count) {
+      decode_page_table_device = fixed_decode_page_table;
+      layer_page_ids_device = fixed_decode_page_table;
+    }
+  }
+  const bool query_layout_ok = ConvertRowMajorMatrixToAttentionBf16(
+      *q,
+      token_count,
+      impl_->config.query_head_count,
+      impl_->config.head_dim,
+      query_bf16);
+  const bool scatter_kv_ok = query_layout_ok && ScatterKvRowMajorMatricesToPagedCacheBf16(
+      *k,
+      *v,
+      token_count,
+      cache_start_token,
+      impl_->config.kv_head_count,
+      impl_->config.head_dim,
+      request_context.config().attention_kv_cache.tokens_per_page,
+      layer_page_ids_device->data(),
+      layer_page_id_count,
+      request_context.key_cache(),
+      request_context.value_cache());
+  if (!query_layout_ok || !scatter_kv_ok || !output_bf16->FillZero()) {
     if (debug) {
-      std::cout << "attention_layer: failed to scatter qkv into paged cache\n";
+      std::cout << "attention_layer: failed to prepare device attention inputs"
+                << " query_layout_ok=" << query_layout_ok
+                << " scatter_kv_ok=" << scatter_kv_ok << "\n";
     }
     return false;
   }
 
-  const std::vector<__nv_bfloat16> query_host = MatrixToAttentionQueryBf16(
-      q_host,
-      token_count,
-      impl_->config.query_head_count,
-      impl_->config.head_dim);
-  if (!query_bf16->CopyFromHost(query_host.data(), query_host.size()) ||
-      !output_bf16->FillZero() ||
-      !request_context.key_cache()->CopyFromHost(key_cache_host.data(), key_cache_host.size()) ||
-      !request_context.value_cache()->CopyFromHost(value_cache_host.data(), value_cache_host.size())) {
-    if (debug) {
-      std::cout << "attention_layer: failed to stage query or KV cache to device\n";
+  if (token_count == 1) {
+    const std::size_t decode_max_kv_tokens = request_context.config().max_tokens;
+    const std::size_t decode_page_table_entries =
+        RequiredPagesForTokens(request_context.config().attention_kv_cache, decode_max_kv_tokens);
+    const CudnnPagedAttentionPlan* decode_plan = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(impl_->decode_plan_mutex);
+      if (!impl_->decode_plan_attempted ||
+          impl_->decode_plan_max_kv_tokens != decode_max_kv_tokens ||
+          impl_->decode_plan_page_table_entries != decode_page_table_entries) {
+        CudnnPagedAttentionConfig decode_config;
+        decode_config.cache_config = request_context.config().attention_kv_cache;
+        decode_config.batch_size = 1;
+        decode_config.query_head_count = impl_->config.query_head_count;
+        decode_config.max_query_tokens = 1;
+        decode_config.max_kv_tokens = decode_max_kv_tokens;
+        decode_config.container_page_count = request_context.config().attention_total_pages;
+        decode_config.page_table_entries = decode_page_table_entries;
+        decode_config.attn_scale = static_cast<float>(
+            1.0 / std::sqrt(static_cast<double>(impl_->config.head_dim)));
+        decode_config.causal = true;
+        decode_config.generate_stats = false;
+        impl_->decode_plan = CudnnPagedAttentionPlan::Create(cudnn_handle, decode_config);
+        impl_->decode_plan_attempted = true;
+        impl_->decode_plan_max_kv_tokens = decode_max_kv_tokens;
+        impl_->decode_plan_page_table_entries = decode_page_table_entries;
+        if (impl_->decode_plan && impl_->decode_plan->valid()) {
+          RecordAttentionDecodePlanCreate();
+        }
+      } else if (impl_->decode_plan && impl_->decode_plan->valid()) {
+        RecordAttentionDecodePlanHit();
+      }
+      if (impl_->decode_plan && impl_->decode_plan->valid()) {
+        decode_plan = impl_->decode_plan.get();
+      }
     }
-    return false;
+
+    if (decode_plan != nullptr) {
+      const auto* seq_len_q = request_context.attention_decode_seq_len_q_device();
+      const auto* seq_len_kv = request_context.attention_decode_seq_len_kv_device();
+      if (decode_page_table_device == nullptr) {
+        decode_page_table_device =
+            request_context.attention_decode_page_table_device(impl_->config.layer_index);
+      }
+      const bool decode_aux_ok =
+          seq_len_q != nullptr &&
+          seq_len_q->count() >= 1 &&
+          seq_len_kv != nullptr &&
+          seq_len_kv->count() >= 1 &&
+          decode_page_table_device != nullptr &&
+          decode_page_table_device->count() >= decode_page_table_entries;
+      if (!decode_aux_ok) {
+        if (debug) {
+          std::cout << "attention_layer: decode metadata unavailable\n";
+        }
+        return false;
+      }
+
+      const CudnnPagedAttentionExecution execution{
+          query_bf16->data(),
+          request_context.key_cache()->data(),
+          request_context.value_cache()->data(),
+          seq_len_q->data(),
+          seq_len_kv->data(),
+          decode_page_table_device->data(),
+          decode_page_table_device->data(),
+          output_bf16->data(),
+          nullptr,
+      };
+      if (!decode_plan->Execute(cudnn_handle, execution)) {
+        if (debug) {
+          std::cout << "attention_layer: cached decode attention execute failed\n";
+        }
+        return false;
+      }
+
+      if (!ConvertAttentionBf16ToRowMajorMatrix(
+              *output_bf16,
+              token_count,
+              impl_->config.query_head_count,
+              impl_->config.head_dim,
+              attn_output_fp32)) {
+        if (debug) {
+          std::cout << "attention_layer: failed to convert cached decode output\n";
+        }
+        return false;
+      }
+
+      const bool o_ok =
+          impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected);
+      const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output);
+      if (!o_ok || !residual_ok) {
+        if (debug) {
+          std::cout << "attention_layer: cached decode output projection or residual failed"
+                    << " o_ok=" << o_ok
+                    << " residual_ok=" << residual_ok << "\n";
+        }
+        return false;
+      }
+      return true;
+    }
   }
 
   std::vector<AttentionSequencePages> sequences = {
       AttentionSequencePages{
-          token_count,
+          total_sequence_tokens,
           [&]() {
             std::vector<std::size_t> page_ids;
             page_ids.reserve(layer_pages->size());
@@ -458,20 +525,24 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  auto seq_len_q = DeviceBuffer<std::int32_t>::Create(batch_plan->sequence_lengths.size());
-  auto seq_len_kv = DeviceBuffer<std::int32_t>::Create(batch_plan->sequence_lengths.size());
-  auto page_table_k = DeviceBuffer<std::int32_t>::Create(batch_plan->page_table.size());
-  auto page_table_v = DeviceBuffer<std::int32_t>::Create(batch_plan->page_table.size());
-  if (!seq_len_q.has_value() || !seq_len_kv.has_value() || !page_table_k.has_value() || !page_table_v.has_value()) {
+  if (!request_context.EnsureAttentionAuxCapacity(
+          batch_plan->sequence_lengths.size(),
+          batch_plan->page_table.size())) {
     if (debug) {
       std::cout << "attention_layer: failed to allocate cuDNN auxiliary buffers\n";
     }
     return false;
   }
-  if (!seq_len_q->CopyFromHost(batch_plan->sequence_lengths) ||
+  auto* seq_len_q = request_context.attention_seq_len_q_device();
+  auto* seq_len_kv = request_context.attention_seq_len_kv_device();
+  auto* page_table = request_context.attention_page_table_device();
+  const std::vector<std::int32_t> seq_len_q_host(
+      batch_plan->sequence_lengths.size(),
+      static_cast<std::int32_t>(token_count));
+  if (seq_len_q == nullptr || seq_len_kv == nullptr || page_table == nullptr ||
+      !seq_len_q->CopyFromHost(seq_len_q_host) ||
       !seq_len_kv->CopyFromHost(batch_plan->sequence_lengths) ||
-      !page_table_k->CopyFromHost(batch_plan->page_table) ||
-      !page_table_v->CopyFromHost(batch_plan->page_table)) {
+      !page_table->CopyFromHost(batch_plan->page_table)) {
     if (debug) {
       std::cout << "attention_layer: failed to upload cuDNN auxiliary buffers\n";
     }
@@ -484,8 +555,8 @@ bool AttentionLayerSlice::Run(
       request_context.value_cache()->data(),
       seq_len_q->data(),
       seq_len_kv->data(),
-      page_table_k->data(),
-      page_table_v->data(),
+      page_table->data(),
+      page_table->data(),
       output_bf16->data(),
       nullptr,
   };
@@ -496,26 +567,19 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  std::vector<__nv_bfloat16> attention_output_host(output_bf16->numel());
-  if (!output_bf16->CopyToHost(attention_output_host.data(), attention_output_host.size())) {
+  if (!ConvertAttentionBf16ToRowMajorMatrix(
+          *output_bf16,
+          token_count,
+          impl_->config.query_head_count,
+          impl_->config.head_dim,
+          attn_output_fp32)) {
     if (debug) {
-      std::cout << "attention_layer: failed to copy attention output to host\n";
-    }
-    return false;
-  }
-  const std::vector<float> attention_output_matrix = AttentionOutputBf16ToMatrix(
-      attention_output_host,
-      token_count,
-      impl_->config.query_head_count,
-      impl_->config.head_dim);
-  if (!attn_output_fp32->CopyFromHost(attention_output_matrix.data(), attention_output_matrix.size())) {
-    if (debug) {
-      std::cout << "attention_layer: failed to upload attention output matrix\n";
+      std::cout << "attention_layer: failed to convert attention output to row-major fp32\n";
     }
     return false;
   }
 
-  const bool o_ok = impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected.get());
+  const bool o_ok = impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected);
   const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output);
   if (!o_ok || !residual_ok) {
     if (debug) {

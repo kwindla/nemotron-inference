@@ -84,6 +84,12 @@ class RequestExecutionContext {
   const DeviceBuffer<std::int32_t>* attention_seq_len_kv_device() const;
   DeviceBuffer<std::int32_t>* attention_page_table_device();
   const DeviceBuffer<std::int32_t>* attention_page_table_device() const;
+  DeviceBuffer<std::int32_t>* attention_decode_seq_len_q_device();
+  const DeviceBuffer<std::int32_t>* attention_decode_seq_len_q_device() const;
+  DeviceBuffer<std::int32_t>* attention_decode_seq_len_kv_device();
+  const DeviceBuffer<std::int32_t>* attention_decode_seq_len_kv_device() const;
+  DeviceBuffer<std::int32_t>* attention_decode_page_table_device(std::size_t layer_index);
+  const DeviceBuffer<std::int32_t>* attention_decode_page_table_device(std::size_t layer_index) const;
   DeviceTensorFp32* attention_normed_decode();
   const DeviceTensorFp32* attention_normed_decode() const;
   DeviceTensorFp32* attention_q_decode();
@@ -146,6 +152,10 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorBf16> value_cache,
       std::optional<PagedKvCacheArena> kv_arena);
 
+  bool InitializeAttentionDecodeMetadata();
+  bool SetAttentionDecodeSequenceLength(std::size_t sequence_length);
+  bool AdvanceAttentionDecodeSequenceLength(std::size_t token_count);
+
   RequestExecutionConfig config_;
   std::unique_ptr<DeviceTensorFp32> hidden_;
   std::unique_ptr<DeviceTensorFp32> residual_;
@@ -175,6 +185,11 @@ class RequestExecutionContext {
   DeviceBuffer<std::int32_t> attention_seq_len_q_device_;
   DeviceBuffer<std::int32_t> attention_seq_len_kv_device_;
   DeviceBuffer<std::int32_t> attention_page_table_device_;
+  DeviceBuffer<std::int32_t> attention_decode_seq_len_q_device_;
+  DeviceBuffer<std::int32_t> attention_decode_seq_len_kv_device_;
+  DeviceBuffer<std::int32_t> attention_decode_seq_len_values_device_;
+  std::vector<DeviceBuffer<std::int32_t>> attention_decode_page_tables_by_layer_;
+  std::vector<std::size_t> attention_decode_page_table_counts_by_layer_;
   DeviceBuffer<std::int32_t> expert_selection_indices_device_;
   DeviceBuffer<float> expert_selection_weights_device_;
   std::vector<std::int32_t> expert_selection_indices_host_;

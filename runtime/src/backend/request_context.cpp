@@ -1,8 +1,37 @@
 #include "nemotron/request_context.h"
 
+#include <cuda_runtime.h>
+
+#include <limits>
 #include <utility>
 
+#include "nemotron/runtime_stats.h"
+
 namespace nemotron {
+
+namespace {
+
+bool FitsInt32(std::size_t value) {
+  return value <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
+}
+
+bool CopyInt32ScalarFromDevice(DeviceBuffer<std::int32_t>* buffer, const std::int32_t* source_device) {
+  if (buffer == nullptr ||
+      buffer->data() == nullptr ||
+      buffer->count() == 0 ||
+      source_device == nullptr) {
+    return false;
+  }
+  return cudaMemcpyAsync(
+             buffer->data(),
+             source_device,
+             sizeof(std::int32_t),
+             cudaMemcpyDeviceToDevice,
+             nullptr) == cudaSuccess;
+}
+
+}  // namespace
+
 std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
     const RequestExecutionConfig& config) {
   if (config.hidden_size == 0 || config.max_tokens == 0) {
@@ -161,6 +190,9 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   if (!context->token_ids_device_.Resize(config.max_tokens)) {
     return nullptr;
   }
+  if (!context->InitializeAttentionDecodeMetadata()) {
+    return nullptr;
+  }
   if (!context->EnsureExpertSelectionCapacity(config.expert_selection_capacity)) {
     return nullptr;
   }
@@ -215,7 +247,9 @@ RequestExecutionContext::RequestExecutionContext(
       value_cache_(std::move(value_cache)),
       kv_arena_(std::move(kv_arena)),
       kv_pages_by_layer_(config_.attention_kv_cache.layer_count),
-      kv_page_ids_device_by_layer_(config_.attention_kv_cache.layer_count) {}
+      kv_page_ids_device_by_layer_(config_.attention_kv_cache.layer_count),
+      attention_decode_page_tables_by_layer_(config_.attention_kv_cache.layer_count),
+      attention_decode_page_table_counts_by_layer_(config_.attention_kv_cache.layer_count, 0) {}
 
 RequestExecutionContext::RequestExecutionContext(RequestExecutionContext&&) noexcept = default;
 RequestExecutionContext& RequestExecutionContext::operator=(RequestExecutionContext&&) noexcept = default;
@@ -255,6 +289,25 @@ bool RequestExecutionContext::valid() const {
   if (config_.attention_kv_cache.layer_count != 0 &&
       (!key_cache_ || !key_cache_->valid() || !value_cache_ || !value_cache_->valid())) {
     return false;
+  }
+  if (config_.attention_kv_cache.layer_count != 0) {
+    const std::size_t decode_page_table_entries =
+        RequiredPagesForTokens(config_.attention_kv_cache, config_.max_tokens);
+    if (!attention_decode_seq_len_q_device_.valid() ||
+        attention_decode_seq_len_q_device_.count() != 1 ||
+        !attention_decode_seq_len_kv_device_.valid() ||
+        attention_decode_seq_len_kv_device_.count() != 1 ||
+        !attention_decode_seq_len_values_device_.valid() ||
+        attention_decode_seq_len_values_device_.count() != (config_.max_tokens + 1) ||
+        attention_decode_page_tables_by_layer_.size() != config_.attention_kv_cache.layer_count ||
+        attention_decode_page_table_counts_by_layer_.size() != config_.attention_kv_cache.layer_count) {
+      return false;
+    }
+    for (const auto& page_table : attention_decode_page_tables_by_layer_) {
+      if (!page_table.valid() || page_table.count() != decode_page_table_entries) {
+        return false;
+      }
+    }
   }
   if ((attention_normed_decode_ && !attention_normed_decode_->valid()) ||
       (attention_q_decode_ && !attention_q_decode_->valid()) ||
@@ -404,6 +457,31 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
   const std::size_t required_pages =
       RequiredPagesForTokens(config_.attention_kv_cache, token_count);
   for (std::size_t layer_index = 0; layer_index < kv_pages_by_layer_.size(); ++layer_index) {
+    auto sync_decode_page_table = [&](std::size_t page_count) -> bool {
+      if (page_count == 0 || layer_index >= attention_decode_page_tables_by_layer_.size()) {
+        return true;
+      }
+      DeviceBuffer<std::int32_t>& decode_page_table =
+          attention_decode_page_tables_by_layer_[layer_index];
+      const std::size_t synced_count = attention_decode_page_table_counts_by_layer_[layer_index];
+      if (synced_count >= page_count) {
+        return true;
+      }
+      if (decode_page_table.count() < page_count ||
+          kv_page_ids_device_by_layer_[layer_index].count() < page_count ||
+          cudaMemcpyAsync(
+              decode_page_table.data() + synced_count,
+              kv_page_ids_device_by_layer_[layer_index].data() + synced_count,
+              (page_count - synced_count) * sizeof(std::int32_t),
+              cudaMemcpyDeviceToDevice,
+              nullptr) != cudaSuccess) {
+        return false;
+      }
+      attention_decode_page_table_counts_by_layer_[layer_index] = page_count;
+      RecordAttentionDecodeDevicePageTableCopy();
+      return true;
+    };
+
     std::vector<KvPageHandle>& pages = kv_pages_by_layer_[layer_index];
     bool pages_changed = false;
     if (pages.size() < required_pages) {
@@ -423,6 +501,9 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
     }
     if (!pages_changed &&
         kv_page_ids_device_by_layer_[layer_index].count() == pages.size()) {
+      if (!sync_decode_page_table(pages.size())) {
+        return false;
+      }
       continue;
     }
 
@@ -433,6 +514,9 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
     }
     if (!kv_page_ids_device_by_layer_[layer_index].Resize(page_ids.size()) ||
         !kv_page_ids_device_by_layer_[layer_index].CopyFromHost(page_ids)) {
+      return false;
+    }
+    if (!sync_decode_page_table(pages.size())) {
       return false;
     }
   }
@@ -506,6 +590,38 @@ DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_page_table_device
 
 const DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_page_table_device() const {
   return &attention_page_table_device_;
+}
+
+DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_decode_seq_len_q_device() {
+  return &attention_decode_seq_len_q_device_;
+}
+
+const DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_decode_seq_len_q_device() const {
+  return &attention_decode_seq_len_q_device_;
+}
+
+DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_decode_seq_len_kv_device() {
+  return &attention_decode_seq_len_kv_device_;
+}
+
+const DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_decode_seq_len_kv_device() const {
+  return &attention_decode_seq_len_kv_device_;
+}
+
+DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_decode_page_table_device(
+    std::size_t layer_index) {
+  if (layer_index >= attention_decode_page_tables_by_layer_.size()) {
+    return nullptr;
+  }
+  return &attention_decode_page_tables_by_layer_[layer_index];
+}
+
+const DeviceBuffer<std::int32_t>* RequestExecutionContext::attention_decode_page_table_device(
+    std::size_t layer_index) const {
+  if (layer_index >= attention_decode_page_tables_by_layer_.size()) {
+    return nullptr;
+  }
+  return &attention_decode_page_tables_by_layer_[layer_index];
 }
 
 DeviceTensorFp32* RequestExecutionContext::attention_normed_decode() {
@@ -626,9 +742,13 @@ bool RequestExecutionContext::SetSequenceLength(std::size_t sequence_length) {
   if (sequence_length > config_.max_tokens) {
     return false;
   }
+  if (!EnsureAttentionTokens(sequence_length) ||
+      !SetAttentionDecodeSequenceLength(sequence_length)) {
+    return false;
+  }
   sequence_length_ = sequence_length;
   decode_position_ = sequence_length;
-  return EnsureAttentionTokens(sequence_length);
+  return true;
 }
 
 bool RequestExecutionContext::AdvanceDecodePosition(std::size_t token_count) {
@@ -638,11 +758,17 @@ bool RequestExecutionContext::AdvanceDecodePosition(std::size_t token_count) {
   if (decode_position_ > config_.max_tokens || token_count > (config_.max_tokens - decode_position_)) {
     return false;
   }
-  decode_position_ += token_count;
-  if (decode_position_ > sequence_length_) {
-    sequence_length_ = decode_position_;
+  const std::size_t next_decode_position = decode_position_ + token_count;
+  const std::size_t next_sequence_length =
+      next_decode_position > sequence_length_ ? next_decode_position : sequence_length_;
+  const std::size_t sequence_delta = next_sequence_length - sequence_length_;
+  if (!EnsureAttentionTokens(next_sequence_length) ||
+      !AdvanceAttentionDecodeSequenceLength(sequence_delta)) {
+    return false;
   }
-  return EnsureAttentionTokens(sequence_length_);
+  decode_position_ = next_decode_position;
+  sequence_length_ = next_sequence_length;
+  return true;
 }
 
 bool RequestExecutionContext::ResetForNewRequest() {
@@ -695,6 +821,21 @@ bool RequestExecutionContext::ResetForNewRequest() {
   if (attention_output_bf16_decode_) {
     ok = ok && attention_output_bf16_decode_->FillZero();
   }
+  if (attention_decode_seq_len_kv_device_.count() != 0) {
+    ok = ok && SetAttentionDecodeSequenceLength(0);
+  }
+  if (attention_decode_seq_len_q_device_.count() != 0) {
+    ok = ok && attention_decode_seq_len_values_device_.count() > 1 &&
+         CopyInt32ScalarFromDevice(
+             &attention_decode_seq_len_q_device_,
+             attention_decode_seq_len_values_device_.data() + 1);
+  }
+  for (std::size_t layer_index = 0; layer_index < attention_decode_page_tables_by_layer_.size(); ++layer_index) {
+    attention_decode_page_table_counts_by_layer_[layer_index] = 0;
+    if (attention_decode_page_tables_by_layer_[layer_index].valid()) {
+      ok = ok && attention_decode_page_tables_by_layer_[layer_index].FillByte(0xFF);
+    }
+  }
 
   if (kv_arena_.has_value()) {
     std::vector<std::size_t> page_ids;
@@ -718,6 +859,74 @@ bool RequestExecutionContext::ResetForNewRequest() {
   sequence_length_ = 0;
   decode_position_ = 0;
   return ok;
+}
+
+bool RequestExecutionContext::InitializeAttentionDecodeMetadata() {
+  if (config_.attention_kv_cache.layer_count == 0) {
+    return true;
+  }
+  if (!FitsInt32(config_.max_tokens)) {
+    return false;
+  }
+  const std::size_t decode_page_table_entries =
+      RequiredPagesForTokens(config_.attention_kv_cache, config_.max_tokens);
+  if (decode_page_table_entries == 0 || !FitsInt32(decode_page_table_entries)) {
+    return false;
+  }
+  if (!attention_decode_seq_len_q_device_.Resize(1) ||
+      !attention_decode_seq_len_kv_device_.Resize(1) ||
+      !attention_decode_seq_len_values_device_.Resize(config_.max_tokens + 1)) {
+    return false;
+  }
+  std::vector<std::int32_t> seq_len_values(config_.max_tokens + 1, 0);
+  for (std::size_t index = 0; index < seq_len_values.size(); ++index) {
+    seq_len_values[index] = static_cast<std::int32_t>(index);
+  }
+  if (!attention_decode_seq_len_values_device_.CopyFromHost(seq_len_values) ||
+      !CopyInt32ScalarFromDevice(
+          &attention_decode_seq_len_kv_device_,
+          attention_decode_seq_len_values_device_.data()) ||
+      !CopyInt32ScalarFromDevice(
+          &attention_decode_seq_len_q_device_,
+          attention_decode_seq_len_values_device_.data() + 1)) {
+    return false;
+  }
+  for (DeviceBuffer<std::int32_t>& page_table : attention_decode_page_tables_by_layer_) {
+    if (!page_table.Resize(decode_page_table_entries) ||
+        !page_table.FillByte(0xFF)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RequestExecutionContext::SetAttentionDecodeSequenceLength(std::size_t sequence_length) {
+  if (!FitsInt32(sequence_length)) {
+    return false;
+  }
+  if (attention_decode_seq_len_kv_device_.count() == 0) {
+    return true;
+  }
+  if (attention_decode_seq_len_values_device_.count() <= sequence_length) {
+    return false;
+  }
+  return CopyInt32ScalarFromDevice(
+      &attention_decode_seq_len_kv_device_,
+      attention_decode_seq_len_values_device_.data() + sequence_length);
+}
+
+bool RequestExecutionContext::AdvanceAttentionDecodeSequenceLength(std::size_t token_count) {
+  if (token_count == 0 || attention_decode_seq_len_kv_device_.count() == 0) {
+    return true;
+  }
+  const std::size_t next_sequence_length = sequence_length_ + token_count;
+  if (!FitsInt32(next_sequence_length) ||
+      attention_decode_seq_len_values_device_.count() <= next_sequence_length) {
+    return false;
+  }
+  return CopyInt32ScalarFromDevice(
+      &attention_decode_seq_len_kv_device_,
+      attention_decode_seq_len_values_device_.data() + next_sequence_length);
 }
 
 }  // namespace nemotron
