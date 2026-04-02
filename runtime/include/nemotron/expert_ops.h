@@ -214,37 +214,22 @@ bool FusedRoutedUpProjPackedNvfp4SingleToken(
     DeviceTensorFp32* output_rows,
     cudaStream_t stream = nullptr);
 
-bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+bool FusedRoutedDownProjPackedNvfp4SingleToken(
     const std::uint8_t* activation_rows_packed,
     const std::uint8_t* activation_rows_block_scales,
     const DeviceBuffer<float>& activation_row_tensor_scales,
-    const float* selection_weights_device,
     std::size_t input_cols,
     const DeviceBuffer<const void*>& weight_packed_ptrs,
     const DeviceBuffer<const void*>& weight_block_scale_ptrs,
     const DeviceBuffer<float>& weight_tensor_scales,
-    DeviceTensorFp32* output_row,
+    DeviceTensorFp32* output_rows,
     std::size_t activation_rows_packed_row_stride_bytes = 0,
     cudaStream_t stream = nullptr);
 
-bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+bool FusedRoutedDownProjPackedNvfp4SingleToken(
     const std::uint8_t* activation_rows_packed,
     const std::uint8_t* activation_rows_block_scales,
     const DeviceBuffer<float>& activation_row_tensor_scales,
-    const float* selection_weights_device,
-    std::size_t input_cols,
-    const DeviceBuffer<const void*>& weight_packed_ptrs,
-    const DeviceBuffer<const void*>& weight_block_scale_ptrs,
-    const DeviceBuffer<float>& weight_tensor_scales,
-    DeviceTensorBf16* output_row,
-    std::size_t activation_rows_packed_row_stride_bytes = 0,
-    cudaStream_t stream = nullptr);
-
-bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
-    const std::uint8_t* activation_rows_packed,
-    const std::uint8_t* activation_rows_block_scales,
-    const DeviceBuffer<float>& activation_row_tensor_scales,
-    const float* selection_weights_device,
     std::size_t input_cols,
     const std::uint8_t* contiguous_weight_packed_base,
     std::size_t weight_packed_stride_bytes,
@@ -252,23 +237,7 @@ bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
     std::size_t weight_scale_stride_bytes,
     const float* contiguous_tensor_scales,
     const std::int32_t* selected_expert_indices,
-    DeviceTensorFp32* output_row,
-    std::size_t activation_rows_packed_row_stride_bytes = 0,
-    cudaStream_t stream = nullptr);
-
-bool FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
-    const std::uint8_t* activation_rows_packed,
-    const std::uint8_t* activation_rows_block_scales,
-    const DeviceBuffer<float>& activation_row_tensor_scales,
-    const float* selection_weights_device,
-    std::size_t input_cols,
-    const std::uint8_t* contiguous_weight_packed_base,
-    std::size_t weight_packed_stride_bytes,
-    const std::uint8_t* contiguous_weight_scale_base,
-    std::size_t weight_scale_stride_bytes,
-    const float* contiguous_tensor_scales,
-    const std::int32_t* selected_expert_indices,
-    DeviceTensorBf16* output_row,
+    DeviceTensorFp32* output_rows,
     std::size_t activation_rows_packed_row_stride_bytes = 0,
     cudaStream_t stream = nullptr);
 

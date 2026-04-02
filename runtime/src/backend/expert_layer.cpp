@@ -1051,6 +1051,7 @@ struct ExpertLayerSlice::Impl {
   mutable DeviceBuffer<float> scratch_cutlass_up_alphas;
   mutable DeviceBuffer<float> scratch_cutlass_down_alphas;
   mutable DeviceBuffer<float> scratch_cutlass_down_output;
+  mutable DeviceBuffer<float> scratch_down_proj_per_expert;
   // CUDA graph state for MoE layer (gated by NEMOTRON_CUDA_GRAPH_MOE)
   mutable bool moe_graph_enabled = false;
   mutable cudaGraph_t moe_graph = nullptr;
@@ -2215,10 +2216,12 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
 
     // -- CUTLASS path output buffer --
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
+    impl->scratch_down_proj_per_expert.Resize(top_k * latent);
 
     // CUDA graph scratch buffers (fixed-address copies of variable inputs)
     static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
     impl->moe_graph_enabled = kMoeGraphEnabled;
+    impl->moe_graph_captured = false;
     if (impl->moe_graph_enabled) {
       impl->scratch_graph_indices.Resize(top_k);
       impl->scratch_graph_weights.Resize(top_k);
@@ -2694,9 +2697,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     }
 
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
+    impl->scratch_down_proj_per_expert.Resize(top_k * latent);
 
     static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
     impl->moe_graph_enabled = kMoeGraphEnabled;
+    impl->moe_graph_captured = false;
     if (impl->moe_graph_enabled) {
       impl->scratch_graph_indices.Resize(top_k);
       impl->scratch_graph_weights.Resize(top_k);
@@ -3751,10 +3756,14 @@ bool RunExpertLayerImpl(
         auto graph_output = DeviceTensorFp32::CreateView(
             {1, impl.config.moe_latent_size},
             reinterpret_cast<float*>(impl.scratch_graph_output.data()));
+        auto graph_down_output = DeviceTensorFp32::CreateView(
+            {batch_count, impl.config.moe_latent_size},
+            impl.scratch_down_proj_per_expert.data());
         auto graph_grouped_up = DeviceTensorFp32::CreateView(
             {batch_count, impl.config.routed_expert_intermediate_size},
             impl.scratch_graph_grouped_up.data());
-        graph_ok = graph_ok && graph_latent_view && graph_grouped_up && graph_output;
+        graph_ok = graph_ok && graph_latent_view && graph_grouped_up && graph_output &&
+                   graph_down_output;
 
         if (graph_ok) {
           graph_ok = cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
@@ -3795,11 +3804,10 @@ bool RunExpertLayerImpl(
             }
 
             if (graph_ok) {
-              graph_ok = FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+              graph_ok = FusedRoutedDownProjPackedNvfp4SingleToken(
                   impl.scratch_down_act_packed.data(),
                   impl.scratch_down_act_block_scales.data(),
                   impl.scratch_down_act_tensor_scales,
-                  impl.scratch_graph_weights.data(),
                   impl.config.routed_expert_intermediate_size,
                   impl.contiguous_down_packed.data(),
                   impl.contiguous_down_packed_stride_bytes,
@@ -3807,9 +3815,31 @@ bool RunExpertLayerImpl(
                   impl.contiguous_down_block_scale_stride_bytes,
                   impl.contiguous_down_tensor_scales.data(),
                   impl.scratch_graph_indices.data(),
-                  graph_output.get(),
+                  graph_down_output.get(),
                   down_act_packed_row_stride,
                   graph_stream);
+            }
+
+            if (graph_ok) {
+              graph_ok = GatherIndexedFloatsInPlace(
+                  impl.contiguous_down_tensor_scales.data(),
+                  impl.routed_experts.size(),
+                  impl.scratch_graph_indices.data(),
+                  batch_count,
+                  impl.scratch_selected_down_tensor_scales,
+                  graph_stream);
+            }
+
+            if (graph_ok) {
+              graph_ok = impl.scratch_graph_output.FillZeroAsync(graph_stream) &&
+                         ScaleWeightedAccumulateRowsFp32(
+                             *graph_down_output,
+                             impl.scratch_down_act_tensor_scales.data(),
+                             impl.scratch_selected_down_tensor_scales.data(),
+                             impl.scratch_graph_weights.data(),
+                             batch_count,
+                             graph_output.get(),
+                             graph_stream);
             }
 
             if (graph_ok) {
@@ -4116,6 +4146,18 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
+    const std::size_t down_output_count = batch_count * impl.config.moe_latent_size;
+    auto down_output = DeviceTensorFp32::CreateView(
+        {batch_count, impl.config.moe_latent_size},
+        impl.scratch_down_proj_per_expert.data());
+    if (!down_output || !down_output->valid() ||
+        !impl.scratch_down_proj_per_expert.valid() ||
+        impl.scratch_down_proj_per_expert.count() < down_output_count) {
+      RecordGroupedRoutedExpertFastpathFallback();
+      RecordGroupedRoutedExpertMatmulFallback();
+      return GroupedRoutedResult::kFallback;
+    }
+
     // CUTLASS down_proj remains env-gated on the pointer-array path only.
     bool cutlass_down_ok = false;
     if (impl.cutlass_down_plan != nullptr && impl.cutlass_down_plan->valid() &&
@@ -4127,9 +4169,7 @@ bool RunExpertLayerImpl(
             &impl.scratch_cutlass_down_alphas)) {
       const std::size_t act_scale_row_bytes =
           ExecutionNvfp4ScaleBytes(1, impl.config.routed_expert_intermediate_size);
-      const std::size_t down_output_count = batch_count * impl.config.moe_latent_size;
-
-      auto down_output = DeviceTensorFp32::CreateView(
+      auto cutlass_down_output = DeviceTensorFp32::CreateView(
           {batch_count, impl.config.moe_latent_size},
           impl.scratch_cutlass_down_output.data());
 
@@ -4139,7 +4179,7 @@ bool RunExpertLayerImpl(
           impl.scratch_down_act_matmul_scales.count() >= batch_count * act_scale_row_bytes &&
           impl.scratch_cutlass_down_output.valid() &&
           impl.scratch_cutlass_down_output.count() >= down_output_count &&
-          down_output && down_output->valid() &&
+          cutlass_down_output && cutlass_down_output->valid() &&
           cudaMemsetAsync(
               impl.scratch_cutlass_down_output.data(),
               0,
@@ -4154,11 +4194,11 @@ bool RunExpertLayerImpl(
             impl.scratch_down_act_matmul_scales.data(), act_scale_row_bytes, batch_count);
         BuildStridedDevicePointerArray(
             impl.cutlass_d_ptrs.data(),
-            down_output->data(),
+            cutlass_down_output->data(),
             impl.config.moe_latent_size * sizeof(float), batch_count);
         BuildStridedDevicePointerArray(
             const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_c_ptrs.data())),
-            down_output->data(),
+            cutlass_down_output->data(),
             impl.config.moe_latent_size * sizeof(float), batch_count);
 
         // B pointers already on device from GatherExpertSelectionLookupsCheckedInPlace.
@@ -4188,7 +4228,7 @@ bool RunExpertLayerImpl(
                   [&]() {
                     if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
                       return ScaleWeightedAccumulateRowsFp32(
-                          *down_output,
+                          *cutlass_down_output,
                           impl.scratch_row_scales.data(),
                           impl.scratch_row_scales.data(),
                           selected_weights_device,
@@ -4197,7 +4237,7 @@ bool RunExpertLayerImpl(
                           stream);
                     } else {
                       return ScaleWeightedAccumulateRowsBf16(
-                          *down_output,
+                          *cutlass_down_output,
                           impl.scratch_row_scales.data(),
                           impl.scratch_row_scales.data(),
                           selected_weights_device,
@@ -4224,11 +4264,10 @@ bool RunExpertLayerImpl(
                    &down_ok,
                    [&]() {
                      return use_strided_contiguous_weights
-                                ? FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+                                ? FusedRoutedDownProjPackedNvfp4SingleToken(
                                       impl.scratch_down_act_packed.data(),
                                       impl.scratch_down_act_block_scales.data(),
                                       impl.scratch_down_act_tensor_scales,
-                                      selected_weights_device,
                                       impl.config.routed_expert_intermediate_size,
                                       impl.contiguous_down_packed.data(),
                                       impl.contiguous_down_packed_stride_bytes,
@@ -4236,19 +4275,18 @@ bool RunExpertLayerImpl(
                                       impl.contiguous_down_block_scale_stride_bytes,
                                       impl.contiguous_down_tensor_scales.data(),
                                       selected_indices_device,
-                                      routed_tensor.get(),
+                                      down_output.get(),
                                       down_act_packed_row_stride,
                                       stream)
-                                : FusedRoutedDownProjWeightedPackedNvfp4SingleToken(
+                                : FusedRoutedDownProjPackedNvfp4SingleToken(
                                       impl.scratch_down_act_packed.data(),
                                       impl.scratch_down_act_block_scales.data(),
                                       impl.scratch_down_act_tensor_scales,
-                                      selected_weights_device,
                                       impl.config.routed_expert_intermediate_size,
                                       impl.scratch_down_packed_ptrs,
                                       impl.scratch_down_raw_scale_ptrs,
                                       impl.scratch_selected_down_tensor_scales,
-                                      routed_tensor.get(),
+                                      down_output.get(),
                                       down_act_packed_row_stride,
                                       stream);
                    })) {
@@ -4262,6 +4300,62 @@ bool RunExpertLayerImpl(
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertMatmulFallback();
       return GroupedRoutedResult::kFallback;
+    }
+
+    if (!cutlass_down_ok) {
+      if (use_strided_contiguous_weights &&
+          !GatherIndexedFloatsInPlace(
+              impl.contiguous_down_tensor_scales.data(),
+              impl.routed_experts.size(),
+              selected_indices_device,
+              batch_count,
+              impl.scratch_selected_down_tensor_scales,
+              stream)) {
+        if (debug) {
+          std::cerr << "expert_layer: layer " << impl.config.layer_index
+                    << " routed fastpath down scale gather failed\n";
+        }
+        RecordGroupedRoutedExpertFastpathFallback();
+        RecordGroupedRoutedExpertMergeFallback();
+        return GroupedRoutedResult::kFallback;
+      }
+
+      bool weighted_merge_ok = false;
+      if (!measure_stage(
+              ExpertSubLayerStage::kWeightedMerge,
+              &weighted_merge_ok,
+              [&]() {
+                if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+                  return ScaleWeightedAccumulateRowsFp32(
+                      *down_output,
+                      impl.scratch_down_act_tensor_scales.data(),
+                      impl.scratch_selected_down_tensor_scales.data(),
+                      selected_weights_device,
+                      batch_count,
+                      routed_tensor.get(),
+                      stream);
+                } else {
+                  return ScaleWeightedAccumulateRowsBf16(
+                      *down_output,
+                      impl.scratch_down_act_tensor_scales.data(),
+                      impl.scratch_selected_down_tensor_scales.data(),
+                      selected_weights_device,
+                      batch_count,
+                      routed_tensor.get(),
+                      stream);
+                }
+              })) {
+        return GroupedRoutedResult::kFatal;
+      }
+      if (!weighted_merge_ok) {
+        if (debug) {
+          std::cerr << "expert_layer: layer " << impl.config.layer_index
+                    << " routed fastpath weighted merge failed\n";
+        }
+        RecordGroupedRoutedExpertFastpathFallback();
+        RecordGroupedRoutedExpertMergeFallback();
+        return GroupedRoutedResult::kFallback;
+      }
     }
 
     RecordGroupedRoutedExpertFastpathUse();
