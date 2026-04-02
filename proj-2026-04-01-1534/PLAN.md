@@ -197,7 +197,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - `runtime/src/backend/fused_mamba_decode.cu`
   - `runtime/src/backend/fused_moe_decode.cu`
 
-- [ ] **4. Translate the routed-expert residency design that step 2 proves we need**
+- [~] **4. Translate the routed-expert residency design that step 2 proves we need**
   Goal:
   - stop re-uploading routed expert weights on every decode step
   Scope:
@@ -326,7 +326,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 | 1 | Linear fastpath correctness + layout translation | done | b31feb4 | smoke PASS with NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1; 128x4 activation layout; 8x4 deferred |
 | 2 | Re-baseline with counters and Nsight | done | — | expert staging = 92% of runtime; 588GB uploaded per run; expert residency is #1 priority |
 | 3 | Attention metadata/workspace ownership + sync cleanup | done | — | persistent buffers, removed 6 cudaDeviceSynchronize calls; smoke PASS |
-| 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
+| 4 | Routed-expert residency translation | in-progress | — | 17.1 GB fits in 32 GB; full permanent residency, request-context VRAM now capped from measured post-weight free memory |
 | 5 | Production decode attention translation | pending | — | explicit decode-vs-prefill dispatcher required |
 | 6 | Repeat evidence-driven roofline loop | pending | — | save artifacts and justify each next move |
 
@@ -354,3 +354,8 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4`, `cmake --build build-phase1-tests --target nvfp4_gemm_runner_test device_nvfp4_matrix_test linear_op_test -j4`, and `ctest --test-dir build-phase1-tests -R 'nvfp4_gemm_runner_test|device_nvfp4_matrix_test|linear_op_test' --output-on-failure` all passed. The new large-dimension small-`M` unit repro now passes on both the low-level GEMM runner and the `UploadedLinearOp::Run()` path.
   - what risk remains: the full real-model smoke has not yet been carried to completion after relinking `full_forward_manifest_smoke_test`; it no longer reproduces the old immediate prompt-logit invalidation, but the long-running smoke still needs a definitive pass/fail result and the original `8x4` runtime contract remains intentionally disabled pending a backend-correct implementation.
   - what the next step is: rerun the real-model smoke/parity commands to completion on the relinked binaries, confirm that the fastpath now stays on the validated path end-to-end, and only then decide whether to keep the temporary `128x4` divergence or resume `8x4` work with a backend-verified swizzle/descriptor translation.
+- 2026-04-01: Step 4 checkpoint: matched the vLLM-style weight-first VRAM budgeting path in `SingleTokenForwardModel`.
+  - what changed: `Create()` now calls `cudaMemGetInfo()` before any weight uploads and again after all layer slices are materialized, logging both snapshots under `NEMOTRON_FORWARD_DEBUG`. The model impl stores the post-weight free-VRAM measurement plus a `NEMOTRON_FORWARD_VRAM_RESERVE_MB` headroom budget (default `512 MiB`). `CreateRequestContext()` now derives a capped `RequestExecutionConfig` from that measured post-weight budget before it allocates hidden/residual/scratch buffers, Mamba state, or paged KV cache, shrinking `max_tokens`, `scratch_tokens`, and `attention_total_pages` when the original request budget would exceed the measured remaining VRAM.
+  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4 2>&1 | tail -5` and `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test -j4 2>&1 | tail -5` both passed after the change.
+  - what risk remains: this cap is still per-request and uses the stored post-weight snapshot from model creation, so multiple simultaneously live request contexts are not yet globally coordinated. The budget calculation is also shape-based and does not account for allocator fragmentation beyond the explicit reserve.
+  - what the next step is: rerun the resident-expert model bring-up path on the 32 GB GPU to confirm that full weight residency now leaves enough measured headroom for request-context creation, then continue step 4 with the uploaded-bytes/staging-counter verification against the benchmark path.

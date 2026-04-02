@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "nemotron/request_context.h"
@@ -13,6 +14,7 @@ namespace nemotron {
 class DeviceTensorFp32;
 class ModelSchedule;
 class RuntimeEnvironment;
+struct SerializedPromptIdentity;
 
 enum class ForwardLayerKind {
   kAttention,
@@ -81,7 +83,19 @@ struct SingleTokenForwardTrace {
   std::vector<float> logits;
 };
 
+struct GreedyDecodeConfig {
+  std::size_t max_new_tokens = 0;
+  std::vector<std::int32_t> eos_token_ids;
+};
+
+struct GreedyDecodeResult {
+  std::vector<std::int32_t> generated_token_ids;
+  bool hit_eos = false;
+  bool hit_capacity_limit = false;
+};
+
 SingleTokenForwardConfig KnownNemotron3Super120BA12BConfig();
+SingleTokenForwardConfig KnownNemotron3Nano30BA3BConfig();
 std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
     const ModelSchedule& schedule,
     const SingleTokenForwardConfig& config);
@@ -89,7 +103,7 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
 class SingleTokenForwardModel {
  public:
   static std::unique_ptr<SingleTokenForwardModel> Create(
-      const RuntimeEnvironment& environment,
+      RuntimeEnvironment& environment,
       const SingleTokenForwardConfig& config);
 
   SingleTokenForwardModel(SingleTokenForwardModel&&) noexcept;
@@ -113,6 +127,15 @@ class SingleTokenForwardModel {
       SingleTokenForwardTrace* trace = nullptr,
       std::optional<std::size_t> stop_layer_index = std::nullopt) const;
 
+  bool ContinuePrefill(
+      const std::int32_t* token_ids,
+      std::size_t token_count,
+      RequestExecutionContext& request_context,
+      DeviceTensorFp32* logits,
+      const std::vector<std::size_t>& capture_layer_indices = {},
+      SingleTokenForwardTrace* trace = nullptr,
+      std::optional<std::size_t> stop_layer_index = std::nullopt) const;
+
   bool RunSingleToken(
       std::int32_t token_id,
       RequestExecutionContext& request_context,
@@ -121,8 +144,47 @@ class SingleTokenForwardModel {
       SingleTokenForwardTrace* trace = nullptr,
       std::optional<std::size_t> stop_layer_index = std::nullopt) const;
 
+  bool ContinueSingleToken(
+      std::int32_t token_id,
+      RequestExecutionContext& request_context,
+      DeviceTensorFp32* logits,
+      const std::vector<std::size_t>& capture_layer_indices = {},
+      SingleTokenForwardTrace* trace = nullptr,
+      std::optional<std::size_t> stop_layer_index = std::nullopt) const;
+
+  bool RunGreedyDecode(
+      const std::int32_t* prompt_token_ids,
+      std::size_t prompt_token_count,
+      const GreedyDecodeConfig& decode_config,
+      RequestExecutionContext& request_context,
+      GreedyDecodeResult* result) const;
+
+  bool RunGreedyConversationTurn(
+      const SerializedPromptIdentity& identity,
+      const std::string& conversation_id,
+      const GreedyDecodeConfig& decode_config,
+      RequestExecutionContext& request_context,
+      GreedyDecodeResult* result,
+      std::size_t* matched_token_count = nullptr) const;
+
  private:
   struct Impl;
+
+  bool RunTokens(
+      const std::int32_t* token_ids,
+      std::size_t token_count,
+      RequestExecutionContext& request_context,
+      DeviceTensorFp32* logits,
+      const std::vector<std::size_t>& capture_layer_indices,
+      SingleTokenForwardTrace* trace,
+      std::optional<std::size_t> stop_layer_index,
+      bool reset_request_state) const;
+  bool ContinueGreedyDecode(
+      std::int32_t first_token_id,
+      const GreedyDecodeConfig& decode_config,
+      RequestExecutionContext& request_context,
+      GreedyDecodeResult* result,
+      std::vector<float>* final_boundary_logits = nullptr) const;
 
   explicit SingleTokenForwardModel(std::unique_ptr<Impl> impl);
 

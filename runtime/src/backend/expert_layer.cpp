@@ -6,14 +6,17 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <iostream>
 #include <string>
@@ -454,6 +457,117 @@ std::uint64_t TotalUploadedBytes(const DeviceNvfp4Weight& weight) {
          static_cast<std::uint64_t>(weight.tensor_scale_nbytes());
 }
 
+std::uint64_t EstimatedUploadedBytes(const GemmDescriptor& descriptor) {
+  if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(descriptor.packed_nbytes) +
+         static_cast<std::uint64_t>(descriptor.block_scales_nbytes) +
+         static_cast<std::uint64_t>(
+             ExecutionNvfp4ScaleBytes(descriptor.output_rows, descriptor.input_cols)) +
+         static_cast<std::uint64_t>(descriptor.tensor_scale_nbytes);
+}
+
+constexpr std::uint64_t kBytesPerMiB = 1024ull * 1024ull;
+constexpr std::uint64_t kDefaultForwardVramReserveMiB = 512ull;
+constexpr std::uint64_t kExpertRuntimeHeadroomMiB = 2048ull;
+
+std::uint64_t ParseEnvMiB(const char* name, std::uint64_t default_value_mib) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return default_value_mib;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed_mib = std::strtoull(value, &end, 10);
+  if (end == value || errno != 0) {
+    return default_value_mib;
+  }
+  return static_cast<std::uint64_t>(parsed_mib);
+}
+
+bool ExpertFullResidencyEnabled() {
+  const char* value = std::getenv("NEMOTRON_EXPERT_FULL_RESIDENCY");
+  return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+std::uint64_t ExpertResidencyMinimumHeadroomBytes() {
+  return (ParseEnvMiB("NEMOTRON_FORWARD_VRAM_RESERVE_MB", kDefaultForwardVramReserveMiB) +
+          kExpertRuntimeHeadroomMiB) *
+         kBytesPerMiB;
+}
+
+std::uint64_t ExpertResidencyBudgetBytes() {
+  const char* value = std::getenv("NEMOTRON_EXPERT_RESIDENCY_BUDGET_MB");
+  if (value == nullptr || *value == '\0') {
+    return 0;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const long long parsed_mb = std::strtoll(value, &end, 10);
+  if (end == value || errno != 0 || parsed_mb <= 0) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(parsed_mb) * 1024ull * 1024ull;
+}
+
+std::unique_ptr<DeviceNvfp4Weight> TryUploadNvfp4Weight(
+    const GemmDescriptor& descriptor,
+    bool debug,
+    const char* context) {
+  try {
+    return DeviceNvfp4Weight::Upload(descriptor);
+  } catch (const std::exception& error) {
+    if (debug) {
+      std::cerr << "expert_layer_create: " << context
+                << " upload threw for " << descriptor.tensor_name
+                << ": " << error.what() << "\n";
+    }
+  } catch (...) {
+    if (debug) {
+      std::cerr << "expert_layer_create: " << context
+                << " upload threw for " << descriptor.tensor_name
+                << ": unknown exception\n";
+    }
+  }
+  return nullptr;
+}
+
+struct ExpertResidencyTracker {
+  std::mutex mutex;
+  bool initialized = false;
+  bool skip_remaining_layers_for_vram = false;
+  std::size_t last_layer_index = 0;
+  std::uint64_t resident_routed_expert_bytes = 0;
+  std::size_t resident_layer_count = 0;
+  std::size_t nonresident_layer_count = 0;
+};
+
+ExpertResidencyTracker& GetExpertResidencyTracker() {
+  static ExpertResidencyTracker tracker;
+  return tracker;
+}
+
+void ResetExpertResidencyTrackerIfNeeded(
+    ExpertResidencyTracker* tracker,
+    std::size_t layer_index) {
+  if (tracker == nullptr) {
+    return;
+  }
+  if (!tracker->initialized ||
+      layer_index == 0 ||
+      layer_index < tracker->last_layer_index) {
+    tracker->skip_remaining_layers_for_vram = false;
+    tracker->resident_routed_expert_bytes = 0;
+    tracker->resident_layer_count = 0;
+    tracker->nonresident_layer_count = 0;
+  }
+  tracker->initialized = true;
+  tracker->last_layer_index = layer_index;
+}
+
 bool HasNonFinite(const std::vector<float>& values) {
   for (float value : values) {
     if (!std::isfinite(value)) {
@@ -526,6 +640,9 @@ struct ExpertLayerSlice::Impl {
   std::vector<RoutedExpertRuntime> routed_experts;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
+  std::uint64_t resident_shared_expert_bytes = 0;
+  std::uint64_t resident_routed_expert_bytes = 0;
+  bool full_residency_enabled = false;
   bool fused_direct_moe_supported = false;
 };
 
@@ -853,6 +970,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       return debug_fail("shared_down NVFP4 upload failed");
     }
   }
+  const std::uint64_t resident_shared_expert_bytes =
+      (shared_up_nvfp4_device ? TotalUploadedBytes(*shared_up_nvfp4_device) : 0) +
+      (shared_down_nvfp4_device ? TotalUploadedBytes(*shared_down_nvfp4_device) : 0);
 
   std::vector<Impl::RoutedExpertRuntime> routed_experts(config.n_routed_experts);
   bool fused_direct_moe_supported =
@@ -873,6 +993,137 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       fused_direct_moe_supported = false;
     }
     routed_experts[expert_index] = std::move(runtime_pair);
+  }
+
+  const bool full_residency_requested = ExpertFullResidencyEnabled();
+  const std::uint64_t residency_budget_bytes = ExpertResidencyBudgetBytes();
+  const std::uint64_t minimum_headroom_bytes = ExpertResidencyMinimumHeadroomBytes();
+  std::uint64_t resident_routed_expert_bytes = 0;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
+  bool full_residency_enabled = false;
+  std::size_t fully_resident_layer_count = 0;
+  std::size_t nonresident_layer_count = 0;
+  std::size_t uploaded_routed_experts = 0;
+  std::string residency_reason = "disabled";
+  std::string residency_detail;
+  std::uint64_t cumulative_resident_routed_expert_bytes = 0;
+  std::uint64_t estimated_routed_layer_bytes = 0;
+  for (const Impl::RoutedExpertRuntime& runtime_pair : routed_experts) {
+    if (runtime_pair.up_proj != nullptr) {
+      estimated_routed_layer_bytes += EstimatedUploadedBytes(*runtime_pair.up_proj);
+    }
+    if (runtime_pair.down_proj != nullptr) {
+      estimated_routed_layer_bytes += EstimatedUploadedBytes(*runtime_pair.down_proj);
+    }
+  }
+  std::size_t free_vram_bytes_raw = 0;
+  std::size_t total_vram_bytes_raw = 0;
+  const cudaError_t mem_info_status = cudaMemGetInfo(&free_vram_bytes_raw, &total_vram_bytes_raw);
+  const bool has_mem_info = mem_info_status == cudaSuccess;
+  const std::uint64_t free_vram_bytes = static_cast<std::uint64_t>(free_vram_bytes_raw);
+  const auto clear_routed_residency_uploads = [&]() {
+    for (Impl::RoutedExpertRuntime& runtime_pair : routed_experts) {
+      runtime_pair.up_proj_device.reset();
+      runtime_pair.down_proj_device.reset();
+    }
+    routed_up_nvfp4_views_device.reset();
+    routed_down_nvfp4_views_device.reset();
+    resident_routed_expert_bytes = 0;
+  };
+  auto& residency_tracker = GetExpertResidencyTracker();
+  {
+    std::lock_guard<std::mutex> lock(residency_tracker.mutex);
+    ResetExpertResidencyTrackerIfNeeded(&residency_tracker, config.layer_index);
+    if (!full_residency_requested) {
+      residency_reason = "disabled";
+      ++residency_tracker.nonresident_layer_count;
+    } else if (!fused_direct_moe_supported) {
+      residency_reason = "unsupported";
+      ++residency_tracker.nonresident_layer_count;
+    } else if (residency_tracker.skip_remaining_layers_for_vram) {
+      residency_reason = "vram_skip";
+      ++residency_tracker.nonresident_layer_count;
+      if (has_mem_info) {
+        std::cout << "expert_layer_create: skipping residency for layer " << config.layer_index
+                  << ": free_vram_mib=" << (free_vram_bytes / kBytesPerMiB)
+                  << " minimum_headroom_mib=" << (minimum_headroom_bytes / kBytesPerMiB)
+                  << "\n";
+      }
+    } else if (residency_budget_bytes > 0 &&
+               residency_tracker.resident_routed_expert_bytes + estimated_routed_layer_bytes >
+                   residency_budget_bytes) {
+      residency_reason = "budget_skip";
+      ++residency_tracker.nonresident_layer_count;
+    } else if (has_mem_info &&
+               (free_vram_bytes <= estimated_routed_layer_bytes ||
+                free_vram_bytes - estimated_routed_layer_bytes <= minimum_headroom_bytes)) {
+      residency_reason = "vram_skip";
+      residency_tracker.skip_remaining_layers_for_vram = true;
+      ++residency_tracker.nonresident_layer_count;
+      std::cout << "expert_layer_create: skipping residency for layer " << config.layer_index
+                << ": free_vram_mib=" << (free_vram_bytes / kBytesPerMiB)
+                << " minimum_headroom_mib=" << (minimum_headroom_bytes / kBytesPerMiB)
+                << "\n";
+    } else {
+      try {
+        std::vector<FusedNvfp4WeightView> routed_up_views;
+        std::vector<FusedNvfp4WeightView> routed_down_views;
+        routed_up_views.reserve(routed_experts.size());
+        routed_down_views.reserve(routed_experts.size());
+        for (Impl::RoutedExpertRuntime& runtime_pair : routed_experts) {
+          runtime_pair.up_proj_device =
+              TryUploadNvfp4Weight(*runtime_pair.up_proj, debug, "routed expert up");
+          if (!runtime_pair.up_proj_device || !runtime_pair.up_proj_device->valid()) {
+            residency_reason = "upload_failed";
+            break;
+          }
+          runtime_pair.down_proj_device =
+              TryUploadNvfp4Weight(*runtime_pair.down_proj, debug, "routed expert down");
+          if (!runtime_pair.down_proj_device || !runtime_pair.down_proj_device->valid()) {
+            residency_reason = "upload_failed";
+            break;
+          }
+          resident_routed_expert_bytes +=
+              TotalUploadedBytes(*runtime_pair.up_proj_device) +
+              TotalUploadedBytes(*runtime_pair.down_proj_device);
+          routed_up_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.up_proj_device));
+          routed_down_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.down_proj_device));
+          ++uploaded_routed_experts;
+        }
+        if (uploaded_routed_experts == routed_experts.size()) {
+          routed_up_nvfp4_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up_views);
+          routed_down_nvfp4_views_device =
+              DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down_views);
+          if (routed_up_nvfp4_views_device && routed_down_nvfp4_views_device) {
+            full_residency_enabled = true;
+            residency_reason = "resident";
+            residency_tracker.resident_routed_expert_bytes += resident_routed_expert_bytes;
+            ++residency_tracker.resident_layer_count;
+          } else {
+            residency_reason = "view_upload_failed";
+            clear_routed_residency_uploads();
+            ++residency_tracker.nonresident_layer_count;
+          }
+        } else {
+          clear_routed_residency_uploads();
+          ++residency_tracker.nonresident_layer_count;
+        }
+      } catch (const std::exception& error) {
+        residency_reason = "exception";
+        residency_detail = error.what();
+        clear_routed_residency_uploads();
+        ++residency_tracker.nonresident_layer_count;
+      } catch (...) {
+        residency_reason = "exception";
+        residency_detail = "unknown";
+        clear_routed_residency_uploads();
+        ++residency_tracker.nonresident_layer_count;
+      }
+    }
+    fully_resident_layer_count = residency_tracker.resident_layer_count;
+    nonresident_layer_count = residency_tracker.nonresident_layer_count;
+    cumulative_resident_routed_expert_bytes = residency_tracker.resident_routed_expert_bytes;
   }
 
   auto impl = std::make_unique<Impl>();
@@ -898,7 +1149,41 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->shared_down_nvfp4 = shared_down_nvfp4;
   impl->shared_down_nvfp4_device = std::move(shared_down_nvfp4_device);
   impl->routed_experts = std::move(routed_experts);
+  impl->routed_up_nvfp4_views_device = std::move(routed_up_nvfp4_views_device);
+  impl->routed_down_nvfp4_views_device = std::move(routed_down_nvfp4_views_device);
+  impl->resident_shared_expert_bytes = resident_shared_expert_bytes;
+  impl->resident_routed_expert_bytes = resident_routed_expert_bytes;
+  impl->full_residency_enabled = full_residency_enabled;
   impl->fused_direct_moe_supported = fused_direct_moe_supported;
+  if (debug) {
+    const std::uint64_t resident_total_expert_bytes =
+        resident_shared_expert_bytes + resident_routed_expert_bytes;
+    std::cout << "expert_layer_create: layer=" << config.layer_index
+              << " fused_direct_moe_supported=" << fused_direct_moe_supported
+              << " expert_full_residency_requested=" << full_residency_requested
+              << " expert_full_residency=" << full_residency_enabled
+              << " expert_residency_reason=" << residency_reason
+              << " uploaded_routed_experts=" << uploaded_routed_experts
+              << " estimated_routed_layer_bytes=" << estimated_routed_layer_bytes
+              << " cumulative_resident_routed_expert_bytes="
+              << cumulative_resident_routed_expert_bytes
+              << " expert_residency_budget_mb="
+              << (residency_budget_bytes == 0 ? 0
+                                              : static_cast<long long>(
+                                                    residency_budget_bytes / (1024ull * 1024ull)))
+              << " resident_layer_count=" << fully_resident_layer_count
+              << " nonresident_layer_count=" << nonresident_layer_count
+              << " resident_routed_expert_bytes=" << resident_routed_expert_bytes
+              << " resident_shared_expert_bytes=" << resident_shared_expert_bytes
+              << " resident_total_expert_bytes=" << resident_total_expert_bytes
+              << " resident_total_expert_mib="
+              << (static_cast<double>(resident_total_expert_bytes) / (1024.0 * 1024.0))
+              << "\n";
+    if (!residency_detail.empty()) {
+      std::cout << "expert_layer_create: layer=" << config.layer_index
+                << " expert_residency_detail=" << residency_detail << "\n";
+    }
+  }
   return std::unique_ptr<ExpertLayerSlice>(new ExpertLayerSlice(std::move(impl)));
 }
 
@@ -941,6 +1226,9 @@ bool ExpertLayerSlice::valid() const {
           (impl_->shared_down_family == Impl::SharedDownFamily::kDense &&
            impl_->shared_down_dense != nullptr &&
            impl_->shared_down_dense->valid())) &&
+         (!impl_->full_residency_enabled ||
+          (impl_->routed_up_nvfp4_views_device != nullptr &&
+           impl_->routed_down_nvfp4_views_device != nullptr)) &&
          impl_->routed_experts.size() == impl_->config.n_routed_experts;
 }
 
@@ -1025,61 +1313,76 @@ bool ExpertLayerSlice::Run(
         impl_->fused_direct_moe_supported &&
         FusedMoeDecodeEnabled();
     if (use_fused_direct_decode) {
+      const bool use_full_residency =
+          impl_->full_residency_enabled &&
+          impl_->routed_up_nvfp4_views_device != nullptr &&
+          impl_->routed_down_nvfp4_views_device != nullptr;
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_up_weights;
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_down_weights;
       std::vector<FusedNvfp4WeightView> routed_up_views;
       std::vector<FusedNvfp4WeightView> routed_down_views;
+      std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_views_device;
+      std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_views_device;
+      const FusedNvfp4WeightView* routed_up_device_ptr = nullptr;
+      const FusedNvfp4WeightView* routed_down_device_ptr = nullptr;
       std::uint64_t staging_bytes_uploaded = 0;
       std::uint64_t staging_elapsed_us = 0;
       std::uint64_t experts_staged = 0;
       auto& staging_counters = GetExpertStagingCounters();
-      routed_up_weights.reserve(impl_->routed_experts.size());
-      routed_down_weights.reserve(impl_->routed_experts.size());
-      routed_up_views.reserve(impl_->routed_experts.size());
-      routed_down_views.reserve(impl_->routed_experts.size());
-      staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-      for (const Impl::RoutedExpertRuntime& runtime_pair : impl_->routed_experts) {
-        const auto up_upload_started = std::chrono::steady_clock::now();
-        auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
-        const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - up_upload_started)
-                .count());
-        staging_elapsed_us += up_elapsed_us;
-        staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
-        const auto down_upload_started = std::chrono::steady_clock::now();
-        auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
-        const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - down_upload_started)
-                .count());
-        staging_elapsed_us += down_elapsed_us;
-        staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
-        if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
+      if (use_full_residency) {
+        routed_up_device_ptr = impl_->routed_up_nvfp4_views_device->data();
+        routed_down_device_ptr = impl_->routed_down_nvfp4_views_device->data();
+      } else {
+        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+        routed_up_weights.reserve(impl_->routed_experts.size());
+        routed_down_weights.reserve(impl_->routed_experts.size());
+        routed_up_views.reserve(impl_->routed_experts.size());
+        routed_down_views.reserve(impl_->routed_experts.size());
+        for (const Impl::RoutedExpertRuntime& runtime_pair : impl_->routed_experts) {
+          const auto up_upload_started = std::chrono::steady_clock::now();
+          auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
+          const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - up_upload_started)
+                  .count());
+          staging_elapsed_us += up_elapsed_us;
+          staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
+          const auto down_upload_started = std::chrono::steady_clock::now();
+          auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
+          const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - down_upload_started)
+                  .count());
+          staging_elapsed_us += down_elapsed_us;
+          staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
+          if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
+            return false;
+          }
+          const std::uint64_t upload_bytes =
+              TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
+          staging_bytes_uploaded += upload_bytes;
+          staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
+          ++experts_staged;
+          staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
+          routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
+          routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
+          routed_up_weights.push_back(std::move(up_weight));
+          routed_down_weights.push_back(std::move(down_weight));
+        }
+        routed_up_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up_views);
+        routed_down_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down_views);
+        if (!routed_up_views_device || !routed_down_views_device) {
           return false;
         }
-        const std::uint64_t upload_bytes =
-            TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
-        staging_bytes_uploaded += upload_bytes;
-        staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
-        ++experts_staged;
-        staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
-        routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
-        routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
-        routed_up_weights.push_back(std::move(up_weight));
-        routed_down_weights.push_back(std::move(down_weight));
+        routed_up_device_ptr = routed_up_views_device->data();
+        routed_down_device_ptr = routed_down_views_device->data();
       }
       if (debug) {
-        std::cout << "expert_layer: fused direct staged " << experts_staged
+        std::cout << "expert_layer: fused direct "
+                  << (use_full_residency ? "resident" : "staged")
+                  << " routed experts=" << (use_full_residency ? impl_->routed_experts.size() : experts_staged)
                   << " routed experts bytes=" << staging_bytes_uploaded
                   << " elapsed_us=" << staging_elapsed_us << "\n";
-      }
-      auto routed_up_views_device =
-          DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up_views);
-      auto routed_down_views_device =
-          DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down_views);
-      if (!routed_up_views_device || !routed_down_views_device) {
-        return false;
       }
 
       std::unique_ptr<DeviceArray<int>> selected_indices_device;
@@ -1124,8 +1427,8 @@ bool ExpertLayerSlice::Run(
       fused_params.norm_topk_prob = impl_->config.norm_topk_prob;
       fused_params.shared_up = MakeFusedNvfp4WeightView(*impl_->shared_up_nvfp4_device);
       fused_params.shared_down = MakeFusedNvfp4WeightView(*impl_->shared_down_nvfp4_device);
-      fused_params.routed_up = routed_up_views_device->data();
-      fused_params.routed_down = routed_down_views_device->data();
+      fused_params.routed_up = routed_up_device_ptr;
+      fused_params.routed_down = routed_down_device_ptr;
       fused_params.correction_bias = impl_->gate_score_correction_bias_device->data();
       fused_params.selected_indices =
           selected_indices_device ? selected_indices_device->data() : nullptr;
