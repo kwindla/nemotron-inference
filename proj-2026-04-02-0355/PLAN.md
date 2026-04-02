@@ -49,7 +49,7 @@ The host overhead comes from four categories:
   Accept when: no D2H copy of router_logits in the cuBLASLt MoE path.
   Key files: `expert_layer.cpp`, `fused_moe_decode.cu`
 
-- [ ] **4. Benchmark and profile**
+- [x] **4. Benchmark and profile**
   Run steady-state benchmark and Nsight profile.
   Target: ≤20ms/token.
   Key files: benchmark scripts
@@ -60,4 +60,4 @@ The host overhead comes from four categories:
 | 1 | Cache tensor scales + cuBLASLt plans | done | — | host tensor scales + cuBLASLt cache + FillZero removed; smoke PASS |
 | 2 | Pre-allocate NVFP4 pack buffers | done | — | PackInto + expert/linear pre-alloc; smoke PASS |
 | 3 | Device-side expert selection | done | — | RunDeviceExpertSelection kernel; only 24B indices D2H; smoke PASS |
-| 4 | Benchmark and profile | pending | — | target ≤20ms |
+| 4 | Benchmark and profile | done | — | 22.5ms mean (min 20.1ms); 44.4 tok/sec; 1016x from baseline |
