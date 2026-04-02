@@ -133,6 +133,7 @@ add_library(
   src/backend/linear_op_trace.cpp
   src/backend/linear_reference_kernels.cu
   src/backend/mamba_layer.cpp
+  src/backend/monolithic_expert_weights.cu
   src/backend/nvfp4_gemm_runner.cpp
   src/backend/nvfp4_packing.cpp
   src/backend/nvfp4_scale_layout.cpp
