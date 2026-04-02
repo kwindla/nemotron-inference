@@ -27,6 +27,7 @@ enum class ModelCacheEntryKind : std::uint32_t {
   kDenseWeightFp32 = 3,
   kScaledFp8WeightFp32 = 4,
   kNvfp4Aligned = 5,
+  kScaledFp8WeightNative = 6,
 };
 
 struct ModelCacheEntry {
@@ -48,7 +49,7 @@ struct ModelCacheEntry {
 };
 
 struct ModelCacheHeader {
-  std::uint32_t format_version = 1;
+  std::uint32_t format_version = 2;
   std::string model_id;
   std::string source_revision;
   SingleTokenForwardConfig config;

@@ -45,6 +45,10 @@ class ScaledFp8LinearOp {
   static std::unique_ptr<ScaledFp8LinearOp> CreateView(
       const ScaledFp8LinearConfig& config,
       std::unique_ptr<DeviceDenseWeightFp32> weight_view);
+  static std::unique_ptr<ScaledFp8LinearOp> CreateView(
+      const ScaledFp8LinearConfig& config,
+      std::unique_ptr<DeviceDenseWeightFp32> weight_view,
+      std::unique_ptr<DeviceTensorFp8E4M3> packed_weight_view);
 
   ScaledFp8LinearOp(ScaledFp8LinearOp&&) noexcept;
   ScaledFp8LinearOp& operator=(ScaledFp8LinearOp&&) noexcept;

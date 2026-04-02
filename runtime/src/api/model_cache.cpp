@@ -28,6 +28,7 @@ namespace nemotron {
 namespace {
 
 constexpr char kMagic[] = "NEMO_MODEL_CACHE_V1";
+constexpr std::uint32_t kCurrentModelCacheFormatVersion = 2;
 constexpr std::size_t kAlignmentBytes = 256;
 
 template <typename T>
@@ -98,6 +99,10 @@ bool IsFp32Storage(const std::string& storage_dtype) {
 
 bool IsBf16Storage(const std::string& storage_dtype) {
   return storage_dtype == "bf16" || storage_dtype == "bfloat16";
+}
+
+bool IsFp8E4M3Storage(const std::string& storage_dtype) {
+  return storage_dtype == "fp8_e4m3fn" || storage_dtype == "fp8_e4m3";
 }
 
 std::optional<std::vector<float>> ReadTensorToHostFlatFp32(const KernelTensorDescriptor& descriptor) {
@@ -351,6 +356,10 @@ bool ReadHeader(std::ifstream& input, ModelCacheHeader* header) {
       !DeserializeConfig(input, &header->config)) {
     return false;
   }
+  if (header->format_version == 0 ||
+      header->format_version > kCurrentModelCacheFormatVersion) {
+    return false;
+  }
   std::uint32_t entry_count = 0;
   std::uint64_t payload_nbytes = 0;
   if (!ReadPod(input, &entry_count) || !ReadPod(input, &payload_nbytes)) {
@@ -545,6 +554,35 @@ bool AddDenseEntry(
   return true;
 }
 
+bool AddScaledFp8NativeEntry(
+    const GemmDescriptor& descriptor,
+    float weight_scale,
+    float input_scale,
+    std::unordered_set<std::string>* seen,
+    std::vector<ModelCacheEntry>* entries) {
+  if (!seen->insert(descriptor.tensor_name).second) {
+    return true;
+  }
+  if (descriptor.packed_data == nullptr ||
+      descriptor.output_rows == 0 ||
+      descriptor.input_cols == 0 ||
+      !IsFp8E4M3Storage(descriptor.storage_dtype) ||
+      descriptor.packed_nbytes != descriptor.output_rows * descriptor.input_cols) {
+    return false;
+  }
+  ModelCacheEntry entry;
+  entry.tensor_name = descriptor.tensor_name;
+  entry.kind = ModelCacheEntryKind::kScaledFp8WeightNative;
+  entry.shape = {descriptor.output_rows, descriptor.input_cols};
+  entry.output_rows = descriptor.output_rows;
+  entry.input_cols = descriptor.input_cols;
+  entry.input_scale = input_scale;
+  entry.weight_scale = weight_scale;
+  entry.payload_nbytes = descriptor.packed_nbytes;
+  entries->push_back(std::move(entry));
+  return true;
+}
+
 bool AddNvfp4Entry(
     const GemmDescriptor& descriptor,
     std::unordered_set<std::string>* seen,
@@ -664,10 +702,9 @@ bool WriteDeterministicModelCache(
           const auto weight_scale = ReadScalarFp32(*bindings->in_proj_weight_scale);
           const auto input_scale = ReadScalarFp32(*bindings->in_proj_input_scale);
           if (!weight_scale.has_value() || !input_scale.has_value() ||
-              !AddDenseEntry(
+              !AddScaledFp8NativeEntry(
                   *bindings->in_proj_gemm_weight,
                   *weight_scale,
-                  ModelCacheEntryKind::kScaledFp8WeightFp32,
                   *input_scale,
                   &seen,
                   &entries)) {
@@ -688,10 +725,9 @@ bool WriteDeterministicModelCache(
           const auto weight_scale = ReadScalarFp32(*bindings->out_proj_weight_scale);
           const auto input_scale = ReadScalarFp32(*bindings->out_proj_input_scale);
           if (!weight_scale.has_value() || !input_scale.has_value() ||
-              !AddDenseEntry(
+              !AddScaledFp8NativeEntry(
                   *bindings->out_proj_gemm_weight,
                   *weight_scale,
-                  ModelCacheEntryKind::kScaledFp8WeightFp32,
                   *input_scale,
                   &seen,
                   &entries)) {
@@ -723,10 +759,9 @@ bool WriteDeterministicModelCache(
           const auto weight_scale = ReadScalarFp32(*bindings->fc1_latent_weight_scale);
           const auto input_scale = ReadScalarFp32(*bindings->fc1_latent_input_scale);
           if (!weight_scale.has_value() || !input_scale.has_value() ||
-              !AddDenseEntry(
+              !AddScaledFp8NativeEntry(
                   *bindings->fc1_latent_gemm_weight,
                   *weight_scale,
-                  ModelCacheEntryKind::kScaledFp8WeightFp32,
                   *input_scale,
                   &seen,
                   &entries)) {
@@ -741,10 +776,9 @@ bool WriteDeterministicModelCache(
           const auto weight_scale = ReadScalarFp32(*bindings->shared_up_weight_scale);
           const auto input_scale = ReadScalarFp32(*bindings->shared_up_input_scale);
           if (!weight_scale.has_value() || !input_scale.has_value() ||
-              !AddDenseEntry(
+              !AddScaledFp8NativeEntry(
                   *bindings->shared_up_gemm_weight,
                   *weight_scale,
-                  ModelCacheEntryKind::kScaledFp8WeightFp32,
                   *input_scale,
                   &seen,
                   &entries)) {
@@ -764,10 +798,9 @@ bool WriteDeterministicModelCache(
           const auto weight_scale = ReadScalarFp32(*bindings->shared_down_weight_scale);
           const auto input_scale = ReadScalarFp32(*bindings->shared_down_input_scale);
           if (!weight_scale.has_value() || !input_scale.has_value() ||
-              !AddDenseEntry(
+              !AddScaledFp8NativeEntry(
                   *bindings->shared_down_gemm_weight,
                   *weight_scale,
-                  ModelCacheEntryKind::kScaledFp8WeightFp32,
                   *input_scale,
                   &seen,
                   &entries)) {
@@ -793,6 +826,7 @@ bool WriteDeterministicModelCache(
   }
 
   ModelCacheHeader header;
+  header.format_version = kCurrentModelCacheFormatVersion;
   header.config = config;
   header.entries = std::move(entries);
   FinalizeOffsets(&header.entries, &header.payload_nbytes);
@@ -855,6 +889,16 @@ bool WriteDeterministicModelCache(
                 reinterpret_cast<const std::uint8_t*>(values->data()),
                 values->size() * sizeof(float),
                 &payload_offset)) {
+          return false;
+        }
+        break;
+      }
+      case ModelCacheEntryKind::kScaledFp8WeightNative: {
+        const GemmDescriptor* descriptor = gemm_catalog.FindDescriptor(entry.tensor_name);
+        if (descriptor == nullptr ||
+            descriptor->packed_data == nullptr ||
+            descriptor->packed_nbytes != entry.payload_nbytes ||
+            !WriteByteSpan(output, descriptor->packed_data, descriptor->packed_nbytes, &payload_offset)) {
           return false;
         }
         break;
@@ -1146,15 +1190,11 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
     std::size_t input_cols) const {
   const ModelCacheEntry* entry = FindEntry(tensor_name);
   if (entry == nullptr ||
-      entry->kind != ModelCacheEntryKind::kScaledFp8WeightFp32 ||
+      (entry->kind != ModelCacheEntryKind::kScaledFp8WeightFp32 &&
+       entry->kind != ModelCacheEntryKind::kScaledFp8WeightNative) ||
+      entry->output_rows != output_rows ||
+      entry->input_cols != input_cols ||
       !EnsureEntryResident(entry)) {
-    return nullptr;
-  }
-  auto weight = DeviceDenseWeightFp32::CreateView(
-      entry->output_rows,
-      entry->input_cols,
-      reinterpret_cast<float*>(PayloadPtr(entry)));
-  if (!weight || !weight->valid()) {
     return nullptr;
   }
   ScaledFp8LinearConfig config;
@@ -1163,7 +1203,24 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
   config.tensor_name = tensor_name;
   config.input_scale = entry->input_scale;
   config.weight_scale = entry->weight_scale;
-  return ScaledFp8LinearOp::CreateView(config, std::move(weight));
+  if (entry->kind == ModelCacheEntryKind::kScaledFp8WeightFp32) {
+    auto weight = DeviceDenseWeightFp32::CreateView(
+        entry->output_rows,
+        entry->input_cols,
+        reinterpret_cast<float*>(PayloadPtr(entry)));
+    if (!weight || !weight->valid()) {
+      return nullptr;
+    }
+    return ScaledFp8LinearOp::CreateView(config, std::move(weight));
+  }
+
+  auto packed_weight = DeviceTensorFp8E4M3::CreateView(
+      {entry->output_rows, entry->input_cols},
+      PayloadPtr(entry));
+  if (!packed_weight || !packed_weight->valid()) {
+    return nullptr;
+  }
+  return ScaledFp8LinearOp::CreateView(config, nullptr, std::move(packed_weight));
 }
 
 std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(

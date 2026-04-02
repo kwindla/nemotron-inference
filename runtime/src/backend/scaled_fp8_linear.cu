@@ -210,6 +210,61 @@ __global__ void QuantizeFp8RoundTripKernel(
   }
 }
 
+__global__ void DequantizePackedFp8WeightKernel(
+    const std::uint8_t* input,
+    std::size_t numel,
+    float weight_scale,
+    float* output) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = index; i < numel; i += stride) {
+    __nv_fp8_e4m3 quantized;
+    quantized.__x = input[i];
+    output[i] = static_cast<float>(quantized) * weight_scale;
+  }
+}
+
+bool DequantizePackedFp8WeightToDeviceFp32(
+    const DeviceTensorFp8E4M3& input,
+    float weight_scale,
+    DeviceTensorFp32* output,
+    cudaStream_t stream) {
+  if (!input.valid() || output == nullptr || !output->valid() || input.shape() != output->shape()) {
+    return false;
+  }
+  constexpr int kBlockSize = 256;
+  const std::size_t numel = input.numel();
+  const int grid_size = static_cast<int>(
+      (numel + static_cast<std::size_t>(kBlockSize) - 1u) / static_cast<std::size_t>(kBlockSize));
+  DequantizePackedFp8WeightKernel<<<grid_size, kBlockSize, 0, stream>>>(
+      input.data(),
+      numel,
+      weight_scale,
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+void PopulateDequantizedDescriptor(
+    const ScaledFp8LinearConfig& config,
+    std::string_view tensor_name,
+    const DeviceDenseWeightFp32& weight,
+    GemmDescriptor* descriptor) {
+  if (!weight.valid() || descriptor == nullptr) {
+    return;
+  }
+  descriptor->tensor_name = ResolveDequantizedTensorName(tensor_name);
+  descriptor->op_class = "scaled_fp8_linear_dequantized";
+  descriptor->kernel_family = GemmKernelFamily::kDenseRowMajor;
+  descriptor->output_rows = config.output_rows;
+  descriptor->input_cols = config.input_cols;
+  descriptor->storage_dtype = "fp32";
+  descriptor->compute_dtype = "fp32";
+  descriptor->layout_tag = "row_major";
+  descriptor->alignment_bytes = 16;
+  descriptor->packed_data = reinterpret_cast<const std::uint8_t*>(weight.data());
+  descriptor->packed_nbytes = config.output_rows * config.input_cols * sizeof(float);
+}
+
 }  // namespace
 
 struct ScaledFp8LinearOp::Impl {
@@ -219,6 +274,7 @@ struct ScaledFp8LinearOp::Impl {
   GemmDescriptor dequantized_descriptor;
   std::unique_ptr<DeviceDenseWeightFp32> weight;
   std::unique_ptr<DeviceTensorFp8E4M3> packed_weight;
+  std::unique_ptr<DeviceTensorFp32> dequantized_weight_storage;
   mutable std::mutex rows1_plan_mutex;
   mutable bool rows1_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_plan;
@@ -309,16 +365,33 @@ std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::Create(const ScaledFp8Line
 std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::CreateView(
     const ScaledFp8LinearConfig& config,
     std::unique_ptr<DeviceDenseWeightFp32> weight_view) {
+  return CreateView(config, std::move(weight_view), nullptr);
+}
+
+std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::CreateView(
+    const ScaledFp8LinearConfig& config,
+    std::unique_ptr<DeviceDenseWeightFp32> weight_view,
+    std::unique_ptr<DeviceTensorFp8E4M3> packed_weight_view) {
   if (config.output_rows == 0 ||
       config.input_cols == 0 ||
       !std::isfinite(config.weight_scale) ||
       config.weight_scale <= 0.0f ||
-      !weight_view ||
-      !weight_view->valid() ||
-      weight_view->output_rows() != config.output_rows ||
-      weight_view->input_cols() != config.input_cols) {
+      (!weight_view && !packed_weight_view)) {
     return nullptr;
   }
+  if (weight_view &&
+      (!weight_view->valid() ||
+       weight_view->output_rows() != config.output_rows ||
+       weight_view->input_cols() != config.input_cols)) {
+    return nullptr;
+  }
+  if (packed_weight_view &&
+      (!packed_weight_view->valid() ||
+       packed_weight_view->shape() !=
+           std::vector<std::size_t>{config.output_rows, config.input_cols})) {
+    return nullptr;
+  }
+
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->descriptor.tensor_name = ResolveScaledFp8TensorName(config);
@@ -326,17 +399,26 @@ std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::CreateView(
   impl->descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
   impl->descriptor.output_rows = config.output_rows;
   impl->descriptor.input_cols = config.input_cols;
-  impl->descriptor.storage_dtype = "fp32";
   impl->descriptor.compute_dtype = "fp32";
   impl->descriptor.layout_tag = "row_major";
   impl->descriptor.alignment_bytes = 16;
   impl->family = ClassifyScaledFp8RuntimeOpFamily(impl->descriptor.tensor_name);
   impl->weight = std::move(weight_view);
-  impl->dequantized_descriptor = impl->descriptor;
-  impl->dequantized_descriptor.packed_data =
-      reinterpret_cast<const std::uint8_t*>(impl->weight->data());
-  impl->dequantized_descriptor.packed_nbytes =
-      config.output_rows * config.input_cols * sizeof(float);
+  impl->packed_weight = std::move(packed_weight_view);
+  if (impl->packed_weight && impl->packed_weight->valid()) {
+    impl->descriptor.storage_dtype = "fp8_e4m3fn";
+    impl->descriptor.packed_data = impl->packed_weight->data();
+    impl->descriptor.packed_nbytes = impl->packed_weight->bytes();
+  } else {
+    impl->descriptor.storage_dtype = "fp32";
+  }
+  if (impl->weight && impl->weight->valid()) {
+    PopulateDequantizedDescriptor(
+        config,
+        impl->descriptor.tensor_name,
+        *impl->weight,
+        &impl->dequantized_descriptor);
+  }
   return std::unique_ptr<ScaledFp8LinearOp>(new ScaledFp8LinearOp(std::move(impl)));
 }
 
@@ -440,24 +522,47 @@ bool ScaledFp8LinearOp::Run(
   }
 
   if ((!impl_->weight || !impl_->weight->valid()) &&
-      impl_->descriptor.packed_data != nullptr &&
-      impl_->descriptor.packed_nbytes != 0) {
+      impl_->packed_weight &&
+      impl_->packed_weight->valid()) {
+    if (!impl_->dequantized_weight_storage ||
+        impl_->dequantized_weight_storage->shape() !=
+            std::vector<std::size_t>{impl_->config.output_rows, impl_->config.input_cols}) {
+      impl_->dequantized_weight_storage =
+          DeviceTensorFp32::Create({impl_->config.output_rows, impl_->config.input_cols});
+    }
+    if (!impl_->dequantized_weight_storage ||
+        !impl_->dequantized_weight_storage->valid() ||
+        !DequantizePackedFp8WeightToDeviceFp32(
+            *impl_->packed_weight,
+            impl_->config.weight_scale,
+            impl_->dequantized_weight_storage.get(),
+            stream)) {
+      return false;
+    }
+    impl_->weight = DeviceDenseWeightFp32::CreateView(
+        impl_->config.output_rows,
+        impl_->config.input_cols,
+        impl_->dequantized_weight_storage->data());
+    if (!impl_->weight || !impl_->weight->valid()) {
+      return false;
+    }
+    PopulateDequantizedDescriptor(
+        impl_->config,
+        impl_->descriptor.tensor_name,
+        *impl_->weight,
+        &impl_->dequantized_descriptor);
+    impl_->rows1_dequantized_plan_attempted = false;
+    impl_->rows1_dequantized_plan.reset();
+  } else if ((!impl_->weight || !impl_->weight->valid()) &&
+             impl_->descriptor.packed_data != nullptr &&
+             impl_->descriptor.packed_nbytes != 0) {
     impl_->weight = DeviceDenseWeightFp32::Upload(impl_->descriptor, impl_->config.weight_scale);
     if (impl_->weight && impl_->weight->valid()) {
-      impl_->dequantized_descriptor.tensor_name =
-          ResolveDequantizedTensorName(impl_->descriptor.tensor_name);
-      impl_->dequantized_descriptor.op_class = "scaled_fp8_linear_dequantized";
-      impl_->dequantized_descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
-      impl_->dequantized_descriptor.output_rows = impl_->config.output_rows;
-      impl_->dequantized_descriptor.input_cols = impl_->config.input_cols;
-      impl_->dequantized_descriptor.storage_dtype = "fp32";
-      impl_->dequantized_descriptor.compute_dtype = "fp32";
-      impl_->dequantized_descriptor.layout_tag = "row_major";
-      impl_->dequantized_descriptor.alignment_bytes = 16;
-      impl_->dequantized_descriptor.packed_data =
-          reinterpret_cast<const std::uint8_t*>(impl_->weight->data());
-      impl_->dequantized_descriptor.packed_nbytes =
-          impl_->config.output_rows * impl_->config.input_cols * sizeof(float);
+      PopulateDequantizedDescriptor(
+          impl_->config,
+          impl_->descriptor.tensor_name,
+          *impl_->weight,
+          &impl_->dequantized_descriptor);
       impl_->rows1_dequantized_plan_attempted = false;
       impl_->rows1_dequantized_plan.reset();
     }
