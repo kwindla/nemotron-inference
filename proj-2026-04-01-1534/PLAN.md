@@ -84,7 +84,7 @@ Translate from these upstream designs, not from generic intuition:
 - [x] **4. Routed-expert residency — monolithic tensors matching vLLM memory layout**
   Done. All 23 expert layers monolithic-resident (15.4 GB in 6 cudaMalloc per layer). Zero per-token uploads. VRAM-aware KV cache sizing. Decode at 1,805 ms/token.
 
-- [ ] **5. Profile and identify the next bottleneck**
+- [x] **5. Profile and identify the next bottleneck**
   Goal:
   - decompose the remaining 1,805 ms/token into operator-level costs, with specific focus on host-side overhead
   Scope:
@@ -214,7 +214,7 @@ Translate from these upstream designs, not from generic intuition:
 | 2 | Re-baseline with evidence | done | 8394930 | expert staging = 92% of runtime |
 | 3 | Attention sync cleanup | done | 6fb664b | persistent buffers, removed 6 syncs |
 | 4 | Monolithic expert residency | done | 5a624e1 | 23/23 resident, 0 uploads, 1805 ms/token |
-| 5 | Profile next bottleneck | pending | — | focus on sync/alloc overhead, not just kernels |
+| 5 | Profile next bottleneck | done | — | FusedMoeDirectDecode = 98.4% of GPU time (77ms/call × 23 layers = 1771ms/token) |
 | 6a | Remove explicit syncs + fix dead allocs | pending | — | muted gains alone; needs 6b |
 | 6b | Request-context scratch buffers | pending | — | ~281 mallocs/token → 0 |
 | 6c | Attention BF16 + cuDNN plan reuse | pending | — | attention-specific alloc cleanup |
