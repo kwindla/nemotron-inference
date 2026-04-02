@@ -1317,28 +1317,54 @@ bool ExpertLayerSlice::Run(
           impl_->full_residency_enabled &&
           impl_->routed_up_nvfp4_views_device != nullptr &&
           impl_->routed_down_nvfp4_views_device != nullptr;
+      const bool needs_host_selected_experts = host_selection_debug || !use_full_residency;
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_up_weights;
       std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_down_weights;
       std::vector<FusedNvfp4WeightView> routed_up_views;
       std::vector<FusedNvfp4WeightView> routed_down_views;
       std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_views_device;
       std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_views_device;
+      std::vector<ExpertSelection> selected_experts;
       const FusedNvfp4WeightView* routed_up_device_ptr = nullptr;
       const FusedNvfp4WeightView* routed_down_device_ptr = nullptr;
       std::uint64_t staging_bytes_uploaded = 0;
       std::uint64_t staging_elapsed_us = 0;
       std::uint64_t experts_staged = 0;
       auto& staging_counters = GetExpertStagingCounters();
+      if (needs_host_selected_experts) {
+        std::vector<float> router_logits_host;
+        if (!CopyToHost(*router_logits, &router_logits_host) ||
+            router_logits_host.size() != impl_->config.n_routed_experts) {
+          return false;
+        }
+        selected_experts = SelectTopExperts(
+            impl_->config,
+            router_logits_host,
+            impl_->gate_score_correction_bias);
+        if (selected_experts.size() != impl_->config.top_k) {
+          return false;
+        }
+      }
       if (use_full_residency) {
         routed_up_device_ptr = impl_->routed_up_nvfp4_views_device->data();
         routed_down_device_ptr = impl_->routed_down_nvfp4_views_device->data();
       } else {
         staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-        routed_up_weights.reserve(impl_->routed_experts.size());
-        routed_down_weights.reserve(impl_->routed_experts.size());
-        routed_up_views.reserve(impl_->routed_experts.size());
-        routed_down_views.reserve(impl_->routed_experts.size());
-        for (const Impl::RoutedExpertRuntime& runtime_pair : impl_->routed_experts) {
+        routed_up_weights.reserve(selected_experts.size());
+        routed_down_weights.reserve(selected_experts.size());
+        routed_up_views.reserve(selected_experts.size());
+        routed_down_views.reserve(selected_experts.size());
+        // Non-resident decode uploads a compact top-k view array and passes remapped
+        // selected_indices so the kernel indexes only the staged experts.
+        for (const ExpertSelection& selection : selected_experts) {
+          if (selection.expert_index >= impl_->routed_experts.size()) {
+            return false;
+          }
+          const Impl::RoutedExpertRuntime& runtime_pair =
+              impl_->routed_experts[selection.expert_index];
+          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+            return false;
+          }
           const auto up_upload_started = std::chrono::steady_clock::now();
           auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
           const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
@@ -1387,24 +1413,14 @@ bool ExpertLayerSlice::Run(
 
       std::unique_ptr<DeviceArray<int>> selected_indices_device;
       std::unique_ptr<DeviceArray<float>> selected_weights_device;
-      if (host_selection_debug) {
-        std::vector<float> router_logits_host;
-        if (!CopyToHost(*router_logits, &router_logits_host) ||
-            router_logits_host.size() != impl_->config.n_routed_experts) {
-          return false;
-        }
-        const std::vector<ExpertSelection> selections = SelectTopExperts(
-            impl_->config,
-            router_logits_host,
-            impl_->gate_score_correction_bias);
-        if (selections.size() != impl_->config.top_k) {
-          return false;
-        }
+      if (needs_host_selected_experts) {
         std::vector<int> selected_indices_host(impl_->config.top_k, -1);
         std::vector<float> selected_weights_host(impl_->config.top_k, 0.0f);
-        for (std::size_t slot = 0; slot < selections.size(); ++slot) {
-          selected_indices_host[slot] = static_cast<int>(selections[slot].expert_index);
-          selected_weights_host[slot] = selections[slot].weight;
+        for (std::size_t slot = 0; slot < selected_experts.size(); ++slot) {
+          selected_indices_host[slot] =
+              use_full_residency ? static_cast<int>(selected_experts[slot].expert_index)
+                                 : static_cast<int>(slot);
+          selected_weights_host[slot] = selected_experts[slot].weight;
         }
         selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
         selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);

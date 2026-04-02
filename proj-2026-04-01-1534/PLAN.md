@@ -326,9 +326,10 @@ Use these inputs for every checkpoint unless a step says otherwise:
 | 1 | Linear fastpath correctness + layout translation | done | b31feb4 | smoke PASS with NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1; 128x4 activation layout; 8x4 deferred |
 | 2 | Re-baseline with counters and Nsight | done | — | expert staging = 92% of runtime; 588GB uploaded per run; expert residency is #1 priority |
 | 3 | Attention metadata/workspace ownership + sync cleanup | done | — | persistent buffers, removed 6 cudaDeviceSynchronize calls; smoke PASS |
-| 4 | Routed-expert residency translation | in-progress | — | 17.1 GB fits in 32 GB; full permanent residency, request-context VRAM now capped from measured post-weight free memory |
+| 4 | Routed-expert residency translation | done | — | 21/23 layers resident, 2 use selected-only upload; VRAM-aware budgeting; smoke PASS |
 | 5 | Production decode attention translation | pending | — | explicit decode-vs-prefill dispatcher required |
 | 6 | Repeat evidence-driven roofline loop | pending | — | save artifacts and justify each next move |
+| 7 | Monolithic expert tensor refactor (vLLM memory layout) | placeholder | — | see note below |
 
 ## Progress Log
 
@@ -359,3 +360,21 @@ Use these inputs for every checkpoint unless a step says otherwise:
   - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4 2>&1 | tail -5` and `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test -j4 2>&1 | tail -5` both passed after the change.
   - what risk remains: this cap is still per-request and uses the stored post-weight snapshot from model creation, so multiple simultaneously live request contexts are not yet globally coordinated. The budget calculation is also shape-based and does not account for allocator fragmentation beyond the explicit reserve.
   - what the next step is: rerun the resident-expert model bring-up path on the 32 GB GPU to confirm that full weight residency now leaves enough measured headroom for request-context creation, then continue step 4 with the uploaded-bytes/staging-counter verification against the benchmark path.
+
+## Step 7 (placeholder): Monolithic Expert Tensor Refactor — Match vLLM Memory Layout
+
+This is the next major architectural change after the current plan completes. The current expert residency implementation uses 128 separate `DeviceNvfp4Weight` objects per MoE layer (384 separate `cudaMalloc` calls per layer × 23 layers = 8,832 device allocations for routed experts alone). This causes fragmentation that prevents full residency even when the raw weight data would fit.
+
+vLLM's approach (confirmed from source):
+- Expert weights stored as **monolithic 3D tensors** `[num_experts, dim_out, dim_in]` — one contiguous allocation per weight matrix per MoE layer
+- Kernel indexes experts via `base_ptr + expert_id * stride` — pointer arithmetic, no separate objects
+- NVFP4 layout transforms (w1/w3 reorder, block-scale interleave, alignment padding) done once at load time via `convert_to_nvfp4_moe_kernel_format()`
+- Memory budget: `KV_cache = (total_vram * 0.9) - weights - peak_activations - misc`, measured via dummy forward pass
+
+Required changes for this repo:
+1. Replace per-expert `DeviceNvfp4Weight` with monolithic `DeviceNvfp4ExpertTensor` holding `[E, N, K]` packed data + `[E, N, K/16]` block scales + `[E]` tensor scales
+2. Update the fused MoE kernel to index experts via stride offset instead of separate weight view arrays
+3. Add load-time NVFP4 layout transforms matching vLLM's `prepare_static_weights_for_trtllm_fp4_moe`
+4. Refactor `SingleTokenForwardModel::Create()` allocation order to match vLLM: all weights first (including monolithic expert tensors), then measure remaining VRAM, then size KV cache
+5. Update `ExpertLayerSlice::Create()` to allocate one monolithic tensor per projection instead of 128 separate weights
+6. Remove the per-layer residency/non-residency split — all experts fully resident by construction
