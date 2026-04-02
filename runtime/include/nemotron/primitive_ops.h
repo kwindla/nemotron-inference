@@ -9,6 +9,13 @@ bool ResidualAddFp32(
     const DeviceTensorFp32& rhs,
     DeviceTensorFp32* output);
 
+bool Relu2InPlaceFp32(DeviceTensorFp32* tensor);
+
+bool AccumulateScaledFp32(
+    const DeviceTensorFp32& input,
+    float scale,
+    DeviceTensorFp32* output);
+
 bool RmsNormFp32(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& weight,

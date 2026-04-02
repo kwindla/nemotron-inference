@@ -23,6 +23,29 @@ __global__ void ResidualAddKernel(
   output[index] = lhs[index] + rhs[index];
 }
 
+__global__ void Relu2InPlaceKernel(
+    float* data,
+    std::size_t count) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const float value = data[index];
+  data[index] = value > 0.0f ? (value * value) : 0.0f;
+}
+
+__global__ void AccumulateScaledKernel(
+    const float* input,
+    float scale,
+    float* output,
+    std::size_t count) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  output[index] += input[index] * scale;
+}
+
 __global__ void RmsNormKernel(
     const float* input,
     const float* weight,
@@ -86,6 +109,33 @@ bool ResidualAddFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   ResidualAddKernel<<<grid, block>>>(lhs.data(), rhs.data(), output->data(), count);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+}
+
+bool Relu2InPlaceFp32(DeviceTensorFp32* tensor) {
+  if (tensor == nullptr || !tensor->valid()) {
+    return false;
+  }
+
+  const std::size_t count = tensor->numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  Relu2InPlaceKernel<<<grid, block>>>(tensor->data(), count);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+}
+
+bool AccumulateScaledFp32(
+    const DeviceTensorFp32& input,
+    float scale,
+    DeviceTensorFp32* output) {
+  if (output == nullptr || !input.valid() || !output->valid() || input.shape() != output->shape()) {
+    return false;
+  }
+
+  const std::size_t count = input.numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  AccumulateScaledKernel<<<grid, block>>>(input.data(), scale, output->data(), count);
   return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
 }
 

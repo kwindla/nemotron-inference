@@ -177,7 +177,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const Nvfp4PackedMatrixDeviceView& activations,
-    const DeviceNvfp4Weight& weights,
+    const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output) {
   if (!handle.valid() ||
       !activations.valid() ||
@@ -200,15 +200,15 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
   if (activations.cols != k ||
       output->shape()[0] != m ||
       output->shape()[1] != n ||
-      weights.output_rows() != n ||
-      weights.input_cols() != k) {
+      weights.rows != n ||
+      weights.cols != k) {
     return std::nullopt;
   }
 
   float activation_tensor_scale = 0.0f;
   float weight_tensor_scale = 0.0f;
   if (!ReadDeviceFloat(activations.tensor_scale_data, &activation_tensor_scale) ||
-      !ReadDeviceFloat(reinterpret_cast<const float*>(weights.tensor_scale_data()), &weight_tensor_scale)) {
+      !ReadDeviceFloat(weights.tensor_scale_data, &weight_tensor_scale)) {
     return std::nullopt;
   }
 
@@ -274,7 +274,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
       "cublasLtMatmulDescSetAttribute(B_SCALE_MODE)");
 
   const void* activation_block_scales = activations.block_scales_data;
-  const void* weight_block_scales = weights.matmul_block_scales_data();
+  const void* weight_block_scales = weights.block_scales_data;
   ok &= check_cublas(
       cublasLtMatmulDescSetAttribute(
           op_desc,
@@ -382,7 +382,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
             &alpha,
             activations.packed_data,
             a_desc,
-            weights.packed_data(),
+            weights.packed_data,
             b_desc,
             &beta,
             output->data(),
@@ -423,6 +423,20 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
       heuristic.workspaceSize,
       returned_results,
   };
+}
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const Nvfp4PackedMatrixDeviceView& activations,
+    const DeviceNvfp4Weight& weights,
+    DeviceTensorFp32* output) {
+  return RunNvfp4RowMajorFp32AccumToDevice(
+      handle,
+      plan,
+      activations,
+      MakeNvfp4PackedMatrixDeviceView(weights),
+      output);
 }
 
 std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
