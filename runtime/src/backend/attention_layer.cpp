@@ -116,6 +116,16 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
+bool ProductionAttentionEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_ATTENTION_PRODUCTION");
+  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
+}
+
+bool ScalarAttentionFallbackForced() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_ATTENTION_SCALAR_FALLBACK");
+  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
 const KernelTensorDescriptor* FindKernelBinding(
     const LayerScheduleEntry& layer,
     const KernelCatalog& kernel_catalog,
@@ -862,29 +872,53 @@ bool AttentionLayerSlice::Run(
       return false;
     }
   } else {
-    if (!RunPagedAttentionDeviceFallback(
-            *query_bf16,
-            *request_context.key_cache(),
-            *request_context.value_cache(),
-            request_context.config().attention_kv_cache,
-            impl_->batch_plan.batch_size,
-            impl_->batch_plan.max_pages_per_sequence,
-            impl_->page_table_k->data(),
-            impl_->seq_len_kv->data(),
-            impl_->seq_len_q->data(),
-            impl_->query_starts->data(),
-            impl_->config.query_head_count,
-            token_count,
-            1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
-            true,
-            output_bf16)) {
+    const bool use_production_decode_attention =
+        token_count == 1 && ProductionAttentionEnabled() && !ScalarAttentionFallbackForced();
+    const bool attention_ok =
+        use_production_decode_attention
+            ? RunPagedAttentionDecodeProduction(
+                  *query_bf16,
+                  *request_context.key_cache(),
+                  *request_context.value_cache(),
+                  request_context.config().attention_kv_cache,
+                  impl_->batch_plan.batch_size,
+                  impl_->batch_plan.max_pages_per_sequence,
+                  impl_->page_table_k->data(),
+                  impl_->seq_len_kv->data(),
+                  impl_->seq_len_q->data(),
+                  impl_->query_starts->data(),
+                  impl_->config.query_head_count,
+                  token_count,
+                  1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
+                  true,
+                  output_bf16)
+            : RunPagedAttentionDeviceFallback(
+                  *query_bf16,
+                  *request_context.key_cache(),
+                  *request_context.value_cache(),
+                  request_context.config().attention_kv_cache,
+                  impl_->batch_plan.batch_size,
+                  impl_->batch_plan.max_pages_per_sequence,
+                  impl_->page_table_k->data(),
+                  impl_->seq_len_kv->data(),
+                  impl_->seq_len_q->data(),
+                  impl_->query_starts->data(),
+                  impl_->config.query_head_count,
+                  token_count,
+                  1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
+                  true,
+                  output_bf16);
+    if (!attention_ok) {
       if (debug) {
-        std::cout << "attention_layer: device paged attention fallback failed\n";
+        std::cout << "attention_layer: device paged attention execution failed\n";
       }
       return false;
     }
     if (debug) {
-      std::cout << "attention_layer: using device paged attention fallback\n";
+      std::cout << "attention_layer: using device paged attention "
+                << (use_production_decode_attention ? "decode production kernel"
+                                                    : "fallback")
+                << "\n";
     }
   }
 

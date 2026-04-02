@@ -45,7 +45,7 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
   - Compute still scales linearly with KV length (unavoidable for exact attention), but memory footprint is O(1) and GPU utilization is much higher.
   Key files: `runtime/src/backend/attention_device_fallback.cu`, `runtime/include/nemotron/attention_device_fallback.h`
 
-- [ ] **2. Wire production kernel into attention layer dispatcher**
+- [~] **2. Wire production kernel into attention layer dispatcher**
   In `attention_layer.cpp`, add an explicit dispatcher:
   - `token_count == 1` AND not cuDNN → use production decode kernel
   - `token_count > 1` → use existing fallback (or cuDNN if available)
@@ -63,5 +63,5 @@ Nano attention config: `head_dim=128`, `query_head_count=32`, `kv_head_count=2`,
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Warp-cooperative decode attention kernel | done | — | 2 blocks × 256 threads, GQA-aware, online softmax, lane-sharded; compile PASS |
-| 2 | Wire into attention layer dispatcher | pending | — | decode vs prefill routing |
+| 2 | Wire into attention layer dispatcher | done | — | NEMOTRON_FORWARD_ATTENTION_PRODUCTION gate; smoke PASS |
 | 3 | Verify and benchmark | pending | — | target ≤20ms mean |
