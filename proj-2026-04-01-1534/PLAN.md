@@ -95,7 +95,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 ## Steps
 
-- [ ] **1. Make the linear fastpath correct on the real benchmark path**
+- [x] **1. Make the linear fastpath correct on the real benchmark path**
   Goal:
   - turn `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` from a diagnostic mode into a correct hot path
   Scope:
@@ -323,7 +323,7 @@ Use these inputs for every checkpoint unless a step says otherwise:
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Linear fastpath correctness + layout translation | in progress | d4931e8 | runtime now forces validated small-M `128x4`; `8x4` execute contract still needs a backend-correct re-enable |
+| 1 | Linear fastpath correctness + layout translation | done | b31feb4 | smoke PASS with NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1; 128x4 activation layout; 8x4 deferred |
 | 2 | Re-baseline with counters and Nsight | pending | — | choose next bottleneck from evidence |
 | 3 | Attention metadata/workspace ownership + sync cleanup | pending | — | no new attention math in this step |
 | 4 | Routed-expert residency translation | pending | — | prefer full residency if it fits; else global cache |
