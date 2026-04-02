@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
 
 #include "nemotron/nvfp4_scale_layout.h"
 
@@ -13,6 +14,7 @@ namespace nemotron {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+constexpr int kWarpSize = 32;
 constexpr float kNegInf = -1.0e30f;
 constexpr std::size_t kNvfp4BlockWidth = 16;
 constexpr std::size_t kScaleRowTile = 128;
@@ -20,9 +22,17 @@ constexpr std::size_t kScaleBlockTile = 4;
 constexpr float kFp4MaxFinite = 6.0f;
 constexpr float kFp8E4M3MaxFinite = 448.0f;
 constexpr float kMinScale = 1.0f / 1024.0f;
+constexpr std::size_t kSelectTopExpertsMaxExperts = 1024;
+constexpr std::size_t kSelectTopExpertsMaxGroups = 128;
+constexpr int kSelectTopExpertsWarpCount = kThreadsPerBlock / kWarpSize;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
+}
+
+bool ParallelTopKEnabled() {
+  static const bool kEnabled = std::getenv("NEMOTRON_DISABLE_PARALLEL_TOPK") == nullptr;
+  return kEnabled;
 }
 
 __device__ float Sigmoid(float value) {
@@ -69,6 +79,27 @@ __device__ void StoreExpertValue(float* output, std::size_t index, float value) 
 
 __device__ void StoreExpertValue(__nv_bfloat16* output, std::size_t index, float value) {
   output[index] = __float2bfloat16(value);
+}
+
+__device__ bool SelectTopExpertsBetterCandidate(
+    float candidate_value,
+    std::int32_t candidate_index,
+    float best_value,
+    std::int32_t best_index) {
+  return candidate_value > best_value ||
+         (candidate_value == best_value && candidate_index < best_index);
+}
+
+__device__ void WarpReduceBestCandidate(float* best_value, std::int32_t* best_index) {
+  constexpr unsigned int kFullWarpMask = 0xffffffffu;
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    const float other_value = __shfl_down_sync(kFullWarpMask, *best_value, offset);
+    const std::int32_t other_index = __shfl_down_sync(kFullWarpMask, *best_index, offset);
+    if (SelectTopExpertsBetterCandidate(other_value, other_index, *best_value, *best_index)) {
+      *best_value = other_value;
+      *best_index = other_index;
+    }
+  }
 }
 
 template <typename InputT, typename OutputT>
@@ -136,7 +167,7 @@ __global__ void AddScaledRowKernel(
   StoreExpertValue(accumulator, index, accum);
 }
 
-__global__ void SelectTopExpertsKernel(
+__global__ void SelectTopExpertsSerialKernel(
     const float* router_logits,
     const float* correction_bias,
     std::size_t rows,
@@ -154,9 +185,7 @@ __global__ void SelectTopExpertsKernel(
     return;
   }
 
-  constexpr std::size_t kMaxExperts = 1024;
-  constexpr std::size_t kMaxGroups = 128;
-  if (expert_count > kMaxExperts || n_group > kMaxGroups) {
+  if (expert_count > kSelectTopExpertsMaxExperts || n_group > kSelectTopExpertsMaxGroups) {
     for (std::size_t i = 0; i < top_k; ++i) {
       selected_indices[row * top_k + i] = -1;
       selected_weights[row * top_k + i] = 0.0f;
@@ -167,19 +196,19 @@ __global__ void SelectTopExpertsKernel(
   const float* row_logits = router_logits + (row * expert_count);
   const std::size_t group_size = expert_count / n_group;
 
-  float scores[kMaxExperts];
-  float scores_for_choice[kMaxExperts];
+  float scores[kSelectTopExpertsMaxExperts];
+  float scores_for_choice[kSelectTopExpertsMaxExperts];
   for (std::size_t expert = 0; expert < expert_count; ++expert) {
     scores[expert] = Sigmoid(row_logits[expert]);
     scores_for_choice[expert] = scores[expert] + correction_bias[expert];
   }
 
-  bool group_selected[kMaxGroups];
+  bool group_selected[kSelectTopExpertsMaxGroups];
   for (std::size_t group = 0; group < n_group; ++group) {
     group_selected[group] = false;
   }
 
-  float top_group_score[kMaxGroups];
+  float top_group_score[kSelectTopExpertsMaxGroups];
   for (std::size_t group = 0; group < n_group; ++group) {
     float top1 = kNegInf;
     float top2 = kNegInf;
@@ -215,7 +244,7 @@ __global__ void SelectTopExpertsKernel(
     group_selected[best_group] = true;
   }
 
-  bool expert_taken[kMaxExperts];
+  bool expert_taken[kSelectTopExpertsMaxExperts];
   for (std::size_t expert = 0; expert < expert_count; ++expert) {
     expert_taken[expert] = false;
   }
@@ -250,6 +279,152 @@ __global__ void SelectTopExpertsKernel(
   }
   for (std::size_t pick = 0; pick < expert_pick_count; ++pick) {
     selected_weights[row * top_k + pick] *= routed_scaling_factor;
+  }
+}
+
+__global__ void SelectTopExpertsParallelKernel(
+    const float* router_logits,
+    const float* correction_bias,
+    std::size_t rows,
+    std::size_t expert_count,
+    std::size_t n_group,
+    std::size_t topk_group,
+    std::size_t top_k,
+    bool norm_topk_prob,
+    float routed_scaling_factor,
+    std::int32_t* selected_indices,
+    float* selected_weights) {
+  const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+  if (row >= rows || expert_count == 0 || n_group == 0 || top_k == 0 || expert_count % n_group != 0) {
+    return;
+  }
+
+  __shared__ float shared_scores[kSelectTopExpertsMaxExperts];
+  __shared__ float shared_scores_for_choice[kSelectTopExpertsMaxExperts];
+  __shared__ float shared_top_group_score[kSelectTopExpertsMaxGroups];
+  __shared__ std::uint8_t shared_group_selected[kSelectTopExpertsMaxGroups];
+  __shared__ std::uint8_t shared_expert_taken[kSelectTopExpertsMaxExperts];
+  __shared__ float shared_warp_best_values[kSelectTopExpertsWarpCount];
+  __shared__ std::int32_t shared_warp_best_indices[kSelectTopExpertsWarpCount];
+
+  if (expert_count > kSelectTopExpertsMaxExperts || n_group > kSelectTopExpertsMaxGroups) {
+    for (std::size_t index = threadIdx.x; index < top_k; index += blockDim.x) {
+      selected_indices[row * top_k + index] = -1;
+      selected_weights[row * top_k + index] = 0.0f;
+    }
+    return;
+  }
+
+  const float* row_logits = router_logits + (row * expert_count);
+  for (std::size_t expert = threadIdx.x; expert < expert_count; expert += blockDim.x) {
+    const float score = Sigmoid(row_logits[expert]);
+    shared_scores[expert] = score;
+    shared_scores_for_choice[expert] = score + correction_bias[expert];
+    shared_expert_taken[expert] = 0;
+  }
+  for (std::size_t group = threadIdx.x; group < n_group; group += blockDim.x) {
+    shared_group_selected[group] = 0;
+  }
+  __syncthreads();
+
+  const std::size_t group_size = expert_count / n_group;
+  if (threadIdx.x < n_group) {
+    const std::size_t group = static_cast<std::size_t>(threadIdx.x);
+    float top1 = kNegInf;
+    float top2 = kNegInf;
+    const std::size_t group_offset = group * group_size;
+    for (std::size_t index = 0; index < group_size; ++index) {
+      const float value = shared_scores_for_choice[group_offset + index];
+      if (value > top1) {
+        top2 = top1;
+        top1 = value;
+      } else if (value > top2) {
+        top2 = value;
+      }
+    }
+    if (!isfinite(top2)) {
+      top2 = top1;
+    }
+    shared_top_group_score[group] = top1 + top2;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    const std::size_t group_pick_count = topk_group < n_group ? topk_group : n_group;
+    for (std::size_t pick = 0; pick < group_pick_count; ++pick) {
+      float best_value = kNegInf;
+      std::size_t best_group = 0;
+      for (std::size_t group = 0; group < n_group; ++group) {
+        if (shared_group_selected[group] != 0) {
+          continue;
+        }
+        if (shared_top_group_score[group] > best_value) {
+          best_value = shared_top_group_score[group];
+          best_group = group;
+        }
+      }
+      shared_group_selected[best_group] = 1;
+    }
+  }
+  __syncthreads();
+
+  const std::size_t expert_pick_count = top_k < expert_count ? top_k : expert_count;
+  const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+  const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+  float weight_sum = 0.0f;
+  for (std::size_t pick = 0; pick < expert_pick_count; ++pick) {
+    float best_value = kNegInf;
+    std::int32_t best_expert = 0;
+    for (std::size_t expert = threadIdx.x; expert < expert_count; expert += blockDim.x) {
+      if (shared_expert_taken[expert] != 0) {
+        continue;
+      }
+      const std::size_t group = expert / group_size;
+      const float masked = shared_group_selected[group] != 0 ? shared_scores_for_choice[expert] : 0.0f;
+      if (SelectTopExpertsBetterCandidate(
+              masked,
+              static_cast<std::int32_t>(expert),
+              best_value,
+              best_expert)) {
+        best_value = masked;
+        best_expert = static_cast<std::int32_t>(expert);
+      }
+    }
+
+    WarpReduceBestCandidate(&best_value, &best_expert);
+    if (lane == 0) {
+      shared_warp_best_values[warp] = best_value;
+      shared_warp_best_indices[warp] = best_expert;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+      best_value = lane < kSelectTopExpertsWarpCount ? shared_warp_best_values[lane] : kNegInf;
+      best_expert = lane < kSelectTopExpertsWarpCount ? shared_warp_best_indices[lane] : 0;
+      WarpReduceBestCandidate(&best_value, &best_expert);
+      if (lane == 0) {
+        const std::size_t output_offset = row * top_k + pick;
+        shared_expert_taken[best_expert] = 1;
+        selected_indices[output_offset] = best_expert;
+        selected_weights[output_offset] = shared_scores[best_expert];
+        weight_sum += shared_scores[best_expert];
+        shared_warp_best_values[0] = weight_sum;
+      }
+    }
+    __syncthreads();
+    weight_sum = shared_warp_best_values[0];
+  }
+
+  if (threadIdx.x == 0) {
+    if (norm_topk_prob) {
+      const float denom = weight_sum + 1.0e-20f;
+      for (std::size_t pick = 0; pick < expert_pick_count; ++pick) {
+        selected_weights[row * top_k + pick] /= denom;
+      }
+    }
+    for (std::size_t pick = 0; pick < expert_pick_count; ++pick) {
+      selected_weights[row * top_k + pick] *= routed_scaling_factor;
+    }
   }
 }
 
@@ -1060,18 +1235,35 @@ bool SelectTopExpertsFp32(
   }
   const std::size_t rows = router_logits.shape()[0];
   const std::size_t expert_count = router_logits.shape()[1];
-  SelectTopExpertsKernel<<<static_cast<unsigned int>(rows), 1, 0, stream>>>(
-      router_logits.data(),
-      correction_bias.data(),
-      rows,
-      expert_count,
-      n_group,
-      topk_group,
-      top_k,
-      norm_topk_prob,
-      routed_scaling_factor,
-      selected_indices_device,
-      selected_weights_device);
+  if (ParallelTopKEnabled() &&
+      expert_count <= kSelectTopExpertsMaxExperts &&
+      n_group <= kSelectTopExpertsMaxGroups) {
+    SelectTopExpertsParallelKernel<<<static_cast<unsigned int>(rows), kThreadsPerBlock, 0, stream>>>(
+        router_logits.data(),
+        correction_bias.data(),
+        rows,
+        expert_count,
+        n_group,
+        topk_group,
+        top_k,
+        norm_topk_prob,
+        routed_scaling_factor,
+        selected_indices_device,
+        selected_weights_device);
+  } else {
+    SelectTopExpertsSerialKernel<<<static_cast<unsigned int>(rows), 1, 0, stream>>>(
+        router_logits.data(),
+        correction_bias.data(),
+        rows,
+        expert_count,
+        n_group,
+        topk_group,
+        top_k,
+        norm_topk_prob,
+        routed_scaling_factor,
+        selected_indices_device,
+        selected_weights_device);
+  }
   return CheckCuda(cudaGetLastError());
 }
 

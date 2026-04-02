@@ -56,6 +56,8 @@ bool AddScaledRowBf16(
     DeviceTensorBf16* accumulator,
     cudaStream_t stream = nullptr);
 
+// Grouped expert routing selection. Set NEMOTRON_DISABLE_PARALLEL_TOPK to
+// force the scalar fallback kernel.
 bool SelectTopExpertsFp32(
     const DeviceTensorFp32& router_logits,
     const DeviceTensorFp32& correction_bias,
