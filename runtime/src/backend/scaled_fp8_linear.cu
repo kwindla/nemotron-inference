@@ -349,6 +349,7 @@ struct ScaledFp8LinearOp::Impl {
   mutable std::mutex rows1_dequantized_plan_mutex;
   mutable bool rows1_dequantized_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> rows1_dequantized_plan;
+  mutable std::unique_ptr<DeviceTensorFp8E4M3> fp8_activation_scratch_;
   mutable std::unique_ptr<DeviceTensorFp32> quantized_scratch_;
   mutable std::unique_ptr<DeviceTensorFp32> native_input_scale_;
   mutable std::unique_ptr<DeviceTensorFp32> native_weight_scale_;
@@ -695,25 +696,39 @@ bool ScaledFp8LinearOp::Run(
                 impl_->descriptor.tensor_name +
                 " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
       } else {
-        const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
-            handle,
-            *plan,
-            *impl_->packed_weight,
-            impl_->native_weight_scale_->data(),
-            activations,
-            input_scale,
-            impl_->native_input_scale_->data(),
-            output,
-            stream);
-        if (native_stats.has_value()) {
-          RecordScaledFp8NativeSuccess(impl_->family);
-          return true;
+        if (!impl_->fp8_activation_scratch_ ||
+            impl_->fp8_activation_scratch_->shape() != activations.shape()) {
+          impl_->fp8_activation_scratch_ = DeviceTensorFp8E4M3::Create(activations.shape());
         }
-        LogScaledFp8NativeDiagnosticOnce(
-            "execution_failed:" + impl_->descriptor.tensor_name,
-            "scaled_fp8_linear: native FP8 execution failed tensor=" +
-                impl_->descriptor.tensor_name +
-                " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
+        DeviceTensorFp8E4M3* const fp8_activation_scratch = impl_->fp8_activation_scratch_.get();
+        if (fp8_activation_scratch == nullptr || !fp8_activation_scratch->valid()) {
+          LogScaledFp8NativeDiagnosticOnce(
+              "activation_scratch_failed:" + impl_->descriptor.tensor_name,
+              "scaled_fp8_linear: native FP8 activation scratch allocation failed tensor=" +
+                  impl_->descriptor.tensor_name +
+                  " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
+        } else {
+          const auto native_stats = RunDenseRowMajorFp8E4M3ToDevice(
+              handle,
+              *plan,
+              *impl_->packed_weight,
+              impl_->native_weight_scale_->data(),
+              activations,
+              input_scale,
+              impl_->native_input_scale_->data(),
+              output,
+              fp8_activation_scratch,
+              stream);
+          if (native_stats.has_value()) {
+            RecordScaledFp8NativeSuccess(impl_->family);
+            return true;
+          }
+          LogScaledFp8NativeDiagnosticOnce(
+              "execution_failed:" + impl_->descriptor.tensor_name,
+              "scaled_fp8_linear: native FP8 execution failed tensor=" +
+                  impl_->descriptor.tensor_name +
+                  " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
+        }
       }
     }
   }

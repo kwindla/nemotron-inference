@@ -263,10 +263,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorTypedToDevice(
 
   cublasLtMatmulHeuristicResult_t heuristic{};
   int returned_results = 0;
-  bool ok = output->FillZero(stream);
-  if (!ok) {
-    LogDenseGemmCudaFailure("memset_output", cudaGetLastError());
-  }
+  bool ok = true;
   const MatrixLayoutShape a_shape = ActivationLayoutShape(plan, m, k);
   const MatrixLayoutShape b_shape = WeightLayoutShape(plan, n, k);
   const MatrixLayoutShape c_shape = OutputLayoutShape(plan, *output, m, n);
@@ -805,6 +802,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     float input_scale,
     const float* input_scale_device,
     DeviceTensorFp32* output,
+    DeviceTensorFp8E4M3* activation_scratch,
     cudaStream_t stream) {
   if (!handle.valid() ||
       !weights.valid() ||
@@ -829,8 +827,15 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     return std::nullopt;
   }
 
-  auto quantized_activations = DeviceTensorFp8E4M3::Create(activations.shape());
-  if (!quantized_activations ||
+  std::unique_ptr<DeviceTensorFp8E4M3> owned_activation_scratch;
+  DeviceTensorFp8E4M3* quantized_activations = activation_scratch;
+  if (quantized_activations == nullptr) {
+    owned_activation_scratch = DeviceTensorFp8E4M3::Create(activations.shape());
+    quantized_activations = owned_activation_scratch.get();
+  }
+  if (quantized_activations == nullptr ||
+      !quantized_activations->valid() ||
+      quantized_activations->shape() != activations.shape() ||
       !QuantizeDeviceFp32ToFp8E4M3(
           activations.data(),
           activations.numel(),

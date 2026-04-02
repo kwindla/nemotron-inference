@@ -85,6 +85,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp8E4M3ToDevice(
     float input_scale,
     const float* input_scale_device,
     DeviceTensorFp32* output,
+    DeviceTensorFp8E4M3* activation_scratch = nullptr,
     cudaStream_t stream = nullptr);
 
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ReferenceToDevice(
