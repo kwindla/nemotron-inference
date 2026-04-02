@@ -8,11 +8,15 @@ Get correct steady-state single-token decode as close as practical to roofline o
 
 Working target: `~20 ms/token`.
 
-Current measured baseline from the saved 2026-04-01 benchmark artifact:
+Current measured state (2026-04-02, post monolithic expert refactor):
 
-- hot steady-state mean: `22859.297232 ms/token`
-- steady-state generated tokens/sec: `0.043746`
-- artifact: `artifacts/benchmarks/nano_fused_decode_16tok_20260401T161556Z_cuda130.json`
+- hot steady-state mean: `1805.328 ms/token`
+- steady-state generated tokens/sec: `0.554`
+- expert staging bytes uploaded per run: `0` (all 23 layers monolithic-resident)
+- linear reference fallbacks: `0` (all cuBLASLt fastpath)
+- artifact: `artifacts/benchmarks/nano_fused_decode_16tok_steady_state_20260402T031714Z_cuda130.json`
+
+Original baseline: `22859 ms/token` → current `1805 ms/token` = **12.7x speedup so far**.
 
 This plan is only about steady-state decode throughput, but no throughput checkpoint counts unless the affected path is still correct.
 
@@ -24,357 +28,196 @@ This plan is only about steady-state decode throughput, but no throughput checkp
 - For every hot-path optimization, inspect the fastest proven reference design first and translate it into repo-owned code that we compile ourselves. Do not adopt an external runtime as a dependency.
 - If we intentionally diverge from the fastest known reference design, record why the divergence is required for repo control, prefix-cache work, startup-time work, or local build/runtime constraints.
 - Measure after every major checkpoint. Do not postpone artifact capture and Nsight profiling to the end.
-- Keep checkpoint scopes independent:
-  - step 1 fixes linear/MoE fastpath correctness, not expert residency policy
-  - step 3 changes attention metadata ownership and synchronization behavior, not attention math
-  - step 5 changes attention math and dispatch, not metadata lifetime
 - Do not wire a decode-only optimization in as the generic multi-token default path without an explicit dispatcher.
+- Always check `nvidia-smi` for stale processes and free VRAM before running tests or benchmarks.
 
-## Current Reality
+## Current Reality (updated 2026-04-02)
 
-- The benchmark and diagnostic surfaces already exist:
-  - `nano_fused_decode_bench --mode=steady-state`
-  - `nano_fused_decode_bench --mode=profile-ready`
-  - `--strict-linear`
-  - per-tensor `LinearOpTrace`
-  - expert staging counters
-  - prompt-boundary route matrix and layer probes in `nano_16_token_correctness_test`
-- The largest likely win is still the linear device fastpath, but it is not yet a valid benchmark path:
-  - with `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1`, the real-model split-prefill check diverges
-  - the first observed split-prefill divergence is already localized to expert layer `13`
-- The current fused direct-MoE path stages every routed expert pair on every decode step, not just the selected experts.
-- The current attention fallback path pays avoidable host-side overhead:
-  - per-call auxiliary-buffer allocation/upload
-  - helper-level `cudaDeviceSynchronize()` fences in the release hot path
-- The next optimization after linear fastpath cannot be chosen honestly from intuition alone. It must be chosen from post-fastpath artifacts and Nsight traces.
+What's landed and working:
+- Linear device fastpath (cuBLASLt) enabled with 128x4 activation scale layout — zero reference fallbacks
+- Monolithic expert tensor residency — all 23 expert layers fully GPU-resident via contiguous 3-buffer allocations (6 cudaMalloc per layer vs 1,024 before), zero per-token expert weight uploads
+- VRAM-aware allocation — weights loaded first, KV cache and Mamba state sized to measured remaining VRAM
+- Persistent attention metadata buffers — no per-call cudaMalloc for page tables/seq lengths
+- Removed 6 unconditional cudaDeviceSynchronize calls from attention/Mamba/MoE hot paths
+- Device-side argmax — 4-byte token ID copy instead of vocab_size×4 logits download
+
+What we know about the remaining 1,805 ms/token gap (from Codex code review):
+- **Serialized execution is the dominant bottleneck.** Every RmsNorm, ResidualAdd, dense GEMM, NVFP4 GEMM, NVFP4 activation pack, embedding lookup, and argmax does an unconditional `cudaDeviceSynchronize`. That's hundreds of host-device round-trips per token.
+- **~281 temporary `cudaMalloc/cudaFree` per token.** Each allocation also calls `cudaGetDeviceCount()`. This is pure overhead.
+- **Expert fast path allocates 4 tensors it never uses** before reaching the monolithic return.
+- **Attention per-call BF16 buffer allocation** still happens even with persistent metadata.
+- The scalar attention fallback (1 thread per query) exists but is likely second-order at short sequence lengths (only 6 attention layers).
+- The fused Mamba and MoE kernels are single-CTA (grid=1) which limits GPU utilization but is correct for single-token decode.
+
+What we still need to measure:
+- Exact wall-time breakdown via Nsight Systems: how much is in sync calls vs kernel compute vs allocation overhead
+- Whether removing syncs reveals kernel compute as the next bottleneck or whether there are more structural issues
 
 ## Reference Anchors
 
 Translate from these upstream designs, not from generic intuition:
 
-- `vllm/vllm/_custom_ops.py`
-  - `scaled_fp4_quant`: small-`M` TensorRT-LLM backend uses a distinct NVFP4 scale-factor layout (`8x4`) when `m <= 32`
-  - `scaled_fp4_experts_quant` / `silu_and_mul_scaled_fp4_experts_quant`: MoE activations are packed by token-to-expert layout, not by uploading expert weights per token
-- `vllm/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py`
-  - `align_fp4_moe_weights_for_fi`
-  - `convert_moe_weights_to_flashinfer_trtllm_block_layout`
-- `vllm/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py`
-  - `prepare_static_weights_for_trtllm_fp4_moe`
-  - gated `[w1, w3] -> [w3, w1]` reorder
-  - offline per-expert permutation and block-scale interleave
-- `vllm/vllm/v1/attention/backends/utils.py`
-  - `split_decodes_and_prefills`
-  - chunked-prefill metadata generation
-- `vllm/vllm/v1/attention/backends/flashinfer.py`
-  - persistent workspace/wrapper planning
-  - explicit decode-vs-prefill execution split
-- `vllm/vllm/v1/attention/ops/chunked_prefill_paged_decode.py`
-  - decode-oriented paged attention path separate from context attention
-- `TensorRT-LLM/tensorrt_llm/_torch/attention_backend/trtllm_gen.py`
-  - separate context and generation support checks
-  - persistent workspace allocation
-  - paged-KV generation constraints
-- `TensorRT-LLM/cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h`
-  - distinct kernel types for context, generation, and speculative generation
+- `vllm/vllm/v1/attention/backends/utils.py`: explicit decode-vs-prefill split
+- `vllm/vllm/v1/attention/ops/chunked_prefill_paged_decode.py`: decode-oriented paged attention path
+- `TensorRT-LLM/tensorrt_llm/_torch/attention_backend/trtllm_gen.py`: separate context and generation support
+- `TensorRT-LLM/cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h`: distinct kernel types for context, generation, speculative generation
 
 ## Shared Iteration Inputs
 
-Use these inputs for every checkpoint unless a step says otherwise:
-
-- Manifest:
-  - `artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json`
-- Core build targets:
-  - `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test -j4`
-  - `cmake --build build-benchmarks --target nano_fused_decode_bench -j4`
-- Core correctness runs:
-  - `env NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_BUILD_MODEL=1 ctest --test-dir build-phase1-tests -R '^full_forward_manifest_smoke_test$' --output-on-failure`
-  - `env NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json ./build-phase1-tests/testing/nano_16_token_correctness_test`
-- Core benchmark runs:
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json bash benchmarks/nano_fused_decode/run_nsight_capture.sh -- --strict-linear`
+- Manifest: `artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json`
+- All runs require: `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_FUSED_MAMBA_DECODE=1 NEMOTRON_FORWARD_FUSED_MOE_DECODE=1`
+- Pre-test: always run `nvidia-smi` to check for stale processes and verify free VRAM
+- Core smoke test: `env NEMOTRON_FORWARD_MANIFEST=... NEMOTRON_FORWARD_BUILD_MODEL=1 NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_FUSED_MAMBA_DECODE=1 NEMOTRON_FORWARD_FUSED_MOE_DECODE=1 ./build-phase1-tests/testing/full_forward_manifest_smoke_test`
+- Core benchmark: `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=... NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_FUSED_MAMBA_DECODE=1 NEMOTRON_FORWARD_FUSED_MOE_DECODE=1 bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16`
 
 ## Steps
 
 - [x] **1. Make the linear fastpath correct on the real benchmark path**
-  Goal:
-  - turn `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` from a diagnostic mode into a correct hot path
-  Scope:
-  - only linear/MoE fastpath correctness and backend-native layout translation
-  - do not add expert residency policy here
-  Reference design to translate:
-  - `vllm/vllm/_custom_ops.py`: small-`M` NVFP4 activation packing chooses TRT-LLM-style `8x4` scale-factor layout for decode-like shapes
-  - `vllm/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py`: pad intermediate dims to backend alignment requirements
-  - `vllm/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py`: precompute per-expert weight permutations and block-scale interleave once with the weights, not during decode
-  Implementation checklist:
-  - use `full_forward_manifest_smoke_test` split-prefill plus `nano_16_token_correctness_test` route matrix/layer probes to localize the expert-layer-13 divergence to the exact sub-op and tensor
-  - audit whether the current decode activation quantization path is using the wrong NVFP4 scale-factor layout for `M=1` or other small-`M` cases
-  - translate any required expert weight padding, gated-projection reorder, permutation, or block-scale interleave into create-time repacking
-  - keep or extend diagnostics so failures report:
-    - tensor name
-    - `M/N/K`
-    - backend path
-    - activation scale-factor layout
-    - plan-build versus execute failure
-  - if a fix changes backend-native tensor layout, do it at `Create()` or load time, not per token
-  Verification commands:
-  - `env NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_BUILD_MODEL=1 NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_DEBUG=1 ctest --test-dir build-phase1-tests -R '^full_forward_manifest_smoke_test$' --output-on-failure`
-  - `env NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_LINEAR_TRACE=1 NEMOTRON_NANO_16_TRACE_DIVERGENCE=1 NEMOTRON_NANO_16_TRACE_EMBEDDING=1 NEMOTRON_NANO_16_STRICT_LINEAR=1 ./build-phase1-tests/testing/nano_16_token_correctness_test`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_LINEAR_TRACE=1 bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16 --strict-linear`
-  Accept when:
-  - the real-model split-prefill smoke passes with `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1`
-  - the fixed 16-token Nano prompt parity check passes on the benchmark path
-  - `nano_fused_decode_bench --strict-linear` reports zero reference fallbacks
-  - a new saved benchmark artifact establishes the post-fastpath baseline
-  Key files:
-  - `runtime/src/backend/linear_op.cpp`
-  - `runtime/src/backend/scaled_fp8_linear.cu`
-  - `runtime/src/backend/expert_layer.cpp`
-  - `runtime/src/loader/gemm_execution.cpp`
-  - `runtime/src/loader/cublaslt_gemm_plan.cpp`
-  - `testing/api/nano_16_token_correctness_test.cpp`
-  - `testing/api/full_forward_manifest_smoke_test.cpp`
-  - `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`
+  Done. cuBLASLt NVFP4 fastpath with 128x4 activation layout. Zero reference fallbacks. Smoke PASS.
 
-- [x] **2. Re-baseline with real operator evidence before choosing the next bottleneck**
-  Goal:
-  - replace guesswork with measured post-fastpath evidence
-  Scope:
-  - pure measurement and artifact capture
-  Implementation checklist:
-  - run `nano_fused_decode_bench --mode=steady-state --strict-linear`
-  - run `nano_fused_decode_bench --mode=profile-ready --strict-linear` under Nsight
-  - save:
-    - benchmark JSON artifact
-    - stdout log
-    - linear trace summary
-    - expert staging counter summary
-    - Nsight Systems capture
-  - compare against the pre-fastpath baseline with `compare_artifacts.py`
-  - write a short progress note naming the top remaining bottlenecks by evidence
-  Verification commands:
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_LINEAR_TRACE=1 bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16 --strict-linear`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 NEMOTRON_FORWARD_LINEAR_TRACE=1 bash benchmarks/nano_fused_decode/run_nsight_capture.sh -- --strict-linear`
-  - `python3 benchmarks/nano_fused_decode/compare_artifacts.py <baseline.json> <current.json>`
-  Accept when:
-  - a saved artifact and profile exist for the corrected fastpath path
-  - the next bottleneck ranking is justified by counters and trace data, not by stale assumptions
-  Key files:
-  - `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`
-  - `benchmarks/nano_fused_decode/run_default_bench.sh`
-  - `benchmarks/nano_fused_decode/run_nsight_capture.sh`
-  - `benchmarks/nano_fused_decode/compare_artifacts.py`
-  - `docs/blackwell_inference_progress.md`
+- [x] **2. Re-baseline with real operator evidence**
+  Done. Expert staging was 92% of runtime (588 GB uploaded per run). Drove the expert residency work.
 
 - [x] **3. Remove unconditional hot-path synchronization and transient attention metadata churn**
-  Goal:
-  - eliminate obvious host-side overhead that is already visible in the current code without changing attention math
-  Scope:
-  - attention metadata lifetime, workspace lifetime, and helper synchronization only
-  - do not replace the attention math kernel here
-  Reference design to translate:
-  - `vllm/vllm/v1/attention/backends/flashinfer.py`: persistent workspace buffers and wrapper `plan()` reuse
-  - `TensorRT-LLM/tensorrt_llm/_torch/attention_backend/trtllm_gen.py`: aligned persistent workspace manager instead of per-call scratch allocation
-  Implementation checklist:
-  - move `seq_len_q`, `seq_len_kv`, `query_starts`, `page_table_k`, and `page_table_v` into persistent scratch owned by `AttentionLayerSlice::Impl` or request-context-owned attention scratch
-  - size those buffers for the max supported batch/page configuration and update them in place with async H2D copies only for touched values
-  - remove unconditional helper-level `cudaDeviceSynchronize()` from:
-    - query layout conversion
-    - KV scatter
-    - fallback launch helpers
-  - audit fused Mamba and fused MoE wrappers for required versus accidental per-token host synchronization
-  - keep debug compare and timing fences behind explicit debug/compare gates only
-  Verification commands:
-  - `env NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION=1 ./build-phase1-tests/testing/nano_16_token_correctness_test`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json bash benchmarks/nano_fused_decode/run_nsight_capture.sh`
-  Accept when:
-  - the release decode hot path no longer performs helper-level device-wide syncs per token
-  - correctness is preserved
-  - benchmark artifacts or Nsight traces show reduced host-side gaps before any new attention kernel lands
-  Key files:
-  - `runtime/src/backend/attention_layer.cpp`
-  - `runtime/src/backend/attention_device_fallback.cu`
-  - `runtime/src/backend/fused_mamba_decode.cu`
-  - `runtime/src/backend/fused_moe_decode.cu`
+  Done. Persistent attention buffers, removed 6 cudaDeviceSynchronize calls. Smoke PASS.
 
-- [~] **4. Translate the routed-expert residency design that step 2 proves we need**
-  Goal:
-  - stop re-uploading routed expert weights on every decode step
-  Scope:
-  - routed-expert residency policy only
-  - reuse the backend-native packed layout from step 1
-  Reference design to translate:
-  - `vllm/vllm/model_executor/layers/fused_moe/layer.py`: expert weights are resident model state, not per-token uploads
-  - `vllm/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py`: static FP4 expert preparation happens once with the weights
-  - `vllm/vllm/_custom_ops.py`: runtime moves token-expert activations and offsets, not weights
-  Decision rule:
-  - first evaluate full permanent residency for routed experts on the single-GPU 5090 path
-  - if full permanent residency fits alongside the benchmark working set, prefer it over any cache
-  - if it does not fit, implement a single globally budgeted residency manager
-  Implementation checklist:
-  - quantify post-step-1 packed routed-expert memory footprint and available headroom for:
-    - all routed expert weights
-    - embedding/lm_head/final norm
-    - attention KV cache
-    - Mamba state
-    - benchmark scratch/workspaces
-  - compute the routed-expert footprint from runtime facts, not guesswork:
-    - use `model.plan().expert_layer_count`
-    - use the actual packed weight object sizes after step 1 repacking
-    - for rough planning, one Nano routed expert up+down pair is about `4.76 MiB` before scale tensors, so `128` experts is about `609 MiB` per expert layer before scale tensors
-  - if full residency fits, materialize routed experts at `Create()` into backend-native device objects and prebuild any device views needed by the fused direct-MoE path
-  - if full residency does not fit, implement a global residency manager keyed by:
-    - layer index
-    - expert id
-    - projection kind
-    - packed-layout version
-  - never auto-size independently per layer from free VRAM
-  - add counters:
-    - cache/residency hits
-    - misses
-    - evictions
-    - bytes resident
-    - bytes uploaded
-  Verification commands:
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1 bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16`
-  - compare `expert_staging_counters.total_bytes_uploaded` and `staging_elapsed_us` before and after
-  Accept when:
-  - uploaded expert bytes per token collapse on the benchmark path
-  - memory use is bounded by an explicit residency decision and budget
-  - correctness is preserved
-  - the saved artifact shows a measurable decode gain
-  Key files:
-  - `runtime/src/backend/expert_layer.cpp`
-  - `runtime/include/nemotron/expert_layer.h`
-  - `runtime/include/nemotron/expert_staging_counters.h`
-  - `runtime/src/backend/expert_staging_counters.cpp`
+- [x] **4. Routed-expert residency — monolithic tensors matching vLLM memory layout**
+  Done. All 23 expert layers monolithic-resident (15.4 GB in 6 cudaMalloc per layer). Zero per-token uploads. VRAM-aware KV cache sizing. Decode at 1,805 ms/token.
 
-- [ ] **5. Translate a production decode attention path without regressing multi-token behavior**
+- [ ] **5. Profile and identify the next bottleneck**
   Goal:
-  - replace the current decode hot-path attention fallback with a production generation kernel and explicit dispatcher
+  - decompose the remaining 1,805 ms/token into operator-level costs, with specific focus on host-side overhead
   Scope:
-  - attention math and dispatch only
-  - metadata lifetime and sync cleanup should already be done in step 3
-  Reference design to translate:
-  - `vllm/vllm/v1/attention/backends/utils.py`: explicit decode-vs-prefill split
-  - `vllm/vllm/v1/attention/ops/chunked_prefill_paged_decode.py`: decode path distinct from context attention
-  - `TensorRT-LLM/tensorrt_llm/_torch/attention_backend/trtllm_gen.py`: separate context and generation support rules
-  - `TensorRT-LLM/cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h`: distinct kernel types for context, generation, and speculative generation
-  Local constraints to preserve:
-  - `tokens_per_page == 16` already matches the TensorRT-LLM generation kernel family’s supported page sizes
-  - local decode head shape is `head_dim == 128`, GQA ratio `32 / 2 = 16`
-  Implementation checklist:
-  - add an explicit attention dispatcher:
-    - decode kernel for `token_count == 1`
-    - separate fallback or prefill path for `token_count > 1`
-    - separate debug/compare path
-  - keep the existing scalar/device fallback as the forced fallback path behind an env gate
-  - implement decode math with:
-    - paged KV iteration
-    - online softmax
-    - cooperative reduction across a warp or better
-    - no shared-memory footprint that scales linearly with sequence length
-  - do not route multi-token prefill through the decode kernel
-  - preserve the ability to compare device results against the host/reference path behind `NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION`
-  Verification commands:
-  - `env NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION=1 ./build-phase1-tests/testing/nano_16_token_correctness_test`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json bash benchmarks/nano_fused_decode/run_default_bench.sh --mode=steady-state --decode-tokens 16`
-  - `env NEMOTRON_BUILD_DIR=build-benchmarks NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json bash benchmarks/nano_fused_decode/run_nsight_capture.sh`
+  - pure measurement — no code changes
+  Implementation:
+  - run `--mode=profile-ready` under Nsight Systems to capture a clean single-decode-step trace
+  - measure and report separately:
+    - total CUDA API time (`cudaDeviceSynchronize`, `cudaMalloc`, `cudaFree`, `cudaMemcpy`)
+    - host idle gaps between kernel launches
+    - top-10 kernel launches by duration
+    - number of `cudaDeviceSynchronize` calls per token
+    - number of `cudaMalloc/cudaFree` calls per token
+  - save the Nsight capture under `artifacts/profiles/`
+  - write a progress note with the measured breakdown and the evidence-based next target
   Accept when:
-  - the non-cuDNN decode path is materially faster
-  - multi-token paths still have a valid dispatcher
-  - correctness is preserved
-  - the saved artifact and profile show attention is no longer the dominant stall
-  Key files:
-  - `runtime/src/backend/attention_device_fallback.cu`
-  - `runtime/include/nemotron/attention_device_fallback.h`
-  - `runtime/src/backend/attention_layer.cpp`
+  - an Nsight capture exists for the monolithic-resident fastpath decode
+  - the sync/alloc overhead is quantified separately from kernel compute time
+  - the next bottleneck is identified from trace data
+  Key files: `benchmarks/nano_fused_decode/run_nsight_capture.sh`
 
-- [ ] **6. Repeat the measure -> choose -> translate loop until the next bottleneck is no longer obvious**
+- [ ] **6a. Remove explicit cudaDeviceSynchronize from hot-path ops + fix dead allocations**
   Goal:
-  - turn the remaining work into an evidence-driven loop instead of a one-shot guess
+  - remove unconditional `cudaDeviceSynchronize()` from all hot-path operators
+  - move dead expert allocations after the fused-path early return
+  - remove per-alloc `cudaGetDeviceCount()` (check once at startup)
   Scope:
-  - post-checkpoint measurement and reprioritization
-  Implementation checklist:
-  - after each major throughput checkpoint, save:
-    - a benchmark artifact
-    - an Nsight capture
-    - the linear trace summary
-    - the expert staging summary
-  - compare against the previous artifact
-  - choose only one next bottleneck at a time
-  - each checkpoint note must say:
-    - what changed
-    - what was verified
-    - what risk remains
-    - which reference design was translated
-    - why any intentional deviation was necessary
+  - sync removal only — no allocation pattern changes yet
+  - IMPORTANT: `cudaFree` is also an implicit sync barrier, so this step alone may show muted gains. The full benefit requires step 6b (allocation reuse) to also land.
+  Safety:
+  - all current ops run on the default CUDA stream; stream ordering guarantees correctness without explicit syncs between device ops
+  - keep syncs that precede host reads (D2H copies are blocking anyway via `cudaMemcpyDeviceToHost`)
+  - error localization gets harder — async kernel faults surface at the next blocking call, not at the failing op
+  Confirmed sync sites to remove:
+  - `primitive_ops.cu:89,107` — RmsNorm, ResidualAdd
+  - `dense_gemm_runner.cpp:325` — dense GEMM
+  - `nvfp4_gemm_runner.cpp:397` — NVFP4 GEMM
+  - `device_nvfp4_matrix.cu:424,432,449,470` — NVFP4 activation pack (4 syncs per pack)
+  - `embedding_table.cu:183,190,218` — embedding lookup
+  - `device_argmax.cu:90` — argmax
+  - `scaled_fp8_linear.cu:213,296` — scaled FP8 quantize + GEMM (used by Mamba projections)
+  Also fix:
+  - `device_tensor.cpp:50,125` — remove per-alloc `cudaGetDeviceCount()`
+  - `expert_layer.cpp:1442-1445` — move 4 dead tensor allocs after fused early return
+  Key files: `primitive_ops.cu`, `dense_gemm_runner.cpp`, `nvfp4_gemm_runner.cpp`, `device_nvfp4_matrix.cu`, `embedding_table.cu`, `device_argmax.cu`, `scaled_fp8_linear.cu`, `device_tensor.cpp`, `expert_layer.cpp`
+
+- [ ] **6b. Replace per-token temporary allocations with request-context scratch buffers**
+  Goal:
+  - eliminate ~281 `cudaMalloc/cudaFree` per token by reusing pre-allocated buffers
+  Scope:
+  - allocation reuse only — use request-context-owned scratch buffers instead of per-op temporaries
+  - request-context scratch (not model-global) to avoid races with multiple concurrent requests
+  Key allocation sites to convert:
+  - `single_token_forward_model.cpp:1295-1297` — model-level hidden/residual/scratch tensors per RunTokens call
+  - `mamba_layer.cpp:492-495` — per-call Mamba scratch
+  - `expert_layer.cpp:1440-1445` — per-call expert scratch (for non-fused fallback)
+  - `attention_layer.cpp:557-563,664-667` — per-call attention FP32 scratch + BF16 buffers
+  - `device_nvfp4_matrix.cu:409,436` — temp buffers in NVFP4 activation pack
+  - `scaled_fp8_linear.cu` — quantized activation temp buffer
+  Approach:
+  - for `token_count == 1` decode, all shapes are deterministic from layer config — allocate at request-context creation
+  - add a scratch buffer pool to `RequestExecutionContext` sized for the max-shape layer in the model
+  - operators take a scratch pointer + size instead of allocating internally
+  Key files: `request_context.cpp`, `single_token_forward_model.cpp`, `mamba_layer.cpp`, `expert_layer.cpp`, `attention_layer.cpp`, `device_nvfp4_matrix.cu`, `scaled_fp8_linear.cu`
+
+- [ ] **6c. Pre-allocate attention BF16 buffers and cuDNN plan/workspace**
+  Goal:
+  - eliminate per-call attention buffer allocations and cuDNN plan rebuilds
+  Scope:
+  - attention-layer-specific allocation reuse
+  Key sites:
+  - `attention_layer.cpp:664-667` — BF16 query, KV scatter, output buffers allocated per call
+  - `attention_layer.cpp:748` — cuDNN plan built per call (when cuDNN is available)
+  - `cudnn_paged_attention.cpp:133,296,363` — cuDNN plan creation, workspace alloc, execute sync
+  Approach:
+  - move BF16 buffers to AttentionLayerSlice::Impl, sized for max token count
+  - cache cuDNN plan/workspace in Impl (rebuild only when batch plan shape changes)
+  Key files: `attention_layer.cpp`, `attention_device_fallback.cu`, `cudnn_paged_attention.cpp`
+
+- [ ] **7. Re-measure and decide: production attention or next structural fix**
+  Goal:
+  - after sync/alloc cleanup, re-profile to see the new bottleneck ranking
+  Scope:
+  - measurement + decision
+  Implementation:
+  - run benchmark and Nsight capture post-step-6
+  - if attention is now the dominant cost → proceed to production attention kernel
+  - if kernel compute is now dominant → focus on kernel optimization (multi-CTA fused kernels, better occupancy)
+  - if something else dominates → address that first
   Accept when:
-  - artifacts are saved under `artifacts/benchmarks/`
-  - profiles are saved under `artifacts/profiles/`
-  - the next bottleneck is chosen from evidence rather than from stale plan text
-  Key files:
-  - `benchmarks/nano_fused_decode/run_default_bench.sh`
-  - `benchmarks/nano_fused_decode/run_nsight_capture.sh`
-  - `benchmarks/nano_fused_decode/compare_artifacts.py`
-  - `docs/blackwell_inference_progress.md`
+  - post-cleanup artifact and profile saved
+  - next target chosen from evidence
+
+- [ ] **8. Production decode attention (if step 7 says so)**
+  Goal:
+  - replace the scalar attention fallback with a production decode kernel
+  Precondition:
+  - only execute if step 7 confirms attention is a significant remaining cost
+  Reference design to translate:
+  - `vllm/vllm/v1/attention/ops/chunked_prefill_paged_decode.py`
+  - `TensorRT-LLM/cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h`
+  Local constraints:
+  - `tokens_per_page == 16`, `head_dim == 128`, GQA ratio `32 / 2 = 16`
+  Implementation:
+  - explicit decode-vs-prefill dispatcher
+  - production decode: paged KV, online softmax, cooperative warp reduction
+  - keep scalar fallback behind env gate
+  - preserve device-vs-host compare hook
+  Accept when:
+  - decode attention materially faster, correctness preserved
+  Key files: `runtime/src/backend/attention_device_fallback.cu`, `runtime/include/nemotron/attention_device_fallback.h`, `runtime/src/backend/attention_layer.cpp`
+
+- [ ] **9. Repeat the measure → choose → translate loop**
+  Goal:
+  - continue evidence-driven optimization until 20ms target or architectural limit
+  Implementation:
+  - save artifact + profile after each checkpoint
+  - compare with `compare_artifacts.py`
+  - choose one next bottleneck from evidence
+  Accept when:
+  - artifacts saved, next bottleneck chosen from evidence
 
 ## Progress
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Linear fastpath correctness + layout translation | done | b31feb4 | smoke PASS with NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1; 128x4 activation layout; 8x4 deferred |
-| 2 | Re-baseline with counters and Nsight | done | — | expert staging = 92% of runtime; 588GB uploaded per run; expert residency is #1 priority |
-| 3 | Attention metadata/workspace ownership + sync cleanup | done | — | persistent buffers, removed 6 cudaDeviceSynchronize calls; smoke PASS |
-| 4 | Routed-expert residency translation | done | — | 21/23 layers resident, 2 use selected-only upload; VRAM-aware budgeting; smoke PASS |
-| 5 | Production decode attention translation | pending | — | explicit decode-vs-prefill dispatcher required |
-| 6 | Repeat evidence-driven roofline loop | pending | — | save artifacts and justify each next move |
-| 7 | Monolithic expert tensor refactor (vLLM memory layout) | placeholder | — | see note below |
-
-## Progress Log
-
-- 2026-04-01: Rewrote this plan after a second adversarial review against the local codebase plus the public vLLM and TensorRT-LLM reference sources.
-- 2026-04-01: Main corrections:
-  - step 1 now names the exact NVFP4 and MoE layout/preparation references to translate
-  - step 3 now cleanly separates attention plumbing from attention math
-  - step 4 now has an explicit decision rule: full routed-expert residency first if it fits, otherwise a single globally budgeted residency manager
-  - step 5 now mirrors the reference split between context/prefill and generation kernels instead of proposing one generic replacement kernel
-  - every step now has enough scope, reference, implementation, and verification detail to iterate independently
-- 2026-04-01: Step 1 checkpoint: translated the activation-side NVFP4 execution-scale layout selection so runtime packing now uses `8x4` for small-`M` (`M <= 32`) and keeps `128x4` for larger shapes, matching the vLLM/TensorRT-LLM reference split.
-  - what changed: added explicit NVFP4 execution-scale layout plumbing, taught `PackDeviceRowMajorFp32ToNvfp4` to auto-select `8x4` for decode-like activations, kept weight swizzling on the existing `128x4` path, and improved failure diagnostics so cuBLASLt runner failures print exact status codes while plan-build rejects print the concrete nullopt reason and activation scale layout.
-  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend`, `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test`, and `cmake --build build-benchmarks --target nano_fused_decode_bench` all passed; targeted NVFP4 tests `device_nvfp4_matrix_test`, `linear_op_test`, and `nvfp4_gemm_runner_test` also passed.
-  - what risk remains: the full real-model split-prefill parity path with `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` was not rerun in this checkpoint, so expert-layer-13 may still hide a second issue in routed-expert weight preparation or another cuBLASLt path.
-  - what the next step is: rerun the step-1 smoke and Nano parity commands with fastpath tracing enabled, confirm whether the expert-layer-13 divergence disappears, and only then decide whether routed-expert weight repacking or additional cuBLASLt path fixes are still needed.
-- 2026-04-01: Step 1 follow-up: changed NVFP4 fastpath plan selection to use the uploaded-device runtime plan whenever `NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1` is enabled, instead of probing the descriptor/mmap plan first.
-  - what changed: `UploadedLinearOp::Run()` now routes NVFP4 plan construction directly through `BuildRuntimeGemmPlan()` under fastpath, so cuBLASLt sees the `DeviceNvfp4Weight` buffers allocated with `cudaMalloc` rather than mmap-derived descriptor pointers that may miss the required 16-byte alignment for packed weights or tensor-scale scalars.
-  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend`, `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test nano_16_token_correctness_test -j4`, and `cmake --build build-benchmarks --target nano_fused_decode_bench -j4` all passed after rerunning the phase-1 builds sequentially to avoid a parallel archive-link race in the shared build tree.
-  - what risk remains: this checkpoint intentionally does not add an aligned-buffer workaround to the descriptor path, so any NVFP4 caller that still uses descriptor-backed plans without the device fastpath would retain the original pointer-alignment constraint.
-  - what the next step is: rerun the real-model fastpath smoke/parity commands to confirm the runtime-only NVFP4 path clears the cuBLASLt plan rejects on the benchmark path.
-- 2026-04-01: Step 1 follow-up: isolated the remaining real-model NVFP4 corruption to the small-`M` activation scale-factor layout used by the runtime bridge, then forced the validated `128x4` path in `linear_op.cpp`.
-  - what changed: added large-dimension `M=1` NVFP4 regression coverage in `nvfp4_gemm_runner_test` and `linear_op_test`; the repro showed that the cuBLASLt fastpath diverged badly from the reference path when activations were packed with the small-`M` `8x4` layout, but matched again when the same bridge was forced to `128x4`. `RuntimeNvfp4PackOptions()` now pins the runtime fastpath to `swizzled_128x4` while leaving the generic 8x4 packing support in place for later backend-correct re-enable.
-  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4`, `cmake --build build-phase1-tests --target nvfp4_gemm_runner_test device_nvfp4_matrix_test linear_op_test -j4`, and `ctest --test-dir build-phase1-tests -R 'nvfp4_gemm_runner_test|device_nvfp4_matrix_test|linear_op_test' --output-on-failure` all passed. The new large-dimension small-`M` unit repro now passes on both the low-level GEMM runner and the `UploadedLinearOp::Run()` path.
-  - what risk remains: the full real-model smoke has not yet been carried to completion after relinking `full_forward_manifest_smoke_test`; it no longer reproduces the old immediate prompt-logit invalidation, but the long-running smoke still needs a definitive pass/fail result and the original `8x4` runtime contract remains intentionally disabled pending a backend-correct implementation.
-  - what the next step is: rerun the real-model smoke/parity commands to completion on the relinked binaries, confirm that the fastpath now stays on the validated path end-to-end, and only then decide whether to keep the temporary `128x4` divergence or resume `8x4` work with a backend-verified swizzle/descriptor translation.
-- 2026-04-01: Step 4 checkpoint: matched the vLLM-style weight-first VRAM budgeting path in `SingleTokenForwardModel`.
-  - what changed: `Create()` now calls `cudaMemGetInfo()` before any weight uploads and again after all layer slices are materialized, logging both snapshots under `NEMOTRON_FORWARD_DEBUG`. The model impl stores the post-weight free-VRAM measurement plus a `NEMOTRON_FORWARD_VRAM_RESERVE_MB` headroom budget (default `512 MiB`). `CreateRequestContext()` now derives a capped `RequestExecutionConfig` from that measured post-weight budget before it allocates hidden/residual/scratch buffers, Mamba state, or paged KV cache, shrinking `max_tokens`, `scratch_tokens`, and `attention_total_pages` when the original request budget would exceed the measured remaining VRAM.
-  - what was verified: `cmake --build build-phase1-tests --target nemotron_runtime_backend -j4 2>&1 | tail -5` and `cmake --build build-phase1-tests --target full_forward_manifest_smoke_test -j4 2>&1 | tail -5` both passed after the change.
-  - what risk remains: this cap is still per-request and uses the stored post-weight snapshot from model creation, so multiple simultaneously live request contexts are not yet globally coordinated. The budget calculation is also shape-based and does not account for allocator fragmentation beyond the explicit reserve.
-  - what the next step is: rerun the resident-expert model bring-up path on the 32 GB GPU to confirm that full weight residency now leaves enough measured headroom for request-context creation, then continue step 4 with the uploaded-bytes/staging-counter verification against the benchmark path.
-
-## Step 7 (placeholder): Monolithic Expert Tensor Refactor — Match vLLM Memory Layout
-
-This is the next major architectural change after the current plan completes. The current expert residency implementation uses 128 separate `DeviceNvfp4Weight` objects per MoE layer (384 separate `cudaMalloc` calls per layer × 23 layers = 8,832 device allocations for routed experts alone). This causes fragmentation that prevents full residency even when the raw weight data would fit.
-
-vLLM's approach (confirmed from source):
-- Expert weights stored as **monolithic 3D tensors** `[num_experts, dim_out, dim_in]` — one contiguous allocation per weight matrix per MoE layer
-- Kernel indexes experts via `base_ptr + expert_id * stride` — pointer arithmetic, no separate objects
-- NVFP4 layout transforms (w1/w3 reorder, block-scale interleave, alignment padding) done once at load time via `convert_to_nvfp4_moe_kernel_format()`
-- Memory budget: `KV_cache = (total_vram * 0.9) - weights - peak_activations - misc`, measured via dummy forward pass
-
-Required changes for this repo:
-1. Replace per-expert `DeviceNvfp4Weight` with monolithic `DeviceNvfp4ExpertTensor` holding `[E, N, K]` packed data + `[E, N, K/16]` block scales + `[E]` tensor scales
-2. Update the fused MoE kernel to index experts via stride offset instead of separate weight view arrays
-3. Add load-time NVFP4 layout transforms matching vLLM's `prepare_static_weights_for_trtllm_fp4_moe`
-4. Refactor `SingleTokenForwardModel::Create()` allocation order to match vLLM: all weights first (including monolithic expert tensors), then measure remaining VRAM, then size KV cache
-5. Update `ExpertLayerSlice::Create()` to allocate one monolithic tensor per projection instead of 128 separate weights
-6. Remove the per-layer residency/non-residency split — all experts fully resident by construction
+| 1 | Linear fastpath correctness | done | b31feb4 | cuBLASLt NVFP4 128x4; zero fallbacks |
+| 2 | Re-baseline with evidence | done | 8394930 | expert staging = 92% of runtime |
+| 3 | Attention sync cleanup | done | 6fb664b | persistent buffers, removed 6 syncs |
+| 4 | Monolithic expert residency | done | 5a624e1 | 23/23 resident, 0 uploads, 1805 ms/token |
+| 5 | Profile next bottleneck | pending | — | focus on sync/alloc overhead, not just kernels |
+| 6a | Remove explicit syncs + fix dead allocs | pending | — | muted gains alone; needs 6b |
+| 6b | Request-context scratch buffers | pending | — | ~281 mallocs/token → 0 |
+| 6c | Attention BF16 + cuDNN plan reuse | pending | — | attention-specific alloc cleanup |
+| 7 | Re-measure and decide | pending | — | attention or kernel optimization next? |
+| 8 | Production decode attention | pending | — | contingent on step 7 evidence |
+| 9 | Evidence-driven loop | pending | — | |
