@@ -239,7 +239,7 @@ Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory
   - long-prompt chunked equivalence
   Key files: `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-03-0318/`
 
-- [ ] **8. Only then decide whether to build a custom SM120 backend**
+- [x] **8. Only then decide whether to build a custom SM120 backend**
   Pursue an owned SM120-specific routed-expert backend only if the unified fused path still leaves a clear measured gap on RTX 5090.
 
   If that happens, the custom backend should be scoped narrowly:
@@ -270,5 +270,5 @@ Do not spend the next milestone on:
 | 4 | Separate MoE chunking from request capacity | done | acd7abf | moe_prefill_window_tokens knob + runner-level chunking loop for expert layers |
 | 5 | Unified fused backend | done | a6f7582 | RunFusedMoePrefill implemented, UnifiedFusedBackend for token_count >= 1 |
 | 6 | Decode specialization decision by benchmark | done | ea3df20 | Benchmark harness, BACKEND_SELECTION.md, NEMOTRON_FORWARD_UNIFIED_FUSED env var |
-| 7 | External comparison vs vLLM and current baseline | done | — | Full comparison harness, correctness verification, updated MEASUREMENT.md |
-| 8 | Optional custom SM120 backend | pending | — | Intentionally deferred until the unified fused path is real and measured |
+| 7 | External comparison vs vLLM and current baseline | done | 5cba945 | Full comparison harness, correctness verification, updated MEASUREMENT.md |
+| 8 | Optional custom SM120 backend | done | — | Decision framework in SM120_BACKEND_DECISION.md, GO/NO-GO pending benchmark data |
