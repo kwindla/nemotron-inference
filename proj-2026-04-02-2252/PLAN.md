@@ -24,7 +24,7 @@ With 256 tokens × top_k experts × 23 expert layers, this is tens of thousands 
   Diagnosed via debug logging. Finding: NVFP4 linear ops work fine for M > 1 (Mamba layer 0 completes at M=256). The bottleneck is `expert_layer.cpp:2263-2309` — the batched expert path loops per-token on CPU, calling `RunNvfp4LinearHost` for every expert × every token. The fused GPU MoE path only works for `token_count == 1`.
   Key files: `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **2. GPU expert layer batched prefill path**
+- [x] **2. GPU expert layer batched prefill path**
   Add a GPU-dispatched path for expert layers when `token_count > 1`. The current per-token CPU loop (`expert_layer.cpp:2263-2340`) routes each token to top-k experts, then calls `RunNvfp4LinearHost` per expert. Replace with: (a) batch the router logits computation on GPU (existing), (b) run expert selection on GPU (existing `DeviceExpertSelectionKernel`), (c) for each selected expert, run the up_proj and down_proj NVFP4 GEMMs on GPU using the existing `UploadedLinearOp::Run` path which already works for M > 1 (verified in step 1). The key challenge is that different tokens route to different experts, so the GEMMs need per-expert grouping. The simplest approach: for each expert that has at least one token routed to it, gather the relevant token rows, run the expert GEMM, scatter results back. The M=1 fused decode path must remain unchanged.
   Key files: `runtime/src/backend/expert_layer.cpp`, `testing/backend/`
 
@@ -35,6 +35,6 @@ With 256 tokens × top_k experts × 23 expert layers, this is tens of thousands 
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Diagnose exact failure point | done | — | NVFP4 GEMMs work; expert layer CPU loop is bottleneck |
-| 2 | GPU expert layer batched prefill path | pending | — | |
+| 1 | Diagnose exact failure point | done | baf4be6 | NVFP4 GEMMs work; expert layer CPU loop is bottleneck |
+| 2 | GPU expert layer batched prefill path | done | — | |
 | 3 | End-to-end benchmark | pending | — | |

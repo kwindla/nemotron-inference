@@ -795,6 +795,23 @@ struct ExpertLayerSlice::Impl {
   bool full_residency_enabled = false;
   bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
+
+  static bool ResolveRoutedExpertWeightViews(
+      const Impl& impl,
+      std::size_t expert_index,
+      bool debug,
+      std::unique_ptr<DeviceNvfp4Weight>* staged_up_weight,
+      std::unique_ptr<DeviceNvfp4Weight>* staged_down_weight,
+      Nvfp4PackedMatrixDeviceView* up_view,
+      Nvfp4PackedMatrixDeviceView* down_view);
+
+  bool RunBatchedDirectMoeViaCublaslt(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output) const;
 };
 
 struct MoeDirectDecodeScratch {
@@ -802,6 +819,333 @@ struct MoeDirectDecodeScratch {
   DeviceTensorFp32* routed_up = nullptr;
   DeviceTensorFp32* shared_up = nullptr;
 };
+
+bool BuildExpertRoutingTable(
+    const ExpertLayerConfig& config,
+    std::size_t token_count,
+    const std::vector<int>& selected_indices,
+    const std::vector<float>& selected_weights,
+    std::vector<std::size_t>* expert_offsets,
+    std::vector<int>* expert_token_indices,
+    std::vector<float>* expert_token_weights) {
+  if (expert_offsets == nullptr ||
+      expert_token_indices == nullptr ||
+      expert_token_weights == nullptr ||
+      token_count == 0 ||
+      token_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+
+  const std::size_t selection_count = token_count * config.top_k;
+  if (selected_indices.size() != selection_count ||
+      selected_weights.size() != selection_count) {
+    return false;
+  }
+
+  std::vector<std::size_t> expert_counts(config.n_routed_experts, 0);
+  for (int expert_index : selected_indices) {
+    if (expert_index < 0 ||
+        static_cast<std::size_t>(expert_index) >= config.n_routed_experts) {
+      return false;
+    }
+    ++expert_counts[static_cast<std::size_t>(expert_index)];
+  }
+
+  expert_offsets->assign(config.n_routed_experts + 1, 0);
+  for (std::size_t expert_index = 0; expert_index < config.n_routed_experts; ++expert_index) {
+    (*expert_offsets)[expert_index + 1] =
+        (*expert_offsets)[expert_index] + expert_counts[expert_index];
+  }
+  expert_token_indices->assign(selection_count, 0);
+  expert_token_weights->assign(selection_count, 0.0f);
+
+  std::vector<std::size_t> write_offsets = *expert_offsets;
+  for (std::size_t token_index = 0; token_index < token_count; ++token_index) {
+    for (std::size_t slot = 0; slot < config.top_k; ++slot) {
+      const std::size_t selection_index = token_index * config.top_k + slot;
+      const std::size_t expert_index =
+          static_cast<std::size_t>(selected_indices[selection_index]);
+      const std::size_t write_index = write_offsets[expert_index]++;
+      (*expert_token_indices)[write_index] = static_cast<int>(token_index);
+      (*expert_token_weights)[write_index] = selected_weights[selection_index];
+    }
+  }
+
+  return true;
+}
+
+bool ExpertLayerSlice::Impl::ResolveRoutedExpertWeightViews(
+    const Impl& impl,
+    std::size_t expert_index,
+    bool debug,
+    std::unique_ptr<DeviceNvfp4Weight>* staged_up_weight,
+    std::unique_ptr<DeviceNvfp4Weight>* staged_down_weight,
+    Nvfp4PackedMatrixDeviceView* up_view,
+    Nvfp4PackedMatrixDeviceView* down_view) {
+  if (staged_up_weight == nullptr ||
+      staged_down_weight == nullptr ||
+      up_view == nullptr ||
+      down_view == nullptr ||
+      expert_index >= impl.routed_experts.size()) {
+    return false;
+  }
+
+  const ExpertLayerSlice::Impl::RoutedExpertRuntime& runtime_pair =
+      impl.routed_experts[expert_index];
+  if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+    return false;
+  }
+
+  if (impl.monolithic_resident) {
+    if (impl.monolithic_up == nullptr || impl.monolithic_down == nullptr) {
+      return false;
+    }
+    *up_view = MakeNvfp4PackedMatrixDeviceView(impl.monolithic_up->GetView(expert_index));
+    *down_view = MakeNvfp4PackedMatrixDeviceView(impl.monolithic_down->GetView(expert_index));
+    return up_view->valid() && down_view->valid();
+  }
+
+  if (impl.full_residency_enabled &&
+      runtime_pair.up_proj_device != nullptr &&
+      runtime_pair.down_proj_device != nullptr &&
+      runtime_pair.up_proj_device->valid() &&
+      runtime_pair.down_proj_device->valid()) {
+    *up_view = MakeNvfp4PackedMatrixDeviceView(*runtime_pair.up_proj_device);
+    *down_view = MakeNvfp4PackedMatrixDeviceView(*runtime_pair.down_proj_device);
+    return up_view->valid() && down_view->valid();
+  }
+
+  *staged_up_weight =
+      TryUploadNvfp4Weight(*runtime_pair.up_proj, debug, "batched routed expert up");
+  *staged_down_weight =
+      TryUploadNvfp4Weight(*runtime_pair.down_proj, debug, "batched routed expert down");
+  if (!*staged_up_weight ||
+      !*staged_down_weight ||
+      !(*staged_up_weight)->valid() ||
+      !(*staged_down_weight)->valid()) {
+    return false;
+  }
+
+  *up_view = MakeNvfp4PackedMatrixDeviceView(**staged_up_weight);
+  *down_view = MakeNvfp4PackedMatrixDeviceView(**staged_down_weight);
+  return up_view->valid() && down_view->valid();
+}
+
+bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& normalized,
+    const DeviceTensorFp32& router_logits,
+    DeviceTensorFp32* output) const {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  if (!cublas_handle.valid() ||
+      !input.valid() ||
+      !normalized.valid() ||
+      !router_logits.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      input.shape() != normalized.shape() ||
+      input.shape() != output->shape() ||
+      input.shape().size() != 2 ||
+      input.shape()[0] <= 1 ||
+      input.shape()[1] != config.hidden_size ||
+      router_logits.shape().size() != 2 ||
+      router_logits.shape()[0] != input.shape()[0] ||
+      router_logits.shape()[1] != config.n_routed_experts ||
+      shared_up_nvfp4 == nullptr ||
+      shared_down_nvfp4 == nullptr ||
+      shared_up_nvfp4_device == nullptr ||
+      shared_down_nvfp4_device == nullptr ||
+      !shared_up_nvfp4_device->valid() ||
+      !shared_down_nvfp4_device->valid()) {
+    return false;
+  }
+
+  const std::size_t token_count = input.shape()[0];
+  const std::size_t selection_count = token_count * config.top_k;
+  auto selected_indices_device = DeviceArray<int>::Create(selection_count);
+  auto selected_weights_device = DeviceArray<float>::Create(selection_count);
+  if (!selected_indices_device ||
+      !selected_weights_device ||
+      !RunDeviceExpertSelection(
+          router_logits,
+          *gate_score_correction_bias_device,
+          config.n_routed_experts,
+          config.top_k,
+          config.n_group,
+          config.topk_group,
+          config.routed_scaling_factor,
+          config.norm_topk_prob,
+          selected_indices_device->data(),
+          selected_weights_device->data())) {
+    return false;
+  }
+
+  std::vector<int> selected_indices_host;
+  std::vector<float> selected_weights_host;
+  if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
+      !selected_weights_device->CopyToHost(&selected_weights_host)) {
+    return false;
+  }
+
+  std::vector<std::size_t> expert_offsets;
+  std::vector<int> expert_token_indices_host;
+  std::vector<float> expert_token_weights_host;
+  if (!BuildExpertRoutingTable(
+          config,
+          token_count,
+          selected_indices_host,
+          selected_weights_host,
+          &expert_offsets,
+          &expert_token_indices_host,
+          &expert_token_weights_host)) {
+    return false;
+  }
+
+  auto expert_token_indices_device = DeviceArray<int>::CopyFromHost(expert_token_indices_host);
+  auto expert_token_weights_device = DeviceArray<float>::CopyFromHost(expert_token_weights_host);
+  auto routed_output = DeviceTensorFp32::Create({token_count, config.hidden_size});
+  auto row_scratch = DeviceTensorFp32::Create({token_count, config.hidden_size});
+  auto expert_up_output =
+      DeviceTensorFp32::Create({token_count, config.routed_expert_intermediate_size});
+  auto shared_up_output =
+      DeviceTensorFp32::Create({token_count, config.shared_expert_intermediate_size});
+  if (!expert_token_indices_device ||
+      !expert_token_weights_device ||
+      !routed_output ||
+      !row_scratch ||
+      !expert_up_output ||
+      !shared_up_output ||
+      !routed_output->FillZero()) {
+    return false;
+  }
+
+  const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
+  for (std::size_t expert_index = 0; expert_index < config.n_routed_experts; ++expert_index) {
+    const std::size_t expert_offset = expert_offsets[expert_index];
+    const std::size_t next_expert_offset = expert_offsets[expert_index + 1];
+    if (expert_offset == next_expert_offset) {
+      continue;
+    }
+    const std::size_t expert_token_count = next_expert_offset - expert_offset;
+    auto expert_input = DeviceTensorFp32::CreateView(
+        {expert_token_count, config.hidden_size},
+        row_scratch->data());
+    auto expert_activated = DeviceTensorFp32::CreateView(
+        {expert_token_count, config.routed_expert_intermediate_size},
+        expert_up_output->data());
+    if (!expert_input || !expert_activated) {
+      return false;
+    }
+
+    if (!GatherRowsFp32(
+            normalized,
+            expert_token_indices_device->data() + expert_offset,
+            expert_input.get())) {
+      return false;
+    }
+
+    std::unique_ptr<DeviceNvfp4Weight> staged_up_weight;
+    std::unique_ptr<DeviceNvfp4Weight> staged_down_weight;
+    Nvfp4PackedMatrixDeviceView up_weight_view;
+    Nvfp4PackedMatrixDeviceView down_weight_view;
+    if (!ResolveRoutedExpertWeightViews(
+            *this,
+            expert_index,
+            debug,
+            &staged_up_weight,
+            &staged_down_weight,
+            &up_weight_view,
+            &down_weight_view)) {
+      return false;
+    }
+
+    const auto routed_up_plan = BuildRuntimeNvfp4GemmPlan(
+        *routed_experts[expert_index].up_proj,
+        up_weight_view,
+        expert_token_count,
+        heuristic_cache);
+    const auto routed_down_plan = BuildRuntimeNvfp4GemmPlan(
+        *routed_experts[expert_index].down_proj,
+        down_weight_view,
+        expert_token_count,
+        heuristic_cache);
+    if (!routed_up_plan.has_value() ||
+        !routed_down_plan.has_value() ||
+        !RunNvfp4RowMajorFp32SourceToDevice(
+             cublas_handle,
+             *routed_up_plan,
+             *expert_input,
+             up_weight_view,
+             expert_activated.get(),
+             pack_options)
+             .has_value() ||
+        !Relu2InPlaceFp32(expert_activated.get()) ||
+        !RunNvfp4RowMajorFp32SourceToDevice(
+             cublas_handle,
+             *routed_down_plan,
+             *expert_activated,
+             down_weight_view,
+             expert_input.get(),
+             pack_options)
+             .has_value() ||
+        !ScatterAddWeightedRowsFp32(
+             *expert_input,
+             expert_token_indices_device->data() + expert_offset,
+             expert_token_weights_device->data() + expert_offset,
+             routed_output.get())) {
+      return false;
+    }
+  }
+
+  auto shared_output = DeviceTensorFp32::CreateView(
+      {token_count, config.hidden_size},
+      row_scratch->data());
+  if (!shared_output) {
+    return false;
+  }
+
+  const Nvfp4PackedMatrixDeviceView shared_up_weight_view =
+      MakeNvfp4PackedMatrixDeviceView(*shared_up_nvfp4_device);
+  const Nvfp4PackedMatrixDeviceView shared_down_weight_view =
+      MakeNvfp4PackedMatrixDeviceView(*shared_down_nvfp4_device);
+  const auto shared_up_plan = BuildRuntimeNvfp4GemmPlan(
+      *shared_up_nvfp4,
+      shared_up_weight_view,
+      token_count,
+      heuristic_cache);
+  const auto shared_down_plan = BuildRuntimeNvfp4GemmPlan(
+      *shared_down_nvfp4,
+      shared_down_weight_view,
+      token_count,
+      heuristic_cache);
+  if (!shared_up_plan.has_value() ||
+      !shared_down_plan.has_value() ||
+      !RunNvfp4RowMajorFp32SourceToDevice(
+           cublas_handle,
+           *shared_up_plan,
+           normalized,
+           shared_up_weight_view,
+           shared_up_output.get(),
+           pack_options)
+           .has_value() ||
+      !Relu2InPlaceFp32(shared_up_output.get()) ||
+      !RunNvfp4RowMajorFp32SourceToDevice(
+           cublas_handle,
+           *shared_down_plan,
+           *shared_up_output,
+           shared_down_weight_view,
+           shared_output.get(),
+           pack_options)
+           .has_value() ||
+      !ResidualAddFp32(*routed_output, *shared_output, output) ||
+      !ResidualAddFp32(input, *output, output)) {
+    return false;
+  }
+
+  return true;
+}
 
 bool RunMoeDirectDecodeViaCublaslt(
     const ExpertLayerConfig& config,
@@ -2211,6 +2555,25 @@ bool ExpertLayerSlice::Run(
       }
       collected_fused_debug = true;
       live_fused_output_written = true;
+    }
+
+    const bool use_batched_direct_moe =
+        trace == nullptr &&
+        token_count > 1 &&
+        impl_->fused_direct_moe_supported;
+    if (use_batched_direct_moe) {
+      if (impl_->RunBatchedDirectMoeViaCublaslt(
+              cublas_handle,
+              heuristic_cache,
+              input,
+              *normalized,
+              *router_logits,
+              output)) {
+        return true;
+      }
+      if (debug) {
+        std::cout << "expert_layer: batched direct MoE GPU path failed, falling back\n";
+      }
     }
 
     std::vector<float> input_host;

@@ -16,6 +16,17 @@ bool AccumulateScaledFp32(
     float scale,
     DeviceTensorFp32* output);
 
+bool GatherRowsFp32(
+    const DeviceTensorFp32& input,
+    const int* row_indices_device,
+    DeviceTensorFp32* output);
+
+bool ScatterAddWeightedRowsFp32(
+    const DeviceTensorFp32& input,
+    const int* row_indices_device,
+    const float* row_weights_device,
+    DeviceTensorFp32* output);
+
 bool RmsNormFp32(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& weight,

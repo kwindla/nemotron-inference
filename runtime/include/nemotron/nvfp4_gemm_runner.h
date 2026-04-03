@@ -72,6 +72,14 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp32& activations,
+    const Nvfp4PackedMatrixDeviceView& weights,
+    DeviceTensorFp32* output,
+    const Nvfp4PackOptions& pack_options = {});
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp32& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output,
     const Nvfp4PackOptions& pack_options = {});

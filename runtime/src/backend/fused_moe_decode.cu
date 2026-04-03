@@ -290,10 +290,17 @@ __global__ void DeviceExpertSelectionLegacyKernel(
     const float* router_logits,
     int* selected_indices,
     float* selected_weights) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (threadIdx.x != 0) {
     return;
   }
-  SelectTopExpertsOneToken(params, router_logits, selected_indices, selected_weights);
+  const std::size_t token_index = static_cast<std::size_t>(blockIdx.x);
+  const float* router_row =
+      router_logits + token_index * params.n_routed_experts;
+  int* selected_indices_row =
+      selected_indices + token_index * params.top_k;
+  float* selected_weights_row =
+      selected_weights + token_index * params.top_k;
+  SelectTopExpertsOneToken(params, router_row, selected_indices_row, selected_weights_row);
 }
 
 __global__ void DeviceExpertSelectionKernel(
@@ -301,10 +308,17 @@ __global__ void DeviceExpertSelectionKernel(
     const float* router_logits,
     int* selected_indices,
     float* selected_weights) {
-  if (blockIdx.x != 0 || threadIdx.x >= kWarpExpertSelectionThreads) {
+  if (threadIdx.x >= kWarpExpertSelectionThreads) {
     return;
   }
 
+  const std::size_t token_index = static_cast<std::size_t>(blockIdx.x);
+  const float* router_row =
+      router_logits + token_index * params.n_routed_experts;
+  int* selected_indices_row =
+      selected_indices + token_index * params.top_k;
+  float* selected_weights_row =
+      selected_weights + token_index * params.top_k;
   const int lane = static_cast<int>(threadIdx.x);
   const int n_routed_experts = static_cast<int>(params.n_routed_experts);
   float raw_scores[kExpertsPerWarpSelectionThread];
@@ -316,7 +330,7 @@ __global__ void DeviceExpertSelectionKernel(
     const int expert = lane * kExpertsPerWarpSelectionThread + local_slot;
     if (expert < n_routed_experts) {
       expert_indices[local_slot] = expert;
-      const float raw_score = fused_decode::Sigmoid(router_logits[expert]);
+      const float raw_score = fused_decode::Sigmoid(router_row[expert]);
       raw_scores[local_slot] = raw_score;
       choice_scores[local_slot] = raw_score + params.correction_bias[expert];
     } else {
@@ -379,25 +393,25 @@ __global__ void DeviceExpertSelectionKernel(
     }
 
     if (lane == 0) {
-      selected_indices[selected_slot] = winning_expert;
-      selected_weights[selected_slot] = winning_expert >= 0 ? winning_raw : 0.0f;
+      selected_indices_row[selected_slot] = winning_expert;
+      selected_weights_row[selected_slot] = winning_expert >= 0 ? winning_raw : 0.0f;
     }
   }
 
   if (lane == 0) {
     float weight_sum = 0.0f;
     for (int slot = 0; slot < static_cast<int>(params.top_k); ++slot) {
-      weight_sum += selected_weights[slot];
+      weight_sum += selected_weights_row[slot];
     }
     if (params.norm_topk_prob) {
       const float denominator = weight_sum + 1.0e-20f;
       for (int slot = 0; slot < static_cast<int>(params.top_k); ++slot) {
-        selected_weights[slot] /= denominator;
+        selected_weights_row[slot] /= denominator;
       }
     }
     for (int slot = 0; slot < static_cast<int>(params.top_k); ++slot) {
-      selected_weights[slot] =
-          selected_weights[slot] * params.routed_scaling_factor;
+      selected_weights_row[slot] =
+          selected_weights_row[slot] * params.routed_scaling_factor;
     }
   }
 }
@@ -437,7 +451,7 @@ bool RunDeviceExpertSelection(
       selected_indices == nullptr ||
       selected_weights == nullptr ||
       router_logits.shape().size() != 2 ||
-      router_logits.shape()[0] != 1 ||
+      router_logits.shape()[0] == 0 ||
       router_logits.shape()[1] != n_routed_experts ||
       correction_bias.shape().size() != 1 ||
       correction_bias.shape()[0] != n_routed_experts ||
@@ -469,15 +483,16 @@ bool RunDeviceExpertSelection(
       n_group == 1 &&
       topk_group == 1 &&
       n_routed_experts <= static_cast<std::size_t>(kWarpExpertSelectionCapacity);
+  const dim3 grid(static_cast<unsigned int>(router_logits.shape()[0]));
 
   if (use_warp_selection) {
-    DeviceExpertSelectionKernel<<<1, kWarpExpertSelectionThreads>>>(
+    DeviceExpertSelectionKernel<<<grid, kWarpExpertSelectionThreads>>>(
         params,
         router_logits.data(),
         selected_indices,
         selected_weights);
   } else {
-    DeviceExpertSelectionLegacyKernel<<<1, 1>>>(
+    DeviceExpertSelectionLegacyKernel<<<grid, 1>>>(
         params,
         router_logits.data(),
         selected_indices,

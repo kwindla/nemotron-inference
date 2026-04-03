@@ -777,22 +777,40 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp32& activations,
-    const DeviceNvfp4Weight& weights,
+    const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output,
     const Nvfp4PackOptions& pack_options) {
+  if (!weights.valid()) {
+    return std::nullopt;
+  }
   auto packed = PackDeviceRowMajorFp32ToNvfp4(activations, pack_options);
   if (!packed || !packed->valid()) {
     return std::nullopt;
   }
-  const Nvfp4PackedMatrixDeviceView weight_view = MakeNvfp4PackedMatrixDeviceView(weights);
   return RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       MakeNvfp4PackedMatrixDeviceView(*packed),
       packed->device_tensor_scale_ptr(),
-      weight_view,
-      weight_view.tensor_scale_data,
+      weights,
+      weights.tensor_scale_data,
       output);
+}
+
+std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorFp32& activations,
+    const DeviceNvfp4Weight& weights,
+    DeviceTensorFp32* output,
+    const Nvfp4PackOptions& pack_options) {
+  return RunNvfp4RowMajorFp32SourceToDevice(
+      handle,
+      plan,
+      activations,
+      MakeNvfp4PackedMatrixDeviceView(weights),
+      output,
+      pack_options);
 }
 
 }  // namespace nemotron

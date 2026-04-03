@@ -46,6 +46,53 @@ __global__ void AccumulateScaledKernel(
   output[index] += input[index] * scale;
 }
 
+__global__ void GatherRowsKernel(
+    const float* input,
+    const int* row_indices,
+    float* output,
+    std::size_t output_rows,
+    std::size_t input_rows,
+    std::size_t cols) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t count = output_rows * cols;
+  if (index >= count) {
+    return;
+  }
+
+  const std::size_t row = index / cols;
+  const std::size_t col = index % cols;
+  const int input_row = row_indices[row];
+  if (input_row < 0 || static_cast<std::size_t>(input_row) >= input_rows) {
+    output[index] = 0.0f;
+    return;
+  }
+  output[index] = input[static_cast<std::size_t>(input_row) * cols + col];
+}
+
+__global__ void ScatterAddWeightedRowsKernel(
+    const float* input,
+    const int* row_indices,
+    const float* row_weights,
+    float* output,
+    std::size_t input_rows,
+    std::size_t output_rows,
+    std::size_t cols) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t count = input_rows * cols;
+  if (index >= count) {
+    return;
+  }
+
+  const std::size_t row = index / cols;
+  const std::size_t col = index % cols;
+  const int output_row = row_indices[row];
+  if (output_row < 0 || static_cast<std::size_t>(output_row) >= output_rows) {
+    return;
+  }
+  output[static_cast<std::size_t>(output_row) * cols + col] +=
+      input[index] * row_weights[row];
+}
+
 __global__ void RmsNormKernel(
     const float* input,
     const float* weight,
@@ -136,6 +183,69 @@ bool AccumulateScaledFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
   AccumulateScaledKernel<<<grid, block>>>(input.data(), scale, output->data(), count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool GatherRowsFp32(
+    const DeviceTensorFp32& input,
+    const int* row_indices_device,
+    DeviceTensorFp32* output) {
+  if (output == nullptr ||
+      !input.valid() ||
+      !output->valid() ||
+      row_indices_device == nullptr ||
+      input.shape().size() != 2 ||
+      output->shape().size() != 2 ||
+      input.shape()[1] != output->shape()[1]) {
+    return false;
+  }
+
+  const std::size_t output_rows = output->shape()[0];
+  const std::size_t input_rows = input.shape()[0];
+  const std::size_t cols = input.shape()[1];
+  const std::size_t count = output->numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  GatherRowsKernel<<<grid, block>>>(
+      input.data(),
+      row_indices_device,
+      output->data(),
+      output_rows,
+      input_rows,
+      cols);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool ScatterAddWeightedRowsFp32(
+    const DeviceTensorFp32& input,
+    const int* row_indices_device,
+    const float* row_weights_device,
+    DeviceTensorFp32* output) {
+  if (output == nullptr ||
+      !input.valid() ||
+      !output->valid() ||
+      row_indices_device == nullptr ||
+      row_weights_device == nullptr ||
+      input.shape().size() != 2 ||
+      output->shape().size() != 2 ||
+      input.shape()[1] != output->shape()[1]) {
+    return false;
+  }
+
+  const std::size_t input_rows = input.shape()[0];
+  const std::size_t output_rows = output->shape()[0];
+  const std::size_t cols = input.shape()[1];
+  const std::size_t count = input.numel();
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
+  ScatterAddWeightedRowsKernel<<<grid, block>>>(
+      input.data(),
+      row_indices_device,
+      row_weights_device,
+      output->data(),
+      input_rows,
+      output_rows,
+      cols);
   return CheckCuda(cudaGetLastError());
 }
 
