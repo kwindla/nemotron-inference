@@ -42,6 +42,14 @@ bool EnvEnabled(const char* env_var) {
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool UnifiedFusedBackendEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_UNIFIED_FUSED");
+  if (value != nullptr && value[0] != '\0') {
+    return std::strcmp(value, "0") != 0;
+  }
+  return EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+}
+
 class CudaEventSpan {
  public:
   explicit CudaEventSpan(bool enabled) {
@@ -1429,7 +1437,7 @@ bool ExpertLayerSlice::Impl::SupportsUnifiedFusedBackend(
          fused_prefill_opt_in &&
          fused_direct_moe_supported &&
          (monolithic_resident || full_residency_enabled) &&
-         EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+         UnifiedFusedBackendEnabled();
 }
 
 bool ExpertLayerSlice::Impl::SupportsBatchedCublasLtBackend(
@@ -3443,7 +3451,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
-  const bool fused_prefill_opt_in = EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+  const bool fused_prefill_opt_in = UnifiedFusedBackendEnabled();
   if (fused_direct_moe_supported) {
     device_topk_ids = DeviceArray<int>::Create(max_selection_count);
     device_topk_weights = DeviceArray<float>::Create(max_selection_count);
