@@ -35,6 +35,35 @@ constexpr std::size_t GiB(std::size_t value) {
   return value * 1024ull * 1024ull * 1024ull;
 }
 
+class ScopedEnvOverride {
+ public:
+  ScopedEnvOverride(const char* name, const char* value) : name_(name) {
+    const char* existing = std::getenv(name_.c_str());
+    if (existing != nullptr) {
+      had_original_ = true;
+      original_value_ = existing;
+    }
+    if (value == nullptr) {
+      unsetenv(name_.c_str());
+    } else {
+      setenv(name_.c_str(), value, 1);
+    }
+  }
+
+  ~ScopedEnvOverride() {
+    if (had_original_) {
+      setenv(name_.c_str(), original_value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  bool had_original_ = false;
+  std::string original_value_;
+};
+
 bool CheckCuda(cudaError_t status, const char* message) {
   if (status == cudaSuccess) {
     return true;
@@ -267,7 +296,6 @@ nemotron::RuntimeBootstrapOptions MakeOptions(std::size_t max_context_tokens) {
   options.use_fp16_mamba_state = false;
   options.reusable_node_metadata_bytes = 4096;
   options.verify_manifest_files = false;
-  options.materialize_weight_arena = false;
   return options;
 }
 
@@ -847,6 +875,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
+  ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
+  ScopedEnvOverride decode_consistent_prefill("NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL", "1");
+
   if (!HasCudaDevice()) {
     std::cout << "nano_prefix_cache_ttft_bench: skipped (no CUDA device available)\n";
     return 0;
@@ -922,6 +954,7 @@ int main(int argc, char** argv) {
     cases.push_back(CaseSpec{Scenario::kGlobalRoot, prefix_length, kTailTokenCount});
   }
 
+  std::cout << std::unitbuf;
   std::cout << "nano_prefix_cache_ttft_bench: manifest=" << manifest_path
             << " warmup_iterations=" << options.warmup_iterations
             << " measured_iterations=" << options.measured_iterations

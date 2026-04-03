@@ -1,0 +1,163 @@
+nano_prefix_cache_ttft_bench: manifest="artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json" warmup_iterations=1 measured_iterations=5
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix256
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix256 (total_prompt_tokens=256)
+  cold TTFT                   : median=9248.163 ms p95=9262.795 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix1024
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix1024 (total_prompt_tokens=1024)
+  cold TTFT                   : median=38919.367 ms p95=38968.148 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix4096
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix4096 (total_prompt_tokens=4096)
+  cold TTFT                   : median=187857.178 ms p95=187865.307 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix256_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix256_tail32 (total_prompt_tokens=288)
+  cold TTFT                   : median=10429.749 ms p95=10436.373 ms
+  restore latency             : median=0.333 ms p95=0.337 ms
+  tail prefill latency        : median=1175.305 ms p95=1177.081 ms
+  first-token decode latency  : median=36.709 ms p95=37.116 ms
+  commit/snapshot latency     : median=0.459 ms p95=0.523 ms
+  hot-prefix TTFT             : median=1212.342 ms p95=1214.531 ms
+  speedup factor              : median=8.607x p95=8.614x
+  prefix snapshot size        : median=64652397 bytes p95=64652397 bytes
+  matched prefix token count  : median=256 tokens p95=256 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix1024_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix1024_tail32 (total_prompt_tokens=1056)
+  cold TTFT                   : median=40224.275 ms p95=40244.281 ms
+  restore latency             : median=0.383 ms p95=0.386 ms
+  tail prefill latency        : median=1302.167 ms p95=1305.191 ms
+  first-token decode latency  : median=40.761 ms p95=41.123 ms
+  commit/snapshot latency     : median=0.643 ms p95=0.692 ms
+  hot-prefix TTFT             : median=1343.308 ms p95=1346.182 ms
+  speedup factor              : median=29.929x p95=29.978x
+  prefix snapshot size        : median=105549933 bytes p95=105549933 bytes
+  matched prefix token count  : median=1024 tokens p95=1024 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix4096_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix4096_tail32 (total_prompt_tokens=4128)
+  cold TTFT                   : median=189633.134 ms p95=189671.967 ms
+  restore latency             : median=0.760 ms p95=0.891 ms
+  tail prefill latency        : median=1806.018 ms p95=1809.948 ms
+  first-token decode latency  : median=56.429 ms p95=56.609 ms
+  commit/snapshot latency     : median=1.228 ms p95=1.297 ms
+  hot-prefix TTFT             : median=1863.409 ms p95=1867.256 ms
+  speedup factor              : median=101.767x p95=101.933x
+  prefix snapshot size        : median=269140077 bytes p95=269140077 bytes
+  matched prefix token count  : median=4096 tokens p95=4096 tokens
+nano_prefix_cache_ttft_bench: running cached_global_root_prefix256_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_global_root_prefix256_tail32 (total_prompt_tokens=288)
+  cold TTFT                   : median=10424.410 ms p95=10428.301 ms
+  restore latency             : median=0.333 ms p95=0.339 ms
+  tail prefill latency        : median=1175.263 ms p95=1178.633 ms
+  first-token decode latency  : median=37.005 ms p95=37.133 ms
+  commit/snapshot latency     : median=0.344 ms p95=0.375 ms
+  hot-prefix TTFT             : median=1212.527 ms p95=1216.105 ms
+  speedup factor              : median=8.588x p95=8.611x
+  prefix snapshot size        : median=64652397 bytes p95=64652397 bytes
+  matched prefix token count  : median=256 tokens p95=256 tokens
+nano_prefix_cache_ttft_bench: running cached_global_root_prefix1024_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_global_root_prefix1024_tail32 (total_prompt_tokens=1056)
+  cold TTFT                   : median=40167.313 ms p95=40175.075 ms
+  restore latency             : median=0.382 ms p95=0.384 ms
+  tail prefill latency        : median=1301.521 ms p95=1301.691 ms
+  first-token decode latency  : median=40.700 ms p95=40.913 ms
+  commit/snapshot latency     : median=0.445 ms p95=0.459 ms
+  hot-prefix TTFT             : median=1342.437 ms p95=1342.768 ms
+  speedup factor              : median=29.928x p95=29.958x
+  prefix snapshot size        : median=105549933 bytes p95=105549933 bytes
+  matched prefix token count  : median=1024 tokens p95=1024 tokens
+nano_prefix_cache_ttft_bench: running cached_global_root_prefix4096_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_global_root_prefix4096_tail32 (total_prompt_tokens=4128)
+  cold TTFT                   : median=189637.864 ms p95=189674.577 ms
+  restore latency             : median=0.758 ms p95=0.799 ms
+  tail prefill latency        : median=1807.444 ms p95=1808.813 ms
+  first-token decode latency  : median=56.566 ms p95=57.011 ms
+  commit/snapshot latency     : median=0.713 ms p95=0.733 ms
+  hot-prefix TTFT             : median=1865.190 ms p95=1866.165 ms
+  speedup factor              : median=101.696x p95=101.823x
+  prefix snapshot size        : median=269140077 bytes p95=269140077 bytes
+  matched prefix token count  : median=4096 tokens p95=4096 tokens
