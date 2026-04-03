@@ -55,7 +55,7 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
 
   Key files: `proj-2026-04-03-2113/run-vllm.sh`, `proj-2026-04-03-2113/vllm-serve.sh`
 
-- [ ] **3. Validate vLLM loads and runs Nemotron Nano on RTX 5090**
+- [!] **3. Validate vLLM loads and runs Nemotron Nano on RTX 5090**
   Run a minimal vLLM inference test via the wrapper:
   ```bash
   proj-2026-04-03-2113/run-vllm.sh python3 -c "
@@ -92,7 +92,7 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
 
   Key files: `proj-2026-04-03-0318/bench_vllm_nano.py`, `proj-2026-04-03-0318/run_bench_vllm.sh`
 
-- [ ] **5. Run vLLM benchmark and capture external baseline**
+- [!] **5. Run vLLM benchmark and capture external baseline**
   Run the updated benchmark:
   ```bash
   proj-2026-04-03-0318/run_bench_vllm.sh
@@ -109,6 +109,6 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
 |---|------|--------|--------|-------|
 | 1 | Build vLLM from source with uv | done | — | vllm==0.19.0+cu130 with torch==2.10.0+cu130 |
 | 2 | Create wrapper scripts | done | — | run-vllm.sh and vllm-serve.sh |
-| 3 | Validate vLLM on RTX 5090 | pending | — | |
+| 3 | Validate vLLM on RTX 5090 | blocked | — | cublasSgemm CUBLAS_STATUS_INVALID_VALUE during profiling run. FlashInfer CUTLASS AND Marlin both fail. Nemotron Nano NVFP4 on SM120 is not supported by vLLM v0.19.0. |
 | 4 | Update benchmark scripts for SM120 | done | — | Removed flashinfer_cutlass hard-coding, added --moe-backend CLI arg |
-| 5 | Run vLLM benchmark | pending | — | |
+| 5 | Run vLLM benchmark | blocked | — | Blocked by step 3: vLLM cannot run Nemotron Nano NVFP4 on SM120 |
