@@ -161,7 +161,7 @@ Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory
   Internal profiling does not replace this external comparison.
   Key files: `third_party/vllm/`, `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-03-0318/`
 
-- [ ] **1. Introduce a unified MoE backend surface**
+- [x] **1. Introduce a unified MoE backend surface**
   Add an internal backend surface for routed MoE execution with at least:
   - `PrepareWeights(...)`
   - `Run(...)` for `token_count >= 1`
@@ -263,8 +263,8 @@ Do not spend the next milestone on:
 
 | # | Phase | Status | Commit | Notes |
 |---|-------|--------|--------|-------|
-| 0 | External benchmark and measurement discipline | done | — | Benchmark script, wrapper, measurement methodology, and baseline provenance analysis landed |
-| 1 | Unified MoE backend surface | pending | — | Current runtime still has separate decode and prefill execution structures |
+| 0 | External benchmark and measurement discipline | done | 02d5ada | Benchmark script, wrapper, measurement methodology, and baseline provenance analysis landed |
+| 1 | Unified MoE backend surface | done | — | MoeBackend interface + 4 concrete backends, unified dispatch loop in Run() |
 | 2 | GPU top-k as primary routing contract | partial | 7e0eeb0 | Device routing helper landed, but it currently serves an expert-major contract rather than a vLLM-class `topk_ids` / `topk_weights` contract |
 | 3 | Load-time NVFP4 backend-native weight preparation | pending | — | Current fast path still assumes raw monolithic views rather than prepared backend-native layouts |
 | 4 | Separate MoE chunking from request capacity | partial | 98142a8 | Prefill plumbing exists, but execution-window semantics and runner-level orchestration are not complete |

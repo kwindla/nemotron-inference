@@ -29,6 +29,7 @@
 #include "nemotron/fused_moe_decode.h"
 #include "nemotron/fused_moe_prefill.h"
 #include "nemotron/linear_op.h"
+#include "nemotron/moe_backend.h"
 #include "nemotron/monolithic_expert_weights.h"
 #include "nemotron/nvfp4_packing.h"
 #include "nemotron/nvfp4_weight.h"
@@ -730,6 +731,21 @@ bool MoeCublasLtEnabled() {
   return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
+int GetCurrentDeviceSmVersion() {
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    return 0;
+  }
+
+  int major = 0;
+  int minor = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+    return 0;
+  }
+  return major * 10 + minor;
+}
+
 bool DecodeScratchEnabled() {
   const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
   return value == nullptr || (value[0] != '\0' && std::strcmp(value, "0") != 0);
@@ -875,11 +891,28 @@ float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
 }  // namespace
 
 struct ExpertLayerSlice::Impl {
+  class DecodeCublasLtBackend;
+  class FusedDecodeBackend;
+  class FusedPrefillBackend;
+  class BatchedCublasLtBackend;
+
   struct RoutedExpertRuntime {
     const GemmDescriptor* up_proj = nullptr;
     const GemmDescriptor* down_proj = nullptr;
     std::unique_ptr<DeviceNvfp4Weight> up_proj_device;
     std::unique_ptr<DeviceNvfp4Weight> down_proj_device;
+  };
+
+  struct BackendDispatchState {
+    ExpertLayerRunTrace* trace = nullptr;
+    bool host_selection_debug = false;
+    bool compare_fused_debug = false;
+    bool use_decode_scratch = false;
+    bool collected_fused_debug = false;
+    bool live_fused_output_written = false;
+    std::vector<float> fused_debug_output_host;
+    std::vector<float> fused_debug_routed_host;
+    std::vector<float> fused_debug_shared_host;
   };
 
   enum class ExpertTopology {
@@ -949,6 +982,8 @@ struct ExpertLayerSlice::Impl {
   bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
   bool fused_prefill_opt_in = false;
+  std::vector<std::unique_ptr<MoeBackend>> backends_;
+  BackendDispatchState backend_dispatch_state;
 
   static bool ResolveRoutedExpertWeightViews(
       const Impl& impl,
@@ -966,6 +1001,50 @@ struct ExpertLayerSlice::Impl {
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
       DeviceTensorFp32* output) const;
+
+  bool SupportsDecodeCublasLtBackend(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const;
+
+  bool SupportsFusedDecodeBackend(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const;
+
+  bool SupportsFusedPrefillBackend(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const;
+
+  bool SupportsBatchedCublasLtBackend(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const;
+
+  void ResetBackendDispatchState(
+      ExpertLayerRunTrace* trace,
+      bool host_selection_debug,
+      bool compare_fused_debug,
+      bool use_decode_scratch);
+
+  void InitializeBackends();
+
+  bool RunDecodeCublasLtBackend(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output);
+
+  bool RunFusedDecodeBackend(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output);
 
   bool RunFusedMoePrefillPath(
       CublasLtHandle& cublas_handle,
@@ -1093,6 +1172,73 @@ bool ExpertLayerSlice::Impl::ResolveRoutedExpertWeightViews(
   return up_view->valid() && down_view->valid();
 }
 
+void ExpertLayerSlice::Impl::ResetBackendDispatchState(
+    ExpertLayerRunTrace* trace,
+    bool host_selection_debug,
+    bool compare_fused_debug,
+    bool use_decode_scratch) {
+  backend_dispatch_state.trace = trace;
+  backend_dispatch_state.host_selection_debug = host_selection_debug;
+  backend_dispatch_state.compare_fused_debug = compare_fused_debug;
+  backend_dispatch_state.use_decode_scratch = use_decode_scratch;
+  backend_dispatch_state.collected_fused_debug = false;
+  backend_dispatch_state.live_fused_output_written = false;
+  backend_dispatch_state.fused_debug_output_host.clear();
+  backend_dispatch_state.fused_debug_routed_host.clear();
+  backend_dispatch_state.fused_debug_shared_host.clear();
+}
+
+bool ExpertLayerSlice::Impl::SupportsDecodeCublasLtBackend(
+    const ExpertLayerConfig& backend_config,
+    std::size_t token_count,
+    int device_sm_version) const {
+  (void)backend_config;
+  (void)device_sm_version;
+  return backend_dispatch_state.trace == nullptr &&
+         token_count == 1 &&
+         !backend_dispatch_state.compare_fused_debug &&
+         fused_direct_moe_supported &&
+         FusedMoeDecodeEnabled() &&
+         MoeCublasLtEnabled();
+}
+
+bool ExpertLayerSlice::Impl::SupportsFusedDecodeBackend(
+    const ExpertLayerConfig& backend_config,
+    std::size_t token_count,
+    int device_sm_version) const {
+  (void)backend_config;
+  (void)device_sm_version;
+  return backend_dispatch_state.trace == nullptr &&
+         token_count == 1 &&
+         fused_direct_moe_supported &&
+         FusedMoeDecodeEnabled();
+}
+
+bool ExpertLayerSlice::Impl::SupportsFusedPrefillBackend(
+    const ExpertLayerConfig& backend_config,
+    std::size_t token_count,
+    int device_sm_version) const {
+  (void)backend_config;
+  (void)device_sm_version;
+  return backend_dispatch_state.trace == nullptr &&
+         token_count > 1 &&
+         fused_prefill_opt_in &&
+         fused_direct_moe_supported &&
+         (monolithic_resident || full_residency_enabled) &&
+         EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+}
+
+bool ExpertLayerSlice::Impl::SupportsBatchedCublasLtBackend(
+    const ExpertLayerConfig& backend_config,
+    std::size_t token_count,
+    int device_sm_version) const {
+  (void)backend_config;
+  (void)device_sm_version;
+  return backend_dispatch_state.trace == nullptr &&
+         token_count > 1 &&
+         fused_direct_moe_supported;
+}
+
 bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     CublasLtHandle& cublas_handle,
     GemmHeuristicCache* heuristic_cache,
@@ -1100,16 +1246,6 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     const DeviceTensorFp32& normalized,
     const DeviceTensorFp32& router_logits,
     DeviceTensorFp32* output) const {
-  const auto fallback_to_batched = [&]() {
-    return RunBatchedDirectMoeViaCublaslt(
-        cublas_handle,
-        heuristic_cache,
-        input,
-        normalized,
-        router_logits,
-        output);
-  };
-
   if (!cublas_handle.valid() ||
       !input.valid() ||
       !normalized.valid() ||
@@ -1130,7 +1266,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   const std::size_t token_count = input.shape()[0];
   if (token_count > config.max_token_count ||
       token_count > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
-    return fallback_to_batched();
+    return false;
   }
 
   const std::size_t selection_count = token_count * config.top_k;
@@ -1148,7 +1284,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       shared_down_nvfp4_device == nullptr ||
       !shared_up_nvfp4_device->valid() ||
       !shared_down_nvfp4_device->valid()) {
-    return fallback_to_batched();
+    return false;
   }
 
   if (!RunDeviceExpertSelection(
@@ -1168,25 +1304,25 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
           token_count,
           config.top_k,
           fused_prefill_routing.get())) {
-    return fallback_to_batched();
+    return false;
   }
 
   const FusedNvfp4WeightView* routed_up_device_ptr = nullptr;
   const FusedNvfp4WeightView* routed_down_device_ptr = nullptr;
   if (monolithic_resident) {
     if (monolithic_up_views_device == nullptr || monolithic_down_views_device == nullptr) {
-      return fallback_to_batched();
+      return false;
     }
     routed_up_device_ptr = monolithic_up_views_device->data();
     routed_down_device_ptr = monolithic_down_views_device->data();
   } else if (full_residency_enabled) {
     if (routed_up_nvfp4_views_device == nullptr || routed_down_nvfp4_views_device == nullptr) {
-      return fallback_to_batched();
+      return false;
     }
     routed_up_device_ptr = routed_up_nvfp4_views_device->data();
     routed_down_device_ptr = routed_down_nvfp4_views_device->data();
   } else {
-    return fallback_to_batched();
+    return false;
   }
 
   auto routed_output = DeviceTensorFp32::CreateView(
@@ -1206,7 +1342,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       !expert_up_scratch ||
       !shared_up_scratch ||
       !routed_output->FillZero()) {
-    return fallback_to_batched();
+    return false;
   }
 
   FusedMoePrefillParams params;
@@ -1237,7 +1373,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   if (RunFusedMoePrefill(params)) {
     return true;
   }
-  return fallback_to_batched();
+  return false;
 }
 
 bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
@@ -1695,6 +1831,542 @@ bool RunMoeDirectDecodeViaCublaslt(
   }
 
   return true;
+}
+
+bool ExpertLayerSlice::Impl::RunDecodeCublasLtBackend(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& normalized,
+    const DeviceTensorFp32& router_logits,
+    DeviceTensorFp32* output) {
+  auto selected_indices_device = DeviceArray<int>::Create(config.top_k);
+  auto selected_weights_device = DeviceArray<float>::Create(config.top_k);
+  if (!selected_indices_device ||
+      !selected_weights_device ||
+      !RunDeviceExpertSelection(
+          router_logits,
+          *gate_score_correction_bias_device,
+          config.n_routed_experts,
+          config.top_k,
+          config.n_group,
+          config.topk_group,
+          config.routed_scaling_factor,
+          config.norm_topk_prob,
+          selected_indices_device->data(),
+          selected_weights_device->data())) {
+    return false;
+  }
+
+  std::vector<int> selected_indices_host;
+  if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
+      selected_indices_host.size() != config.top_k) {
+    return false;
+  }
+
+  std::vector<std::size_t> selected_expert_indices;
+  selected_expert_indices.reserve(selected_indices_host.size());
+  for (int selected_index : selected_indices_host) {
+    if (selected_index < 0) {
+      return false;
+    }
+    const std::size_t expert_index = static_cast<std::size_t>(selected_index);
+    if (expert_index >= routed_experts.size()) {
+      return false;
+    }
+    selected_expert_indices.push_back(expert_index);
+  }
+
+  std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_up_weights;
+  std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_down_weights;
+  std::vector<const GemmDescriptor*> routed_up_descriptors;
+  std::vector<const GemmDescriptor*> routed_down_descriptors;
+  std::vector<FusedNvfp4WeightView> routed_up_views;
+  std::vector<FusedNvfp4WeightView> routed_down_views;
+  routed_up_descriptors.reserve(selected_expert_indices.size());
+  routed_down_descriptors.reserve(selected_expert_indices.size());
+  routed_up_views.reserve(selected_expert_indices.size());
+  routed_down_views.reserve(selected_expert_indices.size());
+
+  auto& staging_counters = GetExpertStagingCounters();
+  if (monolithic_resident) {
+    staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+    staging_counters.monolithic_layers.fetch_add(1, std::memory_order_relaxed);
+    if (monolithic_up == nullptr || monolithic_down == nullptr) {
+      return false;
+    }
+    for (std::size_t expert_index : selected_expert_indices) {
+      if (expert_index >= routed_experts.size()) {
+        return false;
+      }
+      const RoutedExpertRuntime& runtime_pair = routed_experts[expert_index];
+      if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+        return false;
+      }
+      routed_up_descriptors.push_back(runtime_pair.up_proj);
+      routed_down_descriptors.push_back(runtime_pair.down_proj);
+      routed_up_views.push_back(monolithic_up->GetView(expert_index));
+      routed_down_views.push_back(monolithic_down->GetView(expert_index));
+    }
+  } else if (full_residency_enabled) {
+    for (std::size_t expert_index : selected_expert_indices) {
+      if (expert_index >= routed_experts.size()) {
+        return false;
+      }
+      const RoutedExpertRuntime& runtime_pair = routed_experts[expert_index];
+      if (runtime_pair.up_proj == nullptr ||
+          runtime_pair.down_proj == nullptr ||
+          runtime_pair.up_proj_device == nullptr ||
+          runtime_pair.down_proj_device == nullptr ||
+          !runtime_pair.up_proj_device->valid() ||
+          !runtime_pair.down_proj_device->valid()) {
+        return false;
+      }
+      routed_up_descriptors.push_back(runtime_pair.up_proj);
+      routed_down_descriptors.push_back(runtime_pair.down_proj);
+      routed_up_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.up_proj_device));
+      routed_down_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.down_proj_device));
+    }
+  } else {
+    staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+    staged_up_weights.reserve(selected_expert_indices.size());
+    staged_down_weights.reserve(selected_expert_indices.size());
+    for (std::size_t expert_index : selected_expert_indices) {
+      if (expert_index >= routed_experts.size()) {
+        return false;
+      }
+      const RoutedExpertRuntime& runtime_pair = routed_experts[expert_index];
+      if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+        return false;
+      }
+      const auto up_upload_started = std::chrono::steady_clock::now();
+      auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
+      const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - up_upload_started)
+              .count());
+      staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
+      const auto down_upload_started = std::chrono::steady_clock::now();
+      auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
+      const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - down_upload_started)
+              .count());
+      staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
+      if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
+        return false;
+      }
+      const std::uint64_t upload_bytes =
+          TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
+      staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
+      staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
+      routed_up_descriptors.push_back(runtime_pair.up_proj);
+      routed_down_descriptors.push_back(runtime_pair.down_proj);
+      routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
+      routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
+      staged_up_weights.push_back(std::move(up_weight));
+      staged_down_weights.push_back(std::move(down_weight));
+    }
+  }
+
+  MoeDirectDecodeScratch moe_scratch;
+  MoeDirectDecodeScratch* moe_scratch_ptr = nullptr;
+  if (backend_dispatch_state.use_decode_scratch) {
+    moe_scratch.output_accum = output_scratch.get();
+    moe_scratch.routed_up = routed_up_scratch.get();
+    moe_scratch.shared_up = shared_up_scratch.get();
+    moe_scratch_ptr = &moe_scratch;
+  }
+  return RunMoeDirectDecodeViaCublaslt(
+      config,
+      routed_up_descriptors,
+      routed_down_descriptors,
+      *shared_up_nvfp4,
+      *shared_up_nvfp4_device,
+      *shared_down_nvfp4,
+      *shared_down_nvfp4_device,
+      cublas_handle,
+      heuristic_cache,
+      input,
+      normalized,
+      selected_weights_device->data(),
+      routed_up_views,
+      routed_down_views,
+      normalized_pack.get(),
+      routed_activated_pack.get(),
+      shared_activated_pack.get(),
+      output,
+      moe_scratch_ptr);
+}
+
+bool ExpertLayerSlice::Impl::RunFusedDecodeBackend(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& normalized,
+    const DeviceTensorFp32& router_logits,
+    DeviceTensorFp32* output) {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool use_monolithic_residency = monolithic_resident;
+  const bool use_full_residency =
+      use_monolithic_residency ||
+      (full_residency_enabled &&
+       routed_up_nvfp4_views_device != nullptr &&
+       routed_down_nvfp4_views_device != nullptr);
+  const bool needs_host_selected_experts =
+      backend_dispatch_state.host_selection_debug || !use_full_residency;
+
+  std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_up_weights;
+  std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_down_weights;
+  std::vector<FusedNvfp4WeightView> routed_up_views;
+  std::vector<FusedNvfp4WeightView> routed_down_views;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_views_device;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_views_device;
+  std::vector<ExpertSelection> selected_experts;
+  const FusedNvfp4WeightView* routed_up_device_ptr = nullptr;
+  const FusedNvfp4WeightView* routed_down_device_ptr = nullptr;
+  std::uint64_t staging_bytes_uploaded = 0;
+  std::uint64_t staging_elapsed_us = 0;
+  std::uint64_t experts_staged = 0;
+  auto& staging_counters = GetExpertStagingCounters();
+
+  if (needs_host_selected_experts) {
+    std::vector<float> router_logits_host;
+    if (!CopyToHost(router_logits, &router_logits_host) ||
+        router_logits_host.size() != config.n_routed_experts) {
+      return false;
+    }
+    selected_experts = SelectTopExperts(
+        config,
+        router_logits_host,
+        gate_score_correction_bias);
+    if (selected_experts.size() != config.top_k) {
+      return false;
+    }
+  }
+
+  if (use_monolithic_residency) {
+    if (monolithic_up_views_device == nullptr ||
+        monolithic_down_views_device == nullptr) {
+      return false;
+    }
+    routed_up_device_ptr = monolithic_up_views_device->data();
+    routed_down_device_ptr = monolithic_down_views_device->data();
+    staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+    staging_counters.monolithic_layers.fetch_add(1, std::memory_order_relaxed);
+  } else if (use_full_residency) {
+    routed_up_device_ptr = routed_up_nvfp4_views_device->data();
+    routed_down_device_ptr = routed_down_nvfp4_views_device->data();
+  } else {
+    staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
+    routed_up_weights.reserve(selected_experts.size());
+    routed_down_weights.reserve(selected_experts.size());
+    routed_up_views.reserve(selected_experts.size());
+    routed_down_views.reserve(selected_experts.size());
+    for (const ExpertSelection& selection : selected_experts) {
+      if (selection.expert_index >= routed_experts.size()) {
+        return false;
+      }
+      const RoutedExpertRuntime& runtime_pair =
+          routed_experts[selection.expert_index];
+      if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
+        return false;
+      }
+      const auto up_upload_started = std::chrono::steady_clock::now();
+      auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
+      const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - up_upload_started)
+              .count());
+      staging_elapsed_us += up_elapsed_us;
+      staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
+      const auto down_upload_started = std::chrono::steady_clock::now();
+      auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
+      const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - down_upload_started)
+              .count());
+      staging_elapsed_us += down_elapsed_us;
+      staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
+      if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
+        return false;
+      }
+      const std::uint64_t upload_bytes =
+          TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
+      staging_bytes_uploaded += upload_bytes;
+      staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
+      ++experts_staged;
+      staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
+      routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
+      routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
+      routed_up_weights.push_back(std::move(up_weight));
+      routed_down_weights.push_back(std::move(down_weight));
+    }
+    routed_up_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up_views);
+    routed_down_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down_views);
+    if (!routed_up_views_device || !routed_down_views_device) {
+      return false;
+    }
+    routed_up_device_ptr = routed_up_views_device->data();
+    routed_down_device_ptr = routed_down_views_device->data();
+  }
+
+  if (debug) {
+    std::cout << "expert_layer: fused direct "
+              << (use_monolithic_residency ? "monolithic"
+                                           : (use_full_residency ? "resident" : "staged"))
+              << " routed experts=" << (use_full_residency ? routed_experts.size() : experts_staged)
+              << " routed experts bytes=" << staging_bytes_uploaded
+              << " elapsed_us=" << staging_elapsed_us << "\n";
+  }
+
+  std::unique_ptr<DeviceArray<int>> selected_indices_device;
+  std::unique_ptr<DeviceArray<float>> selected_weights_device;
+  if (needs_host_selected_experts) {
+    std::vector<int> selected_indices_host(config.top_k, -1);
+    std::vector<float> selected_weights_host(config.top_k, 0.0f);
+    for (std::size_t slot = 0; slot < selected_experts.size(); ++slot) {
+      selected_indices_host[slot] =
+          use_full_residency ? static_cast<int>(selected_experts[slot].expert_index)
+                             : static_cast<int>(slot);
+      selected_weights_host[slot] = selected_experts[slot].weight;
+    }
+    selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
+    selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);
+    if (!selected_indices_device || !selected_weights_device) {
+      return false;
+    }
+  }
+
+  FusedMoeDirectLayerParams fused_params;
+  fused_params.hidden_size = config.hidden_size;
+  fused_params.routed_expert_intermediate_size =
+      config.routed_expert_intermediate_size;
+  fused_params.shared_expert_intermediate_size =
+      config.shared_expert_intermediate_size;
+  fused_params.n_routed_experts = config.n_routed_experts;
+  fused_params.top_k = config.top_k;
+  fused_params.n_group = config.n_group;
+  fused_params.topk_group = config.topk_group;
+  fused_params.routed_scaling_factor = config.routed_scaling_factor;
+  fused_params.norm_topk_prob = config.norm_topk_prob;
+  fused_params.shared_up = MakeFusedNvfp4WeightView(*shared_up_nvfp4_device);
+  fused_params.shared_down = MakeFusedNvfp4WeightView(*shared_down_nvfp4_device);
+  fused_params.routed_up = routed_up_device_ptr;
+  fused_params.routed_down = routed_down_device_ptr;
+  fused_params.correction_bias = gate_score_correction_bias_device->data();
+  fused_params.selected_indices =
+      selected_indices_device ? selected_indices_device->data() : nullptr;
+  fused_params.selected_weights =
+      selected_weights_device ? selected_weights_device->data() : nullptr;
+
+  if (!backend_dispatch_state.compare_fused_debug) {
+    return RunFusedMoeDirectDecode(fused_params, input, normalized, router_logits, output);
+  }
+
+  auto fused_routed_device = DeviceTensorFp32::Create({input.shape()[0], config.hidden_size});
+  auto fused_shared_device = DeviceTensorFp32::Create({input.shape()[0], config.hidden_size});
+  if (!fused_routed_device || !fused_shared_device) {
+    return false;
+  }
+  fused_params.routed_output = fused_routed_device->data();
+  fused_params.shared_output = fused_shared_device->data();
+  if (!RunFusedMoeDirectDecode(
+          fused_params,
+          input,
+          normalized,
+          router_logits,
+          output)) {
+    return false;
+  }
+  if (!CopyToHost(*output, &backend_dispatch_state.fused_debug_output_host) ||
+      !CopyToHost(*fused_routed_device, &backend_dispatch_state.fused_debug_routed_host) ||
+      !CopyToHost(*fused_shared_device, &backend_dispatch_state.fused_debug_shared_host)) {
+    return false;
+  }
+  backend_dispatch_state.collected_fused_debug = true;
+  backend_dispatch_state.live_fused_output_written = true;
+  return true;
+}
+
+class ExpertLayerSlice::Impl::DecodeCublasLtBackend final : public MoeBackend {
+ public:
+  explicit DecodeCublasLtBackend(Impl* impl) : impl_(impl) {}
+
+  const char* Name() const override { return "decode_cublaslt"; }
+
+  bool Supports(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const override {
+    return impl_ != nullptr &&
+           impl_->SupportsDecodeCublasLtBackend(config, token_count, device_sm_version);
+  }
+
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output,
+      ExpertLayerRunTrace* trace) override {
+    (void)config;
+    (void)token_count;
+    (void)trace;
+    const bool ok = impl_->RunDecodeCublasLtBackend(
+        cublas_handle,
+        heuristic_cache,
+        input,
+        normalized,
+        router_logits,
+        output);
+    if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
+      std::cout << "expert_layer: cuBLASLt direct MoE fastpath failed, falling back\n";
+    }
+    return ok;
+  }
+
+ private:
+  Impl* impl_ = nullptr;
+};
+
+class ExpertLayerSlice::Impl::FusedDecodeBackend final : public MoeBackend {
+ public:
+  explicit FusedDecodeBackend(Impl* impl) : impl_(impl) {}
+
+  const char* Name() const override { return "fused_decode"; }
+
+  bool Supports(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const override {
+    return impl_ != nullptr &&
+           impl_->SupportsFusedDecodeBackend(config, token_count, device_sm_version);
+  }
+
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output,
+      ExpertLayerRunTrace* trace) override {
+    (void)config;
+    (void)token_count;
+    (void)trace;
+    return impl_->RunFusedDecodeBackend(
+        cublas_handle,
+        heuristic_cache,
+        input,
+        normalized,
+        router_logits,
+        output);
+  }
+
+ private:
+  Impl* impl_ = nullptr;
+};
+
+class ExpertLayerSlice::Impl::FusedPrefillBackend final : public MoeBackend {
+ public:
+  explicit FusedPrefillBackend(Impl* impl) : impl_(impl) {}
+
+  const char* Name() const override { return "fused_prefill"; }
+
+  bool Supports(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const override {
+    return impl_ != nullptr &&
+           impl_->SupportsFusedPrefillBackend(config, token_count, device_sm_version);
+  }
+
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output,
+      ExpertLayerRunTrace* trace) override {
+    (void)config;
+    (void)token_count;
+    (void)trace;
+    const bool ok = impl_->RunFusedMoePrefillPath(
+        cublas_handle,
+        heuristic_cache,
+        input,
+        normalized,
+        router_logits,
+        output);
+    if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
+      std::cout << "expert_layer: fused prefill direct MoE path failed, falling back\n";
+    }
+    return ok;
+  }
+
+ private:
+  Impl* impl_ = nullptr;
+};
+
+class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
+ public:
+  explicit BatchedCublasLtBackend(Impl* impl) : impl_(impl) {}
+
+  const char* Name() const override { return "batched_cublaslt"; }
+
+  bool Supports(
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      int device_sm_version) const override {
+    return impl_ != nullptr &&
+           impl_->SupportsBatchedCublasLtBackend(config, token_count, device_sm_version);
+  }
+
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const ExpertLayerConfig& config,
+      std::size_t token_count,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output,
+      ExpertLayerRunTrace* trace) override {
+    (void)config;
+    (void)token_count;
+    (void)trace;
+    const bool ok = impl_->RunBatchedDirectMoeViaCublaslt(
+        cublas_handle,
+        heuristic_cache,
+        input,
+        normalized,
+        router_logits,
+        output);
+    if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
+      std::cout << "expert_layer: batched direct MoE GPU path failed, falling back\n";
+    }
+    return ok;
+  }
+
+ private:
+  Impl* impl_ = nullptr;
+};
+
+void ExpertLayerSlice::Impl::InitializeBackends() {
+  backends_.clear();
+  backends_.emplace_back(std::make_unique<DecodeCublasLtBackend>(this));
+  backends_.emplace_back(std::make_unique<FusedDecodeBackend>(this));
+  backends_.emplace_back(std::make_unique<FusedPrefillBackend>(this));
+  backends_.emplace_back(std::make_unique<BatchedCublasLtBackend>(this));
 }
 
 std::optional<ExpertLayerBindings> BuildExpertLayerBindings(
@@ -2400,6 +3072,25 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->monolithic_resident = monolithic_resident;
   impl->fused_direct_moe_supported = fused_direct_moe_supported;
   impl->fused_prefill_opt_in = fused_prefill_opt_in;
+  impl->InitializeBackends();
+  auto prepared_backends_end = std::remove_if(
+      impl->backends_.begin(),
+      impl->backends_.end(),
+      [&](const std::unique_ptr<MoeBackend>& backend) {
+        if (backend->PrepareWeights(
+                impl->config,
+                bindings.routed_experts,
+                impl->shared_up_nvfp4,
+                impl->shared_down_nvfp4)) {
+          return false;
+        }
+        if (debug) {
+          std::cout << "expert_layer_create: layer=" << config.layer_index
+                    << " backend_prepare_failed=" << backend->Name() << "\n";
+        }
+        return true;
+      });
+  impl->backends_.erase(prepared_backends_end, impl->backends_.end());
   if (debug) {
     const std::uint64_t resident_total_expert_bytes =
         resident_shared_expert_bytes + resident_routed_expert_bytes;
@@ -2604,407 +3295,33 @@ bool ExpertLayerSlice::Run(
   }
 
   if (impl_->topology == Impl::ExpertTopology::kDirectMlp) {
-    std::vector<float> fused_debug_output_host;
-    std::vector<float> fused_debug_routed_host;
-    std::vector<float> fused_debug_shared_host;
-    bool collected_fused_debug = false;
-    bool live_fused_output_written = false;
-    const bool use_moe_cublaslt =
-        trace == nullptr &&
-        token_count == 1 &&
-        !compare_fused_debug &&
-        impl_->fused_direct_moe_supported &&
-        FusedMoeDecodeEnabled() &&
-        MoeCublasLtEnabled();
-    if (use_moe_cublaslt) {
-      auto selected_indices_device = DeviceArray<int>::Create(impl_->config.top_k);
-      auto selected_weights_device = DeviceArray<float>::Create(impl_->config.top_k);
-      if (!selected_indices_device ||
-          !selected_weights_device ||
-          !RunDeviceExpertSelection(
-              *router_logits,
-              *impl_->gate_score_correction_bias_device,
-              impl_->config.n_routed_experts,
-              impl_->config.top_k,
-              impl_->config.n_group,
-              impl_->config.topk_group,
-              impl_->config.routed_scaling_factor,
-              impl_->config.norm_topk_prob,
-              selected_indices_device->data(),
-              selected_weights_device->data())) {
-        return false;
+    const int device_sm_version = GetCurrentDeviceSmVersion();
+    impl_->ResetBackendDispatchState(
+        trace,
+        host_selection_debug,
+        compare_fused_debug,
+        use_decode_scratch);
+    for (const auto& backend : impl_->backends_) {
+      if (!backend->Supports(impl_->config, token_count, device_sm_version)) {
+        continue;
       }
-
-      std::vector<int> selected_indices_host;
-      if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
-          selected_indices_host.size() != impl_->config.top_k) {
-        return false;
-      }
-      std::vector<std::size_t> selected_expert_indices;
-      selected_expert_indices.reserve(selected_indices_host.size());
-      for (int selected_index : selected_indices_host) {
-        if (selected_index < 0) {
-          return false;
-        }
-        const std::size_t expert_index = static_cast<std::size_t>(selected_index);
-        if (expert_index >= impl_->routed_experts.size()) {
-          return false;
-        }
-        selected_expert_indices.push_back(expert_index);
-      }
-
-      std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_up_weights;
-      std::vector<std::unique_ptr<DeviceNvfp4Weight>> staged_down_weights;
-      std::vector<const GemmDescriptor*> routed_up_descriptors;
-      std::vector<const GemmDescriptor*> routed_down_descriptors;
-      std::vector<FusedNvfp4WeightView> routed_up_views;
-      std::vector<FusedNvfp4WeightView> routed_down_views;
-      routed_up_descriptors.reserve(selected_expert_indices.size());
-      routed_down_descriptors.reserve(selected_expert_indices.size());
-      routed_up_views.reserve(selected_expert_indices.size());
-      routed_down_views.reserve(selected_expert_indices.size());
-
-      auto& staging_counters = GetExpertStagingCounters();
-      if (impl_->monolithic_resident) {
-        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-        staging_counters.monolithic_layers.fetch_add(1, std::memory_order_relaxed);
-        if (impl_->monolithic_up == nullptr || impl_->monolithic_down == nullptr) {
-          return false;
-        }
-        for (std::size_t expert_index : selected_expert_indices) {
-          if (expert_index >= impl_->routed_experts.size()) {
-            return false;
-          }
-          const Impl::RoutedExpertRuntime& runtime_pair = impl_->routed_experts[expert_index];
-          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
-            return false;
-          }
-          routed_up_descriptors.push_back(runtime_pair.up_proj);
-          routed_down_descriptors.push_back(runtime_pair.down_proj);
-          routed_up_views.push_back(impl_->monolithic_up->GetView(expert_index));
-          routed_down_views.push_back(impl_->monolithic_down->GetView(expert_index));
-        }
-      } else if (impl_->full_residency_enabled) {
-        for (std::size_t expert_index : selected_expert_indices) {
-          if (expert_index >= impl_->routed_experts.size()) {
-            return false;
-          }
-          const Impl::RoutedExpertRuntime& runtime_pair = impl_->routed_experts[expert_index];
-          if (runtime_pair.up_proj == nullptr ||
-              runtime_pair.down_proj == nullptr ||
-              runtime_pair.up_proj_device == nullptr ||
-              runtime_pair.down_proj_device == nullptr ||
-              !runtime_pair.up_proj_device->valid() ||
-              !runtime_pair.down_proj_device->valid()) {
-            return false;
-          }
-          routed_up_descriptors.push_back(runtime_pair.up_proj);
-          routed_down_descriptors.push_back(runtime_pair.down_proj);
-          routed_up_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.up_proj_device));
-          routed_down_views.push_back(MakeFusedNvfp4WeightView(*runtime_pair.down_proj_device));
-        }
-      } else {
-        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-        staged_up_weights.reserve(selected_expert_indices.size());
-        staged_down_weights.reserve(selected_expert_indices.size());
-        for (std::size_t expert_index : selected_expert_indices) {
-          if (expert_index >= impl_->routed_experts.size()) {
-            return false;
-          }
-          const Impl::RoutedExpertRuntime& runtime_pair = impl_->routed_experts[expert_index];
-          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
-            return false;
-          }
-          const auto up_upload_started = std::chrono::steady_clock::now();
-          auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
-          const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - up_upload_started)
-                  .count());
-          staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
-          const auto down_upload_started = std::chrono::steady_clock::now();
-          auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
-          const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - down_upload_started)
-                  .count());
-          staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
-          if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
-            return false;
-          }
-          const std::uint64_t upload_bytes =
-              TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
-          staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
-          staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
-          routed_up_descriptors.push_back(runtime_pair.up_proj);
-          routed_down_descriptors.push_back(runtime_pair.down_proj);
-          routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
-          routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
-          staged_up_weights.push_back(std::move(up_weight));
-          staged_down_weights.push_back(std::move(down_weight));
-        }
-      }
-
-      MoeDirectDecodeScratch moe_scratch;
-      MoeDirectDecodeScratch* moe_scratch_ptr = nullptr;
-      if (use_decode_scratch) {
-        moe_scratch.output_accum = impl_->output_scratch.get();
-        moe_scratch.routed_up = impl_->routed_up_scratch.get();
-        moe_scratch.shared_up = impl_->shared_up_scratch.get();
-        moe_scratch_ptr = &moe_scratch;
-      }
-      if (RunMoeDirectDecodeViaCublaslt(
+      if (!backend->Run(
+              cublas_handle,
+              heuristic_cache,
               impl_->config,
-              routed_up_descriptors,
-              routed_down_descriptors,
-              *impl_->shared_up_nvfp4,
-              *impl_->shared_up_nvfp4_device,
-              *impl_->shared_down_nvfp4,
-              *impl_->shared_down_nvfp4_device,
-              cublas_handle,
-              heuristic_cache,
+              token_count,
               input,
               *normalized,
-              selected_weights_device->data(),
-              routed_up_views,
-              routed_down_views,
-              impl_->normalized_pack.get(),
-              impl_->routed_activated_pack.get(),
-              impl_->shared_activated_pack.get(),
+              *router_logits,
               output,
-              moe_scratch_ptr)) {
-        return true;
+              trace)) {
+        continue;
       }
-
-      if (debug) {
-        std::cout << "expert_layer: cuBLASLt direct MoE fastpath failed, falling back\n";
+      if (impl_->backend_dispatch_state.compare_fused_debug &&
+          impl_->backend_dispatch_state.collected_fused_debug) {
+        break;
       }
-    }
-
-    const bool use_fused_direct_decode =
-        trace == nullptr &&
-        token_count == 1 &&
-        impl_->fused_direct_moe_supported &&
-        FusedMoeDecodeEnabled();
-    if (use_fused_direct_decode) {
-      const bool use_monolithic_residency = impl_->monolithic_resident;
-      const bool use_full_residency =
-          use_monolithic_residency ||
-          (impl_->full_residency_enabled &&
-           impl_->routed_up_nvfp4_views_device != nullptr &&
-           impl_->routed_down_nvfp4_views_device != nullptr);
-      const bool needs_host_selected_experts = host_selection_debug || !use_full_residency;
-      std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_up_weights;
-      std::vector<std::unique_ptr<DeviceNvfp4Weight>> routed_down_weights;
-      std::vector<FusedNvfp4WeightView> routed_up_views;
-      std::vector<FusedNvfp4WeightView> routed_down_views;
-      std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_views_device;
-      std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_views_device;
-      std::vector<ExpertSelection> selected_experts;
-      const FusedNvfp4WeightView* routed_up_device_ptr = nullptr;
-      const FusedNvfp4WeightView* routed_down_device_ptr = nullptr;
-      std::uint64_t staging_bytes_uploaded = 0;
-      std::uint64_t staging_elapsed_us = 0;
-      std::uint64_t experts_staged = 0;
-      auto& staging_counters = GetExpertStagingCounters();
-      if (needs_host_selected_experts) {
-        std::vector<float> router_logits_host;
-        if (!CopyToHost(*router_logits, &router_logits_host) ||
-            router_logits_host.size() != impl_->config.n_routed_experts) {
-          return false;
-        }
-        selected_experts = SelectTopExperts(
-            impl_->config,
-            router_logits_host,
-            impl_->gate_score_correction_bias);
-        if (selected_experts.size() != impl_->config.top_k) {
-          return false;
-        }
-      }
-      if (use_monolithic_residency) {
-        if (impl_->monolithic_up_views_device == nullptr ||
-            impl_->monolithic_down_views_device == nullptr) {
-          return false;
-        }
-        routed_up_device_ptr = impl_->monolithic_up_views_device->data();
-        routed_down_device_ptr = impl_->monolithic_down_views_device->data();
-        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-        staging_counters.monolithic_layers.fetch_add(1, std::memory_order_relaxed);
-      } else if (use_full_residency) {
-        routed_up_device_ptr = impl_->routed_up_nvfp4_views_device->data();
-        routed_down_device_ptr = impl_->routed_down_nvfp4_views_device->data();
-      } else {
-        staging_counters.total_staging_calls.fetch_add(1, std::memory_order_relaxed);
-        routed_up_weights.reserve(selected_experts.size());
-        routed_down_weights.reserve(selected_experts.size());
-        routed_up_views.reserve(selected_experts.size());
-        routed_down_views.reserve(selected_experts.size());
-        // Non-resident decode uploads a compact top-k view array and passes remapped
-        // selected_indices so the kernel indexes only the staged experts.
-        for (const ExpertSelection& selection : selected_experts) {
-          if (selection.expert_index >= impl_->routed_experts.size()) {
-            return false;
-          }
-          const Impl::RoutedExpertRuntime& runtime_pair =
-              impl_->routed_experts[selection.expert_index];
-          if (runtime_pair.up_proj == nullptr || runtime_pair.down_proj == nullptr) {
-            return false;
-          }
-          const auto up_upload_started = std::chrono::steady_clock::now();
-          auto up_weight = DeviceNvfp4Weight::Upload(*runtime_pair.up_proj);
-          const std::uint64_t up_elapsed_us = static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - up_upload_started)
-                  .count());
-          staging_elapsed_us += up_elapsed_us;
-          staging_counters.staging_elapsed_us.fetch_add(up_elapsed_us, std::memory_order_relaxed);
-          const auto down_upload_started = std::chrono::steady_clock::now();
-          auto down_weight = DeviceNvfp4Weight::Upload(*runtime_pair.down_proj);
-          const std::uint64_t down_elapsed_us = static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - down_upload_started)
-                  .count());
-          staging_elapsed_us += down_elapsed_us;
-          staging_counters.staging_elapsed_us.fetch_add(down_elapsed_us, std::memory_order_relaxed);
-          if (!up_weight || !up_weight->valid() || !down_weight || !down_weight->valid()) {
-            return false;
-          }
-          const std::uint64_t upload_bytes =
-              TotalUploadedBytes(*up_weight) + TotalUploadedBytes(*down_weight);
-          staging_bytes_uploaded += upload_bytes;
-          staging_counters.total_bytes_uploaded.fetch_add(upload_bytes, std::memory_order_relaxed);
-          ++experts_staged;
-          staging_counters.total_experts_staged.fetch_add(1, std::memory_order_relaxed);
-          routed_up_views.push_back(MakeFusedNvfp4WeightView(*up_weight));
-          routed_down_views.push_back(MakeFusedNvfp4WeightView(*down_weight));
-          routed_up_weights.push_back(std::move(up_weight));
-          routed_down_weights.push_back(std::move(down_weight));
-        }
-        routed_up_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up_views);
-        routed_down_views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down_views);
-        if (!routed_up_views_device || !routed_down_views_device) {
-          return false;
-        }
-        routed_up_device_ptr = routed_up_views_device->data();
-        routed_down_device_ptr = routed_down_views_device->data();
-      }
-      if (debug) {
-        std::cout << "expert_layer: fused direct "
-                  << (use_monolithic_residency ? "monolithic"
-                                               : (use_full_residency ? "resident" : "staged"))
-                  << " routed experts=" << (use_full_residency ? impl_->routed_experts.size() : experts_staged)
-                  << " routed experts bytes=" << staging_bytes_uploaded
-                  << " elapsed_us=" << staging_elapsed_us << "\n";
-      }
-
-      std::unique_ptr<DeviceArray<int>> selected_indices_device;
-      std::unique_ptr<DeviceArray<float>> selected_weights_device;
-      if (needs_host_selected_experts) {
-        std::vector<int> selected_indices_host(impl_->config.top_k, -1);
-        std::vector<float> selected_weights_host(impl_->config.top_k, 0.0f);
-        for (std::size_t slot = 0; slot < selected_experts.size(); ++slot) {
-          selected_indices_host[slot] =
-              use_full_residency ? static_cast<int>(selected_experts[slot].expert_index)
-                                 : static_cast<int>(slot);
-          selected_weights_host[slot] = selected_experts[slot].weight;
-        }
-        selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
-        selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);
-        if (!selected_indices_device || !selected_weights_device) {
-          return false;
-        }
-      }
-
-      FusedMoeDirectLayerParams fused_params;
-      fused_params.hidden_size = impl_->config.hidden_size;
-      fused_params.routed_expert_intermediate_size =
-          impl_->config.routed_expert_intermediate_size;
-      fused_params.shared_expert_intermediate_size =
-          impl_->config.shared_expert_intermediate_size;
-      fused_params.n_routed_experts = impl_->config.n_routed_experts;
-      fused_params.top_k = impl_->config.top_k;
-      fused_params.n_group = impl_->config.n_group;
-      fused_params.topk_group = impl_->config.topk_group;
-      fused_params.routed_scaling_factor = impl_->config.routed_scaling_factor;
-      fused_params.norm_topk_prob = impl_->config.norm_topk_prob;
-      fused_params.shared_up = MakeFusedNvfp4WeightView(*impl_->shared_up_nvfp4_device);
-      fused_params.shared_down = MakeFusedNvfp4WeightView(*impl_->shared_down_nvfp4_device);
-      fused_params.routed_up = routed_up_device_ptr;
-      fused_params.routed_down = routed_down_device_ptr;
-      fused_params.correction_bias = impl_->gate_score_correction_bias_device->data();
-      fused_params.selected_indices =
-          selected_indices_device ? selected_indices_device->data() : nullptr;
-      fused_params.selected_weights =
-          selected_weights_device ? selected_weights_device->data() : nullptr;
-      if (!compare_fused_debug) {
-        return RunFusedMoeDirectDecode(fused_params, input, *normalized, *router_logits, output);
-      }
-
-      auto fused_routed_device = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-      auto fused_shared_device = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-      if (!fused_routed_device ||
-          !fused_shared_device) {
-        return false;
-      }
-      fused_params.routed_output = fused_routed_device->data();
-      fused_params.shared_output = fused_shared_device->data();
-      if (!RunFusedMoeDirectDecode(
-              fused_params,
-              input,
-              *normalized,
-              *router_logits,
-              output)) {
-        return false;
-      }
-      if (!CopyToHost(*output, &fused_debug_output_host) ||
-          !CopyToHost(*fused_routed_device, &fused_debug_routed_host) ||
-          !CopyToHost(*fused_shared_device, &fused_debug_shared_host)) {
-        return false;
-      }
-      collected_fused_debug = true;
-      live_fused_output_written = true;
-    }
-
-    const bool use_fused_direct_prefill =
-        trace == nullptr &&
-        token_count > 1 &&
-        impl_->fused_prefill_opt_in &&
-        impl_->fused_direct_moe_supported &&
-        (impl_->monolithic_resident || impl_->full_residency_enabled) &&
-        EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-    if (use_fused_direct_prefill) {
-      if (impl_->RunFusedMoePrefillPath(
-              cublas_handle,
-              heuristic_cache,
-              input,
-              *normalized,
-              *router_logits,
-              output)) {
-        return true;
-      }
-      if (debug) {
-        std::cout << "expert_layer: fused prefill direct MoE path failed, falling back\n";
-      }
-    }
-
-    const bool use_batched_direct_moe =
-        !use_fused_direct_prefill &&
-        trace == nullptr &&
-        token_count > 1 &&
-        impl_->fused_direct_moe_supported;
-    if (use_batched_direct_moe) {
-      if (impl_->RunBatchedDirectMoeViaCublaslt(
-              cublas_handle,
-              heuristic_cache,
-              input,
-              *normalized,
-              *router_logits,
-              output)) {
-        return true;
-      }
-      if (debug) {
-        std::cout << "expert_layer: batched direct MoE GPU path failed, falling back\n";
-      }
+      return true;
     }
 
     std::vector<float> input_host;
@@ -3245,7 +3562,7 @@ bool ExpertLayerSlice::Run(
       final_output[i] = input_host[i] + mixer_output[i];
     }
 
-    if (!live_fused_output_written) {
+    if (!impl_->backend_dispatch_state.live_fused_output_written) {
       if (!output->CopyFromHost(final_output.data(), final_output.size())) {
         if (debug) {
           std::cout << "expert_layer: direct final output upload failed\n";
@@ -3267,12 +3584,22 @@ bool ExpertLayerSlice::Run(
           mixer_output.begin(),
           mixer_output.begin() + impl_->config.hidden_size);
     }
-    if (collected_fused_debug) {
+    if (impl_->backend_dispatch_state.collected_fused_debug) {
       std::cerr << "fused_moe_compare: layer=" << impl_->config.layer_index
-                << " final_max_abs_diff=" << MaxAbsDiff(fused_debug_output_host, final_output)
-                << " routed_max_abs_diff=" << MaxAbsDiff(fused_debug_routed_host, routed_hidden_output)
-                << " shared_max_abs_diff=" << MaxAbsDiff(fused_debug_shared_host, shared_output)
-                << " fused0=" << (fused_debug_output_host.empty() ? 0.0f : fused_debug_output_host.front())
+                << " final_max_abs_diff="
+                << MaxAbsDiff(impl_->backend_dispatch_state.fused_debug_output_host, final_output)
+                << " routed_max_abs_diff="
+                << MaxAbsDiff(
+                       impl_->backend_dispatch_state.fused_debug_routed_host,
+                       routed_hidden_output)
+                << " shared_max_abs_diff="
+                << MaxAbsDiff(
+                       impl_->backend_dispatch_state.fused_debug_shared_host,
+                       shared_output)
+                << " fused0="
+                << (impl_->backend_dispatch_state.fused_debug_output_host.empty()
+                        ? 0.0f
+                        : impl_->backend_dispatch_state.fused_debug_output_host.front())
                 << " host0=" << (final_output.empty() ? 0.0f : final_output.front())
                 << "\n";
     }
