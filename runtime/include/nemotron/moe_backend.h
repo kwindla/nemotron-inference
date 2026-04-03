@@ -7,6 +7,20 @@
 
 namespace nemotron {
 
+class DeviceNvfp4Weight;
+class MonolithicNvfp4ExpertWeights;
+
+struct MoeBackendPrepareContext {
+  const ExpertLayerConfig* config = nullptr;
+  const std::vector<ExpertWeightPair>* routed_weights = nullptr;
+  const GemmDescriptor* shared_up = nullptr;
+  const GemmDescriptor* shared_down = nullptr;
+  const MonolithicNvfp4ExpertWeights* monolithic_up = nullptr;
+  const MonolithicNvfp4ExpertWeights* monolithic_down = nullptr;
+  const DeviceNvfp4Weight* shared_up_device = nullptr;
+  const DeviceNvfp4Weight* shared_down_device = nullptr;
+};
+
 class MoeBackend {
  public:
   virtual ~MoeBackend() = default;
@@ -18,15 +32,10 @@ class MoeBackend {
       std::size_t token_count,
       int device_sm_version) const = 0;
 
-  virtual bool PrepareWeights(
-      const ExpertLayerConfig& config,
-      const std::vector<ExpertWeightPair>& routed_weights,
-      const GemmDescriptor* shared_up,
-      const GemmDescriptor* shared_down) {
-    (void)config;
-    (void)routed_weights;
-    (void)shared_up;
-    (void)shared_down;
+  // Backends can use this load-time hook to read resident NVFP4 weights and
+  // cache any backend-native representation needed by Run().
+  virtual bool PrepareWeights(const MoeBackendPrepareContext& context) {
+    (void)context;
     return true;
   }
 
