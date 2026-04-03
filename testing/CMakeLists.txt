@@ -520,6 +520,16 @@ target_compile_features(mamba_conv_prefill_test PRIVATE cxx_std_17)
 nemotron_add_test(mamba_conv_prefill_test)
 
 add_executable(
+  mamba_ssd_prefill_test
+  backend/mamba_ssd_prefill_test.cpp
+)
+
+target_link_libraries(mamba_ssd_prefill_test PRIVATE nemotron_runtime_backend)
+target_compile_features(mamba_ssd_prefill_test PRIVATE cxx_std_17)
+
+nemotron_add_test(mamba_ssd_prefill_test)
+
+add_executable(
   mamba_layer_oracle_test
   backend/mamba_layer_oracle_test.cpp
 )
