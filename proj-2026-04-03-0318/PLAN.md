@@ -271,4 +271,4 @@ Do not spend the next milestone on:
 | 5 | Unified fused backend | done | a6f7582 | RunFusedMoePrefill implemented, UnifiedFusedBackend for token_count >= 1 |
 | 6 | Decode specialization decision by benchmark | done | ea3df20 | Benchmark harness, BACKEND_SELECTION.md, NEMOTRON_FORWARD_UNIFIED_FUSED env var |
 | 7 | External comparison vs vLLM and current baseline | done | 5cba945 | Full comparison harness, correctness verification, updated MEASUREMENT.md |
-| 8 | Optional custom SM120 backend | done | — | Decision framework in SM120_BACKEND_DECISION.md, GO/NO-GO pending benchmark data |
+| 8 | Optional custom SM120 backend | done | 3557b97 | Decision framework in SM120_BACKEND_DECISION.md, GO/NO-GO pending benchmark data |
