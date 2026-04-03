@@ -292,7 +292,7 @@ bool RunDeviceExpertRouting(
   }
 
   const std::size_t selection_count = token_count * top_k;
-  if (selection_count != routing->selection_count() ||
+  if (selection_count > routing->selection_count() ||
       selection_count > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
       routing->n_experts() > kMaxDeviceExpertRoutingExperts) {
     return false;

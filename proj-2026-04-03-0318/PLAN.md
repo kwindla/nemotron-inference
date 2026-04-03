@@ -96,7 +96,7 @@ Optional side probe: `cuDNN FE MoE grouped matmul` is still worth checking, but 
   Add a GPU routing stage that replaces the CPU `BuildExpertRoutingTable` path for prefill and emits the metadata the owned kernel actually consumes: `expert_offsets[n_experts+1]`, `expert_token_indices[selection_count]`, `expert_token_weights[selection_count]`, `active_expert_ids[active_expert_count]`, and `bucket_offsets` or equivalent metadata for the chosen `M` buckets. This should stay entirely on device; do **not** optimize around copying `expert_offsets` back to the host for the current cuBLASLt loop. Allocate these routing outputs and the persistent work-queue buffers once on `ExpertLayerSlice::Impl` and reuse them across runs. Create `runtime/src/backend/expert_routing_device.cu` and `runtime/include/nemotron/expert_routing_device.h`.
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/expert_routing_device.cu` (new)
 
-- [ ] **3. Add prefill fused-path plumbing and runtime gating**
+- [x] **3. Add prefill fused-path plumbing and runtime gating**
   Introduce a new prefill-only entry point, for example `RunFusedMoePrefill()` in `runtime/src/backend/fused_moe_prefill.cu` with a header in `runtime/include/nemotron/fused_moe_prefill.h`. Integrate it in `ExpertLayerSlice::Run()` next to the decode fast path in `expert_layer.cpp`, but gate it with **runtime** checks: `token_count > 1`, direct-MLP topology, no latent projection, NVFP4 routed up/down experts, NVFP4 shared up/down experts, resident monolithic routed weights, Nano-compatible dimensions, and device capability sufficient for SM120 NVFP4 kernels. Do not use `__CUDA_ARCH__` in the host dispatch path. Fall back to `RunBatchedDirectMoeViaCublaslt()` when the fused path is unavailable.
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/fused_moe_prefill.cu` (new), `runtime/include/nemotron/fused_moe_prefill.h` (new)
 
@@ -152,7 +152,7 @@ Optional side probe: `cuDNN FE MoE grouped matmul` is still worth checking, but 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Profile and measure baseline | done | 3ac0b90 | GEMM loop 92-97% of cost; M=4+ dominates histogram; D→H sync negligible |
-| 2 | Build device-side routing compaction for the fused path | done | — | |
-| 3 | Add prefill fused-path plumbing and runtime gating | pending | — | |
+| 2 | Build device-side routing compaction for the fused path | done | 7e0eeb0 | |
+| 3 | Add prefill fused-path plumbing and runtime gating | in-progress | — | |
 | 4 | Implement the routed persistent kernel family | pending | — | |
 | 5 | Benchmark and tune the fused path | pending | — | |

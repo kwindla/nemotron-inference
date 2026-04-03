@@ -748,6 +748,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
         expert_config.n_routed_experts = config.n_routed_experts;
         expert_config.top_k = config.experts_per_token;
+        expert_config.max_token_count = config.max_tokens;
         expert_config.n_group = config.expert_n_group;
         expert_config.topk_group = config.expert_topk_group;
         expert_config.rms_epsilon = config.layer_norm_epsilon;

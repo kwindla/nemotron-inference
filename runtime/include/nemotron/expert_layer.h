@@ -23,6 +23,7 @@ struct ExpertLayerConfig {
   std::size_t shared_expert_intermediate_size = 0;
   std::size_t n_routed_experts = 0;
   std::size_t top_k = 0;
+  std::size_t max_token_count = 1;
   std::size_t n_group = 1;
   std::size_t topk_group = 1;
   float rms_epsilon = 1.0e-5f;

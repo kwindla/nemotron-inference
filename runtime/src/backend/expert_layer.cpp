@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "nemotron/expert_staging_counters.h"
+#include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_decode.h"
+#include "nemotron/fused_moe_prefill.h"
 #include "nemotron/linear_op.h"
 #include "nemotron/monolithic_expert_weights.h"
 #include "nemotron/nvfp4_packing.h"
@@ -926,6 +928,13 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_down_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
+  std::unique_ptr<DeviceArray<int>> fused_prefill_selected_indices;
+  std::unique_ptr<DeviceArray<float>> fused_prefill_selected_weights;
+  std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
   std::unique_ptr<DeviceTensorFp32> normalized_scratch;
   std::unique_ptr<DeviceTensorFp32> router_logits_scratch;
   std::unique_ptr<DeviceTensorFp32> output_scratch;
@@ -939,6 +948,7 @@ struct ExpertLayerSlice::Impl {
   bool full_residency_enabled = false;
   bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
+  bool fused_prefill_opt_in = false;
 
   static bool ResolveRoutedExpertWeightViews(
       const Impl& impl,
@@ -950,6 +960,14 @@ struct ExpertLayerSlice::Impl {
       Nvfp4PackedMatrixDeviceView* down_view);
 
   bool RunBatchedDirectMoeViaCublaslt(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorFp32& input,
+      const DeviceTensorFp32& normalized,
+      const DeviceTensorFp32& router_logits,
+      DeviceTensorFp32* output) const;
+
+  bool RunFusedMoePrefillPath(
       CublasLtHandle& cublas_handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorFp32& input,
@@ -1073,6 +1091,153 @@ bool ExpertLayerSlice::Impl::ResolveRoutedExpertWeightViews(
   *up_view = MakeNvfp4PackedMatrixDeviceView(**staged_up_weight);
   *down_view = MakeNvfp4PackedMatrixDeviceView(**staged_down_weight);
   return up_view->valid() && down_view->valid();
+}
+
+bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& normalized,
+    const DeviceTensorFp32& router_logits,
+    DeviceTensorFp32* output) const {
+  const auto fallback_to_batched = [&]() {
+    return RunBatchedDirectMoeViaCublaslt(
+        cublas_handle,
+        heuristic_cache,
+        input,
+        normalized,
+        router_logits,
+        output);
+  };
+
+  if (!cublas_handle.valid() ||
+      !input.valid() ||
+      !normalized.valid() ||
+      !router_logits.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      input.shape() != normalized.shape() ||
+      input.shape() != output->shape() ||
+      input.shape().size() != 2 ||
+      input.shape()[0] <= 1 ||
+      input.shape()[1] != config.hidden_size ||
+      router_logits.shape().size() != 2 ||
+      router_logits.shape()[0] != input.shape()[0] ||
+      router_logits.shape()[1] != config.n_routed_experts) {
+    return false;
+  }
+
+  const std::size_t token_count = input.shape()[0];
+  if (token_count > config.max_token_count ||
+      token_count > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
+    return fallback_to_batched();
+  }
+
+  const std::size_t selection_count = token_count * config.top_k;
+  if (fused_prefill_selected_indices == nullptr ||
+      fused_prefill_selected_weights == nullptr ||
+      fused_prefill_routing == nullptr ||
+      fused_prefill_routed_output_scratch == nullptr ||
+      fused_prefill_gather_scratch == nullptr ||
+      fused_prefill_expert_up_scratch == nullptr ||
+      fused_prefill_shared_up_scratch == nullptr ||
+      fused_prefill_selected_indices->size() < selection_count ||
+      fused_prefill_selected_weights->size() < selection_count ||
+      fused_prefill_routing->selection_count() < selection_count ||
+      shared_up_nvfp4_device == nullptr ||
+      shared_down_nvfp4_device == nullptr ||
+      !shared_up_nvfp4_device->valid() ||
+      !shared_down_nvfp4_device->valid()) {
+    return fallback_to_batched();
+  }
+
+  if (!RunDeviceExpertSelection(
+          router_logits,
+          *gate_score_correction_bias_device,
+          config.n_routed_experts,
+          config.top_k,
+          config.n_group,
+          config.topk_group,
+          config.routed_scaling_factor,
+          config.norm_topk_prob,
+          fused_prefill_selected_indices->data(),
+          fused_prefill_selected_weights->data()) ||
+      !RunDeviceExpertRouting(
+          fused_prefill_selected_indices->data(),
+          fused_prefill_selected_weights->data(),
+          token_count,
+          config.top_k,
+          fused_prefill_routing.get())) {
+    return fallback_to_batched();
+  }
+
+  const FusedNvfp4WeightView* routed_up_device_ptr = nullptr;
+  const FusedNvfp4WeightView* routed_down_device_ptr = nullptr;
+  if (monolithic_resident) {
+    if (monolithic_up_views_device == nullptr || monolithic_down_views_device == nullptr) {
+      return fallback_to_batched();
+    }
+    routed_up_device_ptr = monolithic_up_views_device->data();
+    routed_down_device_ptr = monolithic_down_views_device->data();
+  } else if (full_residency_enabled) {
+    if (routed_up_nvfp4_views_device == nullptr || routed_down_nvfp4_views_device == nullptr) {
+      return fallback_to_batched();
+    }
+    routed_up_device_ptr = routed_up_nvfp4_views_device->data();
+    routed_down_device_ptr = routed_down_nvfp4_views_device->data();
+  } else {
+    return fallback_to_batched();
+  }
+
+  auto routed_output = DeviceTensorFp32::CreateView(
+      {token_count, config.hidden_size},
+      fused_prefill_routed_output_scratch->data());
+  auto gather_scratch = DeviceTensorFp32::CreateView(
+      {selection_count, config.hidden_size},
+      fused_prefill_gather_scratch->data());
+  auto expert_up_scratch = DeviceTensorFp32::CreateView(
+      {selection_count, config.routed_expert_intermediate_size},
+      fused_prefill_expert_up_scratch->data());
+  auto shared_up_scratch = DeviceTensorFp32::CreateView(
+      {token_count, config.shared_expert_intermediate_size},
+      fused_prefill_shared_up_scratch->data());
+  if (!routed_output ||
+      !gather_scratch ||
+      !expert_up_scratch ||
+      !shared_up_scratch ||
+      !routed_output->FillZero()) {
+    return fallback_to_batched();
+  }
+
+  FusedMoePrefillParams params;
+  params.token_count = token_count;
+  params.selection_count = selection_count;
+  params.hidden_size = config.hidden_size;
+  params.routed_expert_intermediate_size = config.routed_expert_intermediate_size;
+  params.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
+  params.n_routed_experts = config.n_routed_experts;
+  params.top_k = config.top_k;
+  params.shared_up = MakeFusedNvfp4WeightView(*shared_up_nvfp4_device);
+  params.shared_down = MakeFusedNvfp4WeightView(*shared_down_nvfp4_device);
+  params.routed_up = routed_up_device_ptr;
+  params.routed_down = routed_down_device_ptr;
+  params.input = input.data();
+  params.normalized = normalized.data();
+  params.output = output->data();
+  params.routed_output = routed_output->data();
+  params.gather_scratch = gather_scratch->data();
+  params.expert_up_scratch = expert_up_scratch->data();
+  params.shared_up_scratch = shared_up_scratch->data();
+  params.expert_offsets = fused_prefill_routing->expert_offsets();
+  params.sorted_token_indices = fused_prefill_routing->sorted_token_indices();
+  params.sorted_token_weights = fused_prefill_routing->sorted_token_weights();
+  params.active_expert_count = fused_prefill_routing->active_expert_count();
+  params.active_expert_ids = fused_prefill_routing->active_expert_ids();
+
+  if (RunFusedMoePrefill(params)) {
+    return true;
+  }
+  return fallback_to_batched();
 }
 
 bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
@@ -1630,6 +1795,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       config.n_routed_experts == 0 ||
       config.top_k == 0 ||
       config.top_k > config.n_routed_experts ||
+      config.max_token_count == 0 ||
+      config.max_token_count > (std::numeric_limits<std::size_t>::max() / config.top_k) ||
       config.n_group == 0 ||
       config.topk_group == 0 ||
       config.n_routed_experts % config.n_group != 0 ||
@@ -2148,6 +2315,41 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     }
   }
 
+  const std::size_t max_prefill_selection_count = config.max_token_count * config.top_k;
+  std::unique_ptr<DeviceArray<int>> fused_prefill_selected_indices;
+  std::unique_ptr<DeviceArray<float>> fused_prefill_selected_weights;
+  std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
+  const bool fused_prefill_opt_in = EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+  if (fused_direct_moe_supported &&
+      config.max_token_count > 1 &&
+      fused_prefill_opt_in) {
+    fused_prefill_selected_indices = DeviceArray<int>::Create(max_prefill_selection_count);
+    fused_prefill_selected_weights = DeviceArray<float>::Create(max_prefill_selection_count);
+    fused_prefill_routing =
+        DeviceExpertRouting::Create(config.n_routed_experts, max_prefill_selection_count);
+    fused_prefill_routed_output_scratch =
+        DeviceTensorFp32::Create({config.max_token_count, config.hidden_size});
+    fused_prefill_gather_scratch =
+        DeviceTensorFp32::Create({max_prefill_selection_count, config.hidden_size});
+    fused_prefill_expert_up_scratch = DeviceTensorFp32::Create(
+        {max_prefill_selection_count, config.routed_expert_intermediate_size});
+    fused_prefill_shared_up_scratch = DeviceTensorFp32::Create(
+        {config.max_token_count, config.shared_expert_intermediate_size});
+    if (!fused_prefill_selected_indices ||
+        !fused_prefill_selected_weights ||
+        !fused_prefill_routing ||
+        !fused_prefill_routed_output_scratch ||
+        !fused_prefill_gather_scratch ||
+        !fused_prefill_expert_up_scratch ||
+        !fused_prefill_shared_up_scratch) {
+      return debug_fail("fused prefill scratch allocation failed");
+    }
+  }
+
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->topology =
@@ -2177,6 +2379,13 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->monolithic_down_views_device = std::move(monolithic_down_views_device);
   impl->routed_up_nvfp4_views_device = std::move(routed_up_nvfp4_views_device);
   impl->routed_down_nvfp4_views_device = std::move(routed_down_nvfp4_views_device);
+  impl->fused_prefill_selected_indices = std::move(fused_prefill_selected_indices);
+  impl->fused_prefill_selected_weights = std::move(fused_prefill_selected_weights);
+  impl->fused_prefill_routing = std::move(fused_prefill_routing);
+  impl->fused_prefill_routed_output_scratch = std::move(fused_prefill_routed_output_scratch);
+  impl->fused_prefill_gather_scratch = std::move(fused_prefill_gather_scratch);
+  impl->fused_prefill_expert_up_scratch = std::move(fused_prefill_expert_up_scratch);
+  impl->fused_prefill_shared_up_scratch = std::move(fused_prefill_shared_up_scratch);
   impl->normalized_scratch = std::move(normalized_scratch);
   impl->router_logits_scratch = std::move(router_logits_scratch);
   impl->output_scratch = std::move(output_scratch);
@@ -2190,6 +2399,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->full_residency_enabled = full_residency_enabled;
   impl->monolithic_resident = monolithic_resident;
   impl->fused_direct_moe_supported = fused_direct_moe_supported;
+  impl->fused_prefill_opt_in = fused_prefill_opt_in;
   if (debug) {
     const std::uint64_t resident_total_expert_bytes =
         resident_shared_expert_bytes + resident_routed_expert_bytes;
@@ -2282,6 +2492,20 @@ bool ExpertLayerSlice::valid() const {
          (!impl_->full_residency_enabled ||
           (impl_->routed_up_nvfp4_views_device != nullptr &&
            impl_->routed_down_nvfp4_views_device != nullptr)) &&
+         (!(impl_->fused_prefill_opt_in &&
+            impl_->fused_direct_moe_supported &&
+            impl_->config.max_token_count > 1) ||
+          (impl_->fused_prefill_selected_indices != nullptr &&
+           impl_->fused_prefill_selected_weights != nullptr &&
+           impl_->fused_prefill_routing != nullptr &&
+           impl_->fused_prefill_routed_output_scratch != nullptr &&
+           impl_->fused_prefill_routed_output_scratch->valid() &&
+           impl_->fused_prefill_gather_scratch != nullptr &&
+           impl_->fused_prefill_gather_scratch->valid() &&
+           impl_->fused_prefill_expert_up_scratch != nullptr &&
+           impl_->fused_prefill_expert_up_scratch->valid() &&
+           impl_->fused_prefill_shared_up_scratch != nullptr &&
+           impl_->fused_prefill_shared_up_scratch->valid())) &&
          impl_->normalized_scratch != nullptr &&
          impl_->normalized_scratch->valid() &&
          impl_->router_logits_scratch != nullptr &&
@@ -2741,7 +2965,30 @@ bool ExpertLayerSlice::Run(
       live_fused_output_written = true;
     }
 
+    const bool use_fused_direct_prefill =
+        trace == nullptr &&
+        token_count > 1 &&
+        impl_->fused_prefill_opt_in &&
+        impl_->fused_direct_moe_supported &&
+        (impl_->monolithic_resident || impl_->full_residency_enabled) &&
+        EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+    if (use_fused_direct_prefill) {
+      if (impl_->RunFusedMoePrefillPath(
+              cublas_handle,
+              heuristic_cache,
+              input,
+              *normalized,
+              *router_logits,
+              output)) {
+        return true;
+      }
+      if (debug) {
+        std::cout << "expert_layer: fused prefill direct MoE path failed, falling back\n";
+      }
+    }
+
     const bool use_batched_direct_moe =
+        !use_fused_direct_prefill &&
         trace == nullptr &&
         token_count > 1 &&
         impl_->fused_direct_moe_supported;
