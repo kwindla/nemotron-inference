@@ -98,4 +98,4 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
 | 2 | GPU causal conv1d prefill kernel | done | 9585ad2 | |
 | 3 | GPU SSD chunked prefill kernel | done | 694e811 | v1 simple per-hidden-thread scan, not chunked |
 | 4 | Wire GPU prefill into MambaLayer + e2e tests | done | 09e6a4e | |
-| 5 | Benchmark and tune | done | — | BLOCKED: NVFP4 linear ops fall back to CPU for M>1; need batched NVFP4 GEMM fix |
+| 5 | Benchmark and tune | done | bb4b45e | BLOCKED: NVFP4 linear ops fall back to CPU for M>1; need batched NVFP4 GEMM fix |
