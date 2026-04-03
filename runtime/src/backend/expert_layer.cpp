@@ -954,7 +954,7 @@ float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
 struct ExpertLayerSlice::Impl {
   class DecodeCublasLtBackend;
   class FusedDecodeBackend;
-  class FusedPrefillBackend;
+  class UnifiedFusedBackend;
   class BatchedCublasLtBackend;
 
   struct RoutedExpertRuntime {
@@ -1096,7 +1096,7 @@ struct ExpertLayerSlice::Impl {
       std::size_t token_count,
       int device_sm_version) const;
 
-  bool SupportsFusedPrefillBackend(
+  bool SupportsUnifiedFusedBackend(
       const ExpertLayerConfig& config,
       std::size_t token_count,
       int device_sm_version) const;
@@ -1418,14 +1418,14 @@ bool ExpertLayerSlice::Impl::SupportsFusedDecodeBackend(
          FusedMoeDecodeEnabled();
 }
 
-bool ExpertLayerSlice::Impl::SupportsFusedPrefillBackend(
+bool ExpertLayerSlice::Impl::SupportsUnifiedFusedBackend(
     const ExpertLayerConfig& backend_config,
     std::size_t token_count,
     int device_sm_version) const {
   (void)backend_config;
   (void)device_sm_version;
   return backend_dispatch_state.trace == nullptr &&
-         token_count > 1 &&
+         token_count >= 1 &&
          fused_prefill_opt_in &&
          fused_direct_moe_supported &&
          (monolithic_resident || full_residency_enabled) &&
@@ -1464,7 +1464,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       input.shape() != normalized.shape() ||
       input.shape() != output->shape() ||
       input.shape().size() != 2 ||
-      input.shape()[0] <= 1 ||
+      input.shape()[0] == 0 ||
       input.shape()[1] != config.hidden_size ||
       router_logits.shape().size() != 2 ||
       router_logits.shape()[0] != input.shape()[0] ||
@@ -1532,6 +1532,27 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     return false;
   }
 
+  if (routed_experts.size() != config.n_routed_experts ||
+      shared_up_nvfp4 == nullptr ||
+      shared_down_nvfp4 == nullptr) {
+    return false;
+  }
+
+  std::vector<const GemmDescriptor*> routed_up_descriptors(
+      config.n_routed_experts,
+      nullptr);
+  std::vector<const GemmDescriptor*> routed_down_descriptors(
+      config.n_routed_experts,
+      nullptr);
+  for (std::size_t expert_index = 0; expert_index < config.n_routed_experts; ++expert_index) {
+    if (routed_experts[expert_index].up_proj == nullptr ||
+        routed_experts[expert_index].down_proj == nullptr) {
+      return false;
+    }
+    routed_up_descriptors[expert_index] = routed_experts[expert_index].up_proj;
+    routed_down_descriptors[expert_index] = routed_experts[expert_index].down_proj;
+  }
+
   auto routed_output = DeviceTensorFp32::CreateView(
       {token_count, config.hidden_size},
       fused_prefill_routed_output_scratch->data());
@@ -1560,6 +1581,12 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
   params.n_routed_experts = config.n_routed_experts;
   params.top_k = config.top_k;
+  params.cublas_handle = &cublas_handle;
+  params.heuristic_cache = heuristic_cache;
+  params.shared_up_descriptor = shared_up_nvfp4;
+  params.shared_down_descriptor = shared_down_nvfp4;
+  params.routed_up_descriptors = routed_up_descriptors.data();
+  params.routed_down_descriptors = routed_down_descriptors.data();
   params.shared_up =
       (prepared_weights != nullptr && prepared_weights->prepared)
           ? prepared_weights->shared_up
@@ -2615,18 +2642,18 @@ class ExpertLayerSlice::Impl::FusedDecodeBackend final : public MoeBackend {
   PreparedMoeWeights prepared_weights_;
 };
 
-class ExpertLayerSlice::Impl::FusedPrefillBackend final : public MoeBackend {
+class ExpertLayerSlice::Impl::UnifiedFusedBackend final : public MoeBackend {
  public:
-  explicit FusedPrefillBackend(Impl* impl) : impl_(impl) {}
+  explicit UnifiedFusedBackend(Impl* impl) : impl_(impl) {}
 
-  const char* Name() const override { return "fused_prefill"; }
+  const char* Name() const override { return "unified_fused"; }
 
   bool Supports(
       const ExpertLayerConfig& config,
       std::size_t token_count,
       int device_sm_version) const override {
     return impl_ != nullptr &&
-           impl_->SupportsFusedPrefillBackend(config, token_count, device_sm_version);
+           impl_->SupportsUnifiedFusedBackend(config, token_count, device_sm_version);
   }
 
   bool PrepareWeights(const MoeBackendPrepareContext& context) override {
@@ -2689,7 +2716,7 @@ class ExpertLayerSlice::Impl::FusedPrefillBackend final : public MoeBackend {
         output,
         &prepared_weights_);
     if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
-      std::cout << "expert_layer: fused prefill direct MoE path failed, falling back\n";
+      std::cout << "expert_layer: unified fused MoE path failed, falling back\n";
     }
     return ok;
   }
@@ -2784,9 +2811,9 @@ class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
 
 void ExpertLayerSlice::Impl::InitializeBackends() {
   backends_.clear();
+  backends_.emplace_back(std::make_unique<UnifiedFusedBackend>(this));
   backends_.emplace_back(std::make_unique<DecodeCublasLtBackend>(this));
   backends_.emplace_back(std::make_unique<FusedDecodeBackend>(this));
-  backends_.emplace_back(std::make_unique<FusedPrefillBackend>(this));
   backends_.emplace_back(std::make_unique<BatchedCublasLtBackend>(this));
 }
 
@@ -3425,7 +3452,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     }
   }
   if (fused_direct_moe_supported &&
-      config.max_token_count > 1 &&
+      config.max_token_count > 0 &&
       fused_prefill_opt_in) {
     fused_prefill_routing =
         DeviceExpertRouting::Create(config.n_routed_experts, max_selection_count);
@@ -3618,7 +3645,7 @@ bool ExpertLayerSlice::valid() const {
            impl_->device_topk_weights != nullptr)) &&
          (!(impl_->fused_prefill_opt_in &&
             impl_->fused_direct_moe_supported &&
-            impl_->config.max_token_count > 1) ||
+            impl_->config.max_token_count > 0) ||
           (impl_->fused_prefill_routing != nullptr &&
            impl_->fused_prefill_routed_output_scratch != nullptr &&
            impl_->fused_prefill_routed_output_scratch->valid() &&

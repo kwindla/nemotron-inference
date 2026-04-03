@@ -6,6 +6,10 @@
 
 namespace nemotron {
 
+class CublasLtHandle;
+class GemmHeuristicCache;
+struct GemmDescriptor;
+
 struct FusedMoePrefillParams {
   std::size_t token_count = 0;
   std::size_t selection_count = 0;
@@ -14,6 +18,12 @@ struct FusedMoePrefillParams {
   std::size_t shared_expert_intermediate_size = 0;
   std::size_t n_routed_experts = 0;
   std::size_t top_k = 0;
+  CublasLtHandle* cublas_handle = nullptr;
+  GemmHeuristicCache* heuristic_cache = nullptr;
+  const GemmDescriptor* shared_up_descriptor = nullptr;
+  const GemmDescriptor* shared_down_descriptor = nullptr;
+  const GemmDescriptor* const* routed_up_descriptors = nullptr;
+  const GemmDescriptor* const* routed_down_descriptors = nullptr;
   FusedNvfp4WeightView shared_up;
   FusedNvfp4WeightView shared_down;
   const FusedNvfp4WeightView* routed_up = nullptr;

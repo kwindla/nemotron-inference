@@ -200,7 +200,7 @@ Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory
   - size MoE scratch to the bounded execution window, not to the full request context
   Key files: `runtime/src/api/single_token_forward_model.cpp`, `runtime/src/backend/request_context.cpp`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **5. Land a unified fused backend before a custom kernel**
+- [x] **5. Land a unified fused backend before a custom kernel**
   Implement one fused backend that follows the vLLM-class contract:
   - GPU top-k inputs
   - prepared NVFP4 weights
@@ -267,8 +267,8 @@ Do not spend the next milestone on:
 | 1 | Unified MoE backend surface | done | 2537abc | MoeBackend interface + 4 concrete backends, unified dispatch loop in Run() |
 | 2 | GPU top-k as primary routing contract | done | 4dc5eb4 | topk_ids/topk_weights in MoeBackend::Run(), single RunDeviceExpertSelection call site |
 | 3 | Load-time NVFP4 backend-native weight preparation | done | fcb3f00 | MoeBackendPrepareContext + PreparedMoeWeights on all 4 backends |
-| 4 | Separate MoE chunking from request capacity | done | — | moe_prefill_window_tokens knob + runner-level chunking loop for expert layers |
-| 5 | Unified fused backend | pending | — | `RunFusedMoePrefill()` is still a stub and the decode fused kernel is decode-only |
+| 4 | Separate MoE chunking from request capacity | done | acd7abf | moe_prefill_window_tokens knob + runner-level chunking loop for expert layers |
+| 5 | Unified fused backend | done | — | RunFusedMoePrefill implemented, UnifiedFusedBackend for token_count >= 1 |
 | 6 | Decode specialization decision by benchmark | pending | — | Existing decode kernel has not yet been compared against a unified fused backend |
 | 7 | External comparison vs vLLM and current baseline | pending | — | Source-level comparison is done; runtime benchmark comparison is not |
 | 8 | Optional custom SM120 backend | pending | — | Intentionally deferred until the unified fused path is real and measured |
