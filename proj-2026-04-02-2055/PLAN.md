@@ -75,7 +75,7 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
   Remove `DecodeConsistentPrefillEnabled()` and the model-wide token-by-token replay loop at `single_token_forward_model.cpp:1242-1287`. Replace with per-layer dispatch: attention and expert layers always use batched prefill; only `MambaLayer::Run()` (starts at line 479) branches on token count. The fused decode env vars (`NEMOTRON_FORWARD_FUSED_MAMBA_DECODE`, `NEMOTRON_FORWARD_FUSED_MOE_DECODE`) should only affect the `token_count == 1` path inside each layer, not the model-wide dispatch. Expert layers already gate fused decode on `token_count == 1` (`expert_layer.cpp:1860`, `:2032`), so they need no change. After this step, multi-token prefill should work with batched attention + batched expert + the existing CPU-fallback Mamba path. Clean up `NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL` references in tests (e.g., `nano_16_token_correctness_test.cpp:381`). Add a correctness test: run a 16-token prefill + 3 decode steps with fused decode enabled, compare output tokens against the sequential baseline. Extend or reuse `mamba_layer_oracle_test.cpp:455` for the Mamba-specific parity check.
   Key files: `runtime/src/api/single_token_forward_model.cpp`, `testing/api/`, `testing/backend/mamba_layer_oracle_test.cpp`
 
-- [ ] **2. GPU causal conv1d prefill kernel**
+- [x] **2. GPU causal conv1d prefill kernel**
   Add a CUDA kernel `RunMambaConvPrefill()` that replaces the CPU conv loop in `mamba_layer.cpp:774-800`. Following vLLM's `causal_conv1d_fn` pattern: process all N tokens through the 1D depthwise causal convolution on GPU, applying SiLU activation. The kernel produces two outputs: (a) a device `[T, conv_dim]` tensor of conv results for the SSD step, and (b) updated conv state in `request_context.mamba_conv_state()` in our `[conv_dim][conv_kernel_size]` layout. The conv state update is equivalent to repeated `ShiftConvState` from the initial in-context state — for each channel, the final state contains the last `conv_kernel_size` input values in oldest-to-newest order. Accept optional initial conv state for cache-restore scenarios. For Nano dimensions (conv_dim=6144, kernel_size=4, token_count=32-4096), each channel's convolution is independent — a dot product of `conv_kernel_size` taps with the weight vector, slid causally over the token sequence. Add parity test: compare conv outputs and final conv state against the existing CPU reference path.
   Key files: `runtime/src/backend/mamba_conv_prefill.cu` (new), `runtime/include/nemotron/mamba_conv_prefill.h` (new), `runtime/src/backend/mamba_layer.cpp`, `testing/backend/`
 
@@ -94,8 +94,8 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Split model-wide decode-consistent gate | done | — | |
-| 2 | GPU causal conv1d prefill kernel | pending | — | |
+| 1 | Split model-wide decode-consistent gate | done | fabb259 | |
+| 2 | GPU causal conv1d prefill kernel | done | — | |
 | 3 | GPU SSD chunked prefill kernel | pending | — | |
 | 4 | Wire GPU prefill into MambaLayer + e2e tests | pending | — | |
 | 5 | Benchmark and tune | pending | — | |

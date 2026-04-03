@@ -510,6 +510,16 @@ target_compile_definitions(
 nemotron_add_test(mamba_update_fixture_test)
 
 add_executable(
+  mamba_conv_prefill_test
+  backend/mamba_conv_prefill_test.cpp
+)
+
+target_link_libraries(mamba_conv_prefill_test PRIVATE nemotron_runtime_backend)
+target_compile_features(mamba_conv_prefill_test PRIVATE cxx_std_17)
+
+nemotron_add_test(mamba_conv_prefill_test)
+
+add_executable(
   mamba_layer_oracle_test
   backend/mamba_layer_oracle_test.cpp
 )

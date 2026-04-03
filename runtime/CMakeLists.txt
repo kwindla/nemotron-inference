@@ -132,6 +132,7 @@ add_library(
   src/backend/linear_op_counters.cpp
   src/backend/linear_op_trace.cpp
   src/backend/linear_reference_kernels.cu
+  src/backend/mamba_conv_prefill.cu
   src/backend/mamba_layer.cpp
   src/backend/monolithic_expert_weights.cu
   src/backend/nvfp4_gemm_runner.cpp
