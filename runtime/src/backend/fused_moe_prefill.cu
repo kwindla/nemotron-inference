@@ -227,6 +227,21 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
+  // routed_up / routed_down are device arrays of FusedNvfp4WeightView.
+  // Copy them to host so we can read per-expert views for GEMM plan building.
+  std::vector<FusedNvfp4WeightView> routed_up_host;
+  std::vector<FusedNvfp4WeightView> routed_down_host;
+  if (!CopyDeviceBufferToHost(
+          params.routed_up,
+          params.n_routed_experts,
+          &routed_up_host) ||
+      !CopyDeviceBufferToHost(
+          params.routed_down,
+          params.n_routed_experts,
+          &routed_down_host)) {
+    return false;
+  }
+
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
   for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
     const int expert_id_int = active_expert_ids_host[active_slot];
@@ -235,14 +250,14 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     }
     const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
     if (expert_id >= params.n_routed_experts ||
-        !ValidFusedNvfp4WeightView(params.routed_up[expert_id]) ||
-        !ValidFusedNvfp4WeightView(params.routed_down[expert_id]) ||
+        !ValidFusedNvfp4WeightView(routed_up_host[expert_id]) ||
+        !ValidFusedNvfp4WeightView(routed_down_host[expert_id]) ||
         !DescriptorMatchesWeightView(
             params.routed_up_descriptors[expert_id],
-            params.routed_up[expert_id]) ||
+            routed_up_host[expert_id]) ||
         !DescriptorMatchesWeightView(
             params.routed_down_descriptors[expert_id],
-            params.routed_down[expert_id])) {
+            routed_down_host[expert_id])) {
       return false;
     }
 
@@ -271,9 +286,9 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     }
 
     const Nvfp4PackedMatrixDeviceView up_weight_view =
-        MakeNvfp4PackedMatrixDeviceView(params.routed_up[expert_id]);
+        MakeNvfp4PackedMatrixDeviceView(routed_up_host[expert_id]);
     const Nvfp4PackedMatrixDeviceView down_weight_view =
-        MakeNvfp4PackedMatrixDeviceView(params.routed_down[expert_id]);
+        MakeNvfp4PackedMatrixDeviceView(routed_down_host[expert_id]);
     const auto routed_up_plan = BuildRuntimeNvfp4GemmPlan(
         *params.routed_up_descriptors[expert_id],
         up_weight_view,

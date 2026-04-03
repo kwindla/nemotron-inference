@@ -8,7 +8,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
 
 ## Steps
 
-- [ ] **1. Bare-minimum inference sanity check**
+- [x] **1. Bare-minimum inference sanity check**
   Run `nano_save_prompt_oracle` directly with `NEMOTRON_FORWARD_UNIFIED_FUSED=1` and inspect the output JSON by hand. The goal is to verify the unified fused backend loads, runs a 16-token prefill, generates 16 decode tokens, and does not crash or produce garbage (e.g., all-zero logits, repeated token IDs, NaN values). Compare the generated tokens visually against a default-backend run. No scripts — just two direct invocations and manual diff of the JSON output.
 
   Run commands:
@@ -89,7 +89,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Bare-minimum inference sanity check | pending | — | |
+| 1 | Bare-minimum inference sanity check | done | — | Fixed device/host pointer bug in RunFusedMoePrefill, verified bit-identical output |
 | 2 | Audit and fix verify_correctness.sh | pending | — | |
 | 3 | Run internal performance benchmarks | pending | — | |
 | 4 | Run vLLM external baseline | pending | — | |

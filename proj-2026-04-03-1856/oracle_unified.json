@@ -1,0 +1,13 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+  "prompt_token_ids": [10, 25708, 1010, 4568, 1584, 1261, 25399, 27089, 1046, 50856, 15776, 10693, 1046, 11, 1010, 10],
+  "prompt_token_count": 16,
+  "decode_token_count": 16,
+  "boundary_token_id": 1047,
+  "boundary_top5": [{"index": 1047, "value": 17.713316}, {"index": 3174, "value": 17.4390469}, {"index": 1064, "value": 17.2314243}, {"index": 1034, "value": 17.0271778}, {"index": 1474, "value": 16.6574249}],
+  "boundary_max_logit": 17.713316,
+  "generated_token_ids": [1047, 1329, 32420, 16925, 1058, 1766, 1049, 3605, 1766, 1050, 3605, 1766, 1051, 3605, 1766, 1052],
+  "route": "A",
+  "route_description": "batched prefill + reference decode",
+  "timestamp_utc": "2026-04-03T20:36:04Z"
+}
