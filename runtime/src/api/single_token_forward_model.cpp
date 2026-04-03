@@ -54,17 +54,35 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
-std::unique_ptr<DeviceTensorFp32> CreateDecodeRowView(
+std::unique_ptr<DeviceTensorFp32> CreateTokenRangeView(
     DeviceTensorFp32* buffer,
+    std::size_t token_offset,
+    std::size_t token_count,
     std::size_t hidden_size) {
   if (buffer == nullptr ||
       !buffer->valid() ||
       buffer->shape().size() != 2 ||
-      buffer->shape()[0] == 0 ||
+      token_count == 0 ||
+      token_offset > buffer->shape()[0] ||
+      token_count > (buffer->shape()[0] - token_offset) ||
       buffer->shape()[1] != hidden_size) {
     return nullptr;
   }
-  return DeviceTensorFp32::CreateView({1, hidden_size}, buffer->data());
+  return DeviceTensorFp32::CreateView(
+      {token_count, hidden_size},
+      buffer->data() + (token_offset * hidden_size));
+}
+
+std::unique_ptr<DeviceTensorFp32> CreateDecodeRowView(
+    DeviceTensorFp32* buffer,
+    std::size_t hidden_size) {
+  return CreateTokenRangeView(buffer, 0, 1, hidden_size);
+}
+
+std::size_t EffectiveMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
+  return config.moe_prefill_window_tokens > 0
+             ? config.moe_prefill_window_tokens
+             : config.max_tokens;
 }
 
 std::size_t ParseEnvMiB(const char* env_var, std::size_t default_value_mib) {
@@ -678,6 +696,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
     }
   }
   impl->layers.reserve(plan->layers.size());
+  const std::size_t effective_moe_window_tokens = EffectiveMoePrefillWindowTokens(config);
 
   for (const ForwardLayerPlanEntry& plan_entry : plan->layers) {
     const LayerScheduleEntry* layer = schedule.FindLayer(plan_entry.layer_index);
@@ -748,7 +767,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
         expert_config.n_routed_experts = config.n_routed_experts;
         expert_config.top_k = config.experts_per_token;
-        expert_config.max_token_count = config.max_tokens;
+        expert_config.max_token_count = effective_moe_window_tokens;
         expert_config.n_group = config.expert_n_group;
         expert_config.topk_group = config.expert_topk_group;
         expert_config.rms_epsilon = config.layer_norm_epsilon;
@@ -1187,6 +1206,8 @@ bool SingleTokenForwardModel::RunTokens(
   const bool logits_valid = have_logits && logits->valid();
   const std::vector<std::size_t> expected_logits_shape = {token_count, impl_->config.vocab_size};
   const bool logits_shape_ok = logits_valid && logits->shape() == expected_logits_shape;
+  const std::size_t effective_moe_window_tokens =
+      EffectiveMoePrefillWindowTokens(impl_->config);
 
   if (!model_valid ||
       !have_tokens ||
@@ -1365,14 +1386,47 @@ bool SingleTokenForwardModel::RunTokens(
       case ForwardLayerKind::kExpert: {
         const bool created = layer.expert_slice != nullptr;
         const bool valid_slice = created && layer.expert_slice->valid();
-        const bool ran =
-            valid_slice &&
-            layer.expert_slice->Run(
+        bool ran = false;
+        if (valid_slice) {
+          if (token_count > effective_moe_window_tokens) {
+            ran = true;
+            // Chunk only MoE execution so expert scratch tracks the bounded window.
+            for (std::size_t token_offset = 0;
+                 token_offset < token_count;
+                 token_offset += effective_moe_window_tokens) {
+              const std::size_t chunk_token_count =
+                  std::min(effective_moe_window_tokens, token_count - token_offset);
+              auto current_chunk = CreateTokenRangeView(
+                  current,
+                  token_offset,
+                  chunk_token_count,
+                  impl_->config.hidden_size);
+              auto next_chunk = CreateTokenRangeView(
+                  next,
+                  token_offset,
+                  chunk_token_count,
+                  impl_->config.hidden_size);
+              ran = current_chunk != nullptr &&
+                    next_chunk != nullptr &&
+                    layer.expert_slice->Run(
+                        *impl_->cublas,
+                        impl_->heuristic_cache.get(),
+                        *current_chunk,
+                        next_chunk.get(),
+                        nullptr);
+              if (!ran) {
+                break;
+              }
+            }
+          } else {
+            ran = layer.expert_slice->Run(
                 *impl_->cublas,
                 impl_->heuristic_cache.get(),
                 *current,
                 next,
                 nullptr);
+          }
+        }
         if (debug && (!created || !valid_slice || !ran)) {
           std::cout << "single_token_forward_model: expert failure"
                     << " created=" << created

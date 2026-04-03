@@ -191,7 +191,7 @@ Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory
   This is a major plan change. The fast path should not be constrained to consume only the raw monolithic layout if backend-native preparation produces materially better execution behavior.
   Key files: `runtime/src/backend/monolithic_expert_weights.cu`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **4. Separate MoE chunking from request capacity**
+- [x] **4. Separate MoE chunking from request capacity**
   Add a dedicated MoE execution window knob and move long-prefill chunk orchestration to the model runner. Prompts larger than the MoE execution window should be driven as repeated internal chunks using the existing `RunPrefill(...)` / `ContinuePrefill(...)` semantics, rather than forcing expert-layer fallback to the monolithic path.
 
   This phase also owns the request-buffer cleanup:
@@ -266,8 +266,8 @@ Do not spend the next milestone on:
 | 0 | External benchmark and measurement discipline | done | 02d5ada | Benchmark script, wrapper, measurement methodology, and baseline provenance analysis landed |
 | 1 | Unified MoE backend surface | done | 2537abc | MoeBackend interface + 4 concrete backends, unified dispatch loop in Run() |
 | 2 | GPU top-k as primary routing contract | done | 4dc5eb4 | topk_ids/topk_weights in MoeBackend::Run(), single RunDeviceExpertSelection call site |
-| 3 | Load-time NVFP4 backend-native weight preparation | done | — | MoeBackendPrepareContext + PreparedMoeWeights on all 4 backends |
-| 4 | Separate MoE chunking from request capacity | partial | 98142a8 | Prefill plumbing exists, but execution-window semantics and runner-level orchestration are not complete |
+| 3 | Load-time NVFP4 backend-native weight preparation | done | fcb3f00 | MoeBackendPrepareContext + PreparedMoeWeights on all 4 backends |
+| 4 | Separate MoE chunking from request capacity | done | — | moe_prefill_window_tokens knob + runner-level chunking loop for expert layers |
 | 5 | Unified fused backend | pending | — | `RunFusedMoePrefill()` is still a stub and the decode fused kernel is decode-only |
 | 6 | Decode specialization decision by benchmark | pending | — | Existing decode kernel has not yet been compared against a unified fused backend |
 | 7 | External comparison vs vLLM and current baseline | pending | — | Source-level comparison is done; runtime benchmark comparison is not |
