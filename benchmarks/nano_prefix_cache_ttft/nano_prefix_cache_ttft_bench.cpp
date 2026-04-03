@@ -286,11 +286,11 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
 
 nemotron::RuntimeBootstrapOptions MakeOptions(std::size_t max_context_tokens) {
   nemotron::RuntimeBootstrapOptions options;
-  options.service_target.total_memory_bytes = GiB(128);
-  options.service_target.weights_bytes = GiB(100);
-  options.service_target.workspace_bytes = GiB(8);
-  options.service_target.graph_bytes = GiB(4);
-  options.service_target.safety_headroom_bytes = GiB(4);
+  options.service_target.total_memory_bytes = GiB(32);
+  options.service_target.weights_bytes = GiB(20);
+  options.service_target.workspace_bytes = GiB(1);
+  options.service_target.graph_bytes = 512ULL * 1024 * 1024;
+  options.service_target.safety_headroom_bytes = GiB(1);
   options.service_target.target_active_requests = 1;
   options.service_target.target_context_tokens = max_context_tokens;
   options.use_fp16_mamba_state = false;
@@ -877,6 +877,7 @@ int main(int argc, char** argv) {
 
   ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
   ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
+  ScopedEnvOverride linear_device_fastpath("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", "1");
 
   if (!HasCudaDevice()) {
     std::cout << "nano_prefix_cache_ttft_bench: skipped (no CUDA device available)\n";

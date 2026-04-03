@@ -87,7 +87,7 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
   Modify `MambaLayer::Run()` (starts at `mamba_layer.cpp:479`; replace the host multi-token fallback at lines 743-876) so that `token_count > 1` dispatches to the new GPU conv prefill (step 2) + GPU SSD prefill (step 3). The `token_count == 1` path stays on the existing fused decode kernels unchanged. The overall flow for multi-token prefill becomes: input norm → in-projection GEMM (batched, existing) → GPU conv prefill (produces `[T, conv_dim]` outputs + final conv state) → GPU SSD prefill (produces `[T, intermediate_size]` outputs + final SSM state) → **batched gated group RMSNorm** (apply `y * SiLU(gate)`, then per-group RMS norm over `intermediate_size/n_groups` = 512 elements with per-element weight; current `FusedMambaDecodeGroupNormKernel` is single-row only per `fused_mamba_decode.cu:324` — a batched variant is required) → out-projection GEMM (batched, existing) → residual add. Add end-to-end correctness tests: (a) multi-turn conversation with global-root restore + tail prefill + decode, comparing cached vs uncached token parity; (b) split-prefill equivalence: prefill N tokens in one shot vs K + (N-K) with cache restore between. These tests validate that the GPU prefill path produces state compatible with the fused decode kernel.
   Key files: `runtime/src/backend/mamba_layer.cpp`, `runtime/src/backend/mamba_gated_group_norm.cu` (new), `testing/api/`, `testing/backend/`
 
-- [ ] **5. Benchmark and tune**
+- [x] **5. Benchmark and tune**
   Re-run the TTFT benchmark (`benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`) with the GPU prefill path. The benchmark should no longer need to set `NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL=1`. Measure cold prefill at 256/1K/4K tokens and cached tail prefill at 32 tokens. Profile with Nsight Compute to identify kernel bottlenecks. Tune chunk_size (64/128/256/2048) and thread-block geometry for RTX 5090 (SM 12.0, 128 SMs, 32 GB VRAM). Expected performance: 32-token tail ~40-60ms, 256-token cold ~70-140ms (2-4x single decode step), 4K cold ~1-3s. If 4K cold prefill is still dominated by sequential inter-chunk state passing, add a parallel scan across chunk summaries. Save benchmark results to the project directory.
   Key files: `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-02-2055/`
 
@@ -97,5 +97,5 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
 | 1 | Split model-wide decode-consistent gate | done | fabb259 | |
 | 2 | GPU causal conv1d prefill kernel | done | 9585ad2 | |
 | 3 | GPU SSD chunked prefill kernel | done | 694e811 | v1 simple per-hidden-thread scan, not chunked |
-| 4 | Wire GPU prefill into MambaLayer + e2e tests | done | — | |
-| 5 | Benchmark and tune | pending | — | |
+| 4 | Wire GPU prefill into MambaLayer + e2e tests | done | 09e6a4e | |
+| 5 | Benchmark and tune | done | — | BLOCKED: NVFP4 linear ops fall back to CPU for M>1; need batched NVFP4 GEMM fix |
