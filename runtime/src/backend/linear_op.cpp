@@ -25,6 +25,7 @@ struct UploadedLinearOp::Impl {
   std::unique_ptr<DeviceDenseWeightFp32> dense_weight;
   std::unique_ptr<DeviceTensorBf16> dense_weight_bf16;
   std::unique_ptr<DeviceNvfp4Weight> nvfp4_weight;
+  mutable std::unique_ptr<DeviceTensorFp32> dense_weight_fp32_storage_;
   mutable std::unique_ptr<DeviceTensorFp32> bf16_activation_scratch_;
   mutable std::unique_ptr<DeviceTensorFp32> bf16_output_scratch_;
   mutable std::mutex dense_rows1_plan_mutex;
@@ -52,6 +53,10 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
   return BuildCublasLtGemmPlan(*execution);
 }
 
+bool IsBf16StorageType(std::string_view storage_dtype) {
+  return storage_dtype == "bf16" || storage_dtype == "bfloat16";
+}
+
 bool IsBf16DenseDescriptor(const GemmDescriptor& descriptor) {
   return descriptor.kernel_family == GemmKernelFamily::kDenseRowMajor &&
          descriptor.output_rows != 0 &&
@@ -59,7 +64,7 @@ bool IsBf16DenseDescriptor(const GemmDescriptor& descriptor) {
          descriptor.layout_tag == "row_major" &&
          !descriptor.is_scaled() &&
          descriptor.packed_bytes().valid() &&
-         (descriptor.storage_dtype == "bf16" || descriptor.storage_dtype == "bfloat16") &&
+         IsBf16StorageType(descriptor.storage_dtype) &&
          descriptor.packed_nbytes ==
              descriptor.output_rows * descriptor.input_cols * sizeof(__nv_bfloat16);
 }
@@ -235,11 +240,39 @@ std::optional<CublasLtGemmPlan> ResolveDensePlan(
 
 bool EnsureDenseWeightFp32(
     const GemmDescriptor& descriptor,
-    std::unique_ptr<DeviceDenseWeightFp32>* dense_weight) {
+    const DeviceTensorBf16* dense_weight_bf16,
+    std::unique_ptr<DeviceTensorFp32>* dense_weight_fp32_storage,
+    std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
+    cudaStream_t stream) {
   if (*dense_weight && (*dense_weight)->valid()) {
     return true;
   }
-  if (!IsBf16DenseDescriptor(descriptor)) {
+  if (dense_weight_bf16 != nullptr && dense_weight_bf16->valid()) {
+    if (dense_weight_fp32_storage == nullptr) {
+      return false;
+    }
+    const std::vector<std::size_t> shape = {descriptor.output_rows, descriptor.input_cols};
+    if (!*dense_weight_fp32_storage ||
+        !(*dense_weight_fp32_storage)->valid() ||
+        (*dense_weight_fp32_storage)->shape() != shape) {
+      *dense_weight_fp32_storage = DeviceTensorFp32::Create(shape);
+    }
+    if (!*dense_weight_fp32_storage ||
+        !(*dense_weight_fp32_storage)->valid() ||
+        !ConvertDeviceBf16ToFp32(
+            dense_weight_bf16->data(),
+            descriptor.output_rows * descriptor.input_cols,
+            (*dense_weight_fp32_storage)->data(),
+            stream)) {
+      return false;
+    }
+    *dense_weight = DeviceDenseWeightFp32::CreateView(
+        descriptor.output_rows,
+        descriptor.input_cols,
+        (*dense_weight_fp32_storage)->data());
+    return *dense_weight && (*dense_weight)->valid();
+  }
+  if (descriptor.packed_data == nullptr) {
     return false;
   }
   *dense_weight = DeviceDenseWeightFp32::Upload(descriptor);
@@ -820,11 +853,18 @@ template <typename OutputTensorT>
 bool RunDenseReferenceFallback(
     const GemmDescriptor& descriptor,
     std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
+    const DeviceTensorBf16* dense_weight_bf16,
+    std::unique_ptr<DeviceTensorFp32>* dense_weight_fp32_storage,
     const DeviceTensorFp32& activations,
     OutputTensorT* output,
     std::unique_ptr<DeviceTensorFp32>* output_fp32_scratch,
     cudaStream_t stream) {
-  if (!EnsureDenseWeightFp32(descriptor, dense_weight)) {
+  if (!EnsureDenseWeightFp32(
+          descriptor,
+          dense_weight_bf16,
+          dense_weight_fp32_storage,
+          dense_weight,
+          stream)) {
     return false;
   }
   if constexpr (std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
@@ -849,6 +889,8 @@ template <typename OutputTensorT>
 bool RunDenseReferenceFallback(
     const GemmDescriptor& descriptor,
     std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
+    const DeviceTensorBf16* dense_weight_bf16,
+    std::unique_ptr<DeviceTensorFp32>* dense_weight_fp32_storage,
     const DeviceTensorBf16& activations,
     OutputTensorT* output,
     std::unique_ptr<DeviceTensorFp32>* activations_fp32_scratch,
@@ -867,6 +909,8 @@ bool RunDenseReferenceFallback(
   return RunDenseReferenceFallback(
       descriptor,
       dense_weight,
+      dense_weight_bf16,
+      dense_weight_fp32_storage,
       *activations_fp32,
       output,
       output_fp32_scratch,
@@ -912,6 +956,20 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::CreateDenseView(
   auto impl = std::make_unique<Impl>();
   impl->descriptor = descriptor;
   impl->dense_weight = std::move(weight_view);
+  return std::unique_ptr<UploadedLinearOp>(new UploadedLinearOp(std::move(impl)));
+}
+
+std::unique_ptr<UploadedLinearOp> UploadedLinearOp::CreateDenseBf16View(
+    const GemmDescriptor& descriptor,
+    std::unique_ptr<DeviceTensorBf16> weight_view) {
+  if (descriptor.kernel_family != GemmKernelFamily::kDenseRowMajor ||
+      !weight_view || !weight_view->valid()) {
+    return nullptr;
+  }
+  auto impl = std::make_unique<Impl>();
+  impl->descriptor = descriptor;
+  impl->descriptor.storage_dtype = "bf16";
+  impl->dense_weight_bf16 = std::move(weight_view);
   return std::unique_ptr<UploadedLinearOp>(new UploadedLinearOp(std::move(impl)));
 }
 
@@ -1020,6 +1078,8 @@ bool UploadedLinearOp::Run(
       return RunDenseReferenceFallback(
           impl_->descriptor,
           &impl_->dense_weight,
+          impl_->dense_weight_bf16.get(),
+          &impl_->dense_weight_fp32_storage_,
           activations,
           output,
           &impl_->bf16_output_scratch_,
@@ -1121,6 +1181,8 @@ bool UploadedLinearOp::Run(
       return RunDenseReferenceFallback(
           impl_->descriptor,
           &impl_->dense_weight,
+          impl_->dense_weight_bf16.get(),
+          &impl_->dense_weight_fp32_storage_,
           activations,
           output,
           &impl_->bf16_activation_scratch_,
@@ -1232,6 +1294,8 @@ bool UploadedLinearOp::Run(
       return RunDenseReferenceFallback(
           impl_->descriptor,
           &impl_->dense_weight,
+          impl_->dense_weight_bf16.get(),
+          &impl_->dense_weight_fp32_storage_,
           activations,
           output,
           &impl_->bf16_activation_scratch_,

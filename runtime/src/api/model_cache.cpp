@@ -28,7 +28,7 @@ namespace nemotron {
 namespace {
 
 constexpr char kMagic[] = "NEMO_MODEL_CACHE_V1";
-constexpr std::uint32_t kCurrentModelCacheFormatVersion = 2;
+constexpr std::uint32_t kCurrentModelCacheFormatVersion = 3;
 constexpr std::size_t kAlignmentBytes = 256;
 
 template <typename T>
@@ -549,9 +549,40 @@ bool AddDenseEntry(
   entry.input_cols = descriptor.input_cols;
   entry.input_scale = input_scale;
   entry.weight_scale = storage_scale;
-  entry.payload_nbytes = descriptor.output_rows * descriptor.input_cols * sizeof(float);
+  if (kind == ModelCacheEntryKind::kDenseWeightBf16) {
+    if (!IsBf16Storage(descriptor.storage_dtype) ||
+        descriptor.packed_nbytes !=
+            descriptor.output_rows * descriptor.input_cols * sizeof(__nv_bfloat16)) {
+      return false;
+    }
+    entry.payload_nbytes = descriptor.packed_nbytes;
+  } else {
+    entry.payload_nbytes = descriptor.output_rows * descriptor.input_cols * sizeof(float);
+  }
   entries->push_back(std::move(entry));
   return true;
+}
+
+bool AddDenseWeightEntry(
+    const GemmDescriptor& descriptor,
+    std::unordered_set<std::string>* seen,
+    std::vector<ModelCacheEntry>* entries) {
+  if (IsBf16Storage(descriptor.storage_dtype)) {
+    return AddDenseEntry(
+        descriptor,
+        1.0f,
+        ModelCacheEntryKind::kDenseWeightBf16,
+        0.0f,
+        seen,
+        entries);
+  }
+  return AddDenseEntry(
+      descriptor,
+      1.0f,
+      ModelCacheEntryKind::kDenseWeightFp32,
+      0.0f,
+      seen,
+      entries);
 }
 
 bool AddScaledFp8NativeEntry(
@@ -659,7 +690,7 @@ bool WriteDeterministicModelCache(
     return false;
   }
   if (!AddEmbeddingEntry(*embedding, &seen, &entries) ||
-      !AddDenseEntry(*lm_head, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries) ||
+      !AddDenseWeightEntry(*lm_head, &seen, &entries) ||
       (final_norm != nullptr && !AddTensorFp32Entry(*final_norm, &seen, &entries))) {
     return false;
   }
@@ -674,10 +705,10 @@ bool WriteDeterministicModelCache(
         const auto bindings = BuildAttentionLayerBindings(*layer, kernel_catalog, gemm_catalog);
         if (!bindings.has_value() ||
             !AddTensorFp32Entry(*bindings->norm_weight, &seen, &entries) ||
-            !AddDenseEntry(*bindings->q_proj, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries) ||
-            !AddDenseEntry(*bindings->k_proj, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries) ||
-            !AddDenseEntry(*bindings->v_proj, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries) ||
-            !AddDenseEntry(*bindings->o_proj, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries)) {
+            !AddDenseWeightEntry(*bindings->q_proj, &seen, &entries) ||
+            !AddDenseWeightEntry(*bindings->k_proj, &seen, &entries) ||
+            !AddDenseWeightEntry(*bindings->v_proj, &seen, &entries) ||
+            !AddDenseWeightEntry(*bindings->o_proj, &seen, &entries)) {
           return false;
         }
         break;
@@ -710,13 +741,7 @@ bool WriteDeterministicModelCache(
                   &entries)) {
             return false;
           }
-        } else if (!AddDenseEntry(
-                       *bindings->in_proj_gemm_weight,
-                       1.0f,
-                       ModelCacheEntryKind::kDenseWeightFp32,
-                       0.0f,
-                       &seen,
-                       &entries)) {
+        } else if (!AddDenseWeightEntry(*bindings->in_proj_gemm_weight, &seen, &entries)) {
           return false;
         }
         if (bindings->out_proj_kernel_weight != nullptr &&
@@ -733,13 +758,7 @@ bool WriteDeterministicModelCache(
                   &entries)) {
             return false;
           }
-        } else if (!AddDenseEntry(
-                       *bindings->out_proj_gemm_weight,
-                       1.0f,
-                       ModelCacheEntryKind::kDenseWeightFp32,
-                       0.0f,
-                       &seen,
-                       &entries)) {
+        } else if (!AddDenseWeightEntry(*bindings->out_proj_gemm_weight, &seen, &entries)) {
           return false;
         }
         break;
@@ -749,8 +768,8 @@ bool WriteDeterministicModelCache(
         if (!bindings.has_value() ||
             !AddTensorFp32Entry(*bindings->input_norm_weight, &seen, &entries) ||
             !AddTensorFp32Entry(*bindings->gate_score_correction_bias, &seen, &entries) ||
-            !AddDenseEntry(*bindings->gate_weight, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries) ||
-            !AddDenseEntry(*bindings->fc2_latent_weight, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries)) {
+            !AddDenseWeightEntry(*bindings->gate_weight, &seen, &entries) ||
+            !AddDenseWeightEntry(*bindings->fc2_latent_weight, &seen, &entries)) {
           return false;
         }
         if (bindings->fc1_latent_kernel_weight != nullptr &&
@@ -767,7 +786,7 @@ bool WriteDeterministicModelCache(
                   &entries)) {
             return false;
           }
-        } else if (!AddDenseEntry(*bindings->fc1_latent_gemm_weight, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries)) {
+        } else if (!AddDenseWeightEntry(*bindings->fc1_latent_gemm_weight, &seen, &entries)) {
           return false;
         }
         if (bindings->shared_up_kernel_weight != nullptr &&
@@ -784,7 +803,7 @@ bool WriteDeterministicModelCache(
                   &entries)) {
             return false;
           }
-        } else if (!AddDenseEntry(*bindings->shared_up_gemm_weight, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries)) {
+        } else if (!AddDenseWeightEntry(*bindings->shared_up_gemm_weight, &seen, &entries)) {
           return false;
         }
         if (bindings->shared_down_gemm_weight->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
@@ -806,7 +825,7 @@ bool WriteDeterministicModelCache(
                   &entries)) {
             return false;
           }
-        } else if (!AddDenseEntry(*bindings->shared_down_gemm_weight, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries)) {
+        } else if (!AddDenseWeightEntry(*bindings->shared_down_gemm_weight, &seen, &entries)) {
           return false;
         }
         for (const ExpertWeightPair& pair : bindings->routed_experts) {
@@ -815,8 +834,8 @@ bool WriteDeterministicModelCache(
                 !AddNvfp4Entry(*pair.down_proj, &seen, &entries)) {
               return false;
             }
-          } else if (!AddDenseEntry(*pair.up_proj, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries) ||
-                     !AddDenseEntry(*pair.down_proj, 1.0f, ModelCacheEntryKind::kDenseWeightFp32, 0.0f, &seen, &entries)) {
+          } else if (!AddDenseWeightEntry(*pair.up_proj, &seen, &entries) ||
+                     !AddDenseWeightEntry(*pair.down_proj, &seen, &entries)) {
             return false;
           }
         }
@@ -889,6 +908,17 @@ bool WriteDeterministicModelCache(
                 reinterpret_cast<const std::uint8_t*>(values->data()),
                 values->size() * sizeof(float),
                 &payload_offset)) {
+          return false;
+        }
+        break;
+      }
+      case ModelCacheEntryKind::kDenseWeightBf16: {
+        const GemmDescriptor* descriptor = gemm_catalog.FindDescriptor(entry.tensor_name);
+        if (descriptor == nullptr ||
+            !IsBf16Storage(descriptor->storage_dtype) ||
+            descriptor->packed_data == nullptr ||
+            descriptor->packed_nbytes != entry.payload_nbytes ||
+            !WriteByteSpan(output, descriptor->packed_data, descriptor->packed_nbytes, &payload_offset)) {
           return false;
         }
         break;
@@ -1163,9 +1193,28 @@ std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateDenseLinearView(
     const GemmDescriptor& descriptor) const {
   const ModelCacheEntry* entry = FindEntry(descriptor.tensor_name);
   if (entry == nullptr ||
-      entry->kind != ModelCacheEntryKind::kDenseWeightFp32 ||
+      (entry->kind != ModelCacheEntryKind::kDenseWeightFp32 &&
+       entry->kind != ModelCacheEntryKind::kDenseWeightBf16) ||
+      entry->output_rows != descriptor.output_rows ||
+      entry->input_cols != descriptor.input_cols ||
       !EnsureEntryResident(entry)) {
     return nullptr;
+  }
+  if (entry->kind == ModelCacheEntryKind::kDenseWeightBf16) {
+    auto weight = DeviceTensorBf16::CreateView(
+        {entry->output_rows, entry->input_cols},
+        reinterpret_cast<__nv_bfloat16*>(PayloadPtr(entry)));
+    if (!weight || !weight->valid()) {
+      return nullptr;
+    }
+    GemmDescriptor cached_descriptor = descriptor;
+    cached_descriptor.storage_dtype = "bf16";
+    cached_descriptor.compute_dtype = "bf16";
+    cached_descriptor.layout_tag = "row_major";
+    cached_descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
+    cached_descriptor.packed_data = nullptr;
+    cached_descriptor.packed_nbytes = 0;
+    return UploadedLinearOp::CreateDenseBf16View(cached_descriptor, std::move(weight));
   }
   auto weight = DeviceDenseWeightFp32::CreateView(
       entry->output_rows,

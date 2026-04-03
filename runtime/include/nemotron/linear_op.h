@@ -24,6 +24,9 @@ class UploadedLinearOp {
   static std::unique_ptr<UploadedLinearOp> CreateDenseView(
       const GemmDescriptor& descriptor,
       std::unique_ptr<DeviceDenseWeightFp32> weight_view);
+  static std::unique_ptr<UploadedLinearOp> CreateDenseBf16View(
+      const GemmDescriptor& descriptor,
+      std::unique_ptr<DeviceTensorBf16> weight_view);
   static std::unique_ptr<UploadedLinearOp> CreateNvfp4View(
       const GemmDescriptor& descriptor,
       std::unique_ptr<DeviceNvfp4Weight> weight_view);
