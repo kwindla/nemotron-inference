@@ -24,7 +24,7 @@ The exact failure point needs diagnosis. Possible causes:
 
 ## Steps
 
-- [ ] **1. Diagnose the exact failure point**
+- [x] **1. Diagnose the exact failure point**
   Add targeted diagnostic output to `linear_op.cpp` Run() for the M > 1 NVFP4 path. For each GEMM where M > 1: log whether BuildRuntimeGemmPlan succeeded, whether RunNvfp4RowMajorFp32SourceToDevice succeeded, and if not, at which sub-step it failed (packing, PrepareNvfp4MatmulCall, ExecutePreparedNvfp4Matmul, or algo heuristic). Run a short probe: 16-token prefill of the first 2 layers with `LINEAR_DEVICE_FASTPATH=1` and `NEMOTRON_FORWARD_DEBUG=1`. Capture the output to identify whether the failure is in plan building, algo selection, dimension validation, or execution. This step produces a diagnosis, not a fix.
   Key files: `runtime/src/backend/linear_op.cpp`, `runtime/src/backend/nvfp4_gemm_runner.cpp`
 
@@ -39,6 +39,6 @@ The exact failure point needs diagnosis. Possible causes:
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Diagnose exact failure point | pending | — | |
+| 1 | Diagnose exact failure point | done | — | NVFP4 M>1 works; bottleneck is expert/MoE layer per-token loop |
 | 2 | Fix M > 1 NVFP4 GEMM path | pending | — | |
 | 3 | End-to-end benchmark | pending | — | |
