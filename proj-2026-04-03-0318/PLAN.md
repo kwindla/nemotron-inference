@@ -92,7 +92,7 @@ Optional side probe: `cuDNN FE MoE grouped matmul` is still worth checking, but 
   Instrument the expert layer batched path (`expert_layer.cpp:934-1148`) with CUDA events to measure: (a) device expert selection time, (b) D→H copy + CPU routing table build + H→D copy time, (c) per-expert GEMM loop total time, (d) shared expert time, (e) residual add time, (f) allocation time. Record the full `expert_token_count` histogram per layer, not just the average active-expert count, because the fused kernel design depends on the actual `M` buckets that occur in practice. Use dedicated telemetry or a debug dump mode that does **not** route through `ExpertLayerRunTrace`, since the current GPU fast paths are gated on `trace == nullptr`. Save at least one representative 32-token tail-prefill routing histogram and timing breakdown for Nano.
   Key files: `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **2. Build device-side routing compaction for the fused path**
+- [x] **2. Build device-side routing compaction for the fused path**
   Add a GPU routing stage that replaces the CPU `BuildExpertRoutingTable` path for prefill and emits the metadata the owned kernel actually consumes: `expert_offsets[n_experts+1]`, `expert_token_indices[selection_count]`, `expert_token_weights[selection_count]`, `active_expert_ids[active_expert_count]`, and `bucket_offsets` or equivalent metadata for the chosen `M` buckets. This should stay entirely on device; do **not** optimize around copying `expert_offsets` back to the host for the current cuBLASLt loop. Allocate these routing outputs and the persistent work-queue buffers once on `ExpertLayerSlice::Impl` and reuse them across runs. Create `runtime/src/backend/expert_routing_device.cu` and `runtime/include/nemotron/expert_routing_device.h`.
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/expert_routing_device.cu` (new)
 
@@ -151,8 +151,8 @@ Optional side probe: `cuDNN FE MoE grouped matmul` is still worth checking, but 
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Profile and measure baseline | done | — | GEMM loop 92-97% of cost; M=4+ dominates histogram; D→H sync negligible |
-| 2 | Build device-side routing compaction for the fused path | pending | — | |
+| 1 | Profile and measure baseline | done | 3ac0b90 | GEMM loop 92-97% of cost; M=4+ dominates histogram; D→H sync negligible |
+| 2 | Build device-side routing compaction for the fused path | done | — | |
 | 3 | Add prefill fused-path plumbing and runtime gating | pending | — | |
 | 4 | Implement the routed persistent kernel family | pending | — | |
 | 5 | Benchmark and tune the fused path | pending | — | |

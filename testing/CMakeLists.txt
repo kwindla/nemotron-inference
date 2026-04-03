@@ -213,6 +213,16 @@ target_compile_features(device_argmax_test PRIVATE cxx_std_17)
 nemotron_add_test(device_argmax_test)
 
 add_executable(
+  expert_routing_device_test
+  backend/expert_routing_device_test.cpp
+)
+
+target_link_libraries(expert_routing_device_test PRIVATE nemotron_runtime_backend)
+target_compile_features(expert_routing_device_test PRIVATE cxx_std_17)
+
+nemotron_add_test(expert_routing_device_test)
+
+add_executable(
   device_nvfp4_matrix_test
   backend/device_nvfp4_matrix_test.cpp
 )
