@@ -24,6 +24,8 @@ struct UploadedLinearOp::Impl {
   std::unique_ptr<DeviceDenseWeightFp32> dense_weight;
   std::unique_ptr<DeviceTensorBf16> dense_weight_bf16;
   std::unique_ptr<DeviceNvfp4Weight> nvfp4_weight;
+  mutable std::unique_ptr<DeviceTensorFp32> bf16_activation_scratch_;
+  mutable std::unique_ptr<DeviceTensorFp32> bf16_output_scratch_;
   mutable std::mutex dense_rows1_plan_mutex;
   mutable bool dense_rows1_plan_attempted = false;
   mutable std::optional<CublasLtGemmPlan> dense_rows1_plan;
@@ -266,6 +268,19 @@ bool EnsureDenseWeightBf16(
   return true;
 }
 
+DeviceTensorFp32* EnsureFp32Scratch(
+    std::unique_ptr<DeviceTensorFp32>* scratch,
+    const std::vector<std::size_t>& shape) {
+  if (*scratch && (*scratch)->valid() && (*scratch)->shape() == shape) {
+    return scratch->get();
+  }
+  *scratch = DeviceTensorFp32::Create(shape);
+  if (!*scratch || !(*scratch)->valid()) {
+    return nullptr;
+  }
+  return scratch->get();
+}
+
 template <typename ActivationTensorT, typename OutputTensorT>
 std::optional<DenseRowMajorDeviceStats> RunDenseNativeDispatch(
     CublasLtHandle& handle,
@@ -358,6 +373,7 @@ bool RunDenseReferenceFallback(
     std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
     const DeviceTensorFp32& activations,
     OutputTensorT* output,
+    std::unique_ptr<DeviceTensorFp32>* output_fp32_scratch,
     cudaStream_t stream) {
   if (!EnsureDenseWeightFp32(descriptor, dense_weight)) {
     return false;
@@ -365,12 +381,12 @@ bool RunDenseReferenceFallback(
   if constexpr (std::is_same_v<OutputTensorT, DeviceTensorFp32>) {
     return RunDenseRowMajorFp32ReferenceToDevice(**dense_weight, activations, output).has_value();
   } else {
-    auto output_fp32 = DeviceTensorFp32::Create(output->shape());
-    return output_fp32 &&
+    DeviceTensorFp32* output_fp32 = EnsureFp32Scratch(output_fp32_scratch, output->shape());
+    return output_fp32 != nullptr &&
            RunDenseRowMajorFp32ReferenceToDevice(
                **dense_weight,
                activations,
-               output_fp32.get())
+               output_fp32)
                .has_value() &&
            ConvertDeviceFp32ToBf16(
                output_fp32->data(),
@@ -386,9 +402,12 @@ bool RunDenseReferenceFallback(
     std::unique_ptr<DeviceDenseWeightFp32>* dense_weight,
     const DeviceTensorBf16& activations,
     OutputTensorT* output,
+    std::unique_ptr<DeviceTensorFp32>* activations_fp32_scratch,
+    std::unique_ptr<DeviceTensorFp32>* output_fp32_scratch,
     cudaStream_t stream) {
-  auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
-  if (!activations_fp32 ||
+  DeviceTensorFp32* activations_fp32 =
+      EnsureFp32Scratch(activations_fp32_scratch, activations.shape());
+  if (activations_fp32 == nullptr ||
       !ConvertDeviceBf16ToFp32(
           activations.data(),
           activations.numel(),
@@ -396,7 +415,13 @@ bool RunDenseReferenceFallback(
           stream)) {
     return false;
   }
-  return RunDenseReferenceFallback(descriptor, dense_weight, *activations_fp32, output, stream);
+  return RunDenseReferenceFallback(
+      descriptor,
+      dense_weight,
+      *activations_fp32,
+      output,
+      output_fp32_scratch,
+      stream);
 }
 
 }  // namespace
@@ -545,6 +570,7 @@ bool UploadedLinearOp::Run(
           &impl_->dense_weight,
           activations,
           output,
+          &impl_->bf16_output_scratch_,
           stream);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
@@ -591,8 +617,9 @@ bool UploadedLinearOp::Run(
       if ((!impl_->dense_weight_bf16 || !impl_->dense_weight_bf16->valid()) &&
           impl_->dense_weight != nullptr &&
           impl_->dense_weight->valid()) {
-        auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
-        if (!activations_fp32 ||
+        DeviceTensorFp32* activations_fp32 =
+            EnsureFp32Scratch(&impl_->bf16_activation_scratch_, activations.shape());
+        if (activations_fp32 == nullptr ||
             !ConvertDeviceBf16ToFp32(
                 activations.data(),
                 activations.numel(),
@@ -641,11 +668,14 @@ bool UploadedLinearOp::Run(
           &impl_->dense_weight,
           activations,
           output,
+          &impl_->bf16_activation_scratch_,
+          &impl_->bf16_output_scratch_,
           stream);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled: {
-      auto activations_fp32 = DeviceTensorFp32::Create(activations.shape());
-      if (!activations_fp32 ||
+      DeviceTensorFp32* activations_fp32 =
+          EnsureFp32Scratch(&impl_->bf16_activation_scratch_, activations.shape());
+      if (activations_fp32 == nullptr ||
           !ConvertDeviceBf16ToFp32(
               activations.data(),
               activations.numel(),
@@ -743,14 +773,17 @@ bool UploadedLinearOp::Run(
           &impl_->dense_weight,
           activations,
           output,
+          &impl_->bf16_activation_scratch_,
+          &impl_->bf16_output_scratch_,
           stream);
     }
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled: {
-      auto output_fp32 = DeviceTensorFp32::Create(output->shape());
-      if (!output_fp32) {
+      DeviceTensorFp32* output_fp32 =
+          EnsureFp32Scratch(&impl_->bf16_output_scratch_, output->shape());
+      if (output_fp32 == nullptr) {
         return false;
       }
-      if (!Run(handle, heuristic_cache, activations, output_fp32.get(), stream)) {
+      if (!Run(handle, heuristic_cache, activations, output_fp32, stream)) {
         return false;
       }
       return ConvertDeviceFp32ToBf16(
