@@ -30,6 +30,7 @@ namespace {
 constexpr const char* kNanoModelId = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4";
 constexpr std::size_t kPromptTokenCount = 16;
 constexpr std::size_t kDecodeTokenCount = 16;
+constexpr std::size_t kParityContinuationStepCount = 3;
 
 constexpr std::size_t GiB(std::size_t value) {
   return value * 1024ull * 1024ull * 1024ull;
@@ -378,7 +379,7 @@ struct PrefillRouteConfig {
   const char* route_id = "";
   const char* description = "";
   bool fused_enabled = false;
-  bool decode_consistent_prefill_enabled = false;
+  bool sequential_prefill_enabled = false;
 };
 
 class ScopedRouteOverrides {
@@ -389,10 +390,7 @@ class ScopedRouteOverrides {
             route.fused_enabled ? "1" : "0"),
         fused_moe_(
             "NEMOTRON_FORWARD_FUSED_MOE_DECODE",
-            route.fused_enabled ? "1" : "0"),
-        decode_consistent_prefill_(
-            "NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL",
-            route.decode_consistent_prefill_enabled ? "1" : "0") {}
+            route.fused_enabled ? "1" : "0") {}
 
   ScopedRouteOverrides(const ScopedRouteOverrides&) = delete;
   ScopedRouteOverrides& operator=(const ScopedRouteOverrides&) = delete;
@@ -400,26 +398,19 @@ class ScopedRouteOverrides {
  private:
   ScopedEnvOverride fused_mamba_;
   ScopedEnvOverride fused_moe_;
-  ScopedEnvOverride decode_consistent_prefill_;
 };
 
 constexpr PrefillRouteConfig kRouteA = {
     "A",
-    "reference kernels + legacy multi-token prefill",
-    false,
-    false,
-};
-constexpr PrefillRouteConfig kRouteB = {
-    "B",
-    "reference kernels + decode-consistent prefill",
+    "sequential single-token baseline",
     false,
     true,
 };
 constexpr PrefillRouteConfig kRouteC = {
     "C",
-    "fused kernels + decode-consistent prefill",
+    "batched prefill + fused decode",
     true,
-    true,
+    false,
 };
 
 std::string PairId(
@@ -959,7 +950,6 @@ void PrintPrefillSummaryTable(
 
   std::cout << "nano_16_token_correctness_test: prefill route legend "
             << "A=(" << kRouteA.description << "), "
-            << "B=(" << kRouteB.description << "), "
             << "C=(" << kRouteC.description << ")\n";
   std::cout << "nano_16_token_correctness_test: prefill comparison matrix\n";
   std::cout << std::left << std::setw(8) << "pair"
@@ -992,74 +982,115 @@ std::optional<BoundaryObservation> RunPrefillBoundary(
   (void)route_overrides;
   const auto& prompt_token_ids = FixedPromptTokenIds();
 
-  auto logits =
-      nemotron::DeviceTensorFp32::Create({kPromptTokenCount, model.config().vocab_size});
-  if (logits == nullptr || !logits->valid()) {
-    return std::nullopt;
-  }
-  nemotron::SingleTokenForwardTrace trace;
-  nemotron::SingleTokenForwardTrace* trace_ptr = capture_trace_rows ? &trace : nullptr;
-
   std::cout << "nano_16_token_correctness_test: " << RouteDetail(route)
             << " prefill start prompt_tokens=" << kPromptTokenCount << "\n";
   std::cout.flush();
   const auto start = std::chrono::steady_clock::now();
-  if (!model.RunPrefill(
-          prompt_token_ids.data(),
+  BoundaryObservation observation;
+
+  if (route.sequential_prefill_enabled) {
+    auto logits = nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
+    if (logits == nullptr || !logits->valid()) {
+      return std::nullopt;
+    }
+
+    nemotron::SingleTokenForwardTrace final_trace;
+    for (std::size_t token_index = 0; token_index < prompt_token_ids.size(); ++token_index) {
+      nemotron::SingleTokenForwardTrace* trace_ptr =
+          capture_trace_rows && token_index + 1 == prompt_token_ids.size()
+              ? &final_trace
+              : nullptr;
+      const bool token_ok =
+          token_index == 0
+              ? model.RunSingleToken(
+                    prompt_token_ids[token_index],
+                    request_context,
+                    logits.get(),
+                    /*capture_layer_indices=*/{},
+                    trace_ptr)
+              : model.ContinueSingleToken(
+                    prompt_token_ids[token_index],
+                    request_context,
+                    logits.get(),
+                    /*capture_layer_indices=*/{},
+                    trace_ptr);
+      if (!token_ok) {
+        return std::nullopt;
+      }
+    }
+
+    observation.logits_row = CopyTensorToHost(*logits);
+    if (capture_trace_rows) {
+      observation.prompt_boundary_embedding_row = std::move(final_trace.embedding_output);
+      observation.prompt_boundary_final_hidden_normed_row =
+          std::move(final_trace.final_hidden_normed);
+    }
+  } else {
+    auto logits =
+        nemotron::DeviceTensorFp32::Create({kPromptTokenCount, model.config().vocab_size});
+    if (logits == nullptr || !logits->valid()) {
+      return std::nullopt;
+    }
+    nemotron::SingleTokenForwardTrace trace;
+    nemotron::SingleTokenForwardTrace* trace_ptr = capture_trace_rows ? &trace : nullptr;
+    if (!model.RunPrefill(
+            prompt_token_ids.data(),
+            prompt_token_ids.size(),
+            request_context,
+            logits.get(),
+            /*capture_layer_indices=*/{},
+            trace_ptr)) {
+      return std::nullopt;
+    }
+
+    const std::vector<float> host_logits = CopyTensorToHost(*logits);
+    observation.logits_row =
+        SliceRow(host_logits, prompt_token_ids.size() - 1, model.config().vocab_size);
+    if (capture_trace_rows) {
+      const std::size_t prompt_boundary_index = prompt_token_ids.size() - 1;
+      const std::size_t hidden_size = model.config().hidden_size;
+      auto embedding_row = ExtractTraceRow(
+          trace.embedding_output,
           prompt_token_ids.size(),
-          request_context,
-          logits.get(),
-          /*capture_layer_indices=*/{},
-          trace_ptr)) {
-    return std::nullopt;
+          prompt_boundary_index,
+          hidden_size);
+      if (!embedding_row.has_value()) {
+        std::cerr
+            << "nano_16_token_correctness_test: failed to capture prompt-boundary embedding row "
+            << "route=" << route.route_id
+            << " trace_values=" << trace.embedding_output.size()
+            << " hidden_size=" << hidden_size << "\n";
+        return std::nullopt;
+      }
+      auto final_hidden_normed_row = ExtractTraceRow(
+          trace.final_hidden_normed,
+          prompt_token_ids.size(),
+          prompt_boundary_index,
+          hidden_size);
+      if (!final_hidden_normed_row.has_value()) {
+        std::cerr
+            << "nano_16_token_correctness_test: failed to capture prompt-boundary final-norm row "
+            << "route=" << route.route_id
+            << " trace_values=" << trace.final_hidden_normed.size()
+            << " hidden_size=" << hidden_size << "\n";
+        return std::nullopt;
+      }
+      observation.prompt_boundary_embedding_row = std::move(*embedding_row);
+      observation.prompt_boundary_final_hidden_normed_row =
+          std::move(*final_hidden_normed_row);
+    }
   }
-  const std::vector<float> host_logits = CopyTensorToHost(*logits);
+
   const auto end = std::chrono::steady_clock::now();
-  const std::vector<float> final_row =
-      SliceRow(host_logits, prompt_token_ids.size() - 1, model.config().vocab_size);
-  const auto selected_token_id = ArgMaxTokenId(final_row);
+  const auto selected_token_id = ArgMaxTokenId(observation.logits_row);
   if (!selected_token_id.has_value()) {
     return std::nullopt;
   }
 
-  BoundaryObservation observation;
   observation.selected_token_id = *selected_token_id;
-  observation.logits_row = final_row;
   observation.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
   observation.sequence_length = request_context.sequence_length();
   observation.decode_position = request_context.decode_position();
-  if (capture_trace_rows) {
-    const std::size_t prompt_boundary_index = prompt_token_ids.size() - 1;
-    const std::size_t hidden_size = model.config().hidden_size;
-    auto embedding_row = ExtractTraceRow(
-        trace.embedding_output,
-        prompt_token_ids.size(),
-        prompt_boundary_index,
-        hidden_size);
-    if (!embedding_row.has_value()) {
-      std::cerr << "nano_16_token_correctness_test: failed to capture prompt-boundary embedding row "
-                << "route=" << route.route_id
-                << " trace_values=" << trace.embedding_output.size()
-                << " hidden_size=" << hidden_size << "\n";
-      return std::nullopt;
-    }
-    auto final_hidden_normed_row = ExtractTraceRow(
-        trace.final_hidden_normed,
-        prompt_token_ids.size(),
-        prompt_boundary_index,
-        hidden_size);
-    if (!final_hidden_normed_row.has_value()) {
-      std::cerr
-          << "nano_16_token_correctness_test: failed to capture prompt-boundary final-norm row "
-          << "route=" << route.route_id
-          << " trace_values=" << trace.final_hidden_normed.size()
-          << " hidden_size=" << hidden_size << "\n";
-      return std::nullopt;
-    }
-    observation.prompt_boundary_embedding_row = std::move(*embedding_row);
-    observation.prompt_boundary_final_hidden_normed_row =
-        std::move(*final_hidden_normed_row);
-  }
 
   std::cout << "nano_16_token_correctness_test: " << RouteDetail(route)
             << " prefill complete elapsed_ms=" << observation.elapsed_ms
@@ -1243,7 +1274,8 @@ std::optional<LayerObservation> RunLayerObservation(
   if (request_context == nullptr || !request_context->valid()) {
     return std::nullopt;
   }
-  auto logits = nemotron::DeviceTensorFp32::Create({kPromptTokenCount, model.config().vocab_size});
+  const std::size_t logit_rows = route.sequential_prefill_enabled ? 1 : kPromptTokenCount;
+  auto logits = nemotron::DeviceTensorFp32::Create({logit_rows, model.config().vocab_size});
   if (logits == nullptr || !logits->valid()) {
     return std::nullopt;
   }
@@ -1253,14 +1285,39 @@ std::optional<LayerObservation> RunLayerObservation(
             << " layer compare start layer_index=" << layer_index << "\n";
   std::cout.flush();
   const auto start = std::chrono::steady_clock::now();
-  if (!model.RunPrefill(
-          FixedPromptTokenIds().data(),
-          FixedPromptTokenIds().size(),
-          *request_context,
-          logits.get(),
-          {layer_index},
-          &trace,
-          layer_index)) {
+  if (route.sequential_prefill_enabled) {
+    const auto& prompt_token_ids = FixedPromptTokenIds();
+    for (std::size_t token_index = 0; token_index < prompt_token_ids.size(); ++token_index) {
+      nemotron::SingleTokenForwardTrace* trace_ptr =
+          token_index + 1 == prompt_token_ids.size() ? &trace : nullptr;
+      const bool token_ok =
+          token_index == 0
+              ? model.RunSingleToken(
+                    prompt_token_ids[token_index],
+                    *request_context,
+                    logits.get(),
+                    {layer_index},
+                    trace_ptr,
+                    layer_index)
+              : model.ContinueSingleToken(
+                    prompt_token_ids[token_index],
+                    *request_context,
+                    logits.get(),
+                    {layer_index},
+                    trace_ptr,
+                    layer_index);
+      if (!token_ok) {
+        return std::nullopt;
+      }
+    }
+  } else if (!model.RunPrefill(
+                 FixedPromptTokenIds().data(),
+                 FixedPromptTokenIds().size(),
+                 *request_context,
+                 logits.get(),
+                 {layer_index},
+                 &trace,
+                 layer_index)) {
     return std::nullopt;
   }
   const auto end = std::chrono::steady_clock::now();
@@ -1466,15 +1523,11 @@ bool run_nano_correctness_gate() {
   if (!using_saved_oracle) {
     route_a_context = model->CreateRequestContext();
   }
-  auto route_b_context = model->CreateRequestContext();
   auto route_c_context = model->CreateRequestContext();
   if ((!using_saved_oracle &&
        !expect(
            route_a_context != nullptr && route_a_context->valid(),
            "Route A request context should create")) ||
-      !expect(
-          route_b_context != nullptr && route_b_context->valid(),
-          "Route B request context should create") ||
       !expect(
           route_c_context != nullptr && route_c_context->valid(),
           "Route C request context should create")) {
@@ -1486,72 +1539,28 @@ bool run_nano_correctness_gate() {
     route_a_live_prefill =
         RunPrefillBoundary(*model, kRouteA, *route_a_context, capture_embedding_trace);
   }
-  const auto route_b_prefill =
-      RunPrefillBoundary(*model, kRouteB, *route_b_context, capture_embedding_trace);
   const auto route_c_prefill =
       RunPrefillBoundary(*model, kRouteC, *route_c_context, capture_embedding_trace);
   if ((!using_saved_oracle &&
        !expect(route_a_live_prefill.has_value(), "Route A prefill boundary should succeed")) ||
-      !expect(route_b_prefill.has_value(), "Route B prefill boundary should succeed") ||
       !expect(route_c_prefill.has_value(), "Route C prefill boundary should succeed")) {
     return false;
   }
   const BoundaryObservation route_a_prefill =
       using_saved_oracle ? MakeOracleBoundaryObservation(*saved_oracle) : *route_a_live_prefill;
 
-  const BoundaryComparison route_ab_comparison =
-      MakeBoundaryComparison(kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
   const BoundaryComparison route_ac_comparison =
       MakeBoundaryComparison(kRouteA, route_a_prefill, kRouteC, *route_c_prefill);
-  const BoundaryComparison route_bc_comparison =
-      MakeBoundaryComparison(kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
-  PrintPrefillSummaryTable(
-      using_saved_oracle
-          ? std::vector<BoundaryComparison>{
-                route_ab_comparison,
-                route_ac_comparison,
-                route_bc_comparison,
-            }
-          : std::vector<BoundaryComparison>{
-                route_ab_comparison,
-                route_bc_comparison,
-                route_ac_comparison,
-            });
-  if (capture_embedding_trace) {
-    if (!using_saved_oracle) {
-      PrintTraceComparisonSummary(kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
-    }
-    PrintTraceComparisonSummary(kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
+  PrintPrefillSummaryTable({route_ac_comparison});
+  if (capture_embedding_trace && !using_saved_oracle) {
+    PrintTraceComparisonSummary(kRouteA, route_a_prefill, kRouteC, *route_c_prefill);
   }
 
-  bool has_prefill_mismatch = false;
-  if (using_saved_oracle) {
-    if (HasSelectedTokenMismatch(route_ab_comparison)) {
-      PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
-      has_prefill_mismatch = true;
+  if (HasSelectedTokenMismatch(route_ac_comparison)) {
+    PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteC, *route_c_prefill);
+    if (!using_saved_oracle) {
+      MaybeTraceDivergentPromptLayers(*model, kRouteA, kRouteC);
     }
-    if (HasSelectedTokenMismatch(route_ac_comparison)) {
-      PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteC, *route_c_prefill);
-      has_prefill_mismatch = true;
-    }
-    if (HasSelectedTokenMismatch(route_bc_comparison)) {
-      PrintBoundaryMismatch("prefill", 0, kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
-      MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
-      has_prefill_mismatch = true;
-    }
-  } else {
-    if (HasSelectedTokenMismatch(route_ab_comparison)) {
-      PrintBoundaryMismatch("prefill", 0, kRouteA, route_a_prefill, kRouteB, *route_b_prefill);
-      MaybeTraceDivergentPromptLayers(*model, kRouteA, kRouteB);
-      has_prefill_mismatch = true;
-    }
-    if (HasSelectedTokenMismatch(route_bc_comparison)) {
-      PrintBoundaryMismatch("prefill", 0, kRouteB, *route_b_prefill, kRouteC, *route_c_prefill);
-      MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
-      has_prefill_mismatch = true;
-    }
-  }
-  if (has_prefill_mismatch) {
     return false;
   }
 
@@ -1560,51 +1569,28 @@ bool run_nano_correctness_gate() {
     for (std::size_t token_index = 1; token_index < generated_token_ids.size(); ++token_index) {
       const std::int32_t consume_token = generated_token_ids[token_index - 1];
       const std::int32_t expected_token = generated_token_ids[token_index];
-      const auto route_b_step = RunContinuationBoundary(
-          *model,
-          kRouteB,
-          *route_b_context,
-          consume_token,
-          token_index);
       const auto route_c_step = RunContinuationBoundary(
           *model,
           kRouteC,
           *route_c_context,
           consume_token,
           token_index);
-      if (!expect(route_b_step.has_value(), "Route B continuation boundary should succeed") ||
-          !expect(route_c_step.has_value(), "Route C continuation boundary should succeed")) {
+      if (!expect(route_c_step.has_value(), "Route C continuation boundary should succeed")) {
         return false;
       }
 
-      const bool route_b_match = route_b_step->selected_token_id == expected_token;
       const bool route_c_match = route_c_step->selected_token_id == expected_token;
-      if (route_b_match && route_c_match) {
+      if (route_c_match) {
         continue;
       }
 
-      if (!route_b_match) {
-        PrintOracleDecodeMismatch(
-            token_index,
-            consume_token,
-            expected_token,
-            kRouteB,
-            *route_b_step,
-            generated_token_ids);
-      }
-      if (!route_c_match) {
-        PrintOracleDecodeMismatch(
-            token_index,
-            consume_token,
-            expected_token,
-            kRouteC,
-            *route_c_step,
-            generated_token_ids);
-      }
-      if (route_b_step->selected_token_id != route_c_step->selected_token_id) {
-        PrintBoundaryMismatch("decode", token_index, kRouteB, *route_b_step, kRouteC, *route_c_step);
-        MaybeTraceDivergentPromptLayers(*model, kRouteB, kRouteC);
-      }
+      PrintOracleDecodeMismatch(
+          token_index,
+          consume_token,
+          expected_token,
+          kRouteC,
+          *route_c_step,
+          generated_token_ids);
       return false;
     }
 
@@ -1618,7 +1604,9 @@ bool run_nano_correctness_gate() {
   std::int32_t route_c_token = route_c_prefill->selected_token_id;
   std::vector<std::int32_t> generated_token_ids = {route_a_token};
 
-  for (std::size_t token_index = 1; token_index < kDecodeTokenCount; ++token_index) {
+  for (std::size_t token_index = 1;
+       token_index <= kParityContinuationStepCount;
+       ++token_index) {
     const auto route_a_step =
         RunContinuationBoundary(*model, kRouteA, *route_a_context, route_a_token, token_index);
     const auto route_c_step =

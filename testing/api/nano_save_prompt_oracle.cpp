@@ -89,7 +89,6 @@ struct PrefillRouteConfig {
   const char* route_id = "";
   const char* description = "";
   bool fused_enabled = false;
-  bool decode_consistent_prefill_enabled = false;
 };
 
 class ScopedRouteOverrides {
@@ -100,10 +99,7 @@ class ScopedRouteOverrides {
             route.fused_enabled ? "1" : "0"),
         fused_moe_(
             "NEMOTRON_FORWARD_FUSED_MOE_DECODE",
-            route.fused_enabled ? "1" : "0"),
-        decode_consistent_prefill_(
-            "NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL",
-            route.decode_consistent_prefill_enabled ? "1" : "0") {}
+            route.fused_enabled ? "1" : "0") {}
 
   ScopedRouteOverrides(const ScopedRouteOverrides&) = delete;
   ScopedRouteOverrides& operator=(const ScopedRouteOverrides&) = delete;
@@ -111,13 +107,11 @@ class ScopedRouteOverrides {
  private:
   ScopedEnvOverride fused_mamba_;
   ScopedEnvOverride fused_moe_;
-  ScopedEnvOverride decode_consistent_prefill_;
 };
 
 constexpr PrefillRouteConfig kRouteA = {
     "A",
-    "reference kernels + legacy multi-token prefill",
-    false,
+    "batched prefill + reference decode",
     false,
 };
 

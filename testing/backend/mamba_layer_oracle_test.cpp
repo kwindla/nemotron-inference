@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -51,6 +52,38 @@ bool expect(bool condition, const std::string& message) {
   }
   return true;
 }
+
+class ScopedEnvOverride {
+ public:
+  ScopedEnvOverride(const char* name, const char* value) : name_(name) {
+    const char* existing = std::getenv(name_.c_str());
+    if (existing != nullptr) {
+      had_original_ = true;
+      original_value_ = existing;
+    }
+    if (value == nullptr) {
+      unsetenv(name_.c_str());
+    } else {
+      setenv(name_.c_str(), value, 1);
+    }
+  }
+
+  ~ScopedEnvOverride() {
+    if (had_original_) {
+      setenv(name_.c_str(), original_value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+  ScopedEnvOverride(const ScopedEnvOverride&) = delete;
+  ScopedEnvOverride& operator=(const ScopedEnvOverride&) = delete;
+
+ private:
+  std::string name_;
+  std::string original_value_;
+  bool had_original_ = false;
+};
 
 std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
@@ -569,6 +602,111 @@ bool run_mamba_layer_fixture() {
       !expect(
           max_abs_diff(batch_ssm_state, sequential_ssm_state) <= 5.0e-5f,
           "batched Mamba SSM state should match repeated single-row execution")) {
+    return false;
+  }
+
+  std::vector<float> continuation_input(metadata->hidden_size, 0.0f);
+  for (std::size_t i = 0; i < metadata->hidden_size; ++i) {
+    continuation_input[i] =
+        input_hidden[i] + (0.001f * static_cast<float>(kBatchTokens)) -
+        (0.00005f * static_cast<float>(i % 11));
+  }
+
+  auto continuation_input_tensor = DeviceTensorFp32::Create({1, metadata->hidden_size});
+  auto batch_continuation_output = DeviceTensorFp32::Create({1, metadata->hidden_size});
+  auto sequential_continuation_output = DeviceTensorFp32::Create({1, metadata->hidden_size});
+  if (!expect(
+          continuation_input_tensor != nullptr && continuation_input_tensor->valid(),
+          "continuation input tensor should create for mamba oracle") ||
+      !expect(
+          batch_continuation_output != nullptr && batch_continuation_output->valid(),
+          "batched continuation output tensor should create for mamba oracle") ||
+      !expect(
+          sequential_continuation_output != nullptr &&
+              sequential_continuation_output->valid(),
+          "sequential continuation output tensor should create for mamba oracle") ||
+      !expect(
+          continuation_input_tensor->CopyFromHost(
+              continuation_input.data(),
+              continuation_input.size()),
+          "continuation input should upload")) {
+    return false;
+  }
+
+  {
+    ScopedEnvOverride fused_decode("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
+    if (!expect(
+            slice->Run(
+                *cublas,
+                &heuristic_cache,
+                *batch_request,
+                *continuation_input_tensor,
+                batch_continuation_output.get()),
+            "batched continuation should execute through fused decode") ||
+        !expect(
+            slice->Run(
+                *cublas,
+                &heuristic_cache,
+                *sequential_request,
+                *continuation_input_tensor,
+                sequential_continuation_output.get()),
+            "sequential continuation should execute through fused decode")) {
+      return false;
+    }
+  }
+
+  std::vector<float> batch_continuation_host(continuation_input.size(), 0.0f);
+  std::vector<float> sequential_continuation_host(continuation_input.size(), 0.0f);
+  std::vector<float> batch_post_continuation_conv_state(initial_conv_state.size(), 0.0f);
+  std::vector<float> batch_post_continuation_ssm_state(initial_ssm_state.size(), 0.0f);
+  std::vector<float> sequential_post_continuation_conv_state(initial_conv_state.size(), 0.0f);
+  std::vector<float> sequential_post_continuation_ssm_state(initial_ssm_state.size(), 0.0f);
+  if (!expect(
+          batch_continuation_output->CopyToHost(
+              batch_continuation_host.data(),
+              batch_continuation_host.size()),
+          "batched continuation output should download") ||
+      !expect(
+          sequential_continuation_output->CopyToHost(
+              sequential_continuation_host.data(),
+              sequential_continuation_host.size()),
+          "sequential continuation output should download") ||
+      !expect(
+          batch_request->mamba_conv_state()->CopyToHost(
+              batch_post_continuation_conv_state.data(),
+              batch_post_continuation_conv_state.size()),
+          "batched continuation conv state should download") ||
+      !expect(
+          batch_request->mamba_state()->CopyToHost(
+              batch_post_continuation_ssm_state.data(),
+              batch_post_continuation_ssm_state.size()),
+          "batched continuation ssm state should download") ||
+      !expect(
+          sequential_request->mamba_conv_state()->CopyToHost(
+              sequential_post_continuation_conv_state.data(),
+              sequential_post_continuation_conv_state.size()),
+          "sequential continuation conv state should download") ||
+      !expect(
+          sequential_request->mamba_state()->CopyToHost(
+              sequential_post_continuation_ssm_state.data(),
+              sequential_post_continuation_ssm_state.size()),
+          "sequential continuation ssm state should download")) {
+    return false;
+  }
+
+  if (!expect(
+          max_abs_diff(batch_continuation_host, sequential_continuation_host) <= 2.0e-3f,
+          "fused decode continuation output should match sequential baseline after batched prefill") ||
+      !expect(
+          max_abs_diff(
+              batch_post_continuation_conv_state,
+              sequential_post_continuation_conv_state) <= 1.0e-5f,
+          "fused decode continuation conv state should match sequential baseline after batched prefill") ||
+      !expect(
+          max_abs_diff(
+              batch_post_continuation_ssm_state,
+              sequential_post_continuation_ssm_state) <= 5.0e-5f,
+          "fused decode continuation ssm state should match sequential baseline after batched prefill")) {
     return false;
   }
 

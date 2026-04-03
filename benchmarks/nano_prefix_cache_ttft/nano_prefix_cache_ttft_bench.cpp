@@ -877,7 +877,6 @@ int main(int argc, char** argv) {
 
   ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
   ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
-  ScopedEnvOverride decode_consistent_prefill("NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL", "1");
 
   if (!HasCudaDevice()) {
     std::cout << "nano_prefix_cache_ttft_bench: skipped (no CUDA device available)\n";

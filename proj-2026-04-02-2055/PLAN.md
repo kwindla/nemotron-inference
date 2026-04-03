@@ -71,7 +71,7 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
 
 ## Steps
 
-- [ ] **1. Split the model-wide decode-consistent gate**
+- [x] **1. Split the model-wide decode-consistent gate**
   Remove `DecodeConsistentPrefillEnabled()` and the model-wide token-by-token replay loop at `single_token_forward_model.cpp:1242-1287`. Replace with per-layer dispatch: attention and expert layers always use batched prefill; only `MambaLayer::Run()` (starts at line 479) branches on token count. The fused decode env vars (`NEMOTRON_FORWARD_FUSED_MAMBA_DECODE`, `NEMOTRON_FORWARD_FUSED_MOE_DECODE`) should only affect the `token_count == 1` path inside each layer, not the model-wide dispatch. Expert layers already gate fused decode on `token_count == 1` (`expert_layer.cpp:1860`, `:2032`), so they need no change. After this step, multi-token prefill should work with batched attention + batched expert + the existing CPU-fallback Mamba path. Clean up `NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL` references in tests (e.g., `nano_16_token_correctness_test.cpp:381`). Add a correctness test: run a 16-token prefill + 3 decode steps with fused decode enabled, compare output tokens against the sequential baseline. Extend or reuse `mamba_layer_oracle_test.cpp:455` for the Mamba-specific parity check.
   Key files: `runtime/src/api/single_token_forward_model.cpp`, `testing/api/`, `testing/backend/mamba_layer_oracle_test.cpp`
 
@@ -94,7 +94,7 @@ vLLM layout: `(nheads, headdim, dstate)` — contiguous with `nheads*headdim = 4
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Split model-wide decode-consistent gate | pending | — | |
+| 1 | Split model-wide decode-consistent gate | done | — | |
 | 2 | GPU causal conv1d prefill kernel | pending | — | |
 | 3 | GPU SSD chunked prefill kernel | pending | — | |
 | 4 | Wire GPU prefill into MambaLayer + e2e tests | pending | — | |

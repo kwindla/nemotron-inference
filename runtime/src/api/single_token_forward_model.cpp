@@ -49,15 +49,6 @@ bool EnvEnabled(const char* env_var) {
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
-bool DecodeConsistentPrefillEnabled() {
-  const char* explicit_value = std::getenv("NEMOTRON_FORWARD_DECODE_CONSISTENT_PREFILL");
-  if (explicit_value != nullptr) {
-    return explicit_value[0] != '\0' && std::string(explicit_value) != "0";
-  }
-  return EnvEnabled("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE") ||
-         EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_DECODE");
-}
-
 bool DecodeScratchEnabled() {
   const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
@@ -1239,52 +1230,6 @@ bool SingleTokenForwardModel::RunTokens(
     return false;
   }
 
-  if (token_count > 1 && DecodeConsistentPrefillEnabled()) {
-    if (trace != nullptr) {
-      trace->embedding_output.clear();
-      trace->captured_layers.clear();
-      trace->final_hidden.clear();
-      trace->final_hidden_normed.clear();
-      trace->logits.clear();
-    }
-    auto step_logits = DeviceTensorFp32::Create({1, impl_->config.vocab_size});
-    if (step_logits == nullptr || !step_logits->valid()) {
-      std::cerr << "single_token_forward_model: sequential prefill logits buffer allocation failed\n";
-      return false;
-    }
-
-    for (std::size_t token_index = 0; token_index < token_count; ++token_index) {
-      SingleTokenForwardTrace step_trace;
-      SingleTokenForwardTrace* step_trace_ptr = trace != nullptr ? &step_trace : nullptr;
-      const bool step_reset = reset_request_state && token_index == 0;
-      if (!RunTokens(
-              token_ids + token_index,
-              1,
-              request_context,
-              step_logits.get(),
-              capture_layer_indices,
-              step_trace_ptr,
-              stop_layer_index,
-              step_reset)) {
-        std::cerr << "single_token_forward_model: sequential prefill step failed at token "
-                  << token_index << "\n";
-        return false;
-      }
-      if (!CopyDeviceLogitsRow(*step_logits, token_index, logits)) {
-        std::cerr << "single_token_forward_model: sequential prefill logits row copy failed at token "
-                  << token_index << "\n";
-        return false;
-      }
-      if (trace != nullptr) {
-        AppendHostRow(step_trace.embedding_output, &trace->embedding_output);
-        AppendCapturedLayers(step_trace.captured_layers, &trace->captured_layers);
-        AppendHostRow(step_trace.final_hidden, &trace->final_hidden);
-        AppendHostRow(step_trace.final_hidden_normed, &trace->final_hidden_normed);
-        AppendHostRow(step_trace.logits, &trace->logits);
-      }
-    }
-    return true;
-  }
   if (impl_->plan.attention_layer_count != 0 && impl_->cudnn == nullptr) {
     std::cerr << "single_token_forward_model: attention backend handle unavailable\n";
     return false;
