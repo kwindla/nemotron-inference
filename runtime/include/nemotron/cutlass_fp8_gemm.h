@@ -15,8 +15,9 @@ bool CutlassFp8DenseGemmAvailable();
 // D (output):      FP32, RowMajor, [M, N]
 //
 // The epilogue applies D = alpha * (A @ B), with beta fixed to 0.
-// This minimal kernel is specialized for the decode path and currently only
-// accepts M <= 16.
+// This minimal kernel is specialized for the decode path, currently only
+// accepts M <= 16, and caches CUTLASS workspace/adapter state internally so
+// repeated decode calls avoid per-call initialize-time allocation work.
 bool RunCutlassFp8DenseGemm(
     int m,
     int n,
