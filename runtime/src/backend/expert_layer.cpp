@@ -522,6 +522,32 @@ std::vector<ExpertSelection> SelectTopExperts(
   return selections;
 }
 
+bool BuildSelectedExpertsFromTopK(
+    const ExpertLayerConfig& config,
+    const std::vector<int>& topk_ids,
+    const std::vector<float>& topk_weights,
+    std::vector<ExpertSelection>* selected_experts) {
+  if (selected_experts == nullptr ||
+      topk_ids.size() != config.top_k ||
+      topk_weights.size() != config.top_k) {
+    return false;
+  }
+
+  selected_experts->clear();
+  selected_experts->reserve(config.top_k);
+  for (std::size_t slot = 0; slot < config.top_k; ++slot) {
+    const int expert_index = topk_ids[slot];
+    if (expert_index < 0 ||
+        static_cast<std::size_t>(expert_index) >= config.n_routed_experts) {
+      return false;
+    }
+    selected_experts->push_back(ExpertSelection{
+        static_cast<std::size_t>(expert_index),
+        topk_weights[slot]});
+  }
+  return true;
+}
+
 bool CopyToHost(const DeviceTensorFp32& tensor, std::vector<float>* output) {
   if (!tensor.valid() || output == nullptr) {
     return false;
@@ -608,6 +634,22 @@ class DeviceArray {
   T* data_ = nullptr;
   std::size_t size_ = 0;
 };
+
+template <typename T>
+bool CopyDeviceBufferToHost(
+    const T* device_data,
+    std::size_t count,
+    std::vector<T>* output) {
+  if (device_data == nullptr || output == nullptr) {
+    return false;
+  }
+  output->assign(count, T{});
+  return cudaMemcpy(
+             output->data(),
+             device_data,
+             count * sizeof(T),
+             cudaMemcpyDeviceToHost) == cudaSuccess;
+}
 
 FusedNvfp4WeightView MakeFusedNvfp4WeightView(const DeviceNvfp4Weight& weight) {
   return FusedNvfp4WeightView{
@@ -961,8 +1003,8 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> monolithic_down_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_up_nvfp4_views_device;
   std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> routed_down_nvfp4_views_device;
-  std::unique_ptr<DeviceArray<int>> fused_prefill_selected_indices;
-  std::unique_ptr<DeviceArray<float>> fused_prefill_selected_weights;
+  std::unique_ptr<DeviceArray<int>> device_topk_ids;
+  std::unique_ptr<DeviceArray<float>> device_topk_weights;
   std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
@@ -1000,6 +1042,8 @@ struct ExpertLayerSlice::Impl {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output) const;
 
   bool SupportsDecodeCublasLtBackend(
@@ -1028,6 +1072,10 @@ struct ExpertLayerSlice::Impl {
       bool compare_fused_debug,
       bool use_decode_scratch);
 
+  bool RunBackendExpertSelection(
+      const DeviceTensorFp32& router_logits,
+      std::size_t token_count);
+
   void InitializeBackends();
 
   bool RunDecodeCublasLtBackend(
@@ -1036,6 +1084,8 @@ struct ExpertLayerSlice::Impl {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output);
 
   bool RunFusedDecodeBackend(
@@ -1044,6 +1094,8 @@ struct ExpertLayerSlice::Impl {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output);
 
   bool RunFusedMoePrefillPath(
@@ -1052,7 +1104,10 @@ struct ExpertLayerSlice::Impl {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output) const;
+
 };
 
 struct MoeDirectDecodeScratch {
@@ -1188,6 +1243,40 @@ void ExpertLayerSlice::Impl::ResetBackendDispatchState(
   backend_dispatch_state.fused_debug_shared_host.clear();
 }
 
+bool ExpertLayerSlice::Impl::RunBackendExpertSelection(
+    const DeviceTensorFp32& router_logits,
+    std::size_t token_count) {
+  if (!router_logits.valid() ||
+      gate_score_correction_bias_device == nullptr ||
+      !gate_score_correction_bias_device->valid() ||
+      device_topk_ids == nullptr ||
+      device_topk_weights == nullptr ||
+      config.top_k == 0 ||
+      token_count == 0 ||
+      token_count > config.max_token_count ||
+      token_count > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
+    return false;
+  }
+
+  const std::size_t selection_count = token_count * config.top_k;
+  if (device_topk_ids->size() < selection_count ||
+      device_topk_weights->size() < selection_count) {
+    return false;
+  }
+
+  return RunDeviceExpertSelection(
+      router_logits,
+      *gate_score_correction_bias_device,
+      config.n_routed_experts,
+      config.top_k,
+      config.n_group,
+      config.topk_group,
+      config.routed_scaling_factor,
+      config.norm_topk_prob,
+      device_topk_ids->data(),
+      device_topk_weights->data());
+}
+
 bool ExpertLayerSlice::Impl::SupportsDecodeCublasLtBackend(
     const ExpertLayerConfig& backend_config,
     std::size_t token_count,
@@ -1245,11 +1334,15 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
     const DeviceTensorFp32& router_logits,
+    const int* topk_ids,
+    const float* topk_weights,
     DeviceTensorFp32* output) const {
   if (!cublas_handle.valid() ||
       !input.valid() ||
       !normalized.valid() ||
       !router_logits.valid() ||
+      topk_ids == nullptr ||
+      topk_weights == nullptr ||
       output == nullptr ||
       !output->valid() ||
       input.shape() != normalized.shape() ||
@@ -1270,15 +1363,11 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   }
 
   const std::size_t selection_count = token_count * config.top_k;
-  if (fused_prefill_selected_indices == nullptr ||
-      fused_prefill_selected_weights == nullptr ||
-      fused_prefill_routing == nullptr ||
+  if (fused_prefill_routing == nullptr ||
       fused_prefill_routed_output_scratch == nullptr ||
       fused_prefill_gather_scratch == nullptr ||
       fused_prefill_expert_up_scratch == nullptr ||
       fused_prefill_shared_up_scratch == nullptr ||
-      fused_prefill_selected_indices->size() < selection_count ||
-      fused_prefill_selected_weights->size() < selection_count ||
       fused_prefill_routing->selection_count() < selection_count ||
       shared_up_nvfp4_device == nullptr ||
       shared_down_nvfp4_device == nullptr ||
@@ -1287,20 +1376,9 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     return false;
   }
 
-  if (!RunDeviceExpertSelection(
-          router_logits,
-          *gate_score_correction_bias_device,
-          config.n_routed_experts,
-          config.top_k,
-          config.n_group,
-          config.topk_group,
-          config.routed_scaling_factor,
-          config.norm_topk_prob,
-          fused_prefill_selected_indices->data(),
-          fused_prefill_selected_weights->data()) ||
-      !RunDeviceExpertRouting(
-          fused_prefill_selected_indices->data(),
-          fused_prefill_selected_weights->data(),
+  if (!RunDeviceExpertRouting(
+          topk_ids,
+          topk_weights,
           token_count,
           config.top_k,
           fused_prefill_routing.get())) {
@@ -1382,6 +1460,8 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
     const DeviceTensorFp32& router_logits,
+    const int* topk_ids,
+    const float* topk_weights,
     DeviceTensorFp32* output) const {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool moe_profile = EnvEnabled("NEMOTRON_FORWARD_MOE_PROFILE");
@@ -1389,6 +1469,8 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
       !input.valid() ||
       !normalized.valid() ||
       !router_logits.valid() ||
+      topk_ids == nullptr ||
+      topk_weights == nullptr ||
       output == nullptr ||
       !output->valid() ||
       input.shape() != normalized.shape() ||
@@ -1419,30 +1501,13 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
   CudaEventSpan residual_span(moe_profile);
   total_span.RecordStart();
   selection_span.RecordStart();
-  auto selected_indices_device = DeviceArray<int>::Create(selection_count);
-  auto selected_weights_device = DeviceArray<float>::Create(selection_count);
-  if (!selected_indices_device ||
-      !selected_weights_device ||
-      !RunDeviceExpertSelection(
-          router_logits,
-          *gate_score_correction_bias_device,
-          config.n_routed_experts,
-          config.top_k,
-          config.n_group,
-          config.topk_group,
-          config.routed_scaling_factor,
-          config.norm_topk_prob,
-          selected_indices_device->data(),
-          selected_weights_device->data())) {
-    return false;
-  }
   selection_span.RecordEnd();
 
   std::vector<int> selected_indices_host;
   std::vector<float> selected_weights_host;
   routing_span.RecordStart();
-  if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
-      !selected_weights_device->CopyToHost(&selected_weights_host)) {
+  if (!CopyDeviceBufferToHost(topk_ids, selection_count, &selected_indices_host) ||
+      !CopyDeviceBufferToHost(topk_weights, selection_count, &selected_weights_host)) {
     return false;
   }
 
@@ -1839,27 +1904,16 @@ bool ExpertLayerSlice::Impl::RunDecodeCublasLtBackend(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
     const DeviceTensorFp32& router_logits,
+    const int* topk_ids,
+    const float* topk_weights,
     DeviceTensorFp32* output) {
-  auto selected_indices_device = DeviceArray<int>::Create(config.top_k);
-  auto selected_weights_device = DeviceArray<float>::Create(config.top_k);
-  if (!selected_indices_device ||
-      !selected_weights_device ||
-      !RunDeviceExpertSelection(
-          router_logits,
-          *gate_score_correction_bias_device,
-          config.n_routed_experts,
-          config.top_k,
-          config.n_group,
-          config.topk_group,
-          config.routed_scaling_factor,
-          config.norm_topk_prob,
-          selected_indices_device->data(),
-          selected_weights_device->data())) {
+  (void)router_logits;
+  if (topk_ids == nullptr || topk_weights == nullptr) {
     return false;
   }
 
   std::vector<int> selected_indices_host;
-  if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
+  if (!CopyDeviceBufferToHost(topk_ids, config.top_k, &selected_indices_host) ||
       selected_indices_host.size() != config.top_k) {
     return false;
   }
@@ -1989,7 +2043,7 @@ bool ExpertLayerSlice::Impl::RunDecodeCublasLtBackend(
       heuristic_cache,
       input,
       normalized,
-      selected_weights_device->data(),
+      topk_weights,
       routed_up_views,
       routed_down_views,
       normalized_pack.get(),
@@ -2005,8 +2059,15 @@ bool ExpertLayerSlice::Impl::RunFusedDecodeBackend(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& normalized,
     const DeviceTensorFp32& router_logits,
+    const int* topk_ids,
+    const float* topk_weights,
     DeviceTensorFp32* output) {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  (void)cublas_handle;
+  (void)heuristic_cache;
+  if (topk_ids == nullptr || topk_weights == nullptr) {
+    return false;
+  }
   const bool use_monolithic_residency = monolithic_resident;
   const bool use_full_residency =
       use_monolithic_residency ||
@@ -2030,7 +2091,7 @@ bool ExpertLayerSlice::Impl::RunFusedDecodeBackend(
   std::uint64_t experts_staged = 0;
   auto& staging_counters = GetExpertStagingCounters();
 
-  if (needs_host_selected_experts) {
+  if (backend_dispatch_state.host_selection_debug) {
     std::vector<float> router_logits_host;
     if (!CopyToHost(router_logits, &router_logits_host) ||
         router_logits_host.size() != config.n_routed_experts) {
@@ -2041,6 +2102,18 @@ bool ExpertLayerSlice::Impl::RunFusedDecodeBackend(
         router_logits_host,
         gate_score_correction_bias);
     if (selected_experts.size() != config.top_k) {
+      return false;
+    }
+  } else if (needs_host_selected_experts) {
+    std::vector<int> topk_ids_host;
+    std::vector<float> topk_weights_host;
+    if (!CopyDeviceBufferToHost(topk_ids, config.top_k, &topk_ids_host) ||
+        !CopyDeviceBufferToHost(topk_weights, config.top_k, &topk_weights_host) ||
+        !BuildSelectedExpertsFromTopK(
+            config,
+            topk_ids_host,
+            topk_weights_host,
+            &selected_experts)) {
       return false;
     }
   }
@@ -2156,9 +2229,9 @@ bool ExpertLayerSlice::Impl::RunFusedDecodeBackend(
   fused_params.routed_down = routed_down_device_ptr;
   fused_params.correction_bias = gate_score_correction_bias_device->data();
   fused_params.selected_indices =
-      selected_indices_device ? selected_indices_device->data() : nullptr;
+      selected_indices_device ? selected_indices_device->data() : topk_ids;
   fused_params.selected_weights =
-      selected_weights_device ? selected_weights_device->data() : nullptr;
+      selected_weights_device ? selected_weights_device->data() : topk_weights;
 
   if (!backend_dispatch_state.compare_fused_debug) {
     return RunFusedMoeDirectDecode(fused_params, input, normalized, router_logits, output);
@@ -2211,6 +2284,8 @@ class ExpertLayerSlice::Impl::DecodeCublasLtBackend final : public MoeBackend {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) override {
     (void)config;
@@ -2222,6 +2297,8 @@ class ExpertLayerSlice::Impl::DecodeCublasLtBackend final : public MoeBackend {
         input,
         normalized,
         router_logits,
+        topk_ids,
+        topk_weights,
         output);
     if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
       std::cout << "expert_layer: cuBLASLt direct MoE fastpath failed, falling back\n";
@@ -2255,6 +2332,8 @@ class ExpertLayerSlice::Impl::FusedDecodeBackend final : public MoeBackend {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) override {
     (void)config;
@@ -2266,6 +2345,8 @@ class ExpertLayerSlice::Impl::FusedDecodeBackend final : public MoeBackend {
         input,
         normalized,
         router_logits,
+        topk_ids,
+        topk_weights,
         output);
   }
 
@@ -2295,6 +2376,8 @@ class ExpertLayerSlice::Impl::FusedPrefillBackend final : public MoeBackend {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) override {
     (void)config;
@@ -2306,6 +2389,8 @@ class ExpertLayerSlice::Impl::FusedPrefillBackend final : public MoeBackend {
         input,
         normalized,
         router_logits,
+        topk_ids,
+        topk_weights,
         output);
     if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
       std::cout << "expert_layer: fused prefill direct MoE path failed, falling back\n";
@@ -2339,6 +2424,8 @@ class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) override {
     (void)config;
@@ -2350,6 +2437,8 @@ class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
         input,
         normalized,
         router_logits,
+        topk_ids,
+        topk_weights,
         output);
     if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
       std::cout << "expert_layer: batched direct MoE GPU path failed, falling back\n";
@@ -2987,33 +3076,36 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     }
   }
 
-  const std::size_t max_prefill_selection_count = config.max_token_count * config.top_k;
-  std::unique_ptr<DeviceArray<int>> fused_prefill_selected_indices;
-  std::unique_ptr<DeviceArray<float>> fused_prefill_selected_weights;
+  const std::size_t max_selection_count = config.max_token_count * config.top_k;
+  std::unique_ptr<DeviceArray<int>> device_topk_ids;
+  std::unique_ptr<DeviceArray<float>> device_topk_weights;
   std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
   const bool fused_prefill_opt_in = EnvEnabled("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+  if (fused_direct_moe_supported) {
+    device_topk_ids = DeviceArray<int>::Create(max_selection_count);
+    device_topk_weights = DeviceArray<float>::Create(max_selection_count);
+    if (!device_topk_ids || !device_topk_weights) {
+      return debug_fail("device top-k scratch allocation failed");
+    }
+  }
   if (fused_direct_moe_supported &&
       config.max_token_count > 1 &&
       fused_prefill_opt_in) {
-    fused_prefill_selected_indices = DeviceArray<int>::Create(max_prefill_selection_count);
-    fused_prefill_selected_weights = DeviceArray<float>::Create(max_prefill_selection_count);
     fused_prefill_routing =
-        DeviceExpertRouting::Create(config.n_routed_experts, max_prefill_selection_count);
+        DeviceExpertRouting::Create(config.n_routed_experts, max_selection_count);
     fused_prefill_routed_output_scratch =
         DeviceTensorFp32::Create({config.max_token_count, config.hidden_size});
     fused_prefill_gather_scratch =
-        DeviceTensorFp32::Create({max_prefill_selection_count, config.hidden_size});
+        DeviceTensorFp32::Create({max_selection_count, config.hidden_size});
     fused_prefill_expert_up_scratch = DeviceTensorFp32::Create(
-        {max_prefill_selection_count, config.routed_expert_intermediate_size});
+        {max_selection_count, config.routed_expert_intermediate_size});
     fused_prefill_shared_up_scratch = DeviceTensorFp32::Create(
         {config.max_token_count, config.shared_expert_intermediate_size});
-    if (!fused_prefill_selected_indices ||
-        !fused_prefill_selected_weights ||
-        !fused_prefill_routing ||
+    if (!fused_prefill_routing ||
         !fused_prefill_routed_output_scratch ||
         !fused_prefill_gather_scratch ||
         !fused_prefill_expert_up_scratch ||
@@ -3051,8 +3143,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->monolithic_down_views_device = std::move(monolithic_down_views_device);
   impl->routed_up_nvfp4_views_device = std::move(routed_up_nvfp4_views_device);
   impl->routed_down_nvfp4_views_device = std::move(routed_down_nvfp4_views_device);
-  impl->fused_prefill_selected_indices = std::move(fused_prefill_selected_indices);
-  impl->fused_prefill_selected_weights = std::move(fused_prefill_selected_weights);
+  impl->device_topk_ids = std::move(device_topk_ids);
+  impl->device_topk_weights = std::move(device_topk_weights);
   impl->fused_prefill_routing = std::move(fused_prefill_routing);
   impl->fused_prefill_routed_output_scratch = std::move(fused_prefill_routed_output_scratch);
   impl->fused_prefill_gather_scratch = std::move(fused_prefill_gather_scratch);
@@ -3183,12 +3275,13 @@ bool ExpertLayerSlice::valid() const {
          (!impl_->full_residency_enabled ||
           (impl_->routed_up_nvfp4_views_device != nullptr &&
            impl_->routed_down_nvfp4_views_device != nullptr)) &&
+         (!impl_->fused_direct_moe_supported ||
+          (impl_->device_topk_ids != nullptr &&
+           impl_->device_topk_weights != nullptr)) &&
          (!(impl_->fused_prefill_opt_in &&
             impl_->fused_direct_moe_supported &&
             impl_->config.max_token_count > 1) ||
-          (impl_->fused_prefill_selected_indices != nullptr &&
-           impl_->fused_prefill_selected_weights != nullptr &&
-           impl_->fused_prefill_routing != nullptr &&
+          (impl_->fused_prefill_routing != nullptr &&
            impl_->fused_prefill_routed_output_scratch != nullptr &&
            impl_->fused_prefill_routed_output_scratch->valid() &&
            impl_->fused_prefill_gather_scratch != nullptr &&
@@ -3301,27 +3394,44 @@ bool ExpertLayerSlice::Run(
         host_selection_debug,
         compare_fused_debug,
         use_decode_scratch);
+    bool have_supported_backend = false;
     for (const auto& backend : impl_->backends_) {
-      if (!backend->Supports(impl_->config, token_count, device_sm_version)) {
-        continue;
-      }
-      if (!backend->Run(
-              cublas_handle,
-              heuristic_cache,
-              impl_->config,
-              token_count,
-              input,
-              *normalized,
-              *router_logits,
-              output,
-              trace)) {
-        continue;
-      }
-      if (impl_->backend_dispatch_state.compare_fused_debug &&
-          impl_->backend_dispatch_state.collected_fused_debug) {
+      if (backend->Supports(impl_->config, token_count, device_sm_version)) {
+        have_supported_backend = true;
         break;
       }
-      return true;
+    }
+    if (have_supported_backend) {
+      if (impl_->RunBackendExpertSelection(*router_logits, token_count)) {
+        const int* topk_ids = impl_->device_topk_ids->data();
+        const float* topk_weights = impl_->device_topk_weights->data();
+        for (const auto& backend : impl_->backends_) {
+          if (!backend->Supports(impl_->config, token_count, device_sm_version)) {
+            continue;
+          }
+          if (!backend->Run(
+                  cublas_handle,
+                  heuristic_cache,
+                  impl_->config,
+                  token_count,
+                  input,
+                  *normalized,
+                  *router_logits,
+                  topk_ids,
+                  topk_weights,
+                  output,
+                  trace)) {
+            continue;
+          }
+          if (impl_->backend_dispatch_state.compare_fused_debug &&
+              impl_->backend_dispatch_state.collected_fused_debug) {
+            break;
+          }
+          return true;
+        }
+      } else if (debug) {
+        std::cout << "expert_layer: device expert selection failed, falling back\n";
+      }
     }
 
     std::vector<float> input_host;

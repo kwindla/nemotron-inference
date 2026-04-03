@@ -38,6 +38,8 @@ class MoeBackend {
       const DeviceTensorFp32& input,
       const DeviceTensorFp32& normalized,
       const DeviceTensorFp32& router_logits,
+      const int* topk_ids,
+      const float* topk_weights,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) = 0;
 };

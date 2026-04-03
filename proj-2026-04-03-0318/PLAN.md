@@ -176,7 +176,7 @@ Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory
   The layer and model code should route both decode and prefill through this shared selection surface.
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/include/nemotron/expert_layer.h`, `runtime/include/nemotron/fused_moe_decode.h`, `runtime/include/nemotron/fused_moe_prefill.h`
 
-- [ ] **2. Make GPU top-k the primary routing contract**
+- [x] **2. Make GPU top-k the primary routing contract**
   Keep router top-k selection on device and make GPU `topk_ids` / `topk_weights` the first-class interface between routing and expert execution. Keep expert-major compaction only as an adapter when the selected backend requires it.
 
   This changes the role of the current device routing helper:
@@ -264,8 +264,8 @@ Do not spend the next milestone on:
 | # | Phase | Status | Commit | Notes |
 |---|-------|--------|--------|-------|
 | 0 | External benchmark and measurement discipline | done | 02d5ada | Benchmark script, wrapper, measurement methodology, and baseline provenance analysis landed |
-| 1 | Unified MoE backend surface | done | — | MoeBackend interface + 4 concrete backends, unified dispatch loop in Run() |
-| 2 | GPU top-k as primary routing contract | partial | 7e0eeb0 | Device routing helper landed, but it currently serves an expert-major contract rather than a vLLM-class `topk_ids` / `topk_weights` contract |
+| 1 | Unified MoE backend surface | done | 2537abc | MoeBackend interface + 4 concrete backends, unified dispatch loop in Run() |
+| 2 | GPU top-k as primary routing contract | done | — | topk_ids/topk_weights in MoeBackend::Run(), single RunDeviceExpertSelection call site |
 | 3 | Load-time NVFP4 backend-native weight preparation | pending | — | Current fast path still assumes raw monolithic views rather than prepared backend-native layouts |
 | 4 | Separate MoE chunking from request capacity | partial | 98142a8 | Prefill plumbing exists, but execution-window semantics and runner-level orchestration are not complete |
 | 5 | Unified fused backend | pending | — | `RunFusedMoePrefill()` is still a stub and the decode fused kernel is decode-only |
