@@ -223,7 +223,7 @@ Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory
   The repository should not carry a separate decode architecture unless it earns its keep on this model and hardware.
   Key files: `runtime/src/backend/fused_moe_decode.cu`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **7. Benchmark the unified path against vLLM and baseline**
+- [x] **7. Benchmark the unified path against vLLM and baseline**
   Re-run the full matrix against:
   - current baseline runtime
   - unified fused backend
@@ -269,6 +269,6 @@ Do not spend the next milestone on:
 | 3 | Load-time NVFP4 backend-native weight preparation | done | fcb3f00 | MoeBackendPrepareContext + PreparedMoeWeights on all 4 backends |
 | 4 | Separate MoE chunking from request capacity | done | acd7abf | moe_prefill_window_tokens knob + runner-level chunking loop for expert layers |
 | 5 | Unified fused backend | done | a6f7582 | RunFusedMoePrefill implemented, UnifiedFusedBackend for token_count >= 1 |
-| 6 | Decode specialization decision by benchmark | done | — | Benchmark harness, BACKEND_SELECTION.md, NEMOTRON_FORWARD_UNIFIED_FUSED env var |
-| 7 | External comparison vs vLLM and current baseline | pending | — | Source-level comparison is done; runtime benchmark comparison is not |
+| 6 | Decode specialization decision by benchmark | done | ea3df20 | Benchmark harness, BACKEND_SELECTION.md, NEMOTRON_FORWARD_UNIFIED_FUSED env var |
+| 7 | External comparison vs vLLM and current baseline | done | — | Full comparison harness, correctness verification, updated MEASUREMENT.md |
 | 8 | Optional custom SM120 backend | pending | — | Intentionally deferred until the unified fused path is real and measured |
