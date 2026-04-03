@@ -9,18 +9,20 @@ Target: reduce 32-token tail prefill from 241ms toward ~80ms by reducing expert 
 
 ## Root Cause Analysis (corrected after review)
 
-With 32 tokens and top_k=6 (Nano config: 128 experts, n_group=1, topk_group=1):
-- Total routed selections: 32 × 6 = 192 token-expert pairs
-- **Active experts: ~100** (not ~45 — birthday paradox with 128 experts and 192 independent selections)
+Nano config (`single_token_forward_model.cpp:400-403`): **512 routed experts, 22 experts per token** (`experts_per_token=22`), `expert_n_group=1`, `expert_topk_group=1`.
+
+With 32 tokens and experts_per_token=22:
+- Total routed selections: 32 × 22 = **704 token-expert pairs**
+- Active experts: with 512 experts and 704 selections, birthday paradox gives ~374 active experts (uniform) — actual count depends on router skew, likely 200-400
 - Per-expert current cost in `RunBatchedDirectMoeViaCublaslt` (`expert_layer.cpp:1024`):
   - `GatherRowsFp32()` → 1 kernel
   - `RunNvfp4RowMajorFp32SourceToDevice()` for up_proj → **multiple kernels** (DeviceNvfp4Matrix::Create + cudaMalloc, pack kernels for nibbles/block-scales/matmul-scales/tensor-scale, cuBLASLt call) — ~5 dispatches total
   - `Relu2InPlaceFp32()` → 1 kernel
   - `RunNvfp4RowMajorFp32SourceToDevice()` for down_proj → ~5 dispatches
   - `ScatterAddWeightedRowsFp32()` → 1 kernel
-  - **Per-expert total: ~13 GPU dispatches** (not 5)
-- Per expert layer: ~100 experts × 13 = **~1,300 dispatches** + routing + shared expert + residual
-- 23 expert layers: **~30,000+ GPU dispatches** per forward pass
+  - **Per-expert total: ~13 GPU dispatches**
+- Per expert layer: ~300 active experts × 13 = **~3,900 dispatches** + routing + shared expert + residual
+- 23 expert layers: **~90,000+ GPU dispatches** per forward pass
 
 Additionally, the current path has **host synchronization overhead**:
 - `expert_layer.cpp:985`: copies expert selection results D→H
@@ -29,7 +31,7 @@ Additionally, the current path has **host synchronization overhead**:
 
 ## What to optimize (in priority order)
 
-1. **NVFP4 pack buffer allocation** (~200 cudaMalloc+cudaFree per layer): Each `RunNvfp4RowMajorFp32SourceToDevice` allocates a fresh `DeviceNvfp4Matrix` via cudaMalloc. The decode path already reuses pre-allocated buffers (`expert_layer.cpp:1165`). Pre-allocating reusable pack buffers for the prefill path eliminates ~200 allocation cycles per layer.
+1. **NVFP4 pack buffer allocation** (~600 cudaMalloc+cudaFree per layer): Each `RunNvfp4RowMajorFp32SourceToDevice` allocates a fresh `DeviceNvfp4Matrix` via cudaMalloc. The decode path already reuses pre-allocated buffers (`expert_layer.cpp:1165`). Pre-allocating reusable pack buffers for the prefill path eliminates ~600 allocation cycles per layer.
 
 2. **Global gather + contiguous per-expert GEMMs**: Replace per-expert gather kernels with one global gather into selection-order buffer. Per-expert GEMMs then read contiguous rows without additional gather. Final scatter uses a single pass with atomic adds (current scatter is non-atomic and only safe because experts are processed serially).
 
@@ -55,11 +57,11 @@ Additionally, the current path has **host synchronization overhead**:
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/device_nvfp4_matrix.cu`
 
 - [ ] **3. Global gather + atomic scatter**
-  Replace per-expert `GatherRowsFp32` + `ScatterAddWeightedRowsFp32` with: (a) one global gather sorting all 192 token-expert pairs into a contiguous `[192, hidden_size]` buffer ordered by expert, (b) per-expert GEMMs read contiguous slices of this buffer (no per-expert gather kernel), (c) one global `ScatterAddWeightedRowsFp32` using atomicAdd to handle multiple experts writing to the same token output row. This reduces ~200 gather+scatter kernels to 2 total per layer. Requires pre-allocating scratch for `selection_count = token_count × top_k` rows.
+  Replace per-expert `GatherRowsFp32` + `ScatterAddWeightedRowsFp32` with: (a) one global gather sorting all 704 token-expert pairs into a contiguous `[704, hidden_size]` buffer ordered by expert, (b) per-expert GEMMs read contiguous slices of this buffer (no per-expert gather kernel), (c) one global `ScatterAddWeightedRowsFp32` using atomicAdd to handle multiple experts writing to the same token output row. This reduces ~600 gather+scatter kernels to 2 total per layer. Requires pre-allocating scratch for `selection_count = token_count × experts_per_token` rows.
   Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/primitive_ops.cu`
 
 - [ ] **4. Benchmark and iterate**
-  Re-run TTFT benchmark. Target: 32-token tail prefill drops from ~241ms toward ~100ms. Profile again if above target — the remaining cost will be cuBLASLt per-expert matmul calls (~100 experts × 2 matmuls = 200 cuBLASLt calls per layer, irreducible without grouped GEMM). Save results.
+  Re-run TTFT benchmark. Target: 32-token tail prefill drops from ~241ms toward ~100ms. Profile again if above target — the remaining cost will be cuBLASLt per-expert matmul calls (~300 experts × 2 matmuls = ~600 cuBLASLt calls per layer, irreducible without grouped GEMM). Save results.
   Key files: `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-03-0318/`
 
 ## Progress
