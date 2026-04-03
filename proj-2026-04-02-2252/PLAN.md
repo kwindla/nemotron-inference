@@ -37,4 +37,4 @@ With 256 tokens × top_k experts × 23 expert layers, this is tens of thousands 
 |---|------|--------|--------|-------|
 | 1 | Diagnose exact failure point | done | baf4be6 | NVFP4 GEMMs work; expert layer CPU loop is bottleneck |
 | 2 | GPU expert layer batched prefill path | done | 636c46e | |
-| 3 | End-to-end benchmark | done | — | 256-tok cold 13.6x, 256-tail TTFT 4.7x; 4K tail regresses — needs profiling |
+| 3 | End-to-end benchmark | done | 4f8bc85 | 256-tok cold 13.6x, 256-tail TTFT 4.7x; 4K tail regresses — needs profiling |
