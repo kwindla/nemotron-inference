@@ -28,7 +28,7 @@ With 256 tokens × top_k experts × 23 expert layers, this is tens of thousands 
   Add a GPU-dispatched path for expert layers when `token_count > 1`. The current per-token CPU loop (`expert_layer.cpp:2263-2340`) routes each token to top-k experts, then calls `RunNvfp4LinearHost` per expert. Replace with: (a) batch the router logits computation on GPU (existing), (b) run expert selection on GPU (existing `DeviceExpertSelectionKernel`), (c) for each selected expert, run the up_proj and down_proj NVFP4 GEMMs on GPU using the existing `UploadedLinearOp::Run` path which already works for M > 1 (verified in step 1). The key challenge is that different tokens route to different experts, so the GEMMs need per-expert grouping. The simplest approach: for each expert that has at least one token routed to it, gather the relevant token rows, run the expert GEMM, scatter results back. The M=1 fused decode path must remain unchanged.
   Key files: `runtime/src/backend/expert_layer.cpp`, `testing/backend/`
 
-- [ ] **3. End-to-end benchmark**
+- [x] **3. End-to-end benchmark**
   Re-run the TTFT benchmark with GPU prefill + GPU expert dispatch. Measure cold prefill at 32/256/1K/4K tokens and cached tail prefill at 32 tokens. Compare against the sequential baseline (from `proj-2026-04-02-1029/ttft_benchmark_results.log`). Target: 32-token tail prefill ~40-60ms (down from 1,175ms), 256-token cold ~70-140ms (down from 9,248ms). Save results.
   Key files: `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-02-2252/`
 
@@ -36,5 +36,5 @@ With 256 tokens × top_k experts × 23 expert layers, this is tens of thousands 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Diagnose exact failure point | done | baf4be6 | NVFP4 GEMMs work; expert layer CPU loop is bottleneck |
-| 2 | GPU expert layer batched prefill path | done | — | |
-| 3 | End-to-end benchmark | pending | — | |
+| 2 | GPU expert layer batched prefill path | done | 636c46e | |
+| 3 | End-to-end benchmark | done | — | 256-tok cold 13.6x, 256-tail TTFT 4.7x; 4K tail regresses — needs profiling |
