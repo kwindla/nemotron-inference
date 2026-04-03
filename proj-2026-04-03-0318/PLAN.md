@@ -1,158 +1,274 @@
-# Plan: Prefill Kernel Launch Optimization
+# Plan: Unified NVFP4 MoE Alignment vs vLLM
 
 Project directory: `./proj-2026-04-03-0318`
 
-## Context
-GPU batched prefill works but 32-token tail prefill costs 241ms instead of the earlier ~50ms stretch target. The bottleneck is kernel launch overhead, allocation overhead, and host synchronization in expert/MoE layers. Expert layers are responsible for ~97% of GPU dispatches per forward pass.
+## Goal
 
-Working target: test whether 32-token tail prefill can move from 241ms toward ~80-100ms by reducing expert-layer overhead. Treat this as a hypothesis, not an expected floor: RTX 5090 / SM120 still has to execute a large number of tiny-M NVFP4 GEMMs, which may leave the post-cleanup floor materially higher.
+Aim for the fastest practical MoE execution on RTX 5090 for both:
 
-## Root Cause Analysis
+- single-token decode
+- short and medium prefill (`32`, `64`, `128`, `256` tokens)
 
-Nano config (`single_token_forward_model.cpp:434-439`): **128 routed experts, 6 experts per token** (`experts_per_token=6`), `expert_n_group=1`, `expert_topk_group=1`.
+This plan is no longer prefill-only. The architectural target is a unified routed MoE execution surface that can serve both decode and prefill, with specialization retained only when benchmarking proves it is worth the complexity.
 
-With 32 tokens and experts_per_token=6:
-- Total routed selections: 32 × 6 = **192 token-expert pairs**
-- Active experts: with 128 experts and 192 selections, uniform occupancy gives **~100 active experts** in expectation — actual count depends on router skew, likely ~70-110
-- Per-expert current cost in `RunBatchedDirectMoeViaCublaslt` (`expert_layer.cpp:1024`):
-  - `GatherRowsFp32()` → 1 kernel
-  - `RunNvfp4RowMajorFp32SourceToDevice()` for up_proj → **multiple kernels** (DeviceNvfp4Matrix::Create + cudaMalloc, pack kernels for nibbles/block-scales/matmul-scales/tensor-scale, cuBLASLt call) — ~5 dispatches total
-  - `Relu2InPlaceFp32()` → 1 kernel
-  - `RunNvfp4RowMajorFp32SourceToDevice()` for down_proj → ~5 dispatches
-  - `ScatterAddWeightedRowsFp32()` → 1 kernel
-  - **Per-expert total: ~13 GPU dispatches**
-- Per expert layer: ~100 active experts × 13 = **~1,300 dispatches** + routing + shared expert + residual
-- 23 expert layers: **~30,000+ GPU dispatches** per forward pass
+## External Baseline
 
-## Host Synchronization Overhead
+The external comparison target for Nemotron Nano NVFP4 on RTX 5090 is:
 
-Each expert layer does **two device-host round-trips** during the batched path (`expert_layer.cpp:965-1007`):
+- vLLM `v0.19.0`
+- model path: `vllm/model_executor/models/nemotron_h.py`
+- MoE backend: `flashinfer_cutlass`
 
-1. **GPU → CPU** (`expert_layer.cpp:985-990`): Expert selection kernel writes `selected_indices[192]` and `selected_weights[192]` to device memory. These are copied to host via `CopyToHost()` — an implicit `cudaDeviceSynchronize()` + `cudaMemcpy D→H`. GPU goes idle while waiting.
+Do **not** treat `flashinfer_trtllm` as the primary latency baseline for this model. vLLM explicitly skips that path for Nemotron Nano NVFP4 because Nano's hidden size is `2688`, and `2688 % 512 != 0`.
 
-2. **CPU routing table construction** (`expert_layer.cpp:992-1004`): `BuildExpertRoutingTable()` runs on CPU — a counting sort that histograms expert indices, prefix-sums to get offsets, then scatters token indices and weights into expert-sorted order. This is O(n_experts + selection_count) = O(128 + 192) = ~320 operations. Fast on CPU (~microseconds) but the **sync cost** of stopping the GPU is the real overhead.
+The relevant vLLM architecture is:
 
-3. **CPU → GPU** (`expert_layer.cpp:1006-1007`): Sorted `expert_token_indices[192]` and `expert_token_weights[192]` are uploaded back to device via `CopyFromHost()`.
+- GPU top-k routing
+- load-time NVFP4 backend-native weight preparation
+- one fused expert call per chunk
+- the same fused MoE stack for chunked prefill and non-chunked execution
+- a runner-level chunk/window size separate from overall request capacity
 
-4. **Memory allocation** (`expert_layer.cpp:1008-1022`): `DeviceTensorFp32::Create()` calls for `routed_output`, `row_scratch`, `expert_up_output`, `shared_up_output` — each does a `cudaMalloc`.
+Internal optimization work counts only if it is measured against this external baseline, not just against our current runtime.
 
-With 23 expert layers: **46 device-host sync points** + **~92 cudaMalloc calls** per forward pass.
+## Current Runtime Snapshot
 
-### GPU replacement for BuildExpertRoutingTable
+The current repo is structurally behind that baseline in three important ways:
 
-`BuildExpertRoutingTable` (`expert_layer.cpp:823-870`) is a counting sort:
-1. **Histogram**: count selections per expert → `expert_counts[128]`
-2. **Prefix-sum**: exclusive scan of counts → `expert_offsets[129]`
-3. **Scatter**: for each selection, write `token_index` and `weight` to `expert_offsets[expert] + count++`
+1. Prefill fused execution is still plumbing-only. `RunFusedMoePrefill()` currently returns fallback immediately.
+2. The active multi-token MoE path is still a host-routed, per-expert loop with gather/GEMM/activation/GEMM/scatter behavior repeated for each active expert.
+3. The only real fused path today is decode-only, and it is a scalar/shared-memory dot-product kernel rather than a unified fused experts backend.
 
-This maps directly to standard GPU primitives:
-1. **GPU histogram**: one kernel, each thread atomically increments `expert_counts[selected_indices[i]]`
-2. **GPU exclusive prefix-sum**: one kernel (or CUB `DeviceScan::ExclusiveSum` over 128 elements)
-3. **GPU scatter**: one kernel, each thread writes its token index and weight to the sorted position
+Known measurement result:
 
-Total: 3 kernel launches instead of 2 sync points + CPU work. The `expert_offsets` array stays on device and is read directly by the per-expert GEMM loop (which only needs the offset and count per expert, read via `cudaMemcpy D→H` of the 129-element array once — or better, iterate on GPU).
+- `32`-token tail prefill is currently far slower than the original stretch target.
+- The per-expert GEMM/pack/launch loop still dominates the measured cost.
+- The existing routing histogram data is still incomplete for plan-locking purposes:
+  - the current histogram is coarse
+  - the current `32`-token artifact needs provenance verification
+  - representative `64`-token and `128`-token histograms still need to be captured
 
-## What to optimize (in priority order)
+## Plan Pivots
 
-1. **Measure the real routed shape distribution**: collect per-layer timing and actual expert-row histograms for Nano 32-token tail prefill. The owned kernel depends on the true `M` distribution, not the uniform expectation.
+This is the concrete change in direction relative to the earlier prefill-centric plan.
 
-2. **Build device-side routing for the fused path**: move routing compaction fully onto the GPU and produce the metadata the persistent kernel actually needs: `expert_offsets`, `active_expert_ids`, routed token indices/weights, and `M`-bucket metadata. Do not optimize the host cuBLASLt loop as an intermediate destination.
+### 1. Optimize against a unified MoE surface, not a prefill-only kernel
 
-3. **Add runtime plumbing and fallback**: wire a new prefill-only fused path into `ExpertLayerSlice::Run()` with runtime capability checks, Nano-shape guards, and a safe fallback to the existing batched path.
+The primary architecture should be one MoE execution surface for `token_count >= 1`. Decode specialization is allowed, but only as a backend choice under that shared surface.
 
-4. **Implement the SM120-specific persistent routed-expert kernel family**: make this the mainline optimization target. The kernel must be expert-major, persistent, and bucketed for Nano's tiny-`M` expert populations.
+### 2. Treat vLLM's routing contract as the reference shape
 
-5. **Benchmark and tune the fused path**: only after the fused path is correct should we spend time tuning bucket boundaries, CTA shapes, shared-memory staging, and accumulation strategy.
+The first-class routing product should be GPU `topk_ids` and `topk_weights`, not an expert-major routing table.
 
-Optional side probe: `cuDNN FE MoE grouped matmul` is still worth checking, but it is no longer on the critical path if we are explicitly owning the kernel.
+Expert-major compaction may still exist, but only as:
+
+- an adapter for the legacy fallback path
+- an adapter for a future custom backend that truly requires it
+
+It should not remain the center of the design.
+
+### 3. Move fast-path weight work to load time
+
+The fast path should be allowed to use a backend-native prepared NVFP4 weight layout. Raw monolithic weights can remain for:
+
+- fallback
+- validation
+- debug comparisons
+
+But "no new weight layout" should not constrain the fast path.
+
+### 4. Separate MoE execution window from request capacity
+
+MoE execution window size must be independent from:
+
+- `max_tokens`
+- KV reservation
+- request bookkeeping
+- persistent request activation capacity
+
+Long-prompt support should come from internal chunk orchestration, not from sizing MoE scratch or persistent row buffers to full prompt context.
+
+### 5. Keep the current decode kernel only if it wins by benchmark
+
+The existing decode-only fused kernel should not be preserved by policy. It should remain only if it is measurably faster than the unified fused backend once that backend exists.
+
+### 6. Delay a custom SM120 backend until the unified fused path is real
+
+An owned SM120-specific routed-expert kernel may still be the right end state, but it should be a follow-on backend, not the first milestone. The custom kernel should target the residual gap after:
+
+- unified backend surface
+- GPU routing contract
+- load-time weight preparation
+- runner-level chunking
+
+are already in place.
 
 ## Constraints
 
-- Experimental cuBLASLt grouped GEMM arrived in CUDA 13.1+, but the documented support does **not** cover CC 12.0 block-scaled NVFP4. Pointer-array grouped mode is also tensorwide-scaling oriented, so it is not a drop-in replacement for this path.
-- Expert weights are contiguous per-expert in monolithic storage (`monolithic_expert_weights.cu:188`). The owned fused path should consume those monolithic views directly rather than introducing a new weight layout.
-- The `token_count == 1` fused decode path must remain unchanged.
-- Shared expert should start as a companion fused kernel, not part of the first routed-kernel milestone.
-- Weight residency matters: if `monolithic_resident` / `full_residency_enabled` is false, per-expert uploads still happen inside the loop. The first fused prefill milestone should target resident monolithic weights only.
-- Pack-buffer reuse, global gather/scatter, and scratch pre-allocation are no longer mainline milestones. They remain fallback ideas for the existing cuBLASLt path, but the owned-kernel branch should not depend on them.
-- The fused prefill path must inherit the same high-level compatibility envelope as `fused_direct_moe_supported` in `expert_layer.cpp`: direct-MLP topology, no latent projection, NVFP4 routed up/down experts, and NVFP4 shared up/down experts. Do not describe the runtime gate as "Nano shape + SM120" only.
-- The owned-kernel branch still needs reusable device scratch. Routing metadata, active-expert lists, bucket offsets, queue state, and any per-layer fused scratch should live on `ExpertLayerSlice::Impl` and be reused across runs rather than being allocated per prefill.
+- The external performance bar is vLLM `flashinfer_cutlass`, not just our current runtime.
+- The fast path must support both decode and prefill, even if different internal backends are selected by token count.
+- Unsupported expert counts, unsupported dimensions, missing residency, or failed fast-path scratch allocation must disable the fast path non-fatally and preserve baseline execution.
+- Consumer Blackwell is `SM120 / compute capability 12.0`; do not assume SM100-only features such as `tcgen05` or TMEM portability.
+- For future custom kernels on SM120, the important limits remain:
+  - `128 KB` shared memory per SM
+  - `99 KB` shared memory per block
+  - `48` resident warps per SM
+  - `1536` resident threads per SM
+  - `64K` 32-bit registers per SM
+- For Nano (`hidden=2688`, routed intermediate `1856`), keeping fp32 input and fp32 intermediate state live across both routed matmuls costs `M * (2688 + 1856) * 4` bytes. That is already near the per-block shared-memory limit at `M=5`, so any custom backend must treat `M>=5` as a streamed or tiled regime.
+- Do not spend the next milestone on more cleanup inside the host-routed cuBLASLt fallback except where required for correctness or comparison.
 
-## RTX 5090 / SM120-specific constraints
+## RTX 5090 Sizing Policy
 
-- GeForce RTX 5090 is **SM120 / compute capability 12.0**, i.e. consumer Blackwell, not datacenter SM100 Blackwell.
-- The SM120 narrow-precision Tensor Core path is extended `mma.sync` FP4/FP6 support. Do **not** assume `tcgen05`, TMEM, or SM100-specific CUTLASS kernels are portable.
-- Compute capability 12.x limits relevant to any future custom kernel: **128 KB shared memory per SM**, **99 KB shared memory per block**, **48 resident warps per SM**, **1536 resident threads per SM**, **32 resident blocks per SM**, **64K 32-bit registers per SM**, **255 registers per thread**.
-- For Blackwell GeForce FP4/NVFP4 via cuBLASLt, keep the documented contract: **TN layout**, `CUBLAS_COMPUTE_32F`, `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`, Tensor Core-friendly **16-byte-aligned** pointers/dimensions, and **16-byte-aligned** scaling-factor bases with tiled/swizzled scaling layouts.
-- CUTLASS SM120 NVFP4 kernels are documented around large TN tiles (for example `128x128x128`), so this workload's many tiny-`M` routed experts are an inherently awkward fit even after host-side cleanup.
-- For Nano's `hidden=2688` and routed intermediate `1856`, keeping fp32 input rows and fp32 intermediate rows live across both routed matmuls costs `M * (2688 + 1856) * 4` bytes. That is ~72.7 KB at `M=4`, ~90.9 KB at `M=5`, and ~109.1 KB at `M=6` before extra staging. So `M>=5` cannot assume a single-CTA "keep everything in shared memory" design under the 99 KB per-block limit; larger buckets need tiled or streamed staging.
+The `64`-token region remains important, but it is now a tuning point inside a unified plan rather than the architectural center of a prefill-only design.
 
-## Steps
+### Separate capacities
 
-- [x] **1. Profile and measure baseline**
-  Instrument the expert layer batched path (`expert_layer.cpp:934-1148`) with CUDA events to measure: (a) device expert selection time, (b) D→H copy + CPU routing table build + H→D copy time, (c) per-expert GEMM loop total time, (d) shared expert time, (e) residual add time, (f) allocation time. Record the full `expert_token_count` histogram per layer, not just the average active-expert count, because the fused kernel design depends on the actual `M` buckets that occur in practice. Use dedicated telemetry or a debug dump mode that does **not** route through `ExpertLayerRunTrace`, since the current GPU fast paths are gated on `trace == nullptr`. Save at least one representative 32-token tail-prefill routing histogram and timing breakdown for Nano.
-  Key files: `runtime/src/backend/expert_layer.cpp`
+- **Request context capacity**: total prompt + decode tokens the request may hold.
+- **MoE execution window**: the token chunk size processed by one routed MoE call.
+- **Persistent request row buffers**: reusable activation buffers on `RequestExecutionContext`.
 
-- [x] **2. Build device-side routing compaction for the fused path**
-  Add a GPU routing stage that replaces the CPU `BuildExpertRoutingTable` path for prefill and emits the metadata the owned kernel actually consumes: `expert_offsets[n_experts+1]`, `expert_token_indices[selection_count]`, `expert_token_weights[selection_count]`, `active_expert_ids[active_expert_count]`, and `bucket_offsets` or equivalent metadata for the chosen `M` buckets. This should stay entirely on device; do **not** optimize around copying `expert_offsets` back to the host for the current cuBLASLt loop. Allocate these routing outputs and the persistent work-queue buffers once on `ExpertLayerSlice::Impl` and reuse them across runs. Create `runtime/src/backend/expert_routing_device.cu` and `runtime/include/nemotron/expert_routing_device.h`.
-  Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/expert_routing_device.cu` (new)
+These must be treated as different capacities.
 
-- [x] **3. Add prefill fused-path plumbing and runtime gating**
-  Introduce a new prefill-only entry point, for example `RunFusedMoePrefill()` in `runtime/src/backend/fused_moe_prefill.cu` with a header in `runtime/include/nemotron/fused_moe_prefill.h`. Integrate it in `ExpertLayerSlice::Run()` next to the decode fast path in `expert_layer.cpp`, but gate it with **runtime** checks: `token_count > 1`, direct-MLP topology, no latent projection, NVFP4 routed up/down experts, NVFP4 shared up/down experts, resident monolithic routed weights, Nano-compatible dimensions, and device capability sufficient for SM120 NVFP4 kernels. Do not use `__CUDA_ARCH__` in the host dispatch path. Fall back to `RunBatchedDirectMoeViaCublaslt()` when the fused path is unavailable.
-  Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/fused_moe_prefill.cu` (new), `runtime/include/nemotron/fused_moe_prefill.h` (new)
+### Recommended initial policy
 
-- [ ] **4. Implement the routed persistent kernel family**
-  Make the owned routed path the mainline optimization target. The kernel should be expert-major, persistent, and fed by the routing metadata from step 2. Start with correctness-first bucket specializations for the real Nano `M` distribution:
+- Keep full request capacity in KV/Mamba state and request bookkeeping.
+- Add a dedicated MoE execution window knob, for example `moe_max_tokens_per_call` or `prefill_window_tokens`.
+- Make `64` tokens the first-class tuning point for early fused benchmarking.
+- Treat `128` tokens as the next extension point.
+- Treat `256` tokens as a later streamed-kernel regime.
+- Shrink persistent request row buffers to decode-sized or another small fixed cap rather than coupling them to full request capacity by default.
 
-  **Integration boundary**
-  - Mirror `FusedMoeDirectLayerParams` from `fused_moe_decode.h`, but extend it with device routing buffers, active-expert lists, bucket metadata, and monolithic routed-weight views for all experts.
-  - Reuse the existing `RunDeviceExpertSelection()` path for router-side work; do not reimplement selection unless profiling proves it necessary.
-  - Keep debug and trace modes on the old path until the fused path is numerically stable.
+### Why this still matters
 
-  **Kernel decomposition**
-  - Phase A: keep router softmax / top-k selection on device using the existing `RunDeviceExpertSelection()` path.
-  - Phase B: build an expert-major routing table fully on device: `expert_offsets[129]`, `expert_token_indices[192]`, `expert_token_weights[192]`, `active_expert_ids[<=128]`, and bucket metadata for the chosen `M` ranges.
-  - Phase C: launch a persistent routed-expert kernel over the active experts. Each CTA or warpgroup repeatedly pops work from a global queue, stages an expert tile from `normalized`, runs the routed `up_proj`, applies `Relu2`, runs `down_proj`, multiplies by route weights, and accumulates into `routed_output[token, hidden]`.
-  - Phase D: run the shared expert in a companion fused kernel first; only fuse it into the routed kernel after the routed path is stable. The shared expert has no routing conflicts and is easier to validate independently.
-  - Phase E: finish with residual add in-kernel if register/shared-memory pressure allows; otherwise keep the existing residual epilogue.
+For Nano (`128` routed experts, `top_k=6`):
 
-  **Scheduling strategy**
-  - Schedule work expert-major, not token-major. Nano has only `192` routed rows per layer and usually `~70-110` active experts, so the average expert has `M ~= 1-3`. The kernel must therefore optimize for many tiny expert batches, not for large batched GEMMs.
-  - Start with `M=1`, `M=2`, and `M=3-4` buckets. Larger `M` values should use a streamed/tiled variant instead of assuming all fp32 row state fits in shared memory.
-  - Keep a global work queue of expert tiles so CTAs that finish a 1-row expert immediately claim more work. Do not bind one CTA permanently to one expert.
-  - Start with a simple ownership rule for output accumulation: one CTA owns one `(expert, token-row tile)` at a time and uses FP32 `atomicAdd` into `routed_output`. If the atomics become a visible bottleneck, upgrade to a token-major segmented reduction epilogue after the fused path is numerically stable.
-  - The fused path must define behavior for every observed `M`, not just the common buckets. The minimum acceptable first milestone is: native fused handling for `M=1`, `M=2`, and `M=3-4`, plus either (a) a streamed/tiled fused fallback for `M>=5`, or (b) explicit per-expert fallback of those rare larger-`M` experts to the existing batched path. Do not ship a path that silently assumes `M<=4`.
+- `32` tokens -> `192` routed selections
+- `64` tokens -> `384` routed selections
+- `128` tokens -> `768` routed selections
+- `256` tokens -> `1536` routed selections
 
-  **SM120 kernel design**
-  - Do not port the scalar `Nvfp4RowMajorDot` loop from `fused_moe_decode.cu` to prefill. That is structurally correct but not the performance target. The new routed kernel should use SM120 NVFP4 Tensor Core microkernels or CUTLASS/CuTe building blocks specialized for consumer Blackwell `mma.sync` FP4/NVFP4 instructions.
-  - Match the documented GeForce NVFP4 contract: TN-layout weights, FP32 accumulation, 16-byte-aligned data/scale pointers, and the existing swizzled/block-scaled weight layouts already produced by `monolithic_expert_weights.cu`.
-  - Avoid a design that materializes a global `[192, hidden]` gather buffer or global routed-intermediate buffer as the steady-state path.
-  - Expect multiple kernel variants. A dedicated `M=1` or `M=2` kernel can be materially different from an `M=3-4` kernel because register pressure, staging strategy, and accumulation ownership are different at Nano's routing scale.
+Increasing chunk size pushes more experts into `M>=5`, where SM120 shared-memory limits make simple tiny-`M` kernels much less attractive. That is why `64` remains a useful operating point, but it should not force a separate prefill-only architecture.
 
-  **Implementation order**
-  1. Land the API surface and feature flag, reusing the existing device expert selection and monolithic weight views.
-  2. Allocate reusable fused-path scratch on `ExpertLayerSlice::Impl`: routing outputs, active-expert arrays, bucket metadata, work queues, and any per-layer fused scratch needed by the new kernels.
-  3. Implement Phase B routing compaction with explicit debug dumps so expert ordering and weights can be validated against the current CPU-sorted path.
-  4. Implement a correctness-first fused routed kernel for `M=1`.
-  5. Extend to `M=2` and `M=3-4`, and add either a streamed/tiled `M>=5` kernel or explicit fallback of those experts to the existing batched path.
-  6. Replace scalar dot-product code with SM120 Tensor Core microkernels for the stabilized buckets.
-  7. Add the companion shared-expert kernel and integrate residual handling.
+## Execution Phases
 
-  **Success criteria**
-  - Reduce routed expert dispatches from `~1,300` per layer to a small fixed count, ideally: routing build + routed persistent launch(es) + shared expert + residual.
-  - Preserve numerical agreement with the current batched path to within explicit FP32 accumulation tolerances on full 32-token Nano prefills.
-  - Demonstrate that the fused path covers the full observed runtime `M` histogram for Nano, including the tail of larger-`M` experts.
-  - Demonstrate that the fused path beats the current batched cuBLASLt baseline on RTX 5090 for the real Nano routed shape distribution, not just on synthetic large-`M` cases.
-  Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/fused_moe_decode.cu`, `runtime/src/backend/monolithic_expert_weights.cu`, `runtime/src/backend/fused_moe_prefill.cu` (new), `runtime/include/nemotron/fused_moe_prefill.h` (new)
+- [x] **0. Lock the external benchmark and measurement discipline**
+  Benchmark vLLM locally for Nemotron Nano NVFP4 on RTX 5090 and make it the explicit bar for both decode and prefill. Capture:
+  - end-to-end latency for `1`, `32`, `64`, `128`, and `256` tokens
+  - MoE-layer time where available
+  - representative per-layer routing histograms for at least `32`, `64`, and `128` tokens
+  - exact provenance for the current `32`-token baseline artifact
+  Internal profiling does not replace this external comparison.
+  Key files: `third_party/vllm/`, `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-03-0318/`
 
-- [ ] **5. Benchmark and tune the fused path**
-  Re-run TTFT and the expert-layer micro-breakdown against the new fused path. Tune bucket boundaries, CTA sizes, work-queue granularity, shared-memory staging, and accumulation strategy only after the first fused implementation is correct. If the fused path still misses the working target, decide based on measurement whether to: (a) improve larger-`M` streamed variants, (b) reduce atomic pressure with a reduction epilogue, or (c) revisit cuDNN FE as a side experiment.
+- [ ] **1. Introduce a unified MoE backend surface**
+  Add an internal backend surface for routed MoE execution with at least:
+  - `PrepareWeights(...)`
+  - `Run(...)` for `token_count >= 1`
+  - `Supports(config, token_count, device)`
+
+  Planned backends:
+  - current batched cuBLASLt fallback
+  - current decode-only scalar kernel
+  - unified fused backend
+  - optional future custom SM120 backend
+
+  The layer and model code should route both decode and prefill through this shared selection surface.
+  Key files: `runtime/src/backend/expert_layer.cpp`, `runtime/include/nemotron/expert_layer.h`, `runtime/include/nemotron/fused_moe_decode.h`, `runtime/include/nemotron/fused_moe_prefill.h`
+
+- [ ] **2. Make GPU top-k the primary routing contract**
+  Keep router top-k selection on device and make GPU `topk_ids` / `topk_weights` the first-class interface between routing and expert execution. Keep expert-major compaction only as an adapter when the selected backend requires it.
+
+  This changes the role of the current device routing helper:
+  - useful for the legacy path
+  - possibly useful for a later custom backend
+  - not the primary contract for the vLLM-aligned fast path
+  Key files: `runtime/src/backend/fused_moe_decode.cu`, `runtime/src/backend/expert_routing_device.cu`, `runtime/include/nemotron/expert_routing_device.h`
+
+- [ ] **3. Add load-time NVFP4 backend-native weight preparation**
+  Prepare routed and shared expert weights once after loading into the format required by the chosen fused backend. Keep the raw monolithic views only for fallback, validation, and debugging.
+
+  This is a major plan change. The fast path should not be constrained to consume only the raw monolithic layout if backend-native preparation produces materially better execution behavior.
+  Key files: `runtime/src/backend/monolithic_expert_weights.cu`, `runtime/src/backend/expert_layer.cpp`
+
+- [ ] **4. Separate MoE chunking from request capacity**
+  Add a dedicated MoE execution window knob and move long-prefill chunk orchestration to the model runner. Prompts larger than the MoE execution window should be driven as repeated internal chunks using the existing `RunPrefill(...)` / `ContinuePrefill(...)` semantics, rather than forcing expert-layer fallback to the monolithic path.
+
+  This phase also owns the request-buffer cleanup:
+  - stop coupling persistent request row buffers to full request capacity by default
+  - keep `max_tokens` for request/KV limits
+  - size MoE scratch to the bounded execution window, not to the full request context
+  Key files: `runtime/src/api/single_token_forward_model.cpp`, `runtime/src/backend/request_context.cpp`, `runtime/src/backend/expert_layer.cpp`
+
+- [ ] **5. Land a unified fused backend before a custom kernel**
+  Implement one fused backend that follows the vLLM-class contract:
+  - GPU top-k inputs
+  - prepared NVFP4 weights
+  - one fused routed-expert execution path used by both decode and prefill
+  - shared experts integrated under the same execution surface
+
+  Preferred order:
+  1. Build the backend surface and integration path.
+  2. Make the backend correct for decode and bounded-window prefill.
+  3. Benchmark it against the current decode kernel and the current batched prefill path.
+
+  If direct FlashInfer/CUTLASS integration is acceptable in this codebase, that is the fastest route to vLLM-class alignment. If it is not acceptable, the internal backend should still mirror that contract closely.
+  Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/src/backend/fused_moe_decode.cu`, `runtime/src/backend/expert_layer.cpp`
+
+- [ ] **6. Decide the fate of the current decode kernel by measurement**
+  Once the unified fused backend exists, benchmark decode at `token_count == 1`:
+  - keep the current decode-only kernel if it still wins
+  - otherwise demote or remove the special case
+
+  The repository should not carry a separate decode architecture unless it earns its keep on this model and hardware.
+  Key files: `runtime/src/backend/fused_moe_decode.cu`, `runtime/src/backend/expert_layer.cpp`
+
+- [ ] **7. Benchmark the unified path against vLLM and baseline**
+  Re-run the full matrix against:
+  - current baseline runtime
+  - unified fused backend
+  - vLLM `flashinfer_cutlass`
+
+  Required coverage:
+  - correctness against the current runtime
+  - decode latency
+  - `32`-token tail prefill
+  - `64`-token and `128`-token chunked prefill
+  - fallback behavior
+  - non-fatal disable behavior
+  - long-prompt chunked equivalence
   Key files: `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-03-0318/`
 
+- [ ] **8. Only then decide whether to build a custom SM120 backend**
+  Pursue an owned SM120-specific routed-expert backend only if the unified fused path still leaves a clear measured gap on RTX 5090.
+
+  If that happens, the custom backend should be scoped narrowly:
+  - target the residual performance gap
+  - use the real measured `M` histogram
+  - specialize for the important buckets
+  - handle `M>=5` as a streamed or tiled regime
+  - plug into the unified backend surface instead of creating a third architecture
+  Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/src/backend/fused_moe_decode.cu`, `runtime/src/backend/expert_routing_device.cu`
+
+## What Not To Optimize Next
+
+Do not spend the next milestone on:
+
+- more host-path cleanup in the cuBLASLt fallback
+- more expert-major routing machinery unless the selected backend requires it
+- preserving the current decode kernel by policy
+- locking the design around a prefill-only persistent kernel before the unified backend surface and weight-prep surface exist
+
 ## Progress
-| # | Step | Status | Commit | Notes |
-|---|------|--------|--------|-------|
-| 1 | Profile and measure baseline | done | 3ac0b90 | GEMM loop 92-97% of cost; M=4+ dominates histogram; D→H sync negligible |
-| 2 | Build device-side routing compaction for the fused path | done | 7e0eeb0 | |
-| 3 | Add prefill fused-path plumbing and runtime gating | in-progress | — | |
-| 4 | Implement the routed persistent kernel family | pending | — | |
-| 5 | Benchmark and tune the fused path | pending | — | |
+
+| # | Phase | Status | Commit | Notes |
+|---|-------|--------|--------|-------|
+| 0 | External benchmark and measurement discipline | done | — | Benchmark script, wrapper, measurement methodology, and baseline provenance analysis landed |
+| 1 | Unified MoE backend surface | pending | — | Current runtime still has separate decode and prefill execution structures |
+| 2 | GPU top-k as primary routing contract | partial | 7e0eeb0 | Device routing helper landed, but it currently serves an expert-major contract rather than a vLLM-class `topk_ids` / `topk_weights` contract |
+| 3 | Load-time NVFP4 backend-native weight preparation | pending | — | Current fast path still assumes raw monolithic views rather than prepared backend-native layouts |
+| 4 | Separate MoE chunking from request capacity | partial | 98142a8 | Prefill plumbing exists, but execution-window semantics and runner-level orchestration are not complete |
+| 5 | Unified fused backend | pending | — | `RunFusedMoePrefill()` is still a stub and the decode fused kernel is decode-only |
+| 6 | Decode specialization decision by benchmark | pending | — | Existing decode kernel has not yet been compared against a unified fused backend |
+| 7 | External comparison vs vLLM and current baseline | pending | — | Source-level comparison is done; runtime benchmark comparison is not |
+| 8 | Optional custom SM120 backend | pending | — | Intentionally deferred until the unified fused path is real and measured |
