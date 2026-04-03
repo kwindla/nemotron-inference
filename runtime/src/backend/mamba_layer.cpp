@@ -16,6 +16,9 @@
 
 #include "nemotron/fused_mamba_decode.h"
 #include "nemotron/linear_op.h"
+#include "nemotron/mamba_conv_prefill.h"
+#include "nemotron/mamba_gated_group_norm.h"
+#include "nemotron/mamba_ssd_prefill.h"
 
 namespace nemotron {
 namespace {
@@ -581,7 +584,84 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  const bool use_fused_decode = trace == nullptr && token_count == 1 && FusedMambaDecodeEnabled();
+  if (token_count > 1) {
+    if (trace != nullptr) {
+      trace->in_proj_output.resize(projected->numel(), 0.0f);
+      if (!projected->CopyToHost(trace->in_proj_output.data(), trace->in_proj_output.size())) {
+        return false;
+      }
+    }
+
+    auto conv_output = DeviceTensorFp32::Create({token_count, conv_dim});
+    if (!conv_output || !conv_output->valid()) {
+      return false;
+    }
+
+    MambaConvPrefillParams conv_params;
+    conv_params.intermediate_size = impl_->config.intermediate_size;
+    conv_params.state_size = impl_->config.state_size;
+    conv_params.n_groups = impl_->config.n_groups;
+    conv_params.conv_kernel_size = impl_->config.conv_kernel_size;
+    conv_params.conv_state_offset_elems = impl_->config.conv_state_offset_elems;
+    conv_params.conv1d_weight = impl_->conv1d_weight_device->data();
+    conv_params.conv1d_bias = impl_->conv1d_bias_device->data();
+    if (!RunMambaConvPrefill(conv_params, request_context, *projected, conv_output.get())) {
+      return false;
+    }
+
+    MambaSsdPrefillParams ssd_params;
+    ssd_params.intermediate_size = impl_->config.intermediate_size;
+    ssd_params.num_heads = impl_->config.num_heads;
+    ssd_params.head_dim = impl_->config.head_dim;
+    ssd_params.state_size = impl_->config.state_size;
+    ssd_params.n_groups = impl_->config.n_groups;
+    ssd_params.ssm_state_offset_elems = impl_->config.ssm_state_offset_elems;
+    ssd_params.time_step_min = impl_->config.time_step_min;
+    ssd_params.A_log = impl_->A_log_device->data();
+    ssd_params.D = impl_->D_device->data();
+    ssd_params.dt_bias = impl_->dt_bias_device->data();
+    if (!RunMambaSsdPrefill(ssd_params, request_context, *projected, *conv_output, scan_output)) {
+      return false;
+    }
+
+    MambaGatedGroupNormParams group_norm_params;
+    group_norm_params.intermediate_size = impl_->config.intermediate_size;
+    group_norm_params.n_groups = impl_->config.n_groups;
+    group_norm_params.mixer_rms_epsilon = impl_->config.mixer_rms_epsilon;
+    group_norm_params.mixer_norm_weight = impl_->mixer_norm_weight_device->data();
+    if (!RunMambaGatedGroupNorm(group_norm_params, *projected, scan_output)) {
+      return false;
+    }
+
+    if (trace != nullptr) {
+      trace->scan_output.resize(scan_output->numel(), 0.0f);
+      if (!scan_output->CopyToHost(trace->scan_output.data(), trace->scan_output.size())) {
+        return false;
+      }
+    }
+
+    const bool out_proj_ok =
+        (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
+         impl_->out_proj_scaled_fp8->Run(
+             cublas_handle, heuristic_cache, *scan_output, projected_output)) ||
+        (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
+         impl_->out_proj_dense->Run(
+             cublas_handle, heuristic_cache, *scan_output, projected_output));
+    if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output)) {
+      return false;
+    }
+
+    if (trace != nullptr) {
+      trace->projected_output.resize(projected_output->numel(), 0.0f);
+      if (!projected_output->CopyToHost(trace->projected_output.data(), trace->projected_output.size())) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  const bool use_fused_decode = trace == nullptr && FusedMambaDecodeEnabled();
   if (use_fused_decode) {
     const bool compare_fused_decode = CompareFusedMambaEnabled();
     std::vector<float> projected_host_before_fused;
@@ -740,12 +820,10 @@ bool MambaLayerSlice::Run(
     return out_proj_ok && ResidualAddFp32(input, *projected_output, output);
   }
 
-  std::vector<float> input_host(input.numel(), 0.0f);
   std::vector<float> projected_host(projected->numel(), 0.0f);
   std::vector<float> conv_state_host(request_context.mamba_conv_state()->numel(), 0.0f);
   std::vector<float> ssm_state_host(request_context.mamba_state()->numel(), 0.0f);
-  if (!input.CopyToHost(input_host.data(), input_host.size()) ||
-      !projected->CopyToHost(projected_host.data(), projected_host.size()) ||
+  if (!projected->CopyToHost(projected_host.data(), projected_host.size()) ||
       !request_context.mamba_conv_state()->CopyToHost(conv_state_host.data(), conv_state_host.size()) ||
       !request_context.mamba_state()->CopyToHost(ssm_state_host.data(), ssm_state_host.size())) {
     return false;

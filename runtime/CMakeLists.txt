@@ -133,6 +133,7 @@ add_library(
   src/backend/linear_op_trace.cpp
   src/backend/linear_reference_kernels.cu
   src/backend/mamba_conv_prefill.cu
+  src/backend/mamba_gated_group_norm.cu
   src/backend/mamba_ssd_prefill.cu
   src/backend/mamba_layer.cpp
   src/backend/monolithic_expert_weights.cu

@@ -408,7 +408,7 @@ constexpr PrefillRouteConfig kRouteA = {
 };
 constexpr PrefillRouteConfig kRouteC = {
     "C",
-    "batched prefill + fused decode",
+    "batched prefill (GPU Mamba prefill) + fused decode",
     true,
     false,
 };

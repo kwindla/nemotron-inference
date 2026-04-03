@@ -530,6 +530,16 @@ target_compile_features(mamba_ssd_prefill_test PRIVATE cxx_std_17)
 nemotron_add_test(mamba_ssd_prefill_test)
 
 add_executable(
+  mamba_gated_group_norm_test
+  backend/mamba_gated_group_norm_test.cpp
+)
+
+target_link_libraries(mamba_gated_group_norm_test PRIVATE nemotron_runtime_backend)
+target_compile_features(mamba_gated_group_norm_test PRIVATE cxx_std_17)
+
+nemotron_add_test(mamba_gated_group_norm_test)
+
+add_executable(
   mamba_layer_oracle_test
   backend/mamba_layer_oracle_test.cpp
 )
