@@ -1,0 +1,464 @@
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:5 M=3:5 M=4+:118
+moe_profile: layer=1 selection=0.587ms routing=0.091ms gemm_loop=12.746ms shared=0.132ms residual=0.012ms alloc=0.264ms total=13.899ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:4 M=2:5 M=3:4 M=4+:115
+moe_profile: layer=3 selection=0.006ms routing=0.064ms gemm_loop=11.654ms shared=0.120ms residual=0.014ms alloc=0.092ms total=11.982ms
+moe_profile: layer=6 active_experts=117 histogram: M=1:10 M=2:7 M=3:9 M=4+:91
+moe_profile: layer=6 selection=0.008ms routing=0.063ms gemm_loop=11.098ms shared=0.124ms residual=0.013ms alloc=0.143ms total=11.502ms
+moe_profile: layer=8 active_experts=105 histogram: M=1:12 M=2:18 M=3:7 M=4+:68
+moe_profile: layer=8 selection=0.007ms routing=0.051ms gemm_loop=9.703ms shared=0.123ms residual=0.017ms alloc=0.085ms total=10.013ms
+moe_profile: layer=10 active_experts=96 histogram: M=1:25 M=2:7 M=3:7 M=4+:57
+moe_profile: layer=10 selection=0.007ms routing=0.052ms gemm_loop=9.009ms shared=0.119ms residual=0.013ms alloc=0.118ms total=9.346ms
+moe_profile: layer=13 active_experts=90 histogram: M=1:13 M=2:8 M=3:8 M=4+:61
+moe_profile: layer=13 selection=0.008ms routing=0.061ms gemm_loop=8.554ms shared=0.120ms residual=0.013ms alloc=0.113ms total=8.907ms
+moe_profile: layer=15 active_experts=71 histogram: M=1:18 M=2:12 M=3:1 M=4+:40
+moe_profile: layer=15 selection=0.007ms routing=0.055ms gemm_loop=6.424ms shared=0.112ms residual=0.010ms alloc=0.076ms total=6.705ms
+moe_profile: layer=17 active_experts=84 histogram: M=1:13 M=2:14 M=3:7 M=4+:50
+moe_profile: layer=17 selection=0.007ms routing=0.052ms gemm_loop=7.599ms shared=0.112ms residual=0.009ms alloc=0.074ms total=7.871ms
+moe_profile: layer=20 active_experts=82 histogram: M=1:14 M=2:6 M=3:7 M=4+:55
+moe_profile: layer=20 selection=0.007ms routing=0.052ms gemm_loop=7.621ms shared=0.108ms residual=0.018ms alloc=0.099ms total=7.937ms
+moe_profile: layer=22 active_experts=92 histogram: M=1:18 M=2:10 M=3:12 M=4+:52
+moe_profile: layer=22 selection=0.007ms routing=0.047ms gemm_loop=8.146ms shared=0.109ms residual=0.009ms alloc=0.073ms total=8.408ms
+moe_profile: layer=24 active_experts=80 histogram: M=1:18 M=2:8 M=3:8 M=4+:46
+moe_profile: layer=24 selection=0.007ms routing=0.057ms gemm_loop=7.464ms shared=0.109ms residual=0.017ms alloc=0.073ms total=7.749ms
+moe_profile: layer=27 active_experts=80 histogram: M=1:17 M=2:4 M=3:9 M=4+:50
+moe_profile: layer=27 selection=0.008ms routing=0.053ms gemm_loop=7.509ms shared=0.105ms residual=0.011ms alloc=0.083ms total=7.793ms
+moe_profile: layer=29 active_experts=87 histogram: M=1:9 M=2:9 M=3:4 M=4+:65
+moe_profile: layer=29 selection=0.007ms routing=0.057ms gemm_loop=7.710ms shared=0.112ms residual=0.009ms alloc=0.076ms total=7.994ms
+moe_profile: layer=31 active_experts=96 histogram: M=1:17 M=2:6 M=3:5 M=4+:68
+moe_profile: layer=31 selection=0.007ms routing=0.057ms gemm_loop=8.684ms shared=0.110ms residual=0.011ms alloc=0.075ms total=8.967ms
+moe_profile: layer=34 active_experts=93 histogram: M=1:13 M=2:9 M=3:7 M=4+:64
+moe_profile: layer=34 selection=0.008ms routing=0.051ms gemm_loop=8.419ms shared=0.113ms residual=0.008ms alloc=0.083ms total=8.714ms
+moe_profile: layer=36 active_experts=93 histogram: M=1:9 M=2:10 M=3:8 M=4+:66
+moe_profile: layer=36 selection=0.007ms routing=0.049ms gemm_loop=8.310ms shared=0.112ms residual=0.009ms alloc=0.074ms total=8.583ms
+moe_profile: layer=38 active_experts=101 histogram: M=1:13 M=2:8 M=3:17 M=4+:63
+moe_profile: layer=38 selection=0.007ms routing=0.056ms gemm_loop=9.139ms shared=0.105ms residual=0.009ms alloc=0.074ms total=9.414ms
+moe_profile: layer=40 active_experts=89 histogram: M=1:25 M=2:11 M=3:8 M=4+:45
+moe_profile: layer=40 selection=0.007ms routing=0.048ms gemm_loop=7.894ms shared=0.113ms residual=0.009ms alloc=0.074ms total=8.168ms
+moe_profile: layer=43 active_experts=106 histogram: M=1:25 M=2:19 M=3:7 M=4+:55
+moe_profile: layer=43 selection=0.008ms routing=0.059ms gemm_loop=9.507ms shared=0.109ms residual=0.010ms alloc=0.084ms total=9.811ms
+moe_profile: layer=45 active_experts=118 histogram: M=1:10 M=2:17 M=3:12 M=4+:79
+moe_profile: layer=45 selection=0.007ms routing=0.047ms gemm_loop=10.452ms shared=0.112ms residual=0.010ms alloc=0.076ms total=10.733ms
+moe_profile: layer=47 active_experts=114 histogram: M=1:13 M=2:10 M=3:13 M=4+:78
+moe_profile: layer=47 selection=0.007ms routing=0.046ms gemm_loop=10.152ms shared=0.116ms residual=0.010ms alloc=0.074ms total=10.424ms
+moe_profile: layer=49 active_experts=109 histogram: M=1:17 M=2:12 M=3:5 M=4+:75
+moe_profile: layer=49 selection=0.007ms routing=0.047ms gemm_loop=9.540ms shared=0.107ms residual=0.010ms alloc=0.076ms total=9.811ms
+moe_profile: layer=51 active_experts=116 histogram: M=1:14 M=2:16 M=3:9 M=4+:77
+moe_profile: layer=51 selection=0.007ms routing=0.052ms gemm_loop=10.261ms shared=0.111ms residual=0.009ms alloc=0.073ms total=10.535ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:5 M=3:5 M=4+:118
+moe_profile: layer=1 selection=0.007ms routing=0.062ms gemm_loop=11.146ms shared=0.118ms residual=0.009ms alloc=0.083ms total=11.454ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:4 M=2:5 M=3:4 M=4+:115
+moe_profile: layer=3 selection=0.007ms routing=0.057ms gemm_loop=11.120ms shared=0.121ms residual=0.010ms alloc=0.224ms total=11.559ms
+moe_profile: layer=6 active_experts=117 histogram: M=1:10 M=2:7 M=3:9 M=4+:91
+moe_profile: layer=6 selection=0.008ms routing=0.065ms gemm_loop=10.476ms shared=0.111ms residual=0.012ms alloc=0.081ms total=10.783ms
+moe_profile: layer=8 active_experts=105 histogram: M=1:12 M=2:18 M=3:7 M=4+:68
+moe_profile: layer=8 selection=0.007ms routing=0.047ms gemm_loop=9.324ms shared=0.112ms residual=0.010ms alloc=0.076ms total=9.596ms
+moe_profile: layer=10 active_experts=96 histogram: M=1:25 M=2:7 M=3:7 M=4+:57
+moe_profile: layer=10 selection=0.007ms routing=0.048ms gemm_loop=8.358ms shared=0.115ms residual=0.009ms alloc=0.075ms total=8.637ms
+moe_profile: layer=13 active_experts=90 histogram: M=1:13 M=2:8 M=3:8 M=4+:61
+moe_profile: layer=13 selection=0.007ms routing=0.068ms gemm_loop=8.329ms shared=0.123ms residual=0.011ms alloc=0.095ms total=8.671ms
+moe_profile: layer=15 active_experts=71 histogram: M=1:18 M=2:12 M=3:1 M=4+:40
+moe_profile: layer=15 selection=0.007ms routing=0.052ms gemm_loop=6.516ms shared=0.122ms residual=0.010ms alloc=0.078ms total=6.807ms
+moe_profile: layer=17 active_experts=84 histogram: M=1:13 M=2:14 M=3:7 M=4+:50
+moe_profile: layer=17 selection=0.007ms routing=0.045ms gemm_loop=7.735ms shared=0.118ms residual=0.019ms alloc=0.077ms total=8.027ms
+moe_profile: layer=20 active_experts=82 histogram: M=1:14 M=2:6 M=3:7 M=4+:55
+moe_profile: layer=20 selection=0.007ms routing=0.072ms gemm_loop=7.563ms shared=0.124ms residual=0.012ms alloc=0.097ms total=7.907ms
+moe_profile: layer=22 active_experts=92 histogram: M=1:18 M=2:10 M=3:12 M=4+:52
+moe_profile: layer=22 selection=0.007ms routing=0.049ms gemm_loop=8.237ms shared=0.117ms residual=0.010ms alloc=0.081ms total=8.526ms
+moe_profile: layer=24 active_experts=80 histogram: M=1:18 M=2:8 M=3:8 M=4+:46
+moe_profile: layer=24 selection=0.007ms routing=0.057ms gemm_loop=7.294ms shared=0.122ms residual=0.011ms alloc=0.077ms total=7.589ms
+moe_profile: layer=27 active_experts=80 histogram: M=1:17 M=2:4 M=3:9 M=4+:50
+moe_profile: layer=27 selection=0.006ms routing=0.067ms gemm_loop=7.480ms shared=0.128ms residual=0.012ms alloc=0.091ms total=7.824ms
+moe_profile: layer=29 active_experts=87 histogram: M=1:9 M=2:9 M=3:4 M=4+:65
+moe_profile: layer=29 selection=0.008ms routing=0.052ms gemm_loop=7.772ms shared=0.121ms residual=0.012ms alloc=0.080ms total=8.069ms
+moe_profile: layer=31 active_experts=96 histogram: M=1:17 M=2:6 M=3:5 M=4+:68
+moe_profile: layer=31 selection=0.007ms routing=0.052ms gemm_loop=8.696ms shared=0.117ms residual=0.012ms alloc=0.078ms total=8.984ms
+moe_profile: layer=34 active_experts=93 histogram: M=1:13 M=2:9 M=3:7 M=4+:64
+moe_profile: layer=34 selection=0.006ms routing=0.063ms gemm_loop=8.541ms shared=0.125ms residual=0.016ms alloc=0.090ms total=8.880ms
+moe_profile: layer=36 active_experts=93 histogram: M=1:9 M=2:10 M=3:8 M=4+:66
+moe_profile: layer=36 selection=0.007ms routing=0.050ms gemm_loop=8.218ms shared=0.120ms residual=0.010ms alloc=0.078ms total=8.508ms
+moe_profile: layer=38 active_experts=101 histogram: M=1:13 M=2:8 M=3:17 M=4+:63
+moe_profile: layer=38 selection=0.008ms routing=0.067ms gemm_loop=9.080ms shared=0.116ms residual=0.013ms alloc=0.078ms total=9.387ms
+moe_profile: layer=40 active_experts=89 histogram: M=1:25 M=2:11 M=3:8 M=4+:45
+moe_profile: layer=40 selection=0.008ms routing=0.048ms gemm_loop=7.817ms shared=0.112ms residual=0.009ms alloc=0.076ms total=8.098ms
+moe_profile: layer=43 active_experts=106 histogram: M=1:25 M=2:19 M=3:7 M=4+:55
+moe_profile: layer=43 selection=0.007ms routing=0.050ms gemm_loop=9.355ms shared=0.115ms residual=0.010ms alloc=0.085ms total=9.648ms
+moe_profile: layer=45 active_experts=118 histogram: M=1:10 M=2:17 M=3:12 M=4+:79
+moe_profile: layer=45 selection=0.007ms routing=0.048ms gemm_loop=10.630ms shared=0.118ms residual=0.011ms alloc=0.083ms total=10.920ms
+moe_profile: layer=47 active_experts=114 histogram: M=1:13 M=2:10 M=3:13 M=4+:78
+moe_profile: layer=47 selection=0.007ms routing=0.047ms gemm_loop=10.134ms shared=0.117ms residual=0.009ms alloc=0.078ms total=10.415ms
+moe_profile: layer=49 active_experts=109 histogram: M=1:17 M=2:12 M=3:5 M=4+:75
+moe_profile: layer=49 selection=0.007ms routing=0.045ms gemm_loop=9.576ms shared=0.106ms residual=0.009ms alloc=0.075ms total=9.842ms
+moe_profile: layer=51 active_experts=116 histogram: M=1:14 M=2:16 M=3:9 M=4+:77
+moe_profile: layer=51 selection=0.007ms routing=0.052ms gemm_loop=10.376ms shared=0.121ms residual=0.009ms alloc=0.075ms total=10.661ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:5 M=3:5 M=4+:118
+moe_profile: layer=1 selection=0.007ms routing=0.041ms gemm_loop=11.395ms shared=0.116ms residual=0.008ms alloc=0.077ms total=11.672ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:4 M=2:5 M=3:4 M=4+:115
+moe_profile: layer=3 selection=0.007ms routing=0.058ms gemm_loop=11.292ms shared=0.112ms residual=0.010ms alloc=0.076ms total=11.577ms
+moe_profile: layer=6 active_experts=117 histogram: M=1:10 M=2:7 M=3:9 M=4+:91
+moe_profile: layer=6 selection=0.007ms routing=0.047ms gemm_loop=10.514ms shared=0.111ms residual=0.010ms alloc=0.079ms total=10.805ms
+moe_profile: layer=8 active_experts=105 histogram: M=1:12 M=2:18 M=3:7 M=4+:68
+moe_profile: layer=8 selection=0.007ms routing=0.053ms gemm_loop=9.228ms shared=0.110ms residual=0.010ms alloc=0.080ms total=9.504ms
+moe_profile: layer=10 active_experts=96 histogram: M=1:25 M=2:7 M=3:7 M=4+:57
+moe_profile: layer=10 selection=0.007ms routing=0.058ms gemm_loop=8.661ms shared=0.115ms residual=0.009ms alloc=0.081ms total=8.962ms
+moe_profile: layer=13 active_experts=90 histogram: M=1:13 M=2:8 M=3:8 M=4+:61
+moe_profile: layer=13 selection=0.006ms routing=0.065ms gemm_loop=8.338ms shared=0.124ms residual=0.013ms alloc=0.089ms total=8.676ms
+moe_profile: layer=15 active_experts=71 histogram: M=1:18 M=2:12 M=3:1 M=4+:40
+moe_profile: layer=15 selection=0.007ms routing=0.066ms gemm_loop=6.467ms shared=0.120ms residual=0.010ms alloc=0.077ms total=6.769ms
+moe_profile: layer=17 active_experts=84 histogram: M=1:13 M=2:14 M=3:7 M=4+:50
+moe_profile: layer=17 selection=0.007ms routing=0.055ms gemm_loop=7.669ms shared=0.119ms residual=0.009ms alloc=0.080ms total=7.963ms
+moe_profile: layer=20 active_experts=82 histogram: M=1:14 M=2:6 M=3:7 M=4+:55
+moe_profile: layer=20 selection=0.008ms routing=0.054ms gemm_loop=7.251ms shared=0.117ms residual=0.010ms alloc=0.085ms total=7.550ms
+moe_profile: layer=22 active_experts=92 histogram: M=1:18 M=2:10 M=3:12 M=4+:52
+moe_profile: layer=22 selection=0.007ms routing=0.047ms gemm_loop=8.082ms shared=0.109ms residual=0.009ms alloc=0.075ms total=8.353ms
+moe_profile: layer=24 active_experts=80 histogram: M=1:18 M=2:8 M=3:8 M=4+:46
+moe_profile: layer=24 selection=0.007ms routing=0.061ms gemm_loop=7.266ms shared=0.108ms residual=0.009ms alloc=0.076ms total=7.545ms
+moe_profile: layer=27 active_experts=80 histogram: M=1:17 M=2:4 M=3:9 M=4+:50
+moe_profile: layer=27 selection=0.008ms routing=0.070ms gemm_loop=7.290ms shared=0.117ms residual=0.011ms alloc=0.098ms total=7.630ms
+moe_profile: layer=29 active_experts=87 histogram: M=1:9 M=2:9 M=3:4 M=4+:65
+moe_profile: layer=29 selection=0.007ms routing=0.054ms gemm_loop=7.840ms shared=0.121ms residual=0.011ms alloc=0.080ms total=8.131ms
+moe_profile: layer=31 active_experts=96 histogram: M=1:17 M=2:6 M=3:5 M=4+:68
+moe_profile: layer=31 selection=0.008ms routing=0.046ms gemm_loop=8.594ms shared=0.115ms residual=0.009ms alloc=0.074ms total=8.875ms
+moe_profile: layer=34 active_experts=93 histogram: M=1:13 M=2:9 M=3:7 M=4+:64
+moe_profile: layer=34 selection=0.007ms routing=0.071ms gemm_loop=8.462ms shared=0.133ms residual=0.013ms alloc=0.087ms total=8.813ms
+moe_profile: layer=36 active_experts=93 histogram: M=1:9 M=2:10 M=3:8 M=4+:66
+moe_profile: layer=36 selection=0.007ms routing=0.054ms gemm_loop=8.366ms shared=0.122ms residual=0.012ms alloc=0.086ms total=8.665ms
+moe_profile: layer=38 active_experts=101 histogram: M=1:13 M=2:8 M=3:17 M=4+:63
+moe_profile: layer=38 selection=0.007ms routing=0.054ms gemm_loop=9.079ms shared=0.121ms residual=0.012ms alloc=0.076ms total=9.371ms
+moe_profile: layer=40 active_experts=89 histogram: M=1:25 M=2:11 M=3:8 M=4+:45
+moe_profile: layer=40 selection=0.007ms routing=0.054ms gemm_loop=7.846ms shared=0.123ms residual=0.012ms alloc=0.076ms total=8.138ms
+moe_profile: layer=43 active_experts=106 histogram: M=1:25 M=2:19 M=3:7 M=4+:55
+moe_profile: layer=43 selection=0.006ms routing=0.062ms gemm_loop=9.667ms shared=0.126ms residual=0.012ms alloc=0.092ms total=10.006ms
+moe_profile: layer=45 active_experts=118 histogram: M=1:10 M=2:17 M=3:12 M=4+:79
+moe_profile: layer=45 selection=0.007ms routing=0.051ms gemm_loop=10.525ms shared=0.116ms residual=0.012ms alloc=0.081ms total=10.815ms
+moe_profile: layer=47 active_experts=114 histogram: M=1:13 M=2:10 M=3:13 M=4+:78
+moe_profile: layer=47 selection=0.007ms routing=0.048ms gemm_loop=10.228ms shared=0.116ms residual=0.010ms alloc=0.075ms total=10.507ms
+moe_profile: layer=49 active_experts=109 histogram: M=1:17 M=2:12 M=3:5 M=4+:75
+moe_profile: layer=49 selection=0.007ms routing=0.059ms gemm_loop=9.633ms shared=0.120ms residual=0.012ms alloc=0.075ms total=9.929ms
+moe_profile: layer=51 active_experts=116 histogram: M=1:14 M=2:16 M=3:9 M=4+:77
+moe_profile: layer=51 selection=0.006ms routing=0.050ms gemm_loop=10.411ms shared=0.123ms residual=0.012ms alloc=0.122ms total=10.752ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:5 M=3:5 M=4+:118
+moe_profile: layer=1 selection=0.006ms routing=0.058ms gemm_loop=11.481ms shared=0.131ms residual=0.013ms alloc=0.078ms total=11.793ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:4 M=2:5 M=3:4 M=4+:115
+moe_profile: layer=3 selection=0.007ms routing=0.052ms gemm_loop=11.422ms shared=0.133ms residual=0.014ms alloc=0.080ms total=11.731ms
+moe_profile: layer=6 active_experts=117 histogram: M=1:10 M=2:7 M=3:9 M=4+:91
+moe_profile: layer=6 selection=0.008ms routing=0.063ms gemm_loop=10.687ms shared=0.123ms residual=0.013ms alloc=0.121ms total=11.052ms
+moe_profile: layer=8 active_experts=105 histogram: M=1:12 M=2:18 M=3:7 M=4+:68
+moe_profile: layer=8 selection=0.007ms routing=0.075ms gemm_loop=9.311ms shared=0.119ms residual=0.014ms alloc=0.091ms total=9.633ms
+moe_profile: layer=10 active_experts=96 histogram: M=1:25 M=2:7 M=3:7 M=4+:57
+moe_profile: layer=10 selection=0.007ms routing=0.052ms gemm_loop=8.704ms shared=0.126ms residual=0.012ms alloc=0.084ms total=9.008ms
+moe_profile: layer=13 active_experts=90 histogram: M=1:13 M=2:8 M=3:8 M=4+:61
+moe_profile: layer=13 selection=0.006ms routing=0.066ms gemm_loop=8.178ms shared=0.117ms residual=0.013ms alloc=0.090ms total=8.506ms
+moe_profile: layer=15 active_experts=71 histogram: M=1:18 M=2:12 M=3:1 M=4+:40
+moe_profile: layer=15 selection=0.007ms routing=0.048ms gemm_loop=6.331ms shared=0.117ms residual=0.010ms alloc=0.075ms total=6.618ms
+moe_profile: layer=17 active_experts=84 histogram: M=1:13 M=2:14 M=3:7 M=4+:50
+moe_profile: layer=17 selection=0.007ms routing=0.053ms gemm_loop=7.619ms shared=0.117ms residual=0.009ms alloc=0.075ms total=7.900ms
+moe_profile: layer=20 active_experts=82 histogram: M=1:14 M=2:6 M=3:7 M=4+:55
+moe_profile: layer=20 selection=0.008ms routing=0.067ms gemm_loop=7.589ms shared=0.121ms residual=0.010ms alloc=0.086ms total=7.909ms
+moe_profile: layer=22 active_experts=92 histogram: M=1:18 M=2:10 M=3:12 M=4+:52
+moe_profile: layer=22 selection=0.007ms routing=0.052ms gemm_loop=8.149ms shared=0.115ms residual=0.009ms alloc=0.115ms total=8.474ms
+moe_profile: layer=24 active_experts=80 histogram: M=1:18 M=2:8 M=3:8 M=4+:46
+moe_profile: layer=24 selection=0.007ms routing=0.053ms gemm_loop=7.273ms shared=0.117ms residual=0.009ms alloc=0.077ms total=7.555ms
+moe_profile: layer=27 active_experts=80 histogram: M=1:17 M=2:4 M=3:9 M=4+:50
+moe_profile: layer=27 selection=0.008ms routing=0.062ms gemm_loop=7.497ms shared=0.122ms residual=0.011ms alloc=0.106ms total=7.847ms
+moe_profile: layer=29 active_experts=87 histogram: M=1:9 M=2:9 M=3:4 M=4+:65
+moe_profile: layer=29 selection=0.007ms routing=0.062ms gemm_loop=7.671ms shared=0.116ms residual=0.009ms alloc=0.078ms total=7.966ms
+moe_profile: layer=31 active_experts=96 histogram: M=1:17 M=2:6 M=3:5 M=4+:68
+moe_profile: layer=31 selection=0.007ms routing=0.048ms gemm_loop=8.650ms shared=0.109ms residual=0.009ms alloc=0.078ms total=8.927ms
+moe_profile: layer=34 active_experts=93 histogram: M=1:13 M=2:9 M=3:7 M=4+:64
+moe_profile: layer=34 selection=0.008ms routing=0.060ms gemm_loop=8.347ms shared=0.126ms residual=0.011ms alloc=0.100ms total=8.689ms
+moe_profile: layer=36 active_experts=93 histogram: M=1:9 M=2:10 M=3:8 M=4+:66
+moe_profile: layer=36 selection=0.007ms routing=0.051ms gemm_loop=8.203ms shared=0.118ms residual=0.010ms alloc=0.076ms total=8.486ms
+moe_profile: layer=38 active_experts=101 histogram: M=1:13 M=2:8 M=3:17 M=4+:63
+moe_profile: layer=38 selection=0.007ms routing=0.054ms gemm_loop=9.058ms shared=0.114ms residual=0.009ms alloc=0.074ms total=9.339ms
+moe_profile: layer=40 active_experts=89 histogram: M=1:25 M=2:11 M=3:8 M=4+:45
+moe_profile: layer=40 selection=0.007ms routing=0.043ms gemm_loop=7.766ms shared=0.115ms residual=0.010ms alloc=0.073ms total=8.038ms
+moe_profile: layer=43 active_experts=106 histogram: M=1:25 M=2:19 M=3:7 M=4+:55
+moe_profile: layer=43 selection=0.008ms routing=0.062ms gemm_loop=9.386ms shared=0.119ms residual=0.011ms alloc=0.099ms total=9.720ms
+moe_profile: layer=45 active_experts=118 histogram: M=1:10 M=2:17 M=3:12 M=4+:79
+moe_profile: layer=45 selection=0.007ms routing=0.057ms gemm_loop=10.435ms shared=0.112ms residual=0.009ms alloc=0.078ms total=10.728ms
+moe_profile: layer=47 active_experts=114 histogram: M=1:13 M=2:10 M=3:13 M=4+:78
+moe_profile: layer=47 selection=0.007ms routing=0.050ms gemm_loop=10.188ms shared=0.113ms residual=0.009ms alloc=0.076ms total=10.467ms
+moe_profile: layer=49 active_experts=109 histogram: M=1:17 M=2:12 M=3:5 M=4+:75
+moe_profile: layer=49 selection=0.007ms routing=0.048ms gemm_loop=9.515ms shared=0.109ms residual=0.010ms alloc=0.105ms total=9.817ms
+moe_profile: layer=51 active_experts=116 histogram: M=1:14 M=2:16 M=3:9 M=4+:77
+moe_profile: layer=51 selection=0.007ms routing=0.048ms gemm_loop=10.325ms shared=0.110ms residual=0.009ms alloc=0.074ms total=10.594ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:5 M=3:5 M=4+:118
+moe_profile: layer=1 selection=0.007ms routing=0.042ms gemm_loop=11.251ms shared=0.112ms residual=0.010ms alloc=0.075ms total=11.523ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:4 M=2:5 M=3:4 M=4+:115
+moe_profile: layer=3 selection=0.007ms routing=0.047ms gemm_loop=11.388ms shared=0.114ms residual=0.010ms alloc=0.073ms total=11.662ms
+moe_profile: layer=6 active_experts=117 histogram: M=1:10 M=2:7 M=3:9 M=4+:91
+moe_profile: layer=6 selection=0.007ms routing=0.066ms gemm_loop=10.716ms shared=0.126ms residual=0.014ms alloc=0.124ms total=11.092ms
+moe_profile: layer=8 active_experts=105 histogram: M=1:12 M=2:18 M=3:7 M=4+:68
+moe_profile: layer=8 selection=0.008ms routing=0.054ms gemm_loop=9.171ms shared=0.120ms residual=0.011ms alloc=0.085ms total=9.475ms
+moe_profile: layer=10 active_experts=96 histogram: M=1:25 M=2:7 M=3:7 M=4+:57
+moe_profile: layer=10 selection=0.007ms routing=0.050ms gemm_loop=8.905ms shared=0.126ms residual=0.011ms alloc=0.080ms total=9.219ms
+moe_profile: layer=13 active_experts=90 histogram: M=1:13 M=2:8 M=3:8 M=4+:61
+moe_profile: layer=13 selection=0.006ms routing=0.079ms gemm_loop=8.456ms shared=0.132ms residual=0.013ms alloc=0.140ms total=8.862ms
+moe_profile: layer=15 active_experts=71 histogram: M=1:18 M=2:12 M=3:1 M=4+:40
+moe_profile: layer=15 selection=0.007ms routing=0.052ms gemm_loop=6.390ms shared=0.120ms residual=0.013ms alloc=0.086ms total=6.696ms
+moe_profile: layer=17 active_experts=84 histogram: M=1:13 M=2:14 M=3:7 M=4+:50
+moe_profile: layer=17 selection=0.007ms routing=0.048ms gemm_loop=7.707ms shared=0.121ms residual=0.011ms alloc=0.086ms total=8.004ms
+moe_profile: layer=20 active_experts=82 histogram: M=1:14 M=2:6 M=3:7 M=4+:55
+moe_profile: layer=20 selection=0.008ms routing=0.065ms gemm_loop=7.674ms shared=0.128ms residual=0.015ms alloc=0.184ms total=8.133ms
+moe_profile: layer=22 active_experts=92 histogram: M=1:18 M=2:10 M=3:12 M=4+:52
+moe_profile: layer=22 selection=0.007ms routing=0.056ms gemm_loop=8.237ms shared=0.124ms residual=0.012ms alloc=0.093ms total=8.560ms
+moe_profile: layer=24 active_experts=80 histogram: M=1:18 M=2:8 M=3:8 M=4+:46
+moe_profile: layer=24 selection=0.007ms routing=0.050ms gemm_loop=7.343ms shared=0.128ms residual=0.011ms alloc=0.079ms total=7.642ms
+moe_profile: layer=27 active_experts=80 histogram: M=1:17 M=2:4 M=3:9 M=4+:50
+moe_profile: layer=27 selection=0.006ms routing=0.064ms gemm_loop=7.246ms shared=0.124ms residual=0.014ms alloc=0.097ms total=7.591ms
+moe_profile: layer=29 active_experts=87 histogram: M=1:9 M=2:9 M=3:4 M=4+:65
+moe_profile: layer=29 selection=0.007ms routing=0.052ms gemm_loop=7.871ms shared=0.122ms residual=0.014ms alloc=0.080ms total=8.172ms
+moe_profile: layer=31 active_experts=96 histogram: M=1:17 M=2:6 M=3:5 M=4+:68
+moe_profile: layer=31 selection=0.007ms routing=0.052ms gemm_loop=8.712ms shared=0.123ms residual=0.014ms alloc=0.084ms total=9.019ms
+moe_profile: layer=34 active_experts=93 histogram: M=1:13 M=2:9 M=3:7 M=4+:64
+moe_profile: layer=34 selection=0.008ms routing=0.070ms gemm_loop=8.290ms shared=0.117ms residual=0.012ms alloc=0.102ms total=8.639ms
+moe_profile: layer=36 active_experts=93 histogram: M=1:9 M=2:10 M=3:8 M=4+:66
+moe_profile: layer=36 selection=0.007ms routing=0.047ms gemm_loop=8.390ms shared=0.115ms residual=0.009ms alloc=0.076ms total=8.669ms
+moe_profile: layer=38 active_experts=101 histogram: M=1:13 M=2:8 M=3:17 M=4+:63
+moe_profile: layer=38 selection=0.007ms routing=0.046ms gemm_loop=9.106ms shared=0.110ms residual=0.009ms alloc=0.077ms total=9.384ms
+moe_profile: layer=40 active_experts=89 histogram: M=1:25 M=2:11 M=3:8 M=4+:45
+moe_profile: layer=40 selection=0.007ms routing=0.053ms gemm_loop=7.758ms shared=0.108ms residual=0.009ms alloc=0.074ms total=8.032ms
+moe_profile: layer=43 active_experts=106 histogram: M=1:25 M=2:19 M=3:7 M=4+:55
+moe_profile: layer=43 selection=0.006ms routing=0.053ms gemm_loop=9.422ms shared=0.115ms residual=0.011ms alloc=0.080ms total=9.721ms
+moe_profile: layer=45 active_experts=118 histogram: M=1:10 M=2:17 M=3:12 M=4+:79
+moe_profile: layer=45 selection=0.007ms routing=0.047ms gemm_loop=10.463ms shared=0.119ms residual=0.010ms alloc=0.074ms total=10.740ms
+moe_profile: layer=47 active_experts=114 histogram: M=1:13 M=2:10 M=3:13 M=4+:78
+moe_profile: layer=47 selection=0.007ms routing=0.046ms gemm_loop=9.996ms shared=0.110ms residual=0.010ms alloc=0.074ms total=10.261ms
+moe_profile: layer=49 active_experts=109 histogram: M=1:17 M=2:12 M=3:5 M=4+:75
+moe_profile: layer=49 selection=0.007ms routing=0.053ms gemm_loop=9.729ms shared=0.112ms residual=0.011ms alloc=0.077ms total=10.009ms
+moe_profile: layer=51 active_experts=116 histogram: M=1:14 M=2:16 M=3:9 M=4+:77
+moe_profile: layer=51 selection=0.007ms routing=0.060ms gemm_loop=10.360ms shared=0.111ms residual=0.009ms alloc=0.074ms total=10.638ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=1 selection=0.010ms routing=0.092ms gemm_loop=11.928ms shared=0.219ms residual=0.030ms alloc=0.106ms total=12.410ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=3 selection=0.007ms routing=0.108ms gemm_loop=12.040ms shared=0.208ms residual=0.022ms alloc=0.102ms total=12.505ms
+moe_profile: layer=6 active_experts=125 histogram: M=1:3 M=2:5 M=3:2 M=4+:115
+moe_profile: layer=6 selection=0.006ms routing=0.112ms gemm_loop=11.732ms shared=0.220ms residual=0.025ms alloc=0.131ms total=12.256ms
+moe_profile: layer=8 active_experts=108 histogram: M=1:10 M=2:7 M=3:5 M=4+:86
+moe_profile: layer=8 selection=0.007ms routing=0.111ms gemm_loop=10.123ms shared=0.215ms residual=0.022ms alloc=0.101ms total=10.598ms
+moe_profile: layer=10 active_experts=112 histogram: M=1:9 M=2:9 M=3:6 M=4+:88
+moe_profile: layer=10 selection=0.008ms routing=0.096ms gemm_loop=10.380ms shared=0.212ms residual=0.022ms alloc=0.100ms total=10.847ms
+moe_profile: layer=13 active_experts=107 histogram: M=1:10 M=2:7 M=3:1 M=4+:89
+moe_profile: layer=13 selection=0.006ms routing=0.108ms gemm_loop=10.483ms shared=0.221ms residual=0.024ms alloc=0.138ms total=11.021ms
+moe_profile: layer=15 active_experts=87 histogram: M=1:12 M=2:6 M=3:5 M=4+:64
+moe_profile: layer=15 selection=0.007ms routing=0.111ms gemm_loop=8.246ms shared=0.214ms residual=0.022ms alloc=0.107ms total=8.721ms
+moe_profile: layer=17 active_experts=100 histogram: M=1:14 M=2:14 M=3:6 M=4+:66
+moe_profile: layer=17 selection=0.007ms routing=0.099ms gemm_loop=9.380ms shared=0.214ms residual=0.022ms alloc=0.110ms total=9.862ms
+moe_profile: layer=20 active_experts=96 histogram: M=1:8 M=2:7 M=3:2 M=4+:79
+moe_profile: layer=20 selection=0.008ms routing=0.176ms gemm_loop=9.186ms shared=0.214ms residual=0.025ms alloc=0.127ms total=9.771ms
+moe_profile: layer=22 active_experts=98 histogram: M=1:9 M=2:4 M=3:6 M=4+:79
+moe_profile: layer=22 selection=0.007ms routing=0.116ms gemm_loop=9.303ms shared=0.208ms residual=0.022ms alloc=0.108ms total=9.782ms
+moe_profile: layer=24 active_experts=102 histogram: M=1:7 M=2:7 M=3:10 M=4+:78
+moe_profile: layer=24 selection=0.007ms routing=0.096ms gemm_loop=9.619ms shared=0.209ms residual=0.022ms alloc=0.099ms total=10.079ms
+moe_profile: layer=27 active_experts=98 histogram: M=1:13 M=2:5 M=3:5 M=4+:75
+moe_profile: layer=27 selection=0.006ms routing=0.120ms gemm_loop=9.449ms shared=0.217ms residual=0.023ms alloc=0.119ms total=9.969ms
+moe_profile: layer=29 active_experts=106 histogram: M=1:5 M=2:7 M=3:3 M=4+:91
+moe_profile: layer=29 selection=0.007ms routing=0.095ms gemm_loop=9.939ms shared=0.216ms residual=0.022ms alloc=0.102ms total=10.409ms
+moe_profile: layer=31 active_experts=114 histogram: M=1:14 M=2:2 M=3:2 M=4+:96
+moe_profile: layer=31 selection=0.007ms routing=0.100ms gemm_loop=10.839ms shared=0.211ms residual=0.022ms alloc=0.100ms total=11.315ms
+moe_profile: layer=34 active_experts=115 histogram: M=1:8 M=2:13 M=3:4 M=4+:90
+moe_profile: layer=34 selection=0.007ms routing=0.124ms gemm_loop=11.232ms shared=0.214ms residual=0.025ms alloc=0.132ms total=11.772ms
+moe_profile: layer=36 active_experts=111 histogram: M=1:9 M=2:7 M=3:5 M=4+:90
+moe_profile: layer=36 selection=0.007ms routing=0.100ms gemm_loop=10.457ms shared=0.211ms residual=0.021ms alloc=0.106ms total=10.928ms
+moe_profile: layer=38 active_experts=113 histogram: M=1:9 M=2:5 M=3:8 M=4+:91
+moe_profile: layer=38 selection=0.007ms routing=0.108ms gemm_loop=10.548ms shared=0.211ms residual=0.022ms alloc=0.167ms total=11.080ms
+moe_profile: layer=40 active_experts=102 histogram: M=1:10 M=2:9 M=3:8 M=4+:75
+moe_profile: layer=40 selection=0.007ms routing=0.101ms gemm_loop=9.581ms shared=0.208ms residual=0.022ms alloc=0.100ms total=10.045ms
+moe_profile: layer=43 active_experts=115 histogram: M=1:7 M=2:6 M=3:5 M=4+:97
+moe_profile: layer=43 selection=0.007ms routing=0.122ms gemm_loop=11.037ms shared=0.217ms residual=0.023ms alloc=0.127ms total=11.568ms
+moe_profile: layer=45 active_experts=123 histogram: M=1:5 M=2:0 M=3:4 M=4+:114
+moe_profile: layer=45 selection=0.007ms routing=0.109ms gemm_loop=11.551ms shared=0.212ms residual=0.021ms alloc=0.102ms total=12.020ms
+moe_profile: layer=47 active_experts=124 histogram: M=1:4 M=2:3 M=3:9 M=4+:108
+moe_profile: layer=47 selection=0.007ms routing=0.097ms gemm_loop=11.602ms shared=0.212ms residual=0.023ms alloc=0.101ms total=12.074ms
+moe_profile: layer=49 active_experts=116 histogram: M=1:12 M=2:8 M=3:0 M=4+:96
+moe_profile: layer=49 selection=0.007ms routing=0.120ms gemm_loop=10.998ms shared=0.215ms residual=0.023ms alloc=0.106ms total=11.481ms
+moe_profile: layer=51 active_experts=121 histogram: M=1:8 M=2:6 M=3:11 M=4+:96
+moe_profile: layer=51 selection=0.007ms routing=0.107ms gemm_loop=11.381ms shared=0.211ms residual=0.021ms alloc=0.100ms total=11.843ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=1 selection=0.007ms routing=0.099ms gemm_loop=11.906ms shared=0.212ms residual=0.021ms alloc=0.103ms total=12.375ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=3 selection=0.007ms routing=0.097ms gemm_loop=11.822ms shared=0.211ms residual=0.021ms alloc=0.100ms total=12.281ms
+moe_profile: layer=6 active_experts=125 histogram: M=1:3 M=2:5 M=3:2 M=4+:115
+moe_profile: layer=6 selection=0.008ms routing=0.116ms gemm_loop=11.790ms shared=0.213ms residual=0.023ms alloc=0.127ms total=12.315ms
+moe_profile: layer=8 active_experts=108 histogram: M=1:10 M=2:7 M=3:5 M=4+:86
+moe_profile: layer=8 selection=0.008ms routing=0.102ms gemm_loop=10.210ms shared=0.208ms residual=0.021ms alloc=0.102ms total=10.680ms
+moe_profile: layer=10 active_experts=112 histogram: M=1:9 M=2:9 M=3:6 M=4+:88
+moe_profile: layer=10 selection=0.007ms routing=0.097ms gemm_loop=10.479ms shared=0.217ms residual=0.021ms alloc=0.102ms total=10.949ms
+moe_profile: layer=13 active_experts=107 histogram: M=1:10 M=2:7 M=3:1 M=4+:89
+moe_profile: layer=13 selection=0.008ms routing=0.111ms gemm_loop=10.282ms shared=0.215ms residual=0.025ms alloc=0.123ms total=10.808ms
+moe_profile: layer=15 active_experts=87 histogram: M=1:12 M=2:6 M=3:5 M=4+:64
+moe_profile: layer=15 selection=0.007ms routing=0.122ms gemm_loop=8.442ms shared=0.214ms residual=0.021ms alloc=0.106ms total=8.924ms
+moe_profile: layer=17 active_experts=100 histogram: M=1:14 M=2:14 M=3:6 M=4+:66
+moe_profile: layer=17 selection=0.007ms routing=0.118ms gemm_loop=9.468ms shared=0.211ms residual=0.022ms alloc=0.103ms total=9.954ms
+moe_profile: layer=20 active_experts=96 histogram: M=1:8 M=2:7 M=3:2 M=4+:79
+moe_profile: layer=20 selection=0.008ms routing=0.120ms gemm_loop=9.139ms shared=0.218ms residual=0.030ms alloc=0.123ms total=9.673ms
+moe_profile: layer=22 active_experts=98 histogram: M=1:9 M=2:4 M=3:6 M=4+:79
+moe_profile: layer=22 selection=0.008ms routing=0.098ms gemm_loop=9.221ms shared=0.211ms residual=0.022ms alloc=0.101ms total=9.691ms
+moe_profile: layer=24 active_experts=102 histogram: M=1:7 M=2:7 M=3:10 M=4+:78
+moe_profile: layer=24 selection=0.007ms routing=0.104ms gemm_loop=9.723ms shared=0.210ms residual=0.021ms alloc=0.103ms total=10.192ms
+moe_profile: layer=27 active_experts=98 histogram: M=1:13 M=2:5 M=3:5 M=4+:75
+moe_profile: layer=27 selection=0.009ms routing=0.130ms gemm_loop=9.406ms shared=0.213ms residual=0.025ms alloc=0.106ms total=9.921ms
+moe_profile: layer=29 active_experts=106 histogram: M=1:5 M=2:7 M=3:3 M=4+:91
+moe_profile: layer=29 selection=0.008ms routing=0.112ms gemm_loop=9.847ms shared=0.216ms residual=0.023ms alloc=0.102ms total=10.328ms
+moe_profile: layer=31 active_experts=114 histogram: M=1:14 M=2:2 M=3:2 M=4+:96
+moe_profile: layer=31 selection=0.007ms routing=0.108ms gemm_loop=10.682ms shared=0.209ms residual=0.024ms alloc=0.102ms total=11.151ms
+moe_profile: layer=34 active_experts=115 histogram: M=1:8 M=2:13 M=3:4 M=4+:90
+moe_profile: layer=34 selection=0.008ms routing=0.122ms gemm_loop=10.872ms shared=0.205ms residual=0.024ms alloc=0.112ms total=11.372ms
+moe_profile: layer=36 active_experts=111 histogram: M=1:9 M=2:7 M=3:5 M=4+:90
+moe_profile: layer=36 selection=0.007ms routing=0.109ms gemm_loop=10.457ms shared=0.208ms residual=0.021ms alloc=0.101ms total=10.922ms
+moe_profile: layer=38 active_experts=113 histogram: M=1:9 M=2:5 M=3:8 M=4+:91
+moe_profile: layer=38 selection=0.007ms routing=0.098ms gemm_loop=10.622ms shared=0.215ms residual=0.021ms alloc=0.103ms total=11.092ms
+moe_profile: layer=40 active_experts=102 histogram: M=1:10 M=2:9 M=3:8 M=4+:75
+moe_profile: layer=40 selection=0.007ms routing=0.100ms gemm_loop=9.542ms shared=0.211ms residual=0.021ms alloc=0.100ms total=10.013ms
+moe_profile: layer=43 active_experts=115 histogram: M=1:7 M=2:6 M=3:5 M=4+:97
+moe_profile: layer=43 selection=0.008ms routing=0.120ms gemm_loop=10.862ms shared=0.210ms residual=0.022ms alloc=0.111ms total=11.364ms
+moe_profile: layer=45 active_experts=123 histogram: M=1:5 M=2:0 M=3:4 M=4+:114
+moe_profile: layer=45 selection=0.007ms routing=0.110ms gemm_loop=11.436ms shared=0.211ms residual=0.022ms alloc=0.099ms total=11.901ms
+moe_profile: layer=47 active_experts=124 histogram: M=1:4 M=2:3 M=3:9 M=4+:108
+moe_profile: layer=47 selection=0.007ms routing=0.107ms gemm_loop=11.505ms shared=0.208ms residual=0.022ms alloc=0.102ms total=11.968ms
+moe_profile: layer=49 active_experts=116 histogram: M=1:12 M=2:8 M=3:0 M=4+:96
+moe_profile: layer=49 selection=0.007ms routing=0.111ms gemm_loop=10.864ms shared=0.208ms residual=0.022ms alloc=0.103ms total=11.330ms
+moe_profile: layer=51 active_experts=121 histogram: M=1:8 M=2:6 M=3:11 M=4+:96
+moe_profile: layer=51 selection=0.007ms routing=0.117ms gemm_loop=11.244ms shared=0.209ms residual=0.020ms alloc=0.102ms total=11.716ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=1 selection=0.007ms routing=0.098ms gemm_loop=11.787ms shared=0.208ms residual=0.021ms alloc=0.109ms total=12.259ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=3 selection=0.007ms routing=0.104ms gemm_loop=11.708ms shared=0.212ms residual=0.021ms alloc=0.101ms total=12.176ms
+moe_profile: layer=6 active_experts=125 histogram: M=1:3 M=2:5 M=3:2 M=4+:115
+moe_profile: layer=6 selection=0.008ms routing=0.111ms gemm_loop=11.567ms shared=0.211ms residual=0.024ms alloc=0.119ms total=12.088ms
+moe_profile: layer=8 active_experts=108 histogram: M=1:10 M=2:7 M=3:5 M=4+:86
+moe_profile: layer=8 selection=0.007ms routing=0.110ms gemm_loop=9.944ms shared=0.222ms residual=0.022ms alloc=0.108ms total=10.433ms
+moe_profile: layer=10 active_experts=112 histogram: M=1:9 M=2:9 M=3:6 M=4+:88
+moe_profile: layer=10 selection=0.007ms routing=0.094ms gemm_loop=10.404ms shared=0.209ms residual=0.023ms alloc=0.100ms total=10.863ms
+moe_profile: layer=13 active_experts=107 histogram: M=1:10 M=2:7 M=3:1 M=4+:89
+moe_profile: layer=13 selection=0.006ms routing=0.132ms gemm_loop=10.268ms shared=0.206ms residual=0.022ms alloc=0.162ms total=10.827ms
+moe_profile: layer=15 active_experts=87 histogram: M=1:12 M=2:6 M=3:5 M=4+:64
+moe_profile: layer=15 selection=0.007ms routing=0.109ms gemm_loop=8.210ms shared=0.206ms residual=0.021ms alloc=0.103ms total=8.670ms
+moe_profile: layer=17 active_experts=100 histogram: M=1:14 M=2:14 M=3:6 M=4+:66
+moe_profile: layer=17 selection=0.008ms routing=0.093ms gemm_loop=9.354ms shared=0.209ms residual=0.023ms alloc=0.099ms total=9.816ms
+moe_profile: layer=20 active_experts=96 histogram: M=1:8 M=2:7 M=3:2 M=4+:79
+moe_profile: layer=20 selection=0.008ms routing=0.118ms gemm_loop=9.794ms shared=0.228ms residual=0.027ms alloc=0.116ms total=10.329ms
+moe_profile: layer=22 active_experts=98 histogram: M=1:9 M=2:4 M=3:6 M=4+:79
+moe_profile: layer=22 selection=0.007ms routing=0.157ms gemm_loop=9.454ms shared=0.222ms residual=0.024ms alloc=0.146ms total=10.038ms
+moe_profile: layer=24 active_experts=102 histogram: M=1:7 M=2:7 M=3:10 M=4+:78
+moe_profile: layer=24 selection=0.008ms routing=0.112ms gemm_loop=9.567ms shared=0.210ms residual=0.022ms alloc=0.106ms total=10.050ms
+moe_profile: layer=27 active_experts=98 histogram: M=1:13 M=2:5 M=3:5 M=4+:75
+moe_profile: layer=27 selection=0.008ms routing=0.110ms gemm_loop=9.498ms shared=0.214ms residual=0.024ms alloc=0.112ms total=10.015ms
+moe_profile: layer=29 active_experts=106 histogram: M=1:5 M=2:7 M=3:3 M=4+:91
+moe_profile: layer=29 selection=0.007ms routing=0.102ms gemm_loop=10.075ms shared=0.214ms residual=0.021ms alloc=0.103ms total=10.545ms
+moe_profile: layer=31 active_experts=114 histogram: M=1:14 M=2:2 M=3:2 M=4+:96
+moe_profile: layer=31 selection=0.007ms routing=0.095ms gemm_loop=10.734ms shared=0.212ms residual=0.022ms alloc=0.101ms total=11.196ms
+moe_profile: layer=34 active_experts=115 histogram: M=1:8 M=2:13 M=3:4 M=4+:90
+moe_profile: layer=34 selection=0.008ms routing=0.125ms gemm_loop=11.020ms shared=0.217ms residual=0.027ms alloc=0.120ms total=11.556ms
+moe_profile: layer=36 active_experts=111 histogram: M=1:9 M=2:7 M=3:5 M=4+:90
+moe_profile: layer=36 selection=0.007ms routing=0.123ms gemm_loop=10.483ms shared=0.208ms residual=0.030ms alloc=0.114ms total=10.993ms
+moe_profile: layer=38 active_experts=113 histogram: M=1:9 M=2:5 M=3:8 M=4+:91
+moe_profile: layer=38 selection=0.007ms routing=0.107ms gemm_loop=10.652ms shared=0.219ms residual=0.024ms alloc=0.103ms total=11.129ms
+moe_profile: layer=40 active_experts=102 histogram: M=1:10 M=2:9 M=3:8 M=4+:75
+moe_profile: layer=40 selection=0.007ms routing=0.095ms gemm_loop=9.460ms shared=0.210ms residual=0.021ms alloc=0.103ms total=9.920ms
+moe_profile: layer=43 active_experts=115 histogram: M=1:7 M=2:6 M=3:5 M=4+:97
+moe_profile: layer=43 selection=0.006ms routing=0.125ms gemm_loop=10.981ms shared=0.223ms residual=0.026ms alloc=0.121ms total=11.525ms
+moe_profile: layer=45 active_experts=123 histogram: M=1:5 M=2:0 M=3:4 M=4+:114
+moe_profile: layer=45 selection=0.007ms routing=0.121ms gemm_loop=11.671ms shared=0.222ms residual=0.027ms alloc=0.112ms total=12.189ms
+moe_profile: layer=47 active_experts=124 histogram: M=1:4 M=2:3 M=3:9 M=4+:108
+moe_profile: layer=47 selection=0.007ms routing=0.109ms gemm_loop=11.504ms shared=0.213ms residual=0.025ms alloc=0.111ms total=12.006ms
+moe_profile: layer=49 active_experts=116 histogram: M=1:12 M=2:8 M=3:0 M=4+:96
+moe_profile: layer=49 selection=0.007ms routing=0.111ms gemm_loop=10.966ms shared=0.224ms residual=0.024ms alloc=0.139ms total=11.495ms
+moe_profile: layer=51 active_experts=121 histogram: M=1:8 M=2:6 M=3:11 M=4+:96
+moe_profile: layer=51 selection=0.007ms routing=0.124ms gemm_loop=11.191ms shared=0.208ms residual=0.022ms alloc=0.105ms total=11.674ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=1 selection=0.007ms routing=0.109ms gemm_loop=11.622ms shared=0.220ms residual=0.022ms alloc=0.105ms total=12.104ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=3 selection=0.007ms routing=0.096ms gemm_loop=11.563ms shared=0.216ms residual=0.023ms alloc=0.117ms total=12.047ms
+moe_profile: layer=6 active_experts=125 histogram: M=1:3 M=2:5 M=3:2 M=4+:115
+moe_profile: layer=6 selection=0.008ms routing=0.112ms gemm_loop=11.562ms shared=0.214ms residual=0.024ms alloc=0.115ms total=12.074ms
+moe_profile: layer=8 active_experts=108 histogram: M=1:10 M=2:7 M=3:5 M=4+:86
+moe_profile: layer=8 selection=0.006ms routing=0.103ms gemm_loop=9.967ms shared=0.211ms residual=0.022ms alloc=0.110ms total=10.451ms
+moe_profile: layer=10 active_experts=112 histogram: M=1:9 M=2:9 M=3:6 M=4+:88
+moe_profile: layer=10 selection=0.007ms routing=0.110ms gemm_loop=10.310ms shared=0.209ms residual=0.022ms alloc=0.100ms total=10.775ms
+moe_profile: layer=13 active_experts=107 histogram: M=1:10 M=2:7 M=3:1 M=4+:89
+moe_profile: layer=13 selection=0.007ms routing=0.118ms gemm_loop=10.132ms shared=0.209ms residual=0.022ms alloc=0.114ms total=10.636ms
+moe_profile: layer=15 active_experts=87 histogram: M=1:12 M=2:6 M=3:5 M=4+:64
+moe_profile: layer=15 selection=0.007ms routing=0.101ms gemm_loop=8.370ms shared=0.211ms residual=0.020ms alloc=0.112ms total=8.844ms
+moe_profile: layer=17 active_experts=100 histogram: M=1:14 M=2:14 M=3:6 M=4+:66
+moe_profile: layer=17 selection=0.007ms routing=0.100ms gemm_loop=9.468ms shared=0.209ms residual=0.024ms alloc=0.119ms total=9.954ms
+moe_profile: layer=20 active_experts=96 histogram: M=1:8 M=2:7 M=3:2 M=4+:79
+moe_profile: layer=20 selection=0.008ms routing=0.114ms gemm_loop=9.174ms shared=0.221ms residual=0.029ms alloc=0.120ms total=9.712ms
+moe_profile: layer=22 active_experts=98 histogram: M=1:9 M=2:4 M=3:6 M=4+:79
+moe_profile: layer=22 selection=0.008ms routing=0.111ms gemm_loop=9.222ms shared=0.220ms residual=0.024ms alloc=0.107ms total=9.719ms
+moe_profile: layer=24 active_experts=102 histogram: M=1:7 M=2:7 M=3:10 M=4+:78
+moe_profile: layer=24 selection=0.007ms routing=0.112ms gemm_loop=9.615ms shared=0.210ms residual=0.023ms alloc=0.104ms total=10.089ms
+moe_profile: layer=27 active_experts=98 histogram: M=1:13 M=2:5 M=3:5 M=4+:75
+moe_profile: layer=27 selection=0.007ms routing=0.130ms gemm_loop=9.606ms shared=0.225ms residual=0.028ms alloc=0.119ms total=10.153ms
+moe_profile: layer=29 active_experts=106 histogram: M=1:5 M=2:7 M=3:3 M=4+:91
+moe_profile: layer=29 selection=0.007ms routing=0.107ms gemm_loop=10.034ms shared=0.219ms residual=0.025ms alloc=0.109ms total=10.531ms
+moe_profile: layer=31 active_experts=114 histogram: M=1:14 M=2:2 M=3:2 M=4+:96
+moe_profile: layer=31 selection=0.006ms routing=0.122ms gemm_loop=10.702ms shared=0.215ms residual=0.027ms alloc=0.136ms total=11.234ms
+moe_profile: layer=34 active_experts=115 histogram: M=1:8 M=2:13 M=3:4 M=4+:90
+moe_profile: layer=34 selection=0.007ms routing=0.121ms gemm_loop=10.929ms shared=0.217ms residual=0.025ms alloc=0.115ms total=11.454ms
+moe_profile: layer=36 active_experts=111 histogram: M=1:9 M=2:7 M=3:5 M=4+:90
+moe_profile: layer=36 selection=0.007ms routing=0.109ms gemm_loop=10.595ms shared=0.214ms residual=0.026ms alloc=0.108ms total=11.092ms
+moe_profile: layer=38 active_experts=113 histogram: M=1:9 M=2:5 M=3:8 M=4+:91
+moe_profile: layer=38 selection=0.007ms routing=0.125ms gemm_loop=10.679ms shared=0.214ms residual=0.024ms alloc=0.109ms total=11.184ms
+moe_profile: layer=40 active_experts=102 histogram: M=1:10 M=2:9 M=3:8 M=4+:75
+moe_profile: layer=40 selection=0.007ms routing=0.122ms gemm_loop=9.679ms shared=0.210ms residual=0.025ms alloc=0.112ms total=10.180ms
+moe_profile: layer=43 active_experts=115 histogram: M=1:7 M=2:6 M=3:5 M=4+:97
+moe_profile: layer=43 selection=0.008ms routing=0.128ms gemm_loop=11.033ms shared=0.220ms residual=0.029ms alloc=0.117ms total=11.577ms
+moe_profile: layer=45 active_experts=123 histogram: M=1:5 M=2:0 M=3:4 M=4+:114
+moe_profile: layer=45 selection=0.007ms routing=0.114ms gemm_loop=11.572ms shared=0.218ms residual=0.026ms alloc=0.108ms total=12.069ms
+moe_profile: layer=47 active_experts=124 histogram: M=1:4 M=2:3 M=3:9 M=4+:108
+moe_profile: layer=47 selection=0.007ms routing=0.120ms gemm_loop=11.744ms shared=0.218ms residual=0.028ms alloc=0.117ms total=12.257ms
+moe_profile: layer=49 active_experts=116 histogram: M=1:12 M=2:8 M=3:0 M=4+:96
+moe_profile: layer=49 selection=0.007ms routing=0.118ms gemm_loop=10.961ms shared=0.211ms residual=0.026ms alloc=0.110ms total=11.457ms
+moe_profile: layer=51 active_experts=121 histogram: M=1:8 M=2:6 M=3:11 M=4+:96
+moe_profile: layer=51 selection=0.007ms routing=0.107ms gemm_loop=11.349ms shared=0.212ms residual=0.024ms alloc=0.103ms total=11.838ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=1 selection=0.007ms routing=0.109ms gemm_loop=11.843ms shared=0.215ms residual=0.021ms alloc=0.103ms total=12.325ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=3 selection=0.007ms routing=0.094ms gemm_loop=11.907ms shared=0.208ms residual=0.021ms alloc=0.103ms total=12.364ms
+moe_profile: layer=6 active_experts=125 histogram: M=1:3 M=2:5 M=3:2 M=4+:115
+moe_profile: layer=6 selection=0.007ms routing=0.114ms gemm_loop=11.780ms shared=0.210ms residual=0.024ms alloc=0.159ms total=12.327ms
+moe_profile: layer=8 active_experts=108 histogram: M=1:10 M=2:7 M=3:5 M=4+:86
+moe_profile: layer=8 selection=0.007ms routing=0.099ms gemm_loop=10.430ms shared=0.218ms residual=0.024ms alloc=0.115ms total=10.920ms
+moe_profile: layer=10 active_experts=112 histogram: M=1:9 M=2:9 M=3:6 M=4+:88
+moe_profile: layer=10 selection=0.007ms routing=0.109ms gemm_loop=10.704ms shared=0.212ms residual=0.023ms alloc=0.123ms total=11.211ms
+moe_profile: layer=13 active_experts=107 histogram: M=1:10 M=2:7 M=3:1 M=4+:89
+moe_profile: layer=13 selection=0.008ms routing=0.112ms gemm_loop=10.250ms shared=0.213ms residual=0.025ms alloc=0.115ms total=10.770ms
+moe_profile: layer=15 active_experts=87 histogram: M=1:12 M=2:6 M=3:5 M=4+:64
+moe_profile: layer=15 selection=0.007ms routing=0.099ms gemm_loop=8.413ms shared=0.206ms residual=0.027ms alloc=0.105ms total=8.886ms
+moe_profile: layer=17 active_experts=100 histogram: M=1:14 M=2:14 M=3:6 M=4+:66
+moe_profile: layer=17 selection=0.007ms routing=0.109ms gemm_loop=9.305ms shared=0.211ms residual=0.021ms alloc=0.104ms total=9.775ms
+moe_profile: layer=20 active_experts=96 histogram: M=1:8 M=2:7 M=3:2 M=4+:79
+moe_profile: layer=20 selection=0.009ms routing=0.121ms gemm_loop=9.378ms shared=0.219ms residual=0.026ms alloc=0.164ms total=9.955ms
+moe_profile: layer=22 active_experts=98 histogram: M=1:9 M=2:4 M=3:6 M=4+:79
+moe_profile: layer=22 selection=0.007ms routing=0.121ms gemm_loop=9.570ms shared=0.217ms residual=0.025ms alloc=0.124ms total=10.096ms
+moe_profile: layer=24 active_experts=102 histogram: M=1:7 M=2:7 M=3:10 M=4+:78
+moe_profile: layer=24 selection=0.007ms routing=0.118ms gemm_loop=9.773ms shared=0.215ms residual=0.023ms alloc=0.110ms total=10.269ms
+moe_profile: layer=27 active_experts=98 histogram: M=1:13 M=2:5 M=3:5 M=4+:75
+moe_profile: layer=27 selection=0.007ms routing=0.112ms gemm_loop=9.700ms shared=0.229ms residual=0.028ms alloc=0.175ms total=10.299ms
+moe_profile: layer=29 active_experts=106 histogram: M=1:5 M=2:7 M=3:3 M=4+:91
+moe_profile: layer=29 selection=0.007ms routing=0.118ms gemm_loop=10.227ms shared=0.217ms residual=0.025ms alloc=0.120ms total=10.739ms
+moe_profile: layer=31 active_experts=114 histogram: M=1:14 M=2:2 M=3:2 M=4+:96
+moe_profile: layer=31 selection=0.007ms routing=0.125ms gemm_loop=10.838ms shared=0.217ms residual=0.026ms alloc=0.118ms total=11.355ms
+moe_profile: layer=34 active_experts=115 histogram: M=1:8 M=2:13 M=3:4 M=4+:90
+moe_profile: layer=34 selection=0.007ms routing=0.123ms gemm_loop=10.892ms shared=0.212ms residual=0.024ms alloc=0.323ms total=11.624ms
+moe_profile: layer=36 active_experts=111 histogram: M=1:9 M=2:7 M=3:5 M=4+:90
+moe_profile: layer=36 selection=0.007ms routing=0.116ms gemm_loop=10.400ms shared=0.224ms residual=0.026ms alloc=0.110ms total=10.904ms
+moe_profile: layer=38 active_experts=113 histogram: M=1:9 M=2:5 M=3:8 M=4+:91
+moe_profile: layer=38 selection=0.006ms routing=0.116ms gemm_loop=10.522ms shared=0.221ms residual=0.027ms alloc=0.114ms total=11.033ms
+moe_profile: layer=40 active_experts=102 histogram: M=1:10 M=2:9 M=3:8 M=4+:75
+moe_profile: layer=40 selection=0.007ms routing=0.116ms gemm_loop=9.604ms shared=0.214ms residual=0.027ms alloc=0.108ms total=10.099ms
+moe_profile: layer=43 active_experts=115 histogram: M=1:7 M=2:6 M=3:5 M=4+:97
+moe_profile: layer=43 selection=0.008ms routing=0.125ms gemm_loop=10.961ms shared=0.218ms residual=0.025ms alloc=0.157ms total=11.542ms
+moe_profile: layer=45 active_experts=123 histogram: M=1:5 M=2:0 M=3:4 M=4+:114
+moe_profile: layer=45 selection=0.006ms routing=0.112ms gemm_loop=11.594ms shared=0.220ms residual=0.027ms alloc=0.123ms total=12.118ms
+moe_profile: layer=47 active_experts=124 histogram: M=1:4 M=2:3 M=3:9 M=4+:108
+moe_profile: layer=47 selection=0.007ms routing=0.109ms gemm_loop=11.772ms shared=0.215ms residual=0.026ms alloc=0.117ms total=12.282ms
+moe_profile: layer=49 active_experts=116 histogram: M=1:12 M=2:8 M=3:0 M=4+:96
+moe_profile: layer=49 selection=0.007ms routing=0.119ms gemm_loop=10.984ms shared=0.215ms residual=0.027ms alloc=0.119ms total=11.506ms
+moe_profile: layer=51 active_experts=121 histogram: M=1:8 M=2:6 M=3:11 M=4+:96
+moe_profile: layer=51 selection=0.007ms routing=0.121ms gemm_loop=11.871ms shared=0.215ms residual=0.027ms alloc=0.130ms total=12.401ms
+moe_profile: layer=1 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=1 selection=0.012ms routing=0.332ms gemm_loop=13.403ms shared=0.806ms residual=0.100ms alloc=0.157ms total=14.853ms
+moe_profile: layer=3 active_experts=128 histogram: M=1:0 M=2:0 M=3:0 M=4+:128
+moe_profile: layer=3 selection=0.012ms routing=0.321ms gemm_loop=13.493ms shared=0.790ms residual=0.100ms alloc=0.137ms total=14.884ms

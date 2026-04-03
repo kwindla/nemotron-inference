@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,149 @@
 
 namespace nemotron {
 namespace {
+
+bool EnvEnabled(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+class CudaEventSpan {
+ public:
+  explicit CudaEventSpan(bool enabled) {
+    if (!enabled) {
+      return;
+    }
+    if (cudaEventCreate(&start_) != cudaSuccess) {
+      start_ = nullptr;
+      return;
+    }
+    if (cudaEventCreate(&end_) != cudaSuccess) {
+      cudaEventDestroy(start_);
+      start_ = nullptr;
+      end_ = nullptr;
+      return;
+    }
+    enabled_ = true;
+  }
+
+  ~CudaEventSpan() {
+    if (start_ != nullptr) {
+      cudaEventDestroy(start_);
+    }
+    if (end_ != nullptr) {
+      cudaEventDestroy(end_);
+    }
+  }
+
+  CudaEventSpan(const CudaEventSpan&) = delete;
+  CudaEventSpan& operator=(const CudaEventSpan&) = delete;
+  CudaEventSpan(CudaEventSpan&&) = delete;
+  CudaEventSpan& operator=(CudaEventSpan&&) = delete;
+
+  void RecordStart() {
+    if (!enabled_) {
+      return;
+    }
+    if (cudaEventRecord(start_) != cudaSuccess) {
+      enabled_ = false;
+    }
+  }
+
+  void RecordEnd() {
+    if (!enabled_) {
+      return;
+    }
+    if (cudaEventRecord(end_) != cudaSuccess) {
+      enabled_ = false;
+    }
+  }
+
+  void SynchronizeEnd() const {
+    if (!enabled_) {
+      return;
+    }
+    cudaEventSynchronize(end_);
+  }
+
+  float ElapsedMilliseconds() const {
+    if (!enabled_) {
+      return 0.0f;
+    }
+    float elapsed_ms = 0.0f;
+    if (cudaEventElapsedTime(&elapsed_ms, start_, end_) != cudaSuccess) {
+      return 0.0f;
+    }
+    return elapsed_ms;
+  }
+
+ private:
+  cudaEvent_t start_ = nullptr;
+  cudaEvent_t end_ = nullptr;
+  bool enabled_ = false;
+};
+
+void PrintMoeProfileHistogram(
+    std::size_t layer_index,
+    const std::vector<std::size_t>& expert_offsets) {
+  if (expert_offsets.size() < 2) {
+    return;
+  }
+
+  std::size_t active_experts = 0;
+  std::size_t experts_with_1 = 0;
+  std::size_t experts_with_2 = 0;
+  std::size_t experts_with_3 = 0;
+  std::size_t experts_with_4_plus = 0;
+  for (std::size_t expert_index = 0; expert_index + 1 < expert_offsets.size(); ++expert_index) {
+    const std::size_t token_count = expert_offsets[expert_index + 1] - expert_offsets[expert_index];
+    if (token_count == 0) {
+      continue;
+    }
+    ++active_experts;
+    if (token_count == 1) {
+      ++experts_with_1;
+    } else if (token_count == 2) {
+      ++experts_with_2;
+    } else if (token_count == 3) {
+      ++experts_with_3;
+    } else {
+      ++experts_with_4_plus;
+    }
+  }
+
+  std::cerr << "moe_profile: layer=" << layer_index
+            << " active_experts=" << active_experts
+            << " histogram: M=1:" << experts_with_1
+            << " M=2:" << experts_with_2
+            << " M=3:" << experts_with_3
+            << " M=4+:" << experts_with_4_plus
+            << "\n";
+}
+
+void PrintMoeProfileTimings(
+    std::size_t layer_index,
+    const CudaEventSpan& selection,
+    const CudaEventSpan& routing,
+    const CudaEventSpan& gemm_loop,
+    const CudaEventSpan& shared,
+    const CudaEventSpan& residual,
+    const CudaEventSpan& alloc,
+    const CudaEventSpan& total) {
+  const std::ios::fmtflags old_flags = std::cerr.flags();
+  const std::streamsize old_precision = std::cerr.precision();
+  std::cerr << std::fixed << std::setprecision(3)
+            << "moe_profile: layer=" << layer_index
+            << " selection=" << selection.ElapsedMilliseconds() << "ms"
+            << " routing=" << routing.ElapsedMilliseconds() << "ms"
+            << " gemm_loop=" << gemm_loop.ElapsedMilliseconds() << "ms"
+            << " shared=" << shared.ElapsedMilliseconds() << "ms"
+            << " residual=" << residual.ElapsedMilliseconds() << "ms"
+            << " alloc=" << alloc.ElapsedMilliseconds() << "ms"
+            << " total=" << total.ElapsedMilliseconds() << "ms"
+            << "\n";
+  std::cerr.flags(old_flags);
+  std::cerr.precision(old_precision);
+}
 
 bool IsFp32Storage(const std::string& storage_dtype) {
   return storage_dtype == "fp32" || storage_dtype == "float32" || storage_dtype == "float";
@@ -939,6 +1083,7 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
     const DeviceTensorFp32& router_logits,
     DeviceTensorFp32* output) const {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  const bool moe_profile = EnvEnabled("NEMOTRON_FORWARD_MOE_PROFILE");
   if (!cublas_handle.valid() ||
       !input.valid() ||
       !normalized.valid() ||
@@ -964,6 +1109,15 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
 
   const std::size_t token_count = input.shape()[0];
   const std::size_t selection_count = token_count * config.top_k;
+  CudaEventSpan total_span(moe_profile);
+  CudaEventSpan selection_span(moe_profile);
+  CudaEventSpan routing_span(moe_profile);
+  CudaEventSpan alloc_span(moe_profile);
+  CudaEventSpan gemm_loop_span(moe_profile);
+  CudaEventSpan shared_span(moe_profile);
+  CudaEventSpan residual_span(moe_profile);
+  total_span.RecordStart();
+  selection_span.RecordStart();
   auto selected_indices_device = DeviceArray<int>::Create(selection_count);
   auto selected_weights_device = DeviceArray<float>::Create(selection_count);
   if (!selected_indices_device ||
@@ -981,9 +1135,11 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
           selected_weights_device->data())) {
     return false;
   }
+  selection_span.RecordEnd();
 
   std::vector<int> selected_indices_host;
   std::vector<float> selected_weights_host;
+  routing_span.RecordStart();
   if (!selected_indices_device->CopyToHost(&selected_indices_host) ||
       !selected_weights_device->CopyToHost(&selected_weights_host)) {
     return false;
@@ -1005,12 +1161,18 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
 
   auto expert_token_indices_device = DeviceArray<int>::CopyFromHost(expert_token_indices_host);
   auto expert_token_weights_device = DeviceArray<float>::CopyFromHost(expert_token_weights_host);
+  routing_span.RecordEnd();
+  if (moe_profile) {
+    PrintMoeProfileHistogram(config.layer_index, expert_offsets);
+  }
+  alloc_span.RecordStart();
   auto routed_output = DeviceTensorFp32::Create({token_count, config.hidden_size});
   auto row_scratch = DeviceTensorFp32::Create({token_count, config.hidden_size});
   auto expert_up_output =
       DeviceTensorFp32::Create({token_count, config.routed_expert_intermediate_size});
   auto shared_up_output =
       DeviceTensorFp32::Create({token_count, config.shared_expert_intermediate_size});
+  alloc_span.RecordEnd();
   if (!expert_token_indices_device ||
       !expert_token_weights_device ||
       !routed_output ||
@@ -1022,6 +1184,7 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
   }
 
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
+  gemm_loop_span.RecordStart();
   for (std::size_t expert_index = 0; expert_index < config.n_routed_experts; ++expert_index) {
     const std::size_t expert_offset = expert_offsets[expert_index];
     const std::size_t next_expert_offset = expert_offsets[expert_index + 1];
@@ -1098,6 +1261,7 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
       return false;
     }
   }
+  gemm_loop_span.RecordEnd();
 
   auto shared_output = DeviceTensorFp32::CreateView(
       {token_count, config.hidden_size},
@@ -1120,6 +1284,7 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
       shared_down_weight_view,
       token_count,
       heuristic_cache);
+  shared_span.RecordStart();
   if (!shared_up_plan.has_value() ||
       !shared_down_plan.has_value() ||
       !RunNvfp4RowMajorFp32SourceToDevice(
@@ -1138,10 +1303,29 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
            shared_down_weight_view,
            shared_output.get(),
            pack_options)
-           .has_value() ||
-      !ResidualAddFp32(*routed_output, *shared_output, output) ||
+           .has_value()) {
+    return false;
+  }
+  shared_span.RecordEnd();
+  residual_span.RecordStart();
+  if (!ResidualAddFp32(*routed_output, *shared_output, output) ||
       !ResidualAddFp32(input, *output, output)) {
     return false;
+  }
+  residual_span.RecordEnd();
+  total_span.RecordEnd();
+
+  if (moe_profile) {
+    total_span.SynchronizeEnd();
+    PrintMoeProfileTimings(
+        config.layer_index,
+        selection_span,
+        routing_span,
+        gemm_loop_span,
+        shared_span,
+        residual_span,
+        alloc_span,
+        total_span);
   }
 
   return true;
