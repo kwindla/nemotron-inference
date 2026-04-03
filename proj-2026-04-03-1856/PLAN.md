@@ -28,7 +28,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
   If the unified backend crashes or produces obviously wrong output, stop and diagnose before proceeding. Save both JSON files as artifacts.
   Key files: `testing/api/nano_save_prompt_oracle.cpp`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **2. Audit and fix verify_correctness.sh**
+- [x] **2. Audit and fix verify_correctness.sh**
   Read `proj-2026-04-03-0318/verify_correctness.sh` line by line and check:
   - Does it set the right env vars for default vs unified? (It should disable unified for the default run and enable it for the unified run.)
   - Does the Python comparison inline script actually compare the right fields?
@@ -39,7 +39,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
   Fix any bugs found. Then run it and capture the output. If it fails, diagnose whether the failure is in the script or in the unified backend.
   Key files: `proj-2026-04-03-0318/verify_correctness.sh`, `testing/api/nano_16_token_correctness_test.cpp`
 
-- [ ] **3. Run internal performance benchmarks**
+- [x] **3. Run internal performance benchmarks**
   First audit `proj-2026-04-03-0318/bench_decode_backends.sh` and `proj-2026-04-03-0318/bench_full_comparison.sh` for correctness — check they invoke the right binaries with the right env vars. Fix any issues.
 
   Then run the decode backend comparison:
@@ -90,7 +90,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Bare-minimum inference sanity check | done | — | Fixed device/host pointer bug in RunFusedMoePrefill, verified bit-identical output |
-| 2 | Audit and fix verify_correctness.sh | pending | — | |
-| 3 | Run internal performance benchmarks | pending | — | |
+| 2 | Audit and fix verify_correctness.sh | done | — | Script correct as-is, all tests pass, 0.0 max logit diff |
+| 3 | Run internal performance benchmarks | done | — | Scalar decode 27x slower (1825ms) than unified/cuBLASLt (67ms). Scalar kernel should be removed. |
 | 4 | Run vLLM external baseline | pending | — | |
 | 5 | Compile results and apply SM120 decision | pending | — | |
