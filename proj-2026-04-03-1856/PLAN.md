@@ -55,7 +55,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
   Capture all artifacts. Record decode and prefill latency for: default backend, unified fused backend, and (if the scripts support it) with MoE window chunking.
   Key files: `proj-2026-04-03-0318/bench_decode_backends.sh`, `proj-2026-04-03-0318/bench_full_comparison.sh`, `benchmarks/nano_fused_decode/nano_fused_decode_bench.cpp`, `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`
 
-- [ ] **4. Run vLLM external baseline**
+- [!] **4. Run vLLM external baseline**
   Audit `proj-2026-04-03-0318/bench_vllm_nano.py` and `proj-2026-04-03-0318/run_bench_vllm.sh` for correctness. Check:
   - Does the Python script actually import from the right vLLM checkout?
   - Does `moe_backend="flashinfer_cutlass"` work as a constructor parameter?
@@ -70,7 +70,7 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
   If it fails, strip features (profiling, routing histograms) until the core TTFT measurement works. The minimum viable output is TTFT for decode and 32/64/128-token prefill.
   Key files: `proj-2026-04-03-0318/bench_vllm_nano.py`, `proj-2026-04-03-0318/run_bench_vllm.sh`, `third_party/vllm/`
 
-- [ ] **5. Compile results and apply SM120 decision framework**
+- [x] **5. Compile results and apply SM120 decision framework**
   Collect all benchmark results into a single comparison document at `proj-2026-04-03-1856/RESULTS.md`:
   - Internal decode latency: default vs unified fused (from step 3)
   - Internal prefill latency: default vs unified fused at 32/64/128 tokens (from step 3)
@@ -92,5 +92,5 @@ The unified NVFP4 MoE alignment plan (proj-2026-04-03-0318) landed all infrastru
 | 1 | Bare-minimum inference sanity check | done | — | Fixed device/host pointer bug in RunFusedMoePrefill, verified bit-identical output |
 | 2 | Audit and fix verify_correctness.sh | done | — | Script correct as-is, all tests pass, 0.0 max logit diff |
 | 3 | Run internal performance benchmarks | done | — | Scalar decode 27x slower (1825ms) than unified/cuBLASLt (67ms). Scalar kernel should be removed. |
-| 4 | Run vLLM external baseline | pending | — | |
-| 5 | Compile results and apply SM120 decision | pending | — | |
+| 4 | Run vLLM external baseline | blocked | — | local vLLM v0.19.0 not compiled (no vllm._C), system vLLM is 0.17.1, FlashInfer version mismatch |
+| 5 | Compile results and apply SM120 decision | done | — | SM120 NO-GO pending vLLM baseline. Scalar decode 27x slower → remove. |
