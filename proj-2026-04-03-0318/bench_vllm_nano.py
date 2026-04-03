@@ -54,10 +54,7 @@ PROFILE_MATCH_KEYWORDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark vLLM offline TTFT for NVIDIA Nemotron Nano NVFP4 with "
-            "flashinfer_cutlass."
-        )
+        description="Benchmark vLLM offline TTFT for NVIDIA Nemotron Nano NVFP4."
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
@@ -82,6 +79,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
+        "--moe-backend",
+        default=None,
+        help=(
+            "Optional vLLM MoE backend override. Default leaves backend "
+            "selection to vLLM."
+        ),
+    )
+    parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
         default=None,
@@ -104,8 +109,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--enforce-eager",
-        action="store_true",
-        help="Force eager execution. Default keeps vLLM's normal hybrid mode.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Force eager execution. Enabled by default; pass "
+            "--no-enforce-eager to use vLLM's normal hybrid mode."
+        ),
     )
     return parser.parse_args()
 
@@ -608,21 +617,26 @@ def main() -> int:
             "ignore_frontend": True,
         }
 
+    llm_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "tokenizer": args.model,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "trust_remote_code": args.trust_remote_code,
+        "seed": args.seed,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_num_seqs": 1,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        "max_model_len": max_prompt_tokens + 8,
+        "enable_prefix_caching": True,
+        "enable_return_routed_experts": True,
+        "enforce_eager": args.enforce_eager,
+        "profiler_config": profiler_config,
+    }
+    if args.moe_backend is not None:
+        llm_kwargs["moe_backend"] = args.moe_backend
+
     llm = LLM(
-        model=args.model,
-        tokenizer=args.model,
-        tensor_parallel_size=args.tensor_parallel_size,
-        trust_remote_code=args.trust_remote_code,
-        seed=args.seed,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_num_seqs=1,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_model_len=max_prompt_tokens + 8,
-        enable_prefix_caching=True,
-        enable_return_routed_experts=True,
-        enforce_eager=args.enforce_eager,
-        profiler_config=profiler_config,
-        moe_backend="flashinfer_cutlass",
+        **llm_kwargs,
     )
 
     try:
@@ -698,7 +712,6 @@ def main() -> int:
                 "local_path": str(LOCAL_VLLM_ROOT),
                 "git_tag": git_output("describe", "--tags", "--always"),
                 "git_commit": git_output("rev-parse", "HEAD"),
-                "requested_moe_backend": "flashinfer_cutlass",
                 "selected_nvfp4_backends": selected_backends,
                 "worker_moe_layers": worker_moe_layers,
             },

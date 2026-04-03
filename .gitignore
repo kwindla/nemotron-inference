@@ -11,3 +11,4 @@ claude-todo.md
 .codex/runtime/
 /codex-jobs/
 proj-*/codex-jobs/*.log
+vllm-env/

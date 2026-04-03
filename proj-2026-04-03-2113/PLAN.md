@@ -20,7 +20,7 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
 
 ## Steps
 
-- [ ] **1. Create uv-managed venv and build vLLM from source**
+- [x] **1. Create uv-managed venv and build vLLM from source**
   Create a project-local virtualenv at `vllm-env/` using uv. Build vLLM v0.19.0 from `third_party/vllm` with SM120 support.
 
   ```bash
@@ -40,7 +40,7 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
   Add `vllm-env/` to `.gitignore` if not already there.
   Key files: `third_party/vllm/pyproject.toml`, `.gitignore`
 
-- [ ] **2. Create wrapper scripts for running vLLM tools**
+- [x] **2. Create wrapper scripts for running vLLM tools**
   Create `proj-2026-04-03-2113/run-vllm.sh` that:
   - Uses `vllm-env/bin/python` directly (no activate needed)
   - Does NOT set `VLLM_FLASH_ATTN_VERSION` (no-op in v0.19.0, FA2 already default on SM120)
@@ -73,7 +73,7 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
   Record whether it produces coherent text.
   Key files: `proj-2026-04-03-2113/run-vllm.sh`
 
-- [ ] **4. Update benchmark scripts for SM120 vLLM reality**
+- [x] **4. Update benchmark scripts for SM120 vLLM reality**
   Update `proj-2026-04-03-0318/bench_vllm_nano.py`:
   - Remove hard-coded `moe_backend="flashinfer_cutlass"` from `LLM()` constructor (line 626)
   - Remove `flashinfer_cutlass` from CLI description text (line 56)
@@ -107,8 +107,8 @@ The comparison target is "vLLM on RTX 5090 with Marlin MoE backend" — what a u
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Build vLLM from source with uv | pending | — | |
-| 2 | Create wrapper scripts | pending | — | |
+| 1 | Build vLLM from source with uv | done | — | vllm==0.19.0+cu130 with torch==2.10.0+cu130 |
+| 2 | Create wrapper scripts | done | — | run-vllm.sh and vllm-serve.sh |
 | 3 | Validate vLLM on RTX 5090 | pending | — | |
-| 4 | Update benchmark scripts for SM120 | pending | — | |
+| 4 | Update benchmark scripts for SM120 | done | — | Removed flashinfer_cutlass hard-coding, added --moe-backend CLI arg |
 | 5 | Run vLLM benchmark | pending | — | |
