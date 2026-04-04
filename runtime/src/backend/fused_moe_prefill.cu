@@ -166,9 +166,6 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  auto input = DeviceTensorFp32::CreateView(
-      {params.token_count, params.hidden_size},
-      const_cast<float*>(params.input));
   auto normalized = DeviceTensorFp32::CreateView(
       {params.token_count, params.hidden_size},
       const_cast<float*>(params.normalized));
@@ -181,7 +178,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   auto shared_up = DeviceTensorFp32::CreateView(
       {params.token_count, params.shared_expert_intermediate_size},
       params.shared_up_scratch);
-  if (!input || !normalized || !output || !routed_output || !shared_up) {
+  if (!normalized || !output || !routed_output || !shared_up) {
     return false;
   }
 
@@ -368,8 +365,9 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
            output.get(),
            pack_options)
            .has_value() ||
-      !ResidualAddFp32(*routed_output, *output, output.get()) ||
-      !ResidualAddFp32(*input, *output, output.get())) {
+      // The caller already updated the BF16 residual buffer at the layer entry.
+      // This backend must return only the MoE delta, not input + delta.
+      !ResidualAddFp32(*routed_output, *output, output.get())) {
     return false;
   }
 
