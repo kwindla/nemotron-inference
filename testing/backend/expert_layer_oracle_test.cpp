@@ -475,7 +475,7 @@ bool run_expert_layer_fixture() {
           "routed NVFP4 activation packing mode should be dynamic_runtime") ||
       !expect(
           metadata->routed_nvfp4_weight_tensor_scale_contract ==
-              "effective_fused_input_scale_x_weight_scale_2",
+              "effective_tensor_scale = input_scale * weight_scale_2",
           "routed NVFP4 tensor scale contract should be effective fused") ||
       !expect(
           expected_norm_output.empty() ||
@@ -525,8 +525,8 @@ bool run_expert_layer_fixture() {
   if (metadata->shared_down_family == "nvfp4") {
     const std::string expected_shared_down_contract =
         metadata->shared_down_nvfp4_input_scale_present
-            ? "effective_fused_input_scale_x_weight_scale_2"
-            : "raw_checkpoint_weight_scale_2";
+            ? "effective_tensor_scale = input_scale * weight_scale_2"
+            : "raw_weight_scale_2";
     if (!expect(
             metadata->shared_down_nvfp4_activation_packing_mode == "dynamic_runtime",
             "shared down NVFP4 activation packing mode should be dynamic_runtime") ||
@@ -709,7 +709,7 @@ bool run_expert_layer_fixture() {
       force_create_env != nullptr && std::string(force_create_env).size() != 0;
   if (!force_create &&
       metadata->routed_nvfp4_weight_tensor_scale_contract ==
-      "effective_fused_input_scale_x_weight_scale_2") {
+      "effective_tensor_scale = input_scale * weight_scale_2") {
     ExpertLayerPreparedBindings prepared_bindings;
     prepared_bindings.input_norm_weight = DeviceTensorFp32::Create({metadata->hidden_size});
     prepared_bindings.gate_score_correction_bias_device =

@@ -294,8 +294,8 @@ bool run_fixture(
     return false;
   }
   const std::string expected_weight_scale_contract = metadata.weight_input_scale_present
-                                                         ? "effective_fused_input_scale_x_weight_scale_2"
-                                                         : "raw_checkpoint_weight_scale_2";
+                                                         ? "effective_tensor_scale = input_scale * weight_scale_2"
+                                                         : "raw_weight_scale_2";
   if (!expect(
           metadata.weight_tensor_scale_contract == expected_weight_scale_contract,
           metadata.fixture_name + ": weight tensor scale contract should match fixture input-scale availability")) {

@@ -41,8 +41,8 @@ MIN_SCALE = 1.0 / 1024.0
 CONTAINER_IMAGE = "nemotron-local/dgx-spark-vllm:0.17.1-b31e9326a-fi065"
 ACTIVATION_PACKING_DYNAMIC_RUNTIME = "dynamic_runtime"
 ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE = "fixed_checkpoint_input_scale"
-RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_checkpoint_weight_scale_2"
-EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_fused_input_scale_x_weight_scale_2"
+RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_weight_scale_2"
+EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_tensor_scale = input_scale * weight_scale_2"
 
 
 def parse_args() -> argparse.Namespace:

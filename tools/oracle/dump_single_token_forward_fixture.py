@@ -36,7 +36,7 @@ FP8_E4M3_MAX_FINITE = 448.0
 MIN_SCALE = 1.0 / 1024.0
 FP4_LEVELS_TENSOR = torch.tensor(FP4_POSITIVE_VALUES, dtype=torch.float32)
 FP4_DECODE_TENSOR = torch.tensor(FP4_DECODE_TABLE, dtype=torch.float32)
-RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "tensor_scale = weight_scale_2"
+RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_weight_scale_2"
 EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_tensor_scale = input_scale * weight_scale_2"
 
 
@@ -888,7 +888,7 @@ def main() -> int:
             "prefix_prefill mode runs a short prompt prefix from scratch and can stop after an early capture layer to keep fixture generation practical.",
             "Attention, Mamba, and MoE blocks mirror the current correctness-first runtime contracts already used by the layer-level oracle fixtures.",
             "Routed expert NVFP4 tensor scales use effective_tensor_scale = input_scale * weight_scale_2.",
-            "Shared-down NVFP4 tensor scales remain raw checkpoint weight_scale_2.",
+            "Shared-down NVFP4 tensor scales remain raw_weight_scale_2.",
             "Captured per-layer outputs are intended for the composed registry-backed forward-path validation.",
             "Captured Mamba layers also include final conv/SSM state snapshots for decode-boundary localization.",
         ],

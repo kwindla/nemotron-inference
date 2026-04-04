@@ -36,8 +36,8 @@ MIN_SCALE = 1.0 / 1024.0
 FP4_DECODE_TABLE_TENSOR = torch.tensor(FP4_DECODE_TABLE, dtype=torch.float32)
 FP4_POSITIVE_VALUES_TENSOR = torch.tensor(FP4_POSITIVE_VALUES, dtype=torch.float32)
 ACTIVATION_PACKING_DYNAMIC_RUNTIME = "dynamic_runtime"
-RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_checkpoint_weight_scale_2"
-EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_fused_input_scale_x_weight_scale_2"
+RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_weight_scale_2"
+EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_tensor_scale = input_scale * weight_scale_2"
 
 
 def configure_torch_precision() -> None:
@@ -754,7 +754,7 @@ def main() -> int:
             "The input hidden state is deterministic unless --input-hidden-bin is provided.",
             "Router, latent projections, shared expert, and selected routed experts all use real checkpoint weights.",
             "Routed NVFP4 activations are dynamically packed to mirror the runtime path.",
-            "Routed NVFP4 tensor scales stored in this fixture follow the runtime/cache contract: effective fused input_scale * weight_scale_2.",
+            "Routed NVFP4 tensor scales stored in this fixture follow the runtime/cache contract: effective_tensor_scale = input_scale * weight_scale_2.",
             "expected_final_output_fp32 includes the outer residual add.",
         ],
     }
