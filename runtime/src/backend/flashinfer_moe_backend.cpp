@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 
 #include <cstdlib>
+#include <iostream>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -115,17 +116,26 @@ const char* ToString(RoutedMoEBackendKind kind) {
   return "unknown";
 }
 
+const char* GetServingPathIdentity() {
+  return "direct_custom_grouped_fused_nvfp4";
+}
+
 RoutedMoEBackendKind ResolveRequestedRoutedMoEBackend() {
   const char* env = std::getenv("NEMOTRON_ROUTED_MOE_BACKEND");
   if (env == nullptr || *env == '\0' || std::string(env) == "auto") {
-    return GetFlashInferRoutedMoEAvailability().available
-               ? RoutedMoEBackendKind::kFlashInfer
-               : RoutedMoEBackendKind::kCustomFused;
+    // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+    return RoutedMoEBackendKind::kCustomFused;
   }
-  const std::string value(env);
-  if (value == "flashinfer") {
-    return RoutedMoEBackendKind::kFlashInfer;
+  if (std::string(env) == "flashinfer") {
+    static std::once_flag warning_once;
+    std::call_once(warning_once, []() {
+      std::cerr
+          << "flashinfer_moe_backend: warning: requested routed backend 'flashinfer' is "
+             "disabled; forcing serving path identity "
+          << GetServingPathIdentity() << "\n";
+    });
   }
+  // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
   return RoutedMoEBackendKind::kCustomFused;
 }
 

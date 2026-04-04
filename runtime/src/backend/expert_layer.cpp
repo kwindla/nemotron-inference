@@ -284,8 +284,13 @@ bool RoutedLookupRepairGroupsEnabled() {
 }
 
 bool CutlassMoeEnabled() {
-  static const bool kEnabled = std::getenv("NEMOTRON_CUTLASS_MOE") != nullptr;
-  return kEnabled;
+  // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+  return false;
+}
+
+bool DisableGroupedRoutedNvfp4() {
+  // FROZEN: direct custom grouped fused kernels only -- grouped NVFP4 stays enabled.
+  return false;
 }
 
 constexpr std::size_t kNvfp4BlockWidth = 16;
@@ -1012,7 +1017,9 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<UploadedLinearOp> shared_down_nvfp4;
   std::vector<RoutedExpertEntry> routed_experts;
   RoutedMoEBackendKind routed_backend_kind = RoutedMoEBackendKind::kCustomFused;
-  std::string routed_backend_detail = "custom fused routed nvfp4";
+  std::string routed_backend_detail =
+      "FROZEN: direct custom grouped fused kernels only";
+  std::string serving_path_identity = ::nemotron::GetServingPathIdentity();
   std::unique_ptr<FlashInferRoutedMoEBackend> flashinfer_routed_backend;
   mutable std::atomic<bool> grouped_routed_nvfp4_enabled{true};
   mutable std::atomic<std::size_t> routed_lookups_materialized_count{0};
@@ -1044,10 +1051,12 @@ struct ExpertLayerSlice::Impl {
   mutable DeviceBuffer<const void*> routed_up_packed_lookup_device;
   mutable DeviceBuffer<const void*> routed_up_raw_scale_lookup_device;
   mutable DeviceBuffer<const void*> routed_up_matmul_scale_lookup_device;
+  mutable DeviceBuffer<float> routed_up_input_scale_lookup_device;
   mutable DeviceBuffer<float> routed_up_tensor_scale_lookup_device;
   mutable DeviceBuffer<const void*> routed_down_packed_lookup_device;
   mutable DeviceBuffer<const void*> routed_down_raw_scale_lookup_device;
   mutable DeviceBuffer<const void*> routed_down_matmul_scale_lookup_device;
+  mutable DeviceBuffer<float> routed_down_input_scale_lookup_device;
   mutable DeviceBuffer<float> routed_down_tensor_scale_lookup_device;
   float* dense_pool = nullptr;
   std::size_t dense_pool_numel = 0;
@@ -1065,13 +1074,15 @@ struct ExpertLayerSlice::Impl {
   mutable DeviceBuffer<const void*> scratch_down_matmul_scale_ptrs;
   mutable DeviceBuffer<std::uint32_t> scratch_missing_count;
   mutable DeviceBuffer<std::int32_t> scratch_missing_indices;
+  mutable DeviceBuffer<float> scratch_selected_up_input_scales;
   mutable DeviceBuffer<float> scratch_selected_up_tensor_scales;
+  mutable DeviceBuffer<float> scratch_selected_down_input_scales;
   mutable DeviceBuffer<float> scratch_selected_down_tensor_scales;
-  // -- NVFP4 packing buffers (latent activation) --
+  // -- NVFP4 packing buffers (latent activation, one row per selected expert) --
   mutable DeviceBuffer<std::uint8_t> scratch_latent_packed_data;
   mutable DeviceBuffer<std::uint8_t> scratch_latent_block_scales;
   mutable DeviceBuffer<std::uint8_t> scratch_latent_matmul_scales;
-  mutable DeviceBuffer<std::uint8_t> scratch_latent_tensor_scale;
+  mutable DeviceBuffer<float> scratch_latent_tensor_scales;
   mutable DeviceBuffer<unsigned int> scratch_global_max_bits;
   // -- ScaleRelu2 output buffers --
   mutable DeviceBuffer<std::uint8_t> scratch_down_act_packed;
@@ -1097,6 +1108,10 @@ struct ExpertLayerSlice::Impl {
   mutable DeviceBuffer<float> scratch_graph_latent_in;
   mutable DeviceBuffer<float> scratch_graph_output;
   mutable DeviceBuffer<float> scratch_graph_grouped_up;
+
+  const char* GetServingPathIdentity() const {
+    return serving_path_identity.c_str();
+  }
 
   ~Impl() {
     if (moe_graph_exec != nullptr) {
@@ -1269,15 +1284,20 @@ bool PopulateContiguousRoutedLookupTables(ImplT* impl) {
   std::vector<const void*> up_packed_lookup(expert_count, nullptr);
   std::vector<const void*> up_raw_scale_lookup(expert_count, nullptr);
   std::vector<const void*> up_matmul_scale_lookup(expert_count, nullptr);
+  std::vector<float> up_input_scale_lookup(expert_count, 0.0f);
   std::vector<float> up_tensor_scale_lookup(expert_count, 0.0f);
   std::vector<const void*> down_packed_lookup(expert_count, nullptr);
   std::vector<const void*> down_raw_scale_lookup(expert_count, nullptr);
   std::vector<const void*> down_matmul_scale_lookup(expert_count, nullptr);
+  std::vector<float> down_input_scale_lookup(expert_count, 0.0f);
   std::vector<float> down_tensor_scale_lookup(expert_count, 0.0f);
 
   for (std::size_t expert_index = 0; expert_index < expert_count; ++expert_index) {
     const auto& entry = impl->routed_experts[expert_index];
-    if (!entry.up_tensor_scale.has_value() || !entry.down_tensor_scale.has_value()) {
+    if (!entry.up_input_scale.has_value() ||
+        !entry.down_input_scale.has_value() ||
+        !entry.up_tensor_scale.has_value() ||
+        !entry.down_tensor_scale.has_value()) {
       return false;
     }
     up_packed_lookup[expert_index] = static_cast<const void*>(
@@ -1289,6 +1309,7 @@ bool PopulateContiguousRoutedLookupTables(ImplT* impl) {
     up_matmul_scale_lookup[expert_index] = static_cast<const void*>(
         impl->contiguous_up_matmul_scales.data() +
         (expert_index * impl->contiguous_up_matmul_scale_stride_bytes));
+    up_input_scale_lookup[expert_index] = *entry.up_input_scale;
     up_tensor_scale_lookup[expert_index] = *entry.up_tensor_scale;
 
     down_packed_lookup[expert_index] = static_cast<const void*>(
@@ -1300,16 +1321,19 @@ bool PopulateContiguousRoutedLookupTables(ImplT* impl) {
     down_matmul_scale_lookup[expert_index] = static_cast<const void*>(
         impl->contiguous_down_matmul_scales.data() +
         (expert_index * impl->contiguous_down_matmul_scale_stride_bytes));
+    down_input_scale_lookup[expert_index] = *entry.down_input_scale;
     down_tensor_scale_lookup[expert_index] = *entry.down_tensor_scale;
   }
 
   return impl->routed_up_packed_lookup_device.CopyFromHost(up_packed_lookup) &&
          impl->routed_up_raw_scale_lookup_device.CopyFromHost(up_raw_scale_lookup) &&
          impl->routed_up_matmul_scale_lookup_device.CopyFromHost(up_matmul_scale_lookup) &&
+         impl->routed_up_input_scale_lookup_device.CopyFromHost(up_input_scale_lookup) &&
          impl->routed_up_tensor_scale_lookup_device.CopyFromHost(up_tensor_scale_lookup) &&
          impl->routed_down_packed_lookup_device.CopyFromHost(down_packed_lookup) &&
          impl->routed_down_raw_scale_lookup_device.CopyFromHost(down_raw_scale_lookup) &&
          impl->routed_down_matmul_scale_lookup_device.CopyFromHost(down_matmul_scale_lookup) &&
+         impl->routed_down_input_scale_lookup_device.CopyFromHost(down_input_scale_lookup) &&
          impl->routed_down_tensor_scale_lookup_device.CopyFromHost(down_tensor_scale_lookup);
 }
 
@@ -1349,6 +1373,7 @@ bool InitializeContiguousRoutedExperts(ImplT* impl) {
       !impl->routed_up_packed_lookup_device.Resize(expert_count) ||
       !impl->routed_up_raw_scale_lookup_device.Resize(expert_count) ||
       !impl->routed_up_matmul_scale_lookup_device.Resize(expert_count) ||
+      !impl->routed_up_input_scale_lookup_device.Resize(expert_count) ||
       !impl->routed_up_tensor_scale_lookup_device.Resize(expert_count) ||
       !impl->contiguous_down_packed.Resize(expert_count * impl->contiguous_down_packed_stride_bytes) ||
       !impl->contiguous_down_block_scales.Resize(
@@ -1359,6 +1384,7 @@ bool InitializeContiguousRoutedExperts(ImplT* impl) {
       !impl->routed_down_packed_lookup_device.Resize(expert_count) ||
       !impl->routed_down_raw_scale_lookup_device.Resize(expert_count) ||
       !impl->routed_down_matmul_scale_lookup_device.Resize(expert_count) ||
+      !impl->routed_down_input_scale_lookup_device.Resize(expert_count) ||
       !impl->routed_down_tensor_scale_lookup_device.Resize(expert_count)) {
     return false;
   }
@@ -1480,6 +1506,8 @@ bool ConfigureRoutedMoEBackend(
     const RoutedExpertEntriesT& routed_experts,
     bool debug,
     std::string* strict_failure_reason) {
+  (void)routed_experts;
+  (void)debug;
   if (impl == nullptr) {
     if (strict_failure_reason != nullptr) {
       *strict_failure_reason = "missing expert layer impl";
@@ -1488,9 +1516,22 @@ bool ConfigureRoutedMoEBackend(
   }
 
   impl->routed_backend_kind = RoutedMoEBackendKind::kCustomFused;
-  impl->routed_backend_detail = "custom fused routed nvfp4";
+  impl->routed_backend_detail =
+      "FROZEN: direct custom grouped fused kernels only";
+  impl->serving_path_identity = ::nemotron::GetServingPathIdentity();
   impl->flashinfer_routed_backend.reset();
+  if (strict_failure_reason != nullptr) {
+    strict_failure_reason->clear();
+  }
+  // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+  (void)ResolveRequestedRoutedMoEBackend();
+  std::cerr << "expert_layer: layer " << impl->config.layer_index
+            << " configured routed serving path identity "
+            << impl->GetServingPathIdentity()
+            << " (" << impl->routed_backend_detail << ")\n";
+  return true;
 
+#if 0
   if (ResolveRequestedRoutedMoEBackend() != RoutedMoEBackendKind::kFlashInfer) {
     return true;
   }
@@ -1614,6 +1655,7 @@ bool ConfigureRoutedMoEBackend(
               << " (" << impl->routed_backend_detail << ")\n";
   }
   return true;
+#endif
 }
 
 std::optional<ExpertLayerBindings> BuildExpertLayerBindings(
@@ -2041,6 +2083,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
           [](const auto& entry) {
             return entry.up_descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
                    entry.down_descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+                   entry.up_input_scale.has_value() &&
+                   entry.down_input_scale.has_value() &&
                    entry.up_tensor_scale.has_value() &&
                    entry.down_tensor_scale.has_value();
           });
@@ -2180,18 +2224,22 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       (!impl->routed_up_packed_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_raw_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_matmul_scale_lookup_device.Resize(config.n_routed_experts) ||
+      !impl->routed_up_input_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_tensor_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_packed_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_raw_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_matmul_scale_lookup_device.Resize(config.n_routed_experts) ||
+      !impl->routed_down_input_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_tensor_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_packed_lookup_device.FillZero() ||
       !impl->routed_up_raw_scale_lookup_device.FillZero() ||
       !impl->routed_up_matmul_scale_lookup_device.FillZero() ||
+      !impl->routed_up_input_scale_lookup_device.FillZero() ||
       !impl->routed_up_tensor_scale_lookup_device.FillZero() ||
       !impl->routed_down_packed_lookup_device.FillZero() ||
       !impl->routed_down_raw_scale_lookup_device.FillZero() ||
       !impl->routed_down_matmul_scale_lookup_device.FillZero() ||
+      !impl->routed_down_input_scale_lookup_device.FillZero() ||
       !impl->routed_down_tensor_scale_lookup_device.FillZero())) {
     impl->grouped_routed_nvfp4_enabled.store(false, std::memory_order_relaxed);
     if (debug) {
@@ -2208,6 +2256,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
           !entry.down_nvfp4_lookup_ready ||
           entry.up_nvfp4_buffers == nullptr ||
           entry.down_nvfp4_buffers == nullptr ||
+          !entry.up_input_scale.has_value() ||
+          !entry.down_input_scale.has_value() ||
           !entry.up_tensor_scale.has_value() ||
           !entry.down_tensor_scale.has_value()) {
         continue;
@@ -2215,10 +2265,12 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       const void* up_packed = entry.up_nvfp4_buffers->packed.data();
       const void* up_raw_scales = entry.up_nvfp4_buffers->block_scales.data();
       const void* up_matmul_scales = entry.up_nvfp4_buffers->matmul_block_scales.data();
+      const float up_input_scale = *entry.up_input_scale;
       const float up_tensor_scale = *entry.up_tensor_scale;
       const void* down_packed = entry.down_nvfp4_buffers->packed.data();
       const void* down_raw_scales = entry.down_nvfp4_buffers->block_scales.data();
       const void* down_matmul_scales = entry.down_nvfp4_buffers->matmul_block_scales.data();
+      const float down_input_scale = *entry.down_input_scale;
       const float down_tensor_scale = *entry.down_tensor_scale;
       const bool copied =
           cudaMemcpy(
@@ -2235,6 +2287,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
               impl->routed_up_matmul_scale_lookup_device.data() + expert_index,
               &up_matmul_scales,
               sizeof(up_matmul_scales),
+              cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_up_input_scale_lookup_device.data() + expert_index,
+              &up_input_scale,
+              sizeof(up_input_scale),
               cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
               impl->routed_up_tensor_scale_lookup_device.data() + expert_index,
@@ -2255,6 +2312,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
               impl->routed_down_matmul_scale_lookup_device.data() + expert_index,
               &down_matmul_scales,
               sizeof(down_matmul_scales),
+              cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_down_input_scale_lookup_device.data() + expert_index,
+              &down_input_scale,
+              sizeof(down_input_scale),
               cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
               impl->routed_down_tensor_scale_lookup_device.data() + expert_index,
@@ -2284,16 +2346,18 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     impl->scratch_down_matmul_scale_ptrs.Resize(top_k);
     impl->scratch_missing_count.Resize(1);
     impl->scratch_missing_indices.Resize(top_k);
+    impl->scratch_selected_up_input_scales.Resize(top_k);
     impl->scratch_selected_up_tensor_scales.Resize(top_k);
+    impl->scratch_selected_down_input_scales.Resize(top_k);
     impl->scratch_selected_down_tensor_scales.Resize(top_k);
     impl->scratch_cutlass_up_alphas.Resize(top_k);
     impl->scratch_cutlass_down_alphas.Resize(top_k);
 
-    // -- NVFP4 packing buffers for latent activation (M=1, K=latent) --
-    impl->scratch_latent_packed_data.Resize((1 * latent + 1u) / 2u);
-    impl->scratch_latent_block_scales.Resize(latent / kNvfp4BlockWidth);
-    impl->scratch_latent_matmul_scales.Resize(ExecutionNvfp4ScaleBytes(1, latent));
-    impl->scratch_latent_tensor_scale.Resize(sizeof(float));
+    // -- NVFP4 packing buffers for latent activation (top_k rows, K=latent) --
+    impl->scratch_latent_packed_data.Resize(top_k * Nvfp4PackedRowBytes(latent));
+    impl->scratch_latent_block_scales.Resize(top_k * (latent / kNvfp4BlockWidth));
+    impl->scratch_latent_matmul_scales.Resize(top_k * ExecutionNvfp4ScaleBytes(1, latent));
+    impl->scratch_latent_tensor_scales.Resize(top_k);
     impl->scratch_global_max_bits.Resize(1);
 
     // -- ScaleRelu2 output buffers (top_k rows, intermediate cols) --
@@ -2313,8 +2377,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
     impl->scratch_down_proj_per_expert.Resize(top_k * latent);
 
-    // CUDA graph scratch buffers (fixed-address copies of variable inputs)
-    static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
+    // FROZEN: direct custom grouped fused kernels only -- graph replay disabled.
+    static constexpr bool kMoeGraphEnabled = false;
     impl->moe_graph_enabled = kMoeGraphEnabled;
     impl->moe_graph_captured = false;
     if (impl->moe_graph_enabled) {
@@ -2347,6 +2411,13 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
           debug,
           &strict_failure_reason)) {
     return debug_fail_with_cleanup(strict_failure_reason.c_str());
+  }
+  if (DisableGroupedRoutedNvfp4()) {
+    impl->grouped_routed_nvfp4_enabled.store(false, std::memory_order_relaxed);
+    if (debug) {
+      std::cerr << "expert_layer_create: layer " << config.layer_index
+                << " disabled grouped routed NVFP4 fastpath via env\n";
+    }
   }
   return std::unique_ptr<ExpertLayerSlice>(new ExpertLayerSlice(std::move(impl)));
 }
@@ -2502,6 +2573,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
           [](const auto& entry) {
             return entry.up_descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
                    entry.down_descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+                   entry.up_input_scale.has_value() &&
+                   entry.down_input_scale.has_value() &&
                    entry.up_tensor_scale.has_value() &&
                    entry.down_tensor_scale.has_value();
           });
@@ -2624,18 +2697,22 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       (!impl->routed_up_packed_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_raw_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_matmul_scale_lookup_device.Resize(config.n_routed_experts) ||
+      !impl->routed_up_input_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_tensor_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_packed_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_raw_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_matmul_scale_lookup_device.Resize(config.n_routed_experts) ||
+      !impl->routed_down_input_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_down_tensor_scale_lookup_device.Resize(config.n_routed_experts) ||
       !impl->routed_up_packed_lookup_device.FillZero() ||
       !impl->routed_up_raw_scale_lookup_device.FillZero() ||
       !impl->routed_up_matmul_scale_lookup_device.FillZero() ||
+      !impl->routed_up_input_scale_lookup_device.FillZero() ||
       !impl->routed_up_tensor_scale_lookup_device.FillZero() ||
       !impl->routed_down_packed_lookup_device.FillZero() ||
       !impl->routed_down_raw_scale_lookup_device.FillZero() ||
       !impl->routed_down_matmul_scale_lookup_device.FillZero() ||
+      !impl->routed_down_input_scale_lookup_device.FillZero() ||
       !impl->routed_down_tensor_scale_lookup_device.FillZero())) {
     impl->grouped_routed_nvfp4_enabled.store(false, std::memory_order_relaxed);
   }
@@ -2648,6 +2725,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
           !entry.down_nvfp4_lookup_ready ||
           entry.up_nvfp4_buffers == nullptr ||
           entry.down_nvfp4_buffers == nullptr ||
+          !entry.up_input_scale.has_value() ||
+          !entry.down_input_scale.has_value() ||
           !entry.up_tensor_scale.has_value() ||
           !entry.down_tensor_scale.has_value()) {
         continue;
@@ -2655,10 +2734,12 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       const void* up_packed = entry.up_nvfp4_buffers->packed.data();
       const void* up_raw_scales = entry.up_nvfp4_buffers->block_scales.data();
       const void* up_matmul_scales = entry.up_nvfp4_buffers->matmul_block_scales.data();
+      const float up_input_scale = *entry.up_input_scale;
       const float up_tensor_scale = *entry.up_tensor_scale;
       const void* down_packed = entry.down_nvfp4_buffers->packed.data();
       const void* down_raw_scales = entry.down_nvfp4_buffers->block_scales.data();
       const void* down_matmul_scales = entry.down_nvfp4_buffers->matmul_block_scales.data();
+      const float down_input_scale = *entry.down_input_scale;
       const float down_tensor_scale = *entry.down_tensor_scale;
       const bool copied =
           cudaMemcpy(
@@ -2675,6 +2756,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
               impl->routed_up_matmul_scale_lookup_device.data() + expert_index,
               &up_matmul_scales,
               sizeof(up_matmul_scales),
+              cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_up_input_scale_lookup_device.data() + expert_index,
+              &up_input_scale,
+              sizeof(up_input_scale),
               cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
               impl->routed_up_tensor_scale_lookup_device.data() + expert_index,
@@ -2695,6 +2781,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
               impl->routed_down_matmul_scale_lookup_device.data() + expert_index,
               &down_matmul_scales,
               sizeof(down_matmul_scales),
+              cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_down_input_scale_lookup_device.data() + expert_index,
+              &down_input_scale,
+              sizeof(down_input_scale),
               cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
               impl->routed_down_tensor_scale_lookup_device.data() + expert_index,
@@ -2726,6 +2817,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
           entry.down_proj->kernel_family() != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
           entry.up_proj->nvfp4_weight() == nullptr ||
           entry.down_proj->nvfp4_weight() == nullptr ||
+          !entry.up_input_scale.has_value() ||
+          !entry.down_input_scale.has_value() ||
           !entry.up_tensor_scale.has_value() ||
           !entry.down_tensor_scale.has_value()) {
         continue;
@@ -2733,10 +2826,12 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       const void* up_packed = entry.up_proj->nvfp4_weight()->packed_data();
       const void* up_raw_scales = entry.up_proj->nvfp4_weight()->block_scales_data();
       const void* up_matmul_scales = entry.up_proj->nvfp4_weight()->matmul_block_scales_data();
+      const float up_input_scale = *entry.up_input_scale;
       const float up_tensor_scale = *entry.up_tensor_scale;
       const void* down_packed = entry.down_proj->nvfp4_weight()->packed_data();
       const void* down_raw_scales = entry.down_proj->nvfp4_weight()->block_scales_data();
       const void* down_matmul_scales = entry.down_proj->nvfp4_weight()->matmul_block_scales_data();
+      const float down_input_scale = *entry.down_input_scale;
       const float down_tensor_scale = *entry.down_tensor_scale;
       if (up_packed == nullptr || up_raw_scales == nullptr || up_matmul_scales == nullptr ||
           down_packed == nullptr || down_raw_scales == nullptr || down_matmul_scales == nullptr) {
@@ -2753,6 +2848,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
               impl->routed_up_matmul_scale_lookup_device.data() + expert_index,
               &up_matmul_scales, sizeof(up_matmul_scales), cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
+              impl->routed_up_input_scale_lookup_device.data() + expert_index,
+              &up_input_scale, sizeof(up_input_scale), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
               impl->routed_up_tensor_scale_lookup_device.data() + expert_index,
               &up_tensor_scale, sizeof(up_tensor_scale), cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
@@ -2764,6 +2862,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
           cudaMemcpy(
               impl->routed_down_matmul_scale_lookup_device.data() + expert_index,
               &down_matmul_scales, sizeof(down_matmul_scales), cudaMemcpyHostToDevice) == cudaSuccess &&
+          cudaMemcpy(
+              impl->routed_down_input_scale_lookup_device.data() + expert_index,
+              &down_input_scale, sizeof(down_input_scale), cudaMemcpyHostToDevice) == cudaSuccess &&
           cudaMemcpy(
               impl->routed_down_tensor_scale_lookup_device.data() + expert_index,
               &down_tensor_scale, sizeof(down_tensor_scale), cudaMemcpyHostToDevice) == cudaSuccess;
@@ -2794,15 +2895,17 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     impl->scratch_down_matmul_scale_ptrs.Resize(top_k);
     impl->scratch_missing_count.Resize(1);
     impl->scratch_missing_indices.Resize(top_k);
+    impl->scratch_selected_up_input_scales.Resize(top_k);
     impl->scratch_selected_up_tensor_scales.Resize(top_k);
+    impl->scratch_selected_down_input_scales.Resize(top_k);
     impl->scratch_selected_down_tensor_scales.Resize(top_k);
     impl->scratch_cutlass_up_alphas.Resize(top_k);
     impl->scratch_cutlass_down_alphas.Resize(top_k);
 
-    impl->scratch_latent_packed_data.Resize((1 * latent + 1u) / 2u);
-    impl->scratch_latent_block_scales.Resize(latent / kNvfp4BlockWidth);
-    impl->scratch_latent_matmul_scales.Resize(ExecutionNvfp4ScaleBytes(1, latent));
-    impl->scratch_latent_tensor_scale.Resize(sizeof(float));
+    impl->scratch_latent_packed_data.Resize(top_k * Nvfp4PackedRowBytes(latent));
+    impl->scratch_latent_block_scales.Resize(top_k * (latent / kNvfp4BlockWidth));
+    impl->scratch_latent_matmul_scales.Resize(top_k * ExecutionNvfp4ScaleBytes(1, latent));
+    impl->scratch_latent_tensor_scales.Resize(top_k);
     impl->scratch_global_max_bits.Resize(1);
 
     impl->scratch_down_act_packed.Resize(top_k * Nvfp4AlignedPackedRowBytes(intermediate));
@@ -2819,7 +2922,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     impl->scratch_cutlass_down_output.Resize(top_k * latent);
     impl->scratch_down_proj_per_expert.Resize(top_k * latent);
 
-    static const bool kMoeGraphEnabled = std::getenv("NEMOTRON_DISABLE_CUDA_GRAPH_MOE") == nullptr;
+    // FROZEN: direct custom grouped fused kernels only -- graph replay disabled.
+    static constexpr bool kMoeGraphEnabled = false;
     impl->moe_graph_enabled = kMoeGraphEnabled;
     impl->moe_graph_captured = false;
     if (impl->moe_graph_enabled) {
@@ -2852,6 +2956,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
           false,
           &strict_failure_reason)) {
     return nullptr;
+  }
+  if (DisableGroupedRoutedNvfp4()) {
+    impl->grouped_routed_nvfp4_enabled.store(false, std::memory_order_relaxed);
   }
 
   // Pre-allocate CUTLASS grouped GEMM plans and device pointer arrays.
@@ -3374,6 +3481,7 @@ bool RunExpertLayerImpl(
   std::vector<float> trace_latent_output;
   std::vector<float> trace_routed_output;
   std::vector<std::size_t> trace_routed_expert_order;
+  std::vector<float> trace_routed_pre_activation_hidden;
   std::vector<float> trace_routed_activated_hidden;
   std::vector<float> trace_routed_expert_outputs;
   std::vector<float> trace_routed_weighted_contributions;
@@ -3398,6 +3506,8 @@ bool RunExpertLayerImpl(
     if (expert_index >= impl.routed_experts.size() ||
         entry.up_descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
         entry.down_descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
+        !entry.up_input_scale.has_value() ||
+        !entry.down_input_scale.has_value() ||
         !entry.up_tensor_scale.has_value() ||
         !entry.down_tensor_scale.has_value()) {
       return false;
@@ -3433,6 +3543,7 @@ bool RunExpertLayerImpl(
       return false;
     }
 
+    const float up_input_scale = *entry.up_input_scale;
     const float up_tensor_scale = *entry.up_tensor_scale;
 
     const void* down_packed = nullptr;
@@ -3466,6 +3577,7 @@ bool RunExpertLayerImpl(
     }
 
     const float down_tensor_scale = *entry.down_tensor_scale;
+    const float down_input_scale = *entry.down_input_scale;
 
     return cudaMemcpy(
                impl.routed_up_packed_lookup_device.data() + expert_index,
@@ -3481,6 +3593,11 @@ bool RunExpertLayerImpl(
                impl.routed_up_matmul_scale_lookup_device.data() + expert_index,
                &up_matmul_scales,
                sizeof(up_matmul_scales),
+               cudaMemcpyHostToDevice) == cudaSuccess &&
+           cudaMemcpy(
+               impl.routed_up_input_scale_lookup_device.data() + expert_index,
+               &up_input_scale,
+               sizeof(up_input_scale),
                cudaMemcpyHostToDevice) == cudaSuccess &&
            cudaMemcpy(
                impl.routed_up_tensor_scale_lookup_device.data() + expert_index,
@@ -3501,6 +3618,11 @@ bool RunExpertLayerImpl(
                impl.routed_down_matmul_scale_lookup_device.data() + expert_index,
                &down_matmul_scales,
                sizeof(down_matmul_scales),
+               cudaMemcpyHostToDevice) == cudaSuccess &&
+           cudaMemcpy(
+               impl.routed_down_input_scale_lookup_device.data() + expert_index,
+               &down_input_scale,
+               sizeof(down_input_scale),
                cudaMemcpyHostToDevice) == cudaSuccess &&
            cudaMemcpy(
                impl.routed_down_tensor_scale_lookup_device.data() + expert_index,
@@ -3784,21 +3906,17 @@ bool RunExpertLayerImpl(
           std::unique_ptr<UploadedLinearOp>& op_slot,
           const ActivationTensorT& activation,
           ActivationTensorT* output_tensor) -> bool {
-    if (op_slot == nullptr ||
-        op_slot->kernel_family() != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-      return false;
-    }
-    std::lock_guard<std::mutex> lock(entry.materialize_mutex);
-    if (op_slot == nullptr ||
-        op_slot->kernel_family() != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-      return false;
-    }
-    op_slot = MaterializeRoutedExpertDenseFallbackOp(descriptor, tensor_scale_override);
-    if (op_slot == nullptr || !op_slot->valid()) {
-      return false;
-    }
-    return op_slot->Run(cublas_handle, heuristic_cache, activation, output_tensor, stream);
+    (void)entry;
+    (void)descriptor;
+    (void)tensor_scale_override;
+    (void)op_slot;
+    (void)activation;
+    (void)output_tensor;
+    // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+    return false;
   };
+  // FROZEN: direct custom grouped fused kernels only -- dense fallback disabled.
+  const bool force_routed_up_dense_fallback = false;
 
   enum class GroupedRoutedResult {
     kUsed,
@@ -3829,17 +3947,21 @@ bool RunExpertLayerImpl(
 
     const std::size_t down_act_packed_row_stride =
         Nvfp4AlignedPackedRowBytes(impl.config.routed_expert_intermediate_size);
+    const std::size_t latent_packed_row_stride =
+        Nvfp4PackedRowBytes(impl.config.moe_latent_size);
     const bool use_strided_contiguous_weights = impl.experts_contiguous;
-    const bool try_cutlass_single_token =
-        CutlassMoeEnabled() && !use_strided_contiguous_weights;
+    // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+    const bool try_cutlass_single_token = false;
+
+    // FROZEN: direct custom grouped fused kernels only -- graph replay disabled.
+#if 0
+    const std::size_t latent_matmul_scale_row_bytes =
+        ExecutionNvfp4ScaleBytes(1, impl.config.moe_latent_size);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool outer_stream_capturing =
         stream != nullptr &&
         cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
         capture_status != cudaStreamCaptureStatusNone;
-
-    // CUDA graph replay fast path: when all experts are warm and graph is
-    // captured, replay the entire MoE compute sequence in one graph launch.
     if (!expert_sublayer_profile_enabled &&
         !outer_stream_capturing &&
         impl.moe_graph_enabled && impl.experts_contiguous &&
@@ -3899,19 +4021,31 @@ bool RunExpertLayerImpl(
           graph_ok = cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeGlobal) == cudaSuccess;
 
           if (graph_ok) {
-            graph_ok = PackDeviceRowMajorFp32ToNvfp4InPlace(
-                *graph_latent_view, {},
+            graph_ok = GatherIndexedFloatsInPlace(
+                impl.routed_up_input_scale_lookup_device.data(),
+                impl.routed_experts.size(),
+                impl.scratch_graph_indices.data(),
+                batch_count,
+                impl.scratch_selected_up_input_scales,
+                graph_stream);
+
+            if (graph_ok) {
+              graph_ok = PackLatentPerSelectedExpertToNvfp4InPlace(
+                *graph_latent_view,
+                batch_count,
+                impl.scratch_selected_up_input_scales.data(),
                 impl.scratch_latent_packed_data.data(),
                 impl.scratch_latent_block_scales.data(),
                 impl.scratch_latent_matmul_scales.data(),
-                reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                impl.scratch_latent_tensor_scales.data(),
                 impl.scratch_global_max_bits.data(), graph_stream);
+            }
 
             if (graph_ok) {
               graph_ok = FusedRoutedUpProjPackedNvfp4SingleToken(
                   impl.scratch_latent_packed_data.data(),
                   impl.scratch_latent_block_scales.data(),
-                  reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+                  impl.scratch_latent_tensor_scales,
                   impl.config.moe_latent_size,
                   impl.contiguous_up_packed.data(),
                   impl.contiguous_up_packed_stride_bytes,
@@ -3920,6 +4054,17 @@ bool RunExpertLayerImpl(
                   impl.contiguous_up_tensor_scales.data(),
                   impl.scratch_graph_indices.data(),
                   graph_grouped_up.get(),
+                  latent_packed_row_stride,
+                  graph_stream);
+            }
+
+            if (graph_ok) {
+              graph_ok = GatherIndexedFloatsInPlace(
+                  impl.routed_down_input_scale_lookup_device.data(),
+                  impl.routed_experts.size(),
+                  impl.scratch_graph_indices.data(),
+                  batch_count,
+                  impl.scratch_selected_down_input_scales,
                   graph_stream);
             }
 
@@ -3930,7 +4075,8 @@ bool RunExpertLayerImpl(
                   nullptr,
                   impl.scratch_down_act_tensor_scales,
                   down_act_packed_row_stride,
-                  graph_stream);
+                  graph_stream,
+                  impl.scratch_selected_down_input_scales.data());
             }
 
             if (graph_ok) {
@@ -4022,6 +4168,7 @@ bool RunExpertLayerImpl(
         impl.moe_graph_enabled = false;
       }
     }
+#endif
 
     if (!use_strided_contiguous_weights) {
       // Merged up+down gather: one kernel launch gathers raw and swizzled scale
@@ -4102,27 +4249,43 @@ bool RunExpertLayerImpl(
       }
     }
 
+    if (!GatherIndexedFloatsInPlace(
+            impl.routed_up_input_scale_lookup_device.data(),
+            impl.routed_experts.size(),
+            selected_indices_device,
+            batch_count,
+            impl.scratch_selected_up_input_scales,
+            stream)) {
+      RecordGroupedRoutedExpertFastpathFallback();
+      RecordGroupedRoutedExpertLookupFallback();
+      return GroupedRoutedResult::kFallback;
+    }
+
     bool pack_ok = false;
     if (!measure_stage(
             ExpertSubLayerStage::kLatentNvfp4Packing,
             &pack_ok,
             [&]() {
               if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
-                return PackDeviceRowMajorFp32ToNvfp4InPlace(
-                    latent_input_row, {},
+                return PackLatentPerSelectedExpertToNvfp4InPlace(
+                    latent_input_row,
+                    batch_count,
+                    impl.scratch_selected_up_input_scales.data(),
                     impl.scratch_latent_packed_data.data(),
                     impl.scratch_latent_block_scales.data(),
                     impl.scratch_latent_matmul_scales.data(),
-                    reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                    impl.scratch_latent_tensor_scales.data(),
                     impl.scratch_global_max_bits.data(),
                     stream);
               } else {
-                return PackDeviceRowMajorBf16ToNvfp4InPlace(
-                    latent_input_row, {},
+                return PackLatentPerSelectedExpertToNvfp4InPlace(
+                    latent_input_row,
+                    batch_count,
+                    impl.scratch_selected_up_input_scales.data(),
                     impl.scratch_latent_packed_data.data(),
                     impl.scratch_latent_block_scales.data(),
                     impl.scratch_latent_matmul_scales.data(),
-                    reinterpret_cast<float*>(impl.scratch_latent_tensor_scale.data()),
+                    impl.scratch_latent_tensor_scales.data(),
                     impl.scratch_global_max_bits.data(),
                     stream);
               }
@@ -4155,24 +4318,26 @@ bool RunExpertLayerImpl(
       RecordGroupedRoutedExpertPackFallback();
       return GroupedRoutedResult::kFallback;
     }
-    // CUTLASS stays as an env-gated single-token fallback on the pointer-array
-    // path. The contiguous decode path always uses the custom strided kernels.
     bool cutlass_up_ok = false;
+    // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+#if 0
     if (impl.cutlass_up_plan != nullptr && impl.cutlass_up_plan->valid() &&
         batch_count == static_cast<std::size_t>(impl.cutlass_up_plan->group_count()) &&
         try_cutlass_single_token &&
         ComputeGroupedUpPackScales(
-            reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+            impl.scratch_latent_tensor_scales,
             impl.scratch_selected_up_tensor_scales,
             &impl.scratch_cutlass_up_alphas)) {
-      // A pointers: all groups share the same packed activation (device fill kernel).
-      FillDevicePointerArray(
+      // A pointers: each group reads its own packed activation row and swizzled scales.
+      BuildStridedDevicePointerArray(
           const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_ptrs.data())),
-          const_cast<void*>(static_cast<const void*>(impl.scratch_latent_packed_data.data())),
+          impl.scratch_latent_packed_data.data(),
+          latent_packed_row_stride,
           batch_count);
-      FillDevicePointerArray(
+      BuildStridedDevicePointerArray(
           const_cast<void**>(reinterpret_cast<const void* const*>(impl.cutlass_a_sf_ptrs.data())),
-          const_cast<void*>(static_cast<const void*>(impl.scratch_latent_matmul_scales.data())),
+          impl.scratch_latent_matmul_scales.data(),
+          latent_matmul_scale_row_bytes,
           batch_count);
       // D pointers: each group writes to a strided output row (device strided-fill kernel).
       BuildStridedDevicePointerArray(
@@ -4209,6 +4374,7 @@ bool RunExpertLayerImpl(
                   << " CUTLASS device up_proj succeeded\n";
       }
     }
+#endif
     bool up_ok = false;
     if (cutlass_up_ok) {
       up_ok = true;
@@ -4220,7 +4386,7 @@ bool RunExpertLayerImpl(
                                 ? FusedRoutedUpProjPackedNvfp4SingleToken(
                                       impl.scratch_latent_packed_data.data(),
                                       impl.scratch_latent_block_scales.data(),
-                                      reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+                                      impl.scratch_latent_tensor_scales,
                                       impl.config.moe_latent_size,
                                       impl.contiguous_up_packed.data(),
                                       impl.contiguous_up_packed_stride_bytes,
@@ -4229,16 +4395,18 @@ bool RunExpertLayerImpl(
                                       impl.contiguous_up_tensor_scales.data(),
                                       selected_indices_device,
                                       grouped_up.get(),
+                                      latent_packed_row_stride,
                                       stream)
                                 : FusedRoutedUpProjPackedNvfp4SingleToken(
                                       impl.scratch_latent_packed_data.data(),
                                       impl.scratch_latent_block_scales.data(),
-                                      reinterpret_cast<const float*>(impl.scratch_latent_tensor_scale.data()),
+                                      impl.scratch_latent_tensor_scales,
                                       impl.config.moe_latent_size,
                                       impl.scratch_up_packed_ptrs,
                                       impl.scratch_up_raw_scale_ptrs,
                                       impl.scratch_selected_up_tensor_scales,
                                       grouped_up.get(),
+                                      latent_packed_row_stride,
                                       stream);
                    })) {
       return GroupedRoutedResult::kFatal;
@@ -4254,6 +4422,17 @@ bool RunExpertLayerImpl(
     }
 
     bool relu2_pack_ok = false;
+    if (!GatherIndexedFloatsInPlace(
+            impl.routed_down_input_scale_lookup_device.data(),
+            impl.routed_experts.size(),
+            selected_indices_device,
+            batch_count,
+            impl.scratch_selected_down_input_scales,
+            stream)) {
+      RecordGroupedRoutedExpertFastpathFallback();
+      RecordGroupedRoutedExpertLookupFallback();
+      return GroupedRoutedResult::kFallback;
+    }
     if (!measure_stage(
             ExpertSubLayerStage::kRelu2Pack,
             &relu2_pack_ok,
@@ -4266,7 +4445,8 @@ bool RunExpertLayerImpl(
                   try_cutlass_single_token ? &impl.scratch_down_act_matmul_scales : nullptr,
                   impl.scratch_down_act_tensor_scales,
                   down_act_packed_row_stride,
-                  stream);
+                  stream,
+                  impl.scratch_selected_down_input_scales.data());
             })) {
       return GroupedRoutedResult::kFatal;
     }
@@ -4288,8 +4468,9 @@ bool RunExpertLayerImpl(
       return GroupedRoutedResult::kFallback;
     }
 
-    // CUTLASS down_proj remains env-gated on the pointer-array path only.
     bool cutlass_down_ok = false;
+    // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
+#if 0
     if (impl.cutlass_down_plan != nullptr && impl.cutlass_down_plan->valid() &&
         batch_count == static_cast<std::size_t>(impl.cutlass_down_plan->group_count()) &&
         try_cutlass_single_token &&
@@ -4386,6 +4567,7 @@ bool RunExpertLayerImpl(
                   << " CUTLASS device down_proj succeeded\n";
       }
     }
+#endif
     bool down_ok = false;
     if (cutlass_down_ok) {
       down_ok = true;
@@ -4498,35 +4680,8 @@ bool RunExpertLayerImpl(
           ActivationTensorT* routed_accumulator,
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
-          std::size_t batch_count) -> GroupedRoutedResult {
-    if (!expert_sublayer_profile_enabled &&
-        impl.routed_backend_kind == RoutedMoEBackendKind::kFlashInfer) {
-      if (trace != nullptr ||
-          routed_accumulator == nullptr ||
-          !routed_accumulator->valid() ||
-          batch_count == 0 ||
-          impl.flashinfer_routed_backend == nullptr ||
-          !impl.flashinfer_routed_backend->valid()) {
-        RecordFlashInferRoutedExpertFallback();
-        return GroupedRoutedResult::kFallback;
-      }
-      if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
-        if (impl.flashinfer_routed_backend->Run(
-                latent_input_row,
-                1,
-                selected_indices_device,
-                selected_weights_device,
-                routed_accumulator)) {
-          RecordFlashInferRoutedExpertUse();
-          return GroupedRoutedResult::kUsed;
-        }
-      }
-      if (debug) {
-        std::cerr << "expert_layer: layer " << impl.config.layer_index
-                  << " flashinfer routed backend failed, falling back to custom fused path\n";
-      }
-      RecordFlashInferRoutedExpertFallback();
-    }
+    std::size_t batch_count) -> GroupedRoutedResult {
+    (void)expert_sublayer_profile_enabled;
     return try_grouped_routed_single_token(
         token_index,
         latent_input_row,
@@ -4643,14 +4798,10 @@ bool RunExpertLayerImpl(
               ExpertSubLayerStage::kRoutedUpProj,
               &up_ok,
               [&]() {
-                bool local_up_ok =
-                    pair->up_proj->Run(
-                        cublas_handle,
-                        heuristic_cache,
-                        *latent_input,
-                        expert_up.get(),
-                        stream);
-                if (!local_up_ok) {
+                Nvfp4PackOptions up_pack_options;
+                up_pack_options.fixed_tensor_scale = pair->up_input_scale;
+                bool local_up_ok = false;
+                if (force_routed_up_dense_fallback) {
                   local_up_ok = retry_with_dense_fallback(
                       *pair,
                       pair->up_descriptor,
@@ -4658,6 +4809,24 @@ bool RunExpertLayerImpl(
                       pair->up_proj,
                       *latent_input,
                       expert_up.get());
+                } else {
+                  local_up_ok =
+                      pair->up_proj->Run(
+                          cublas_handle,
+                          heuristic_cache,
+                          *latent_input,
+                          expert_up.get(),
+                          up_pack_options,
+                          stream);
+                  if (!local_up_ok) {
+                    local_up_ok = retry_with_dense_fallback(
+                        *pair,
+                        pair->up_descriptor,
+                        pair->up_tensor_scale,
+                        pair->up_proj,
+                        *latent_input,
+                        expert_up.get());
+                  }
                 }
                 return local_up_ok;
               })) {
@@ -4669,6 +4838,16 @@ bool RunExpertLayerImpl(
                     << selection.expert_index << "\n";
         }
         return false;
+      }
+      std::vector<float> pre_relu_up_host;
+      if (trace != nullptr && token_index == 0) {
+        pre_relu_up_host.assign(impl.config.routed_expert_intermediate_size, 0.0f);
+        if (!CopyToHost(*expert_up, &pre_relu_up_host)) {
+          if (debug) {
+            std::cout << "expert_layer: routed pre-relu trace download failed\n";
+          }
+          return false;
+        }
       }
       bool routed_relu_ok = false;
       if (!measure_stage(
@@ -4691,11 +4870,14 @@ bool RunExpertLayerImpl(
               ExpertSubLayerStage::kRoutedDownProj,
               &down_ok,
               [&]() {
+                Nvfp4PackOptions down_pack_options;
+                down_pack_options.fixed_tensor_scale = pair->down_input_scale;
                 bool local_down_ok = pair->down_proj->Run(
                     cublas_handle,
                     heuristic_cache,
                     *expert_up,
                     expert_down.get(),
+                    down_pack_options,
                     stream);
                 if (!local_down_ok) {
                   local_down_ok = retry_with_dense_fallback(
@@ -4755,6 +4937,10 @@ bool RunExpertLayerImpl(
           return false;
         }
         trace_routed_expert_order.push_back(selection.expert_index);
+        trace_routed_pre_activation_hidden.insert(
+            trace_routed_pre_activation_hidden.end(),
+            pre_relu_up_host.begin(),
+            pre_relu_up_host.end());
         trace_routed_activated_hidden.insert(
             trace_routed_activated_hidden.end(),
             activated_up_host.begin(),
@@ -4788,6 +4974,7 @@ bool RunExpertLayerImpl(
           latent_row_host,
           latent_row_host + impl.config.moe_latent_size);
       trace->routed_expert_order = trace_routed_expert_order;
+      trace->routed_expert_pre_activation_hidden = trace_routed_pre_activation_hidden;
       trace->routed_expert_activated_hidden = trace_routed_activated_hidden;
       trace->routed_expert_outputs = trace_routed_expert_outputs;
       trace->routed_expert_weighted_contributions = trace_routed_weighted_contributions;

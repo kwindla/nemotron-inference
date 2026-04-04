@@ -15,6 +15,7 @@ enum class RoutedMoEBackendKind {
 };
 
 const char* ToString(RoutedMoEBackendKind kind);
+const char* GetServingPathIdentity();
 
 struct FlashInferRoutedMoEAvailability {
   bool library_found = false;
