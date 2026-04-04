@@ -1,4 +1,5 @@
 #include "nemotron/expert_routing_device.h"
+#include "nemotron/fused_moe_decode.h"
 
 #include <cuda_runtime.h>
 
@@ -6,13 +7,17 @@
 #include <cmath>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 
 namespace {
 
+using nemotron::DeviceTensorFp32;
 using nemotron::DeviceExpertRouting;
+using nemotron::RunDeviceExpertSelection;
 using nemotron::RunDeviceExpertRouting;
 using nemotron::kMaxDeviceExpertRoutingExperts;
 
@@ -151,6 +156,340 @@ bool ExpectEqualPrefix(
     }
   }
   return true;
+}
+
+float Sigmoid(float value) {
+  return 1.0f / (1.0f + std::exp(-value));
+}
+
+struct SelectionParityCase {
+  std::string label;
+  std::size_t token_count = 0;
+  std::size_t n_routed_experts = 0;
+  std::size_t top_k = 0;
+  std::size_t n_group = 0;
+  std::size_t topk_group = 0;
+  float routed_scaling_factor = 1.0f;
+  bool norm_topk_prob = false;
+  std::vector<float> router_logits;
+  std::vector<float> correction_bias;
+};
+
+struct SelectionCandidate {
+  int expert_index = -1;
+  float score = -INFINITY;
+  float raw_weight = 0.0f;
+};
+
+bool SelectionCandidateIsBetter(
+    const SelectionCandidate& candidate,
+    const SelectionCandidate& current) {
+  if (candidate.score > current.score) {
+    return true;
+  }
+  if (candidate.score < current.score) {
+    return false;
+  }
+  return candidate.expert_index < current.expert_index;
+}
+
+void BuildVllmGroupedTopkReference(
+    const SelectionParityCase& test_case,
+    std::vector<int>* topk_ids,
+    std::vector<float>* topk_weights) {
+  topk_ids->assign(test_case.token_count * test_case.top_k, -1);
+  topk_weights->assign(test_case.token_count * test_case.top_k, 0.0f);
+
+  const std::size_t group_size = test_case.n_routed_experts / test_case.n_group;
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    std::vector<float> raw_scores(test_case.n_routed_experts, 0.0f);
+    std::vector<float> choice_scores(test_case.n_routed_experts, 0.0f);
+    for (std::size_t expert_index = 0; expert_index < test_case.n_routed_experts; ++expert_index) {
+      const float raw_score = Sigmoid(
+          test_case.router_logits[token_index * test_case.n_routed_experts + expert_index]);
+      raw_scores[expert_index] = raw_score;
+      choice_scores[expert_index] = raw_score + test_case.correction_bias[expert_index];
+    }
+
+    std::vector<float> group_scores(test_case.n_group, -INFINITY);
+    for (std::size_t group_index = 0; group_index < test_case.n_group; ++group_index) {
+      std::vector<SelectionCandidate> group_candidates;
+      group_candidates.reserve(group_size);
+      for (std::size_t slot = 0; slot < group_size; ++slot) {
+        const std::size_t expert_index = group_index * group_size + slot;
+        group_candidates.push_back(SelectionCandidate{
+            static_cast<int>(expert_index),
+            choice_scores[expert_index],
+            raw_scores[expert_index],
+        });
+      }
+      std::stable_sort(
+          group_candidates.begin(),
+          group_candidates.end(),
+          [](const SelectionCandidate& lhs, const SelectionCandidate& rhs) {
+            return SelectionCandidateIsBetter(lhs, rhs);
+          });
+      const float top1 = group_candidates.empty() ? -INFINITY : group_candidates[0].score;
+      const float top2 =
+          group_candidates.size() > 1 ? group_candidates[1].score : top1;
+      group_scores[group_index] = top1 + top2;
+    }
+
+    std::vector<std::size_t> ranked_groups(test_case.n_group, 0);
+    std::iota(ranked_groups.begin(), ranked_groups.end(), 0);
+    std::stable_sort(
+        ranked_groups.begin(),
+        ranked_groups.end(),
+        [&](std::size_t lhs, std::size_t rhs) {
+          if (group_scores[lhs] > group_scores[rhs]) {
+            return true;
+          }
+          if (group_scores[lhs] < group_scores[rhs]) {
+            return false;
+          }
+          return lhs < rhs;
+        });
+
+    std::vector<bool> selected_groups(test_case.n_group, false);
+    for (std::size_t rank = 0;
+         rank < std::min(test_case.topk_group, test_case.n_group);
+         ++rank) {
+      selected_groups[ranked_groups[rank]] = true;
+    }
+
+    std::vector<SelectionCandidate> candidates;
+    candidates.reserve(test_case.n_routed_experts);
+    for (std::size_t expert_index = 0; expert_index < test_case.n_routed_experts; ++expert_index) {
+      const std::size_t group_index = expert_index / group_size;
+      if (!selected_groups[group_index]) {
+        continue;
+      }
+      candidates.push_back(SelectionCandidate{
+          static_cast<int>(expert_index),
+          choice_scores[expert_index],
+          raw_scores[expert_index],
+      });
+    }
+    std::stable_sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const SelectionCandidate& lhs, const SelectionCandidate& rhs) {
+          return SelectionCandidateIsBetter(lhs, rhs);
+        });
+
+    float weight_sum = 0.0f;
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const SelectionCandidate& candidate = candidates[slot];
+      (*topk_ids)[token_index * test_case.top_k + slot] = candidate.expert_index;
+      (*topk_weights)[token_index * test_case.top_k + slot] = candidate.raw_weight;
+      weight_sum += candidate.raw_weight;
+    }
+
+    if (test_case.norm_topk_prob) {
+      const float denominator = weight_sum + 1.0e-20f;
+      for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+        (*topk_weights)[token_index * test_case.top_k + slot] /= denominator;
+      }
+    }
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      (*topk_weights)[token_index * test_case.top_k + slot] *=
+          test_case.routed_scaling_factor;
+    }
+  }
+}
+
+SelectionParityCase MakeTieSensitiveNanoCase() {
+  SelectionParityCase test_case;
+  test_case.label = "tie_sensitive_nano";
+  test_case.token_count = 2;
+  test_case.n_routed_experts = 512;
+  test_case.top_k = 22;
+  test_case.n_group = 1;
+  test_case.topk_group = 1;
+  test_case.routed_scaling_factor = 5.0f;
+  test_case.norm_topk_prob = true;
+  test_case.router_logits.assign(
+      test_case.token_count * test_case.n_routed_experts,
+      -8.0f);
+  test_case.correction_bias.assign(test_case.n_routed_experts, 0.0f);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    for (std::size_t expert_index = 0; expert_index < test_case.n_routed_experts; ++expert_index) {
+      test_case.router_logits[token_index * test_case.n_routed_experts + expert_index] =
+          -8.0f + 0.001f * static_cast<float>(expert_index);
+    }
+  }
+
+  for (std::size_t expert_index = 0; expert_index < 32; ++expert_index) {
+    test_case.router_logits[expert_index] =
+        1.10f - 0.02f * static_cast<float>(expert_index);
+    test_case.router_logits[test_case.n_routed_experts + expert_index] =
+        0.95f - 0.018f * static_cast<float>(expert_index);
+  }
+
+  test_case.router_logits[7] = 0.8425f;
+  test_case.router_logits[8] = 0.8425f;
+  test_case.router_logits[20] = 0.5875f;
+  test_case.router_logits[21] = 0.5875f;
+  test_case.router_logits[test_case.n_routed_experts + 5] = 0.7935f;
+  test_case.router_logits[test_case.n_routed_experts + 6] = 0.7935f;
+  test_case.router_logits[test_case.n_routed_experts + 18] = 0.4715f;
+  test_case.router_logits[test_case.n_routed_experts + 19] = 0.4715f;
+
+  return test_case;
+}
+
+SelectionParityCase MakeCorrectionBiasNanoCase() {
+  SelectionParityCase test_case;
+  test_case.label = "correction_bias_nano";
+  test_case.token_count = 3;
+  test_case.n_routed_experts = 512;
+  test_case.top_k = 22;
+  test_case.n_group = 1;
+  test_case.topk_group = 1;
+  test_case.routed_scaling_factor = 5.0f;
+  test_case.norm_topk_prob = true;
+  test_case.router_logits.assign(
+      test_case.token_count * test_case.n_routed_experts,
+      -8.0f);
+  test_case.correction_bias.assign(test_case.n_routed_experts, 0.0f);
+
+  for (std::size_t expert_index = 0; expert_index < test_case.n_routed_experts; ++expert_index) {
+    test_case.correction_bias[expert_index] =
+        (static_cast<float>(static_cast<int>((expert_index * 17) % 13) - 6) *
+         0.025f);
+    for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+      test_case.router_logits[token_index * test_case.n_routed_experts + expert_index] =
+          -8.0f + 0.001f * static_cast<float>((expert_index + token_index * 11) % 97);
+    }
+  }
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    for (std::size_t expert_index = 0; expert_index < 28; ++expert_index) {
+      test_case.router_logits[token_index * test_case.n_routed_experts + expert_index] =
+          0.95f - 0.028f * static_cast<float>(expert_index) +
+          0.01f * static_cast<float>(token_index);
+    }
+  }
+
+  test_case.router_logits[22] = 0.31f;
+  test_case.correction_bias[22] = 0.42f;
+  test_case.router_logits[23] = 0.30f;
+  test_case.correction_bias[23] = 0.42f;
+  test_case.router_logits[24] = 0.54f;
+  test_case.correction_bias[24] = -0.18f;
+  test_case.router_logits[test_case.n_routed_experts + 11] = 0.36f;
+  test_case.correction_bias[11] = 0.33f;
+  test_case.router_logits[(2 * test_case.n_routed_experts) + 9] = 0.48f;
+  test_case.correction_bias[9] = -0.12f;
+
+  return test_case;
+}
+
+SelectionParityCase MakeScalingWithoutRenormCase() {
+  SelectionParityCase test_case;
+  test_case.label = "scaling_without_renorm";
+  test_case.token_count = 2;
+  test_case.n_routed_experts = 512;
+  test_case.top_k = 22;
+  test_case.n_group = 1;
+  test_case.topk_group = 1;
+  test_case.routed_scaling_factor = 1.75f;
+  test_case.norm_topk_prob = false;
+  test_case.router_logits.assign(
+      test_case.token_count * test_case.n_routed_experts,
+      -8.0f);
+  test_case.correction_bias.assign(test_case.n_routed_experts, 0.0f);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    for (std::size_t expert_index = 0; expert_index < test_case.n_routed_experts; ++expert_index) {
+      test_case.router_logits[token_index * test_case.n_routed_experts + expert_index] =
+          -7.5f + 0.002f * static_cast<float>((expert_index * 13 + token_index * 29) % 211);
+    }
+    for (std::size_t expert_index = 0; expert_index < 26; ++expert_index) {
+      test_case.router_logits[token_index * test_case.n_routed_experts + expert_index] =
+          0.88f - 0.024f * static_cast<float>(expert_index) +
+          0.006f * static_cast<float>(token_index);
+    }
+  }
+
+  return test_case;
+}
+
+bool RunDeviceSelectionParityCase(const SelectionParityCase& test_case) {
+  auto router_logits_device =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.n_routed_experts});
+  auto correction_bias_device = DeviceTensorFp32::Create({test_case.n_routed_experts});
+  auto topk_ids_device =
+      DeviceBuffer<int>::Create(test_case.token_count * test_case.top_k);
+  auto topk_weights_device =
+      DeviceBuffer<float>::Create(test_case.token_count * test_case.top_k);
+  if (!Expect(
+          router_logits_device != nullptr &&
+              correction_bias_device != nullptr &&
+              topk_ids_device != nullptr &&
+              topk_weights_device != nullptr,
+          test_case.label + ": device buffers should allocate") ||
+      !Expect(
+          router_logits_device->CopyFromHost(
+              test_case.router_logits.data(),
+              test_case.router_logits.size()),
+          test_case.label + ": router logits should upload") ||
+      !Expect(
+          correction_bias_device->CopyFromHost(
+              test_case.correction_bias.data(),
+              test_case.correction_bias.size()),
+          test_case.label + ": correction bias should upload") ||
+      !Expect(
+          RunDeviceExpertSelection(
+              *router_logits_device,
+              *correction_bias_device,
+              test_case.n_routed_experts,
+              test_case.top_k,
+              test_case.n_group,
+              test_case.topk_group,
+              test_case.routed_scaling_factor,
+              test_case.norm_topk_prob,
+              topk_ids_device->data(),
+              topk_weights_device->data()),
+          test_case.label + ": RunDeviceExpertSelection should succeed") ||
+      !Expect(
+          cudaDeviceSynchronize() == cudaSuccess,
+          test_case.label + ": selection kernel should synchronize")) {
+    return false;
+  }
+
+  std::vector<int> actual_topk_ids;
+  std::vector<float> actual_topk_weights;
+  if (!Expect(
+          CopyDeviceValues(
+              topk_ids_device->data(),
+              test_case.token_count * test_case.top_k,
+              &actual_topk_ids),
+          test_case.label + ": topk ids should download") ||
+      !Expect(
+          CopyDeviceValues(
+              topk_weights_device->data(),
+              test_case.token_count * test_case.top_k,
+              &actual_topk_weights),
+          test_case.label + ": topk weights should download")) {
+    return false;
+  }
+
+  std::vector<int> expected_topk_ids;
+  std::vector<float> expected_topk_weights;
+  BuildVllmGroupedTopkReference(
+      test_case,
+      &expected_topk_ids,
+      &expected_topk_weights);
+
+  return ExpectEqualVector(
+             actual_topk_ids,
+             expected_topk_ids,
+             test_case.label + ": topk_ids") &&
+         Expect(
+             MaxAbsDiff(actual_topk_weights, expected_topk_weights) <= 1.0e-5f,
+             test_case.label + ": topk_weights should match vLLM reference");
 }
 
 void FillSelectionPattern(
@@ -389,6 +728,9 @@ int main() {
   }
 
   if (!RunCreateValidationCase() ||
+      !RunDeviceSelectionParityCase(MakeTieSensitiveNanoCase()) ||
+      !RunDeviceSelectionParityCase(MakeCorrectionBiasNanoCase()) ||
+      !RunDeviceSelectionParityCase(MakeScalingWithoutRenormCase()) ||
       !RunParityCase(128, 32, 6, {0, 1}) ||
       !RunParityCase(17, 5, 3, {2})) {
     return 1;

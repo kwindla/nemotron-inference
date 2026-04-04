@@ -27,6 +27,8 @@ void ResetExpertStagingCounters() {
   ResetCounter(&counters.total_staging_calls);
   ResetCounter(&counters.monolithic_layers);
   ResetCounter(&counters.staging_elapsed_us);
+  ResetCounter(&counters.host_routing_adapter_calls);
+  ResetCounter(&counters.host_routing_tensor_copies);
 }
 
 void PrintExpertStagingCounterSummary(std::ostream& stream) {
@@ -42,6 +44,10 @@ void PrintExpertStagingCounterSummary(std::ostream& stream) {
          << LoadCounter(counters.monolithic_layers)
          << " staging_elapsed_us="
          << LoadCounter(counters.staging_elapsed_us)
+         << " host_routing_adapter_calls="
+         << LoadCounter(counters.host_routing_adapter_calls)
+         << " host_routing_tensor_copies="
+         << LoadCounter(counters.host_routing_tensor_copies)
          << "\n";
 }
 

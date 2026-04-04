@@ -14,7 +14,7 @@ Design analysis: `proj-2026-04-03-1816/PLAN.md` and its 9 sub-plans.
   Split the verification story into 4 canonical gates: (a) local correctness / oracle replay, (b) exact-token vLLM parity, (c) internal performance, (d) external TTFT. Strengthen the oracle payload in `nano_save_prompt_oracle.cpp` by adding `manifest_path`, `build_dir`, `backend_flags` (all active `NEMOTRON_FORWARD_*` env vars), and `git_revision` fields to the JSON output, while also defining an optional deeper regression payload for runs that need more localization than boundary top-5 logits. Make the parity artifact explicit about prompt source, prompt token ids, mismatch index, and backend selection metadata. Make benchmark provenance non-optional in `bench_full_comparison.sh` — every artifact must record the exact binary path, build dir, manifest, model id, env vars that affect backend selection, and the vLLM revision/source tree used for external comparisons. Expose the MoE execution window parameter in `nano_prefix_cache_ttft_bench` so it can measure 32, 64, and 128-token tail cases instead of only hardcoded 32. Write a `docs/verification_gates.md` that defines each gate's purpose, inputs, pass criteria, artifact format, and the rule that correctness failures and performance regressions are reported separately.
   Key files: `testing/api/nano_save_prompt_oracle.cpp`, `proj-2026-04-03-0318/bench_full_comparison.sh`, `proj-2026-04-03-2113/compare_vllm_runtime_oracle.py`, `proj-2026-04-03-2113/save_runtime_oracle.py`, `benchmarks/nano_prefix_cache_ttft/`, `docs/verification_gates.md`
 
-- [ ] **2. Freeze MoE routing contract in docs and tests**
+- [x] **2. Freeze MoE routing contract in docs and tests**
   Define the canonical routing contract in `docs/moe_routing_contract.md`: tensor shapes (`topk_ids: int32[token_count, top_k]`, `topk_weights: float32[token_count, top_k]`), token-major ordering, deterministic tie-breaking semantics matching vLLM's `sorted` behavior in grouped-top-k, renormalization and `routed_scaling_factor` semantics, and the boundary between the canonical contract and expert-major compaction adapters. Add a parity test that compares our `RunDeviceExpertSelection()` output against vLLM `grouped_topk()` (from `third_party/vllm/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py`) for representative Nano inputs including tie-sensitive and correction-bias cases. Remove host-side `BuildExpertRoutingTable()` reconstruction from the fast prefill path in `expert_layer.cpp` — keep it only behind an explicit fallback/adapter gate. Add a regression test that asserts the main fast path does not copy routing state to host outside of debug or fallback modes.
   Key files: `docs/moe_routing_contract.md`, `runtime/src/backend/expert_layer.cpp:1170`, `runtime/src/backend/fused_moe_decode.cu:438`, `runtime/src/backend/fused_moe_prefill.cu:220`, `testing/backend/expert_routing_device_test.cpp`
 
@@ -53,8 +53,8 @@ Design analysis: `proj-2026-04-03-1816/PLAN.md` and its 9 sub-plans.
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Canonicalize verification gates and benchmark provenance | done | — | |
-| 2 | Freeze MoE routing contract in docs and tests | pending | — | |
+| 1 | Canonicalize verification gates and benchmark provenance | done | 6910b06 | |
+| 2 | Freeze MoE routing contract in docs and tests | done | — | |
 | 3 | Lock NVFP4 prepared-weight contract and golden tests | pending | — | |
 | 4 | Collapse MoE backend fragmentation around UnifiedFusedBackend | pending | — | |
 | 5 | Add explicit attention backend policy and cuDNN plan caching | pending | — | |

@@ -963,7 +963,7 @@ struct ExpertLayerSlice::Impl {
   class DecodeCublasLtBackend;
   class FusedDecodeBackend;
   class UnifiedFusedBackend;
-  class BatchedCublasLtBackend;
+  class BatchedCublasLtHostRoutingAdapterBackend;
 
   struct RoutedExpertRuntime {
     const GemmDescriptor* up_proj = nullptr;
@@ -1083,7 +1083,7 @@ struct ExpertLayerSlice::Impl {
       const MoeBackendPrepareContext& context,
       PreparedMoeWeights* prepared_weights);
 
-  bool RunBatchedDirectMoeViaCublaslt(
+  bool RunBatchedHostRoutingAdapterViaCublaslt(
       CublasLtHandle& cublas_handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorFp32& input,
@@ -1167,7 +1167,9 @@ struct MoeDirectDecodeScratch {
   DeviceTensorFp32* shared_up = nullptr;
 };
 
-bool BuildExpertRoutingTable(
+// Host-side expert-major routing exists only as an adapter for backends that
+// still consume compacted expert-major dispatch tables.
+bool BuildHostRoutingAdapterTable(
     const ExpertLayerConfig& config,
     std::size_t token_count,
     const std::vector<int>& selected_indices,
@@ -1624,7 +1626,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   return false;
 }
 
-bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
+bool ExpertLayerSlice::Impl::RunBatchedHostRoutingAdapterViaCublaslt(
     CublasLtHandle& cublas_handle,
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorFp32& input,
@@ -1674,6 +1676,13 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
   selection_span.RecordStart();
   selection_span.RecordEnd();
 
+  auto& staging_counters = GetExpertStagingCounters();
+  staging_counters.host_routing_adapter_calls.fetch_add(
+      1,
+      std::memory_order_relaxed);
+  staging_counters.host_routing_tensor_copies.fetch_add(
+      2,
+      std::memory_order_relaxed);
   std::vector<int> selected_indices_host;
   std::vector<float> selected_weights_host;
   routing_span.RecordStart();
@@ -1685,7 +1694,7 @@ bool ExpertLayerSlice::Impl::RunBatchedDirectMoeViaCublaslt(
   std::vector<std::size_t> expert_offsets;
   std::vector<int> expert_token_indices_host;
   std::vector<float> expert_token_weights_host;
-  if (!BuildExpertRoutingTable(
+  if (!BuildHostRoutingAdapterTable(
           config,
           token_count,
           selected_indices_host,
@@ -2734,11 +2743,11 @@ class ExpertLayerSlice::Impl::UnifiedFusedBackend final : public MoeBackend {
   PreparedMoeWeights prepared_weights_;
 };
 
-class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
+class ExpertLayerSlice::Impl::BatchedCublasLtHostRoutingAdapterBackend final : public MoeBackend {
  public:
-  explicit BatchedCublasLtBackend(Impl* impl) : impl_(impl) {}
+  explicit BatchedCublasLtHostRoutingAdapterBackend(Impl* impl) : impl_(impl) {}
 
-  const char* Name() const override { return "batched_cublaslt"; }
+  const char* Name() const override { return "batched_cublaslt_host_routing_adapter"; }
 
   bool Supports(
       const ExpertLayerConfig& config,
@@ -2796,7 +2805,7 @@ class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
     (void)config;
     (void)token_count;
     (void)trace;
-    const bool ok = impl_->RunBatchedDirectMoeViaCublaslt(
+    const bool ok = impl_->RunBatchedHostRoutingAdapterViaCublaslt(
         cublas_handle,
         heuristic_cache,
         input,
@@ -2807,7 +2816,7 @@ class ExpertLayerSlice::Impl::BatchedCublasLtBackend final : public MoeBackend {
         output,
         &prepared_weights_);
     if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
-      std::cout << "expert_layer: batched direct MoE GPU path failed, falling back\n";
+      std::cout << "expert_layer: batched direct MoE host-routing adapter failed, falling back\n";
     }
     return ok;
   }
@@ -2822,7 +2831,7 @@ void ExpertLayerSlice::Impl::InitializeBackends() {
   backends_.emplace_back(std::make_unique<UnifiedFusedBackend>(this));
   backends_.emplace_back(std::make_unique<DecodeCublasLtBackend>(this));
   backends_.emplace_back(std::make_unique<FusedDecodeBackend>(this));
-  backends_.emplace_back(std::make_unique<BatchedCublasLtBackend>(this));
+  backends_.emplace_back(std::make_unique<BatchedCublasLtHostRoutingAdapterBackend>(this));
 }
 
 std::optional<ExpertLayerBindings> BuildExpertLayerBindings(

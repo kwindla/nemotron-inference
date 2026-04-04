@@ -223,6 +223,16 @@ target_compile_features(expert_routing_device_test PRIVATE cxx_std_17)
 nemotron_add_test(expert_routing_device_test)
 
 add_executable(
+  expert_layer_fastpath_test
+  backend/expert_layer_fastpath_test.cpp
+)
+
+target_link_libraries(expert_layer_fastpath_test PRIVATE nemotron_runtime_backend)
+target_compile_features(expert_layer_fastpath_test PRIVATE cxx_std_17)
+
+nemotron_add_test(expert_layer_fastpath_test)
+
+add_executable(
   device_nvfp4_matrix_test
   backend/device_nvfp4_matrix_test.cpp
 )
