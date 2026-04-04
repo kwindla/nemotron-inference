@@ -444,6 +444,16 @@ target_compile_features(nvfp4_weight_test PRIVATE cxx_std_17)
 nemotron_add_test(nvfp4_weight_test)
 
 add_executable(
+  nvfp4_scale_helper_test
+  backend/nvfp4_scale_helper_test.cpp
+)
+
+target_link_libraries(nvfp4_scale_helper_test PRIVATE nemotron_runtime_loader)
+target_compile_features(nvfp4_scale_helper_test PRIVATE cxx_std_17)
+
+nemotron_add_test(nvfp4_scale_helper_test)
+
+add_executable(
   nvfp4_packing_test
   backend/nvfp4_packing_test.cpp
 )
