@@ -167,7 +167,7 @@ void PrintUnexpectedLinearFallbacks(
   }
 
   stream << "nano_fused_decode_bench: unexpected linear reference fallbacks while "
-         << "NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1\n";
+         << "the linear device fastpath was enabled\n";
   for (const LinearFallbackObservation& fallback : fallbacks) {
     stream << "nano_fused_decode_bench: operator=" << fallback.counter_name
            << " reference_fallback_count=" << fallback.count << "\n";
@@ -1093,7 +1093,7 @@ int main(int argc, char** argv) {
           ? options.decode_token_count
           : (options.mode == BenchmarkMode::kProfileReady ? 1 : kDefaultDecodeTokenCount);
   result.linear_device_fastpath_enabled =
-      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
+      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", true);
   result.device_token_select_enabled = device_token_select_enabled;
   result.cudnn_fe_available = cudnn_fe_available;
 

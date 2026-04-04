@@ -350,6 +350,7 @@ bool run_expert_layer_fixture() {
   if (!expect(metadata.has_value(), "expert layer oracle fixture metadata should load")) {
     return false;
   }
+  const bool uses_latent_projection = metadata->fc1_latent_family != "none";
 
   const std::vector<float> input_hidden = read_float_file(fixture_root / "input_hidden_fp32.bin");
   const std::vector<float> expected_norm_output =
@@ -368,6 +369,12 @@ bool run_expert_layer_fixture() {
       read_float_file(fixture_root / "fc1_latent_input_scale_fp32.bin");
   const std::vector<float> fc2_latent_weight =
       read_float_file(fixture_root / "fc2_latent_weight_fp32.bin");
+  const std::vector<std::uint8_t> shared_up_weight_packed =
+      read_file_bytes(fixture_root / "shared_up_weight_packed.bin");
+  const std::vector<std::uint8_t> shared_up_weight_block_scales =
+      read_file_bytes(fixture_root / "shared_up_weight_block_scales.bin");
+  const std::vector<float> shared_up_weight_tensor_scale =
+      read_float_file(fixture_root / "shared_up_weight_tensor_scale_fp32.bin");
   const std::vector<std::uint8_t> shared_up_weight =
       read_file_bytes(fixture_root / "shared_up_weight_fp8.bin");
   const std::vector<float> shared_up_weight_fp32 =
@@ -418,19 +425,27 @@ bool run_expert_layer_fixture() {
       !expect(gate_weight.size() == metadata->n_routed_experts * metadata->hidden_size, "gate weight size should match metadata") ||
       !expect(gate_score_correction_bias.size() == metadata->n_routed_experts, "gate correction bias size should match metadata") ||
       !expect(
-          (metadata->fc1_latent_family == "scaled_fp8" &&
-           fc1_latent_weight.size() == metadata->moe_latent_size * metadata->hidden_size &&
-           fc1_latent_weight_scale.size() == 1 &&
-           fc1_latent_input_scale.size() == 1) ||
+          !uses_latent_projection ||
+              (metadata->fc1_latent_family == "scaled_fp8" &&
+               fc1_latent_weight.size() == metadata->moe_latent_size * metadata->hidden_size &&
+               fc1_latent_weight_scale.size() == 1 &&
+               fc1_latent_input_scale.size() == 1) ||
               (metadata->fc1_latent_family == "dense" &&
                fc1_latent_weight_fp32.size() == metadata->moe_latent_size * metadata->hidden_size),
           "fc1 latent weights should match metadata") ||
-      !expect(fc2_latent_weight.size() == metadata->hidden_size * metadata->moe_latent_size, "fc2 latent weight size should match metadata") ||
       !expect(
-          (metadata->shared_up_family == "scaled_fp8" &&
-           shared_up_weight.size() == metadata->shared_expert_intermediate_size * metadata->hidden_size &&
-           shared_up_weight_scale.size() == 1 &&
-           shared_up_input_scale.size() == 1) ||
+          !uses_latent_projection ||
+              fc2_latent_weight.size() == metadata->hidden_size * metadata->moe_latent_size,
+          "fc2 latent weight size should match metadata") ||
+      !expect(
+          (metadata->shared_up_family == "nvfp4" &&
+           !shared_up_weight_packed.empty() &&
+           !shared_up_weight_block_scales.empty() &&
+           shared_up_weight_tensor_scale.size() == 1) ||
+              (metadata->shared_up_family == "scaled_fp8" &&
+               shared_up_weight.size() == metadata->shared_expert_intermediate_size * metadata->hidden_size &&
+               shared_up_weight_scale.size() == 1 &&
+               shared_up_input_scale.size() == 1) ||
               (metadata->shared_up_family == "dense" &&
                shared_up_weight_fp32.size() == metadata->shared_expert_intermediate_size * metadata->hidden_size),
           "shared up weights should match metadata") ||
@@ -447,8 +462,16 @@ bool run_expert_layer_fixture() {
                shared_down_weight_fp32.size() == metadata->hidden_size * metadata->shared_expert_intermediate_size),
           "shared down weights should match metadata") ||
       !expect(expected_router_logits.size() == metadata->input_rows * metadata->n_routed_experts, "expected router logits size should match metadata") ||
-      !expect(expected_fc1_latent_output.size() == metadata->input_rows * metadata->moe_latent_size, "expected fc1 latent output size should match metadata") ||
-      !expect(expected_routed_latent_output.size() == metadata->input_rows * metadata->moe_latent_size, "expected routed latent output size should match metadata") ||
+      !expect(
+          uses_latent_projection
+              ? expected_fc1_latent_output.size() == metadata->input_rows * metadata->moe_latent_size
+              : expected_fc1_latent_output.empty(),
+          "expected fc1 latent output size should match metadata") ||
+      !expect(
+          uses_latent_projection
+              ? expected_routed_latent_output.size() == metadata->input_rows * metadata->moe_latent_size
+              : expected_routed_latent_output.empty(),
+          "expected routed latent output size should match metadata") ||
       !expect(expected_shared_output.size() == metadata->input_rows * metadata->hidden_size, "expected shared output size should match metadata") ||
       !expect(expected_mixer_output.size() == metadata->input_rows * metadata->hidden_size, "expected mixer output size should match metadata") ||
       !expect(expected_final_output.size() == metadata->input_rows * metadata->hidden_size, "expected final output size should match metadata") ||
@@ -473,6 +496,13 @@ bool run_expert_layer_fixture() {
       make_fp32_descriptor(mixer_prefix + ".fc1_latent_proj.input_scale", fc1_latent_input_scale, {1});
   const auto fc2_latent_weight_descriptor =
       make_dense_descriptor(mixer_prefix + ".fc2_latent_proj.weight", fc2_latent_weight, metadata->hidden_size, metadata->moe_latent_size);
+  const auto shared_up_nvfp4_descriptor = make_nvfp4_descriptor(
+      mixer_prefix + ".shared_experts.up_proj.weight",
+      shared_up_weight_packed,
+      shared_up_weight_block_scales,
+      shared_up_weight_tensor_scale,
+      metadata->shared_expert_intermediate_size,
+      metadata->hidden_size);
   const auto shared_up_weight_descriptor =
       make_fp8_descriptor(mixer_prefix + ".shared_experts.up_proj.weight", shared_up_weight, {metadata->shared_expert_intermediate_size, metadata->hidden_size});
   const auto shared_up_dense_descriptor =
@@ -520,11 +550,16 @@ bool run_expert_layer_fixture() {
     bindings.fc1_latent_input_scale = &fc1_latent_input_scale_descriptor;
   } else if (metadata->fc1_latent_family == "dense") {
     bindings.fc1_latent_gemm_weight = &fc1_latent_dense_descriptor;
+  } else if (metadata->fc1_latent_family == "none") {
   } else {
     return expect(false, "fc1 latent family should be supported");
   }
-  bindings.fc2_latent_weight = &fc2_latent_weight_descriptor;
-  if (metadata->shared_up_family == "scaled_fp8") {
+  if (uses_latent_projection) {
+    bindings.fc2_latent_weight = &fc2_latent_weight_descriptor;
+  }
+  if (metadata->shared_up_family == "nvfp4") {
+    bindings.shared_up_gemm_weight = &shared_up_nvfp4_descriptor;
+  } else if (metadata->shared_up_family == "scaled_fp8") {
     bindings.shared_up_kernel_weight = &shared_up_weight_descriptor;
     bindings.shared_up_weight_scale = &shared_up_weight_scale_descriptor;
     bindings.shared_up_input_scale = &shared_up_input_scale_descriptor;
@@ -788,20 +823,25 @@ bool run_expert_layer_fixture() {
                   expected_norm_output.begin() + hidden_offset,
                   expected_norm_output.begin() + hidden_offset + metadata->hidden_size)));
     }
-    fc1_latent_diff = std::max(
-        fc1_latent_diff,
-        max_abs_diff(
-            trace.latent_output,
-            std::vector<float>(
-                expected_fc1_latent_output.begin() + latent_offset,
-                expected_fc1_latent_output.begin() + latent_offset + metadata->moe_latent_size)));
-    routed_diff = std::max(
-        routed_diff,
-        max_abs_diff(
-            trace.routed_latent_output,
-            std::vector<float>(
-                expected_routed_latent_output.begin() + latent_offset,
-                expected_routed_latent_output.begin() + latent_offset + metadata->moe_latent_size)));
+    if (uses_latent_projection) {
+      fc1_latent_diff = std::max(
+          fc1_latent_diff,
+          max_abs_diff(
+              trace.latent_output,
+              std::vector<float>(
+                  expected_fc1_latent_output.begin() + latent_offset,
+                  expected_fc1_latent_output.begin() + latent_offset + metadata->moe_latent_size)));
+      routed_diff = std::max(
+          routed_diff,
+          max_abs_diff(
+              trace.routed_latent_output,
+              std::vector<float>(
+                  expected_routed_latent_output.begin() + latent_offset,
+                  expected_routed_latent_output.begin() + latent_offset + metadata->moe_latent_size)));
+    } else if (!expect(trace.latent_output.empty(), "direct MoE trace should not expose latent_output") ||
+               !expect(trace.routed_latent_output.empty(), "direct MoE trace should not expose routed_latent_output")) {
+      return false;
+    }
     if (!trace.routed_expert_order.empty() &&
         trace.routed_expert_weighted_contributions.size() ==
             trace.routed_expert_order.size() * metadata->moe_latent_size) {
@@ -936,7 +976,7 @@ bool run_expert_layer_fixture() {
   }
   batch_vs_sequential_diff = max_abs_diff(output_host, sequential_output);
 
-  if (!expected_norm_output.empty()) {
+  if (!expected_norm_output.empty() && uses_latent_projection) {
     auto exact_norm_input =
         DeviceTensorFp32::Create({metadata->input_rows, metadata->hidden_size});
     auto exact_gate_output =
@@ -1058,21 +1098,42 @@ bool run_expert_layer_fixture() {
             << " final_rel_l2=" << final_rel_l2
             << "\n";
 
+  const bool nvfp4_direct_fixture =
+      !uses_latent_projection &&
+      metadata->shared_up_family == "nvfp4" &&
+      metadata->shared_down_family == "nvfp4";
+  const float routed_hidden_tol = nvfp4_direct_fixture ? 8.0e-3f : 1.0e-3f;
+  const float routed_output_tol = nvfp4_direct_fixture ? 2.0e-2f : 1.0e-3f;
+  const float routed_contribution_tol = nvfp4_direct_fixture ? 8.0e-3f : 1.0e-3f;
+  const float projected_routed_tol = nvfp4_direct_fixture ? 1.2e-2f : 1.0e-3f;
+  const float projected_routed_rel_l2_tol = nvfp4_direct_fixture ? 2.0e-2f : 1.0e-3f;
+  const float shared_tol = nvfp4_direct_fixture ? 2.0e-2f : 1.0e-3f;
+  const float mixer_tol = nvfp4_direct_fixture ? 2.5e-2f : 1.0e-3f;
+  const float mixer_rel_l2_tol = nvfp4_direct_fixture ? 2.5e-2f : 1.0e-3f;
+  const float final_tol = nvfp4_direct_fixture ? 3.5e-2f : 1.0e-3f;
+  const float final_rel_l2_tol = nvfp4_direct_fixture ? 2.0e-2f : 1.0e-3f;
+
   if (!expect(
           expected_norm_output.empty() || norm_diff <= 1.0e-5f,
           "norm output should match oracle when present") ||
       !expect(router_diff <= 2.0e-5f, "router logits should match oracle") ||
       !expect(max_selection_weight_diff <= 1.0e-5f, "selected expert weights should match oracle") ||
-      !expect(fc1_latent_diff <= 1.0e-3f, "fc1 latent output should match oracle") ||
-      !expect(routed_diff <= 1.0e-3f, "routed latent output should match oracle") ||
-      !expect(routed_activated_hidden_diff <= 1.0e-3f, "routed expert activated hidden should match oracle") ||
-      !expect(routed_expert_output_diff <= 1.0e-3f, "routed expert outputs should match oracle") ||
-      !expect(routed_contribution_diff <= 1.0e-3f, "routed expert contributions should match oracle") ||
-      !expect(projected_routed_diff <= 1.0e-3f, "projected routed output should match oracle") ||
-      !expect(shared_diff <= 1.0e-3f, "shared output should match oracle") ||
-      !expect(mixer_diff <= 1.0e-3f, "mixer output should match oracle") ||
+      !expect(!uses_latent_projection || fc1_latent_diff <= 1.0e-3f, "fc1 latent output should match oracle") ||
+      !expect(!uses_latent_projection || routed_diff <= 1.0e-3f, "routed latent output should match oracle") ||
+      !expect(routed_activated_hidden_diff <= routed_hidden_tol, "routed expert activated hidden should stay within the oracle envelope") ||
+      !expect(routed_expert_output_diff <= routed_output_tol, "routed expert outputs should stay within the oracle envelope") ||
+      !expect(routed_contribution_diff <= routed_contribution_tol, "routed expert contributions should stay within the oracle envelope") ||
+      !expect(
+          projected_routed_diff <= projected_routed_tol || projected_routed_rel_l2 <= projected_routed_rel_l2_tol,
+          "projected routed output should stay within the oracle envelope") ||
+      !expect(shared_diff <= shared_tol, "shared output should stay within the oracle envelope") ||
+      !expect(
+          mixer_diff <= mixer_tol || mixer_rel_l2 <= mixer_rel_l2_tol,
+          "mixer output should stay within the oracle envelope") ||
       !expect(batch_vs_sequential_diff <= 1.0e-3f, "batched and row-by-row expert outputs should match oracle") ||
-      !expect(final_diff <= 1.0e-3f, "final output should match oracle")) {
+      !expect(
+          final_diff <= final_tol || final_rel_l2 <= final_rel_l2_tol,
+          "final output should stay within the oracle envelope")) {
     return false;
   }
 

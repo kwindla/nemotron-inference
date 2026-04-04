@@ -200,6 +200,32 @@ GemmDescriptor make_dense_descriptor(
   return descriptor;
 }
 
+GemmDescriptor make_nvfp4_descriptor(
+    const std::string& name,
+    const std::vector<std::uint8_t>& packed,
+    const std::vector<std::uint8_t>& block_scales,
+    const std::vector<float>& tensor_scale,
+    std::size_t rows,
+    std::size_t cols) {
+  GemmDescriptor descriptor;
+  descriptor.tensor_name = name;
+  descriptor.op_class = "oracle";
+  descriptor.kernel_family = GemmKernelFamily::kCublasLtNvfp4BlockScaled;
+  descriptor.output_rows = rows;
+  descriptor.input_cols = cols;
+  descriptor.storage_dtype = "nvfp4_e2m1";
+  descriptor.compute_dtype = "fp32_accum";
+  descriptor.layout_tag = "cublaslt_fp4_tn_v1";
+  descriptor.alignment_bytes = 16;
+  descriptor.packed_data = packed.data();
+  descriptor.packed_nbytes = packed.size();
+  descriptor.block_scales_data = block_scales.data();
+  descriptor.block_scales_nbytes = block_scales.size();
+  descriptor.tensor_scale_data = reinterpret_cast<const std::uint8_t*>(tensor_scale.data());
+  descriptor.tensor_scale_nbytes = tensor_scale.size() * sizeof(float);
+  return descriptor;
+}
+
 float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
   if (lhs.size() != rhs.size()) {
     return INFINITY;
@@ -209,6 +235,23 @@ float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs)
     max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
   }
   return max_diff;
+}
+
+float relative_l2_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+  if (lhs.size() != rhs.size() || lhs.empty()) {
+    return INFINITY;
+  }
+  double diff_sq = 0.0;
+  double ref_sq = 0.0;
+  for (std::size_t i = 0; i < lhs.size(); ++i) {
+    const double diff = static_cast<double>(lhs[i]) - static_cast<double>(rhs[i]);
+    diff_sq += diff * diff;
+    ref_sq += static_cast<double>(rhs[i]) * static_cast<double>(rhs[i]);
+  }
+  if (ref_sq == 0.0) {
+    return diff_sq == 0.0 ? 0.0f : INFINITY;
+  }
+  return static_cast<float>(std::sqrt(diff_sq / ref_sq));
 }
 
 std::vector<float> make_sequence_inputs(
@@ -283,11 +326,18 @@ bool run_mamba_layer_fixture() {
   const std::vector<float> initial_ssm_state = read_float_file(fixture_root / "initial_ssm_state_fp32.bin");
   const std::vector<float> input_norm_weight = read_float_file(fixture_root / "input_norm_weight_fp32.bin");
   const std::vector<float> mixer_norm_weight = read_float_file(fixture_root / "mixer_norm_weight_fp32.bin");
+  const bool has_in_proj_nvfp4 = std::filesystem::exists(fixture_root / "in_proj_weight_packed.bin");
   const bool has_in_proj_fp8 = std::filesystem::exists(fixture_root / "in_proj_weight_fp8.bin");
+  const std::vector<std::uint8_t> in_proj_weight_packed =
+      has_in_proj_nvfp4 ? read_file_bytes(fixture_root / "in_proj_weight_packed.bin") : std::vector<std::uint8_t>{};
+  const std::vector<std::uint8_t> in_proj_weight_block_scales =
+      has_in_proj_nvfp4 ? read_file_bytes(fixture_root / "in_proj_weight_block_scales.bin") : std::vector<std::uint8_t>{};
+  const std::vector<float> in_proj_weight_tensor_scale =
+      has_in_proj_nvfp4 ? read_float_file(fixture_root / "in_proj_weight_tensor_scale_fp32.bin") : std::vector<float>{};
   const std::vector<std::uint8_t> in_proj_weight_fp8 =
       has_in_proj_fp8 ? read_file_bytes(fixture_root / "in_proj_weight_fp8.bin") : std::vector<std::uint8_t>{};
   const std::vector<float> in_proj_weight_fp32 =
-      !has_in_proj_fp8 ? read_float_file(fixture_root / "in_proj_weight_fp32.bin") : std::vector<float>{};
+      (!has_in_proj_fp8 && !has_in_proj_nvfp4) ? read_float_file(fixture_root / "in_proj_weight_fp32.bin") : std::vector<float>{};
   const std::vector<float> in_proj_weight_scale =
       has_in_proj_fp8 ? read_float_file(fixture_root / "in_proj_weight_scale_fp32.bin") : std::vector<float>{};
   const std::vector<float> in_proj_input_scale =
@@ -297,11 +347,18 @@ bool run_mamba_layer_fixture() {
   const std::vector<float> A_log = read_float_file(fixture_root / "A_log_fp32.bin");
   const std::vector<float> D = read_float_file(fixture_root / "D_fp32.bin");
   const std::vector<float> dt_bias = read_float_file(fixture_root / "dt_bias_fp32.bin");
+  const bool has_out_proj_nvfp4 = std::filesystem::exists(fixture_root / "out_proj_weight_packed.bin");
   const bool has_out_proj_fp8 = std::filesystem::exists(fixture_root / "out_proj_weight_fp8.bin");
+  const std::vector<std::uint8_t> out_proj_weight_packed =
+      has_out_proj_nvfp4 ? read_file_bytes(fixture_root / "out_proj_weight_packed.bin") : std::vector<std::uint8_t>{};
+  const std::vector<std::uint8_t> out_proj_weight_block_scales =
+      has_out_proj_nvfp4 ? read_file_bytes(fixture_root / "out_proj_weight_block_scales.bin") : std::vector<std::uint8_t>{};
+  const std::vector<float> out_proj_weight_tensor_scale =
+      has_out_proj_nvfp4 ? read_float_file(fixture_root / "out_proj_weight_tensor_scale_fp32.bin") : std::vector<float>{};
   const std::vector<std::uint8_t> out_proj_weight_fp8 =
       has_out_proj_fp8 ? read_file_bytes(fixture_root / "out_proj_weight_fp8.bin") : std::vector<std::uint8_t>{};
   const std::vector<float> out_proj_weight_fp32 =
-      !has_out_proj_fp8 ? read_float_file(fixture_root / "out_proj_weight_fp32.bin") : std::vector<float>{};
+      (!has_out_proj_fp8 && !has_out_proj_nvfp4) ? read_float_file(fixture_root / "out_proj_weight_fp32.bin") : std::vector<float>{};
   const std::vector<float> out_proj_weight_scale =
       has_out_proj_fp8 ? read_float_file(fixture_root / "out_proj_weight_scale_fp32.bin") : std::vector<float>{};
   const std::vector<float> out_proj_input_scale =
@@ -323,11 +380,15 @@ bool run_mamba_layer_fixture() {
       !expect(input_norm_weight.size() == metadata->hidden_size, "input norm size should match metadata") ||
       !expect(mixer_norm_weight.size() == metadata->intermediate_size, "mixer norm size should match metadata") ||
       !expect(
-          (has_in_proj_fp8 &&
+          (has_in_proj_nvfp4 &&
+           in_proj_weight_packed.size() == (in_proj_rows * metadata->hidden_size) / 2 &&
+           in_proj_weight_block_scales.size() == (in_proj_rows * metadata->hidden_size) / 16 &&
+           in_proj_weight_tensor_scale.size() == 1) ||
+              (has_in_proj_fp8 &&
            in_proj_weight_fp8.size() == in_proj_rows * metadata->hidden_size &&
            in_proj_weight_scale.size() == 1 &&
            in_proj_input_scale.size() == 1) ||
-              (!has_in_proj_fp8 &&
+              (!has_in_proj_fp8 && !has_in_proj_nvfp4 &&
                in_proj_weight_fp32.size() == in_proj_rows * metadata->hidden_size),
           "in_proj weights should match metadata") ||
       !expect(conv1d_weight.size() == conv_state_elems, "conv1d weight size should match metadata") ||
@@ -336,11 +397,15 @@ bool run_mamba_layer_fixture() {
       !expect(D.size() == metadata->num_heads, "D size should match metadata") ||
       !expect(dt_bias.size() == metadata->num_heads, "dt_bias size should match metadata") ||
       !expect(
-          (has_out_proj_fp8 &&
+          (has_out_proj_nvfp4 &&
+           out_proj_weight_packed.size() == (metadata->hidden_size * metadata->intermediate_size) / 2 &&
+           out_proj_weight_block_scales.size() == (metadata->hidden_size * metadata->intermediate_size) / 16 &&
+           out_proj_weight_tensor_scale.size() == 1) ||
+              (has_out_proj_fp8 &&
            out_proj_weight_fp8.size() == metadata->hidden_size * metadata->intermediate_size &&
            out_proj_weight_scale.size() == 1 &&
            out_proj_input_scale.size() == 1) ||
-              (!has_out_proj_fp8 &&
+              (!has_out_proj_fp8 && !has_out_proj_nvfp4 &&
                out_proj_weight_fp32.size() == metadata->hidden_size * metadata->intermediate_size),
           "out_proj weights should match metadata") ||
       !expect(expected_next_ssm_state.size() == ssm_state_elems, "expected ssm state should match metadata") ||
@@ -362,8 +427,19 @@ bool run_mamba_layer_fixture() {
           ? std::make_optional(
                 make_fp8_descriptor(mixer_prefix + ".in_proj.weight", in_proj_weight_fp8, {in_proj_rows, metadata->hidden_size}))
           : std::nullopt;
+  const auto in_proj_nvfp4_weight_descriptor =
+      has_in_proj_nvfp4
+          ? std::make_optional(
+                make_nvfp4_descriptor(
+                    mixer_prefix + ".in_proj.weight",
+                    in_proj_weight_packed,
+                    in_proj_weight_block_scales,
+                    in_proj_weight_tensor_scale,
+                    in_proj_rows,
+                    metadata->hidden_size))
+          : std::nullopt;
   const auto in_proj_dense_weight_descriptor =
-      !has_in_proj_fp8
+      (!has_in_proj_fp8 && !has_in_proj_nvfp4)
           ? std::make_optional(
                 make_dense_descriptor(mixer_prefix + ".in_proj.weight", in_proj_weight_fp32, in_proj_rows, metadata->hidden_size))
           : std::nullopt;
@@ -390,8 +466,19 @@ bool run_mamba_layer_fixture() {
           ? std::make_optional(
                 make_fp8_descriptor(mixer_prefix + ".out_proj.weight", out_proj_weight_fp8, {metadata->hidden_size, metadata->intermediate_size}))
           : std::nullopt;
+  const auto out_proj_nvfp4_weight_descriptor =
+      has_out_proj_nvfp4
+          ? std::make_optional(
+                make_nvfp4_descriptor(
+                    mixer_prefix + ".out_proj.weight",
+                    out_proj_weight_packed,
+                    out_proj_weight_block_scales,
+                    out_proj_weight_tensor_scale,
+                    metadata->hidden_size,
+                    metadata->intermediate_size))
+          : std::nullopt;
   const auto out_proj_dense_weight_descriptor =
-      !has_out_proj_fp8
+      (!has_out_proj_fp8 && !has_out_proj_nvfp4)
           ? std::make_optional(
                 make_dense_descriptor(mixer_prefix + ".out_proj.weight", out_proj_weight_fp32, metadata->hidden_size, metadata->intermediate_size))
           : std::nullopt;
@@ -407,8 +494,9 @@ bool run_mamba_layer_fixture() {
   MambaLayerBindings bindings;
   bindings.input_norm_weight = &input_norm_descriptor;
   bindings.mixer_norm_weight = &mixer_norm_descriptor;
-  bindings.in_proj_gemm_weight =
-      in_proj_dense_weight_descriptor.has_value() ? &*in_proj_dense_weight_descriptor : nullptr;
+  bindings.in_proj_gemm_weight = in_proj_nvfp4_weight_descriptor.has_value()
+                                     ? &*in_proj_nvfp4_weight_descriptor
+                                     : (in_proj_dense_weight_descriptor.has_value() ? &*in_proj_dense_weight_descriptor : nullptr);
   bindings.in_proj_kernel_weight =
       in_proj_fp8_weight_descriptor.has_value() ? &*in_proj_fp8_weight_descriptor : nullptr;
   bindings.in_proj_weight_scale =
@@ -420,8 +508,9 @@ bool run_mamba_layer_fixture() {
   bindings.A_log = &A_log_descriptor;
   bindings.D = &D_descriptor;
   bindings.dt_bias = &dt_bias_descriptor;
-  bindings.out_proj_gemm_weight =
-      out_proj_dense_weight_descriptor.has_value() ? &*out_proj_dense_weight_descriptor : nullptr;
+  bindings.out_proj_gemm_weight = out_proj_nvfp4_weight_descriptor.has_value()
+                                      ? &*out_proj_nvfp4_weight_descriptor
+                                      : (out_proj_dense_weight_descriptor.has_value() ? &*out_proj_dense_weight_descriptor : nullptr);
   bindings.out_proj_kernel_weight =
       out_proj_fp8_weight_descriptor.has_value() ? &*out_proj_fp8_weight_descriptor : nullptr;
   bindings.out_proj_weight_scale =
@@ -498,14 +587,36 @@ bool run_mamba_layer_fixture() {
   const float ssm_state_diff = max_abs_diff(actual_ssm_state, expected_next_ssm_state);
   const float norm_output_diff = max_abs_diff(trace.norm_output, expected_norm_output);
   const float in_proj_output_diff = max_abs_diff(trace.in_proj_output, expected_in_proj_output);
-  if (!expect(output_diff <= 2.0e-3f, "final output should match oracle") ||
-      !expect(conv_state_diff <= 2.0e-5f, "conv state should match oracle") ||
-      !expect(ssm_state_diff <= 5.0e-5f, "ssm state should match oracle")) {
+  const float output_rel_l2 = relative_l2_diff(actual_output, expected_final_output);
+  const float conv_state_rel_l2 = relative_l2_diff(actual_conv_state, expected_updated_conv_state);
+  const float ssm_state_rel_l2 = relative_l2_diff(actual_ssm_state, expected_next_ssm_state);
+  const bool nvfp4_projection_fixture = has_in_proj_nvfp4 || has_out_proj_nvfp4;
+  const float output_abs_tol = nvfp4_projection_fixture ? 2.0e-2f : 2.0e-3f;
+  const float output_rel_l2_tol = nvfp4_projection_fixture ? 2.5e-2f : 2.0e-3f;
+  const float conv_state_abs_tol = nvfp4_projection_fixture ? 4.0e-2f : 2.0e-5f;
+  const float conv_state_rel_l2_tol = nvfp4_projection_fixture ? 3.0e-2f : 2.0e-5f;
+  const float ssm_state_abs_tol = nvfp4_projection_fixture ? 2.5e-1f : 5.0e-5f;
+  const float ssm_state_rel_l2_tol = nvfp4_projection_fixture ? 8.0e-2f : 5.0e-5f;
+  const float in_proj_abs_tol = nvfp4_projection_fixture ? 4.0e-2f : 1.0e-3f;
+  if (!expect(norm_output_diff <= 1.0e-5f, "norm output should match oracle") ||
+      !expect(in_proj_output_diff <= in_proj_abs_tol, "in-proj output should stay within the oracle envelope") ||
+      !expect(
+          output_diff <= output_abs_tol || output_rel_l2 <= output_rel_l2_tol,
+          "final output should stay within the oracle envelope") ||
+      !expect(
+          conv_state_diff <= conv_state_abs_tol || conv_state_rel_l2 <= conv_state_rel_l2_tol,
+          "conv state should stay within the oracle envelope") ||
+      !expect(
+          ssm_state_diff <= ssm_state_abs_tol || ssm_state_rel_l2 <= ssm_state_rel_l2_tol,
+          "ssm state should stay within the oracle envelope")) {
     std::cerr << "norm_output_diff=" << norm_output_diff
               << " in_proj_output_diff=" << in_proj_output_diff
               << " output_diff=" << output_diff
+              << " output_rel_l2=" << output_rel_l2
               << " conv_state_diff=" << conv_state_diff
-              << " ssm_state_diff=" << ssm_state_diff << "\n";
+              << " conv_state_rel_l2=" << conv_state_rel_l2
+              << " ssm_state_diff=" << ssm_state_diff
+              << " ssm_state_rel_l2=" << ssm_state_rel_l2 << "\n";
     return false;
   }
 

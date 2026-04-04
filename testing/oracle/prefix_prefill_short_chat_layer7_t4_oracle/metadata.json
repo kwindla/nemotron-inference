@@ -1,0 +1,52 @@
+{
+  "fixture_kind": "prefix_prefill_prefix_oracle_v1",
+  "mode": "prefix_prefill",
+  "prompt_name": "short_chat",
+  "prompt_token_count": 40,
+  "runtime_token_count": 4,
+  "selected_token_index": null,
+  "selected_token_id": null,
+  "runtime_token_ids": [
+    10,
+    25708,
+    1010,
+    4568
+  ],
+  "stop_layer": 7,
+  "hidden_size": 2688,
+  "vocab_size": 131072,
+  "num_hidden_layers": 52,
+  "capture_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "layer_kinds": [
+    "mamba",
+    "moe",
+    "mamba",
+    "moe",
+    "mamba",
+    "attention",
+    "moe",
+    "mamba"
+  ],
+  "oracle_device": "cuda",
+  "final_norm_tensor": "backbone.norm_f.weight",
+  "source_tensors": {
+    "embeddings": "backbone.embeddings.weight",
+    "lm_head": "lm_head.weight"
+  },
+  "notes": [
+    "single_token mode runs one token from scratch with zeroed cache/state.",
+    "prefix_prefill mode runs a short prompt prefix from scratch and can stop after an early capture layer to keep fixture generation practical.",
+    "Attention, Mamba, and MoE blocks mirror the current correctness-first runtime contracts already used by the layer-level oracle fixtures.",
+    "Captured per-layer outputs are intended for the composed registry-backed forward-path validation.",
+    "Captured Mamba layers also include final conv/SSM state snapshots for decode-boundary localization."
+  ]
+}

@@ -117,6 +117,25 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
+std::unique_ptr<DeviceTensorBf16> CreateTokenRangeView(
+    DeviceTensorBf16* buffer,
+    std::size_t token_offset,
+    std::size_t token_count,
+    std::size_t hidden_size) {
+  if (buffer == nullptr ||
+      !buffer->valid() ||
+      buffer->shape().size() != 2 ||
+      token_count == 0 ||
+      token_offset > buffer->shape()[0] ||
+      token_count > (buffer->shape()[0] - token_offset) ||
+      buffer->shape()[1] != hidden_size) {
+    return nullptr;
+  }
+  return DeviceTensorBf16::CreateView(
+      {token_count, hidden_size},
+      buffer->data() + (token_offset * hidden_size));
+}
+
 bool LegacyAttentionPolicyEnvSet(const char* name) {
   return std::getenv(name) != nullptr;
 }
@@ -778,6 +797,43 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
+  if (token_count > 1) {
+    for (std::size_t token_offset = 0; token_offset < token_count; ++token_offset) {
+      auto input_row = DeviceTensorBf16::CreateView(
+          {1, impl_->config.hidden_size},
+          const_cast<__nv_bfloat16*>(input.data()) + (token_offset * impl_->config.hidden_size));
+      auto residual_row = CreateTokenRangeView(
+          residual,
+          token_offset,
+          1,
+          impl_->config.hidden_size);
+      auto output_row = CreateTokenRangeView(
+          output,
+          token_offset,
+          1,
+          impl_->config.hidden_size);
+      if (input_row == nullptr || residual_row == nullptr || output_row == nullptr) {
+        return false;
+      }
+
+      const std::size_t token_sequence_start = sequence_start + token_offset;
+      const std::size_t token_total_sequence_length = token_sequence_start + 1;
+      if (!Run(
+              cublas_handle,
+              cudnn_handle,
+              heuristic_cache,
+              request_context,
+              token_sequence_start,
+              token_total_sequence_length,
+              *input_row,
+              residual_row.get(),
+              output_row.get())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   std::unique_ptr<DeviceTensorBf16> normed_owned;
   std::unique_ptr<DeviceTensorBf16> q_owned;
   std::unique_ptr<DeviceTensorBf16> k_owned;
@@ -911,7 +967,7 @@ bool AttentionLayerSlice::Run(
   const std::size_t required_pages = RequiredPagesForTokens(
       request_context.config().attention_kv_cache,
       total_sequence_length);
-  if (layer_pages->size() != required_pages ||
+  if (layer_pages->size() < required_pages ||
       required_pages > impl_->page_table_k->count() ||
       required_pages > impl_->page_table_v->count()) {
     if (debug) {

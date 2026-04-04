@@ -1,0 +1,37 @@
+{
+  "fixture_kind": "mamba_layer_decode_oracle_v1",
+  "layer_index": 0,
+  "hidden_size": 2688,
+  "intermediate_size": 4096,
+  "num_heads": 64,
+  "head_dim": 64,
+  "state_size": 128,
+  "n_groups": 8,
+  "conv_kernel_size": 4,
+  "input_rms_epsilon": 1e-05,
+  "mixer_rms_epsilon": 1e-05,
+  "time_step_min": 0.001,
+  "source_tensors": {
+    "input_norm_weight": "backbone.layers.0.norm.weight",
+    "mixer_norm_weight": "backbone.layers.0.mixer.norm.weight",
+    "in_proj_weight": "backbone.layers.0.mixer.in_proj.weight",
+    "conv1d_weight": "backbone.layers.0.mixer.conv1d.weight",
+    "conv1d_bias": "backbone.layers.0.mixer.conv1d.bias",
+    "A_log": "backbone.layers.0.mixer.A_log",
+    "D": "backbone.layers.0.mixer.D",
+    "dt_bias": "backbone.layers.0.mixer.dt_bias",
+    "out_proj_weight": "backbone.layers.0.mixer.out_proj.weight",
+    "in_proj_weight_scale": "backbone.layers.0.mixer.in_proj.weight_scale",
+    "in_proj_weight_scale_2": "backbone.layers.0.mixer.in_proj.weight_scale_2",
+    "out_proj_weight_scale": "backbone.layers.0.mixer.out_proj.weight_scale",
+    "out_proj_weight_scale_2": "backbone.layers.0.mixer.out_proj.weight_scale_2"
+  },
+  "notes": [
+    "The input hidden state and initial conv/SSM state are deterministic synthetic tensors unless explicit input/state binaries are provided.",
+    "The fixture uses real layer-0 Mamba weights from the checkpoint.",
+    "Projection fixtures mirror the runtime descriptor contract: scaled-FP8 uses E4M3 input round-trip, NVFP4 uses the fp32 activation path with dynamic activation packing.",
+    "expected_final_output_fp32 includes the fp32 wrapper residual add after the BF16 inner-layer delta cast."
+  ],
+  "in_proj_family": "nvfp4",
+  "out_proj_family": "nvfp4"
+}

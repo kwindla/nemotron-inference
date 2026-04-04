@@ -576,3 +576,63 @@ target_link_libraries(single_token_forward_model_test PRIVATE nemotron_runtime_a
 target_compile_features(single_token_forward_model_test PRIVATE cxx_std_17)
 
 nemotron_add_test(single_token_forward_model_test)
+
+add_executable(
+  prefill_prefix_oracle_test
+  api/prefill_prefix_oracle_test.cpp
+)
+
+target_link_libraries(prefill_prefix_oracle_test PRIVATE nemotron_runtime_api)
+target_compile_features(prefill_prefix_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  prefill_prefix_oracle_test
+  PRIVATE
+    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/testing/oracle/prefix_prefill_short_chat_layer7_t4_oracle"
+)
+
+nemotron_add_test(prefill_prefix_oracle_test)
+
+add_executable(
+  single_token_decode_oracle_test
+  api/single_token_decode_oracle_test.cpp
+)
+
+target_link_libraries(single_token_decode_oracle_test PRIVATE nemotron_runtime_api)
+target_compile_features(single_token_decode_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  single_token_decode_oracle_test
+  PRIVATE
+    NEMOTRON_SINGLE_TOKEN_DECODE_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/testing/oracle/full_model_single_token_short_chat_cuda_v3"
+)
+
+nemotron_add_test(single_token_decode_oracle_test)
+
+add_executable(
+  expert_layer_oracle_test
+  backend/expert_layer_oracle_test.cpp
+)
+
+target_link_libraries(expert_layer_oracle_test PRIVATE nemotron_runtime_backend)
+target_compile_features(expert_layer_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  expert_layer_oracle_test
+  PRIVATE
+    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/testing/oracle/expert_layer1_decode_block"
+)
+
+nemotron_add_test(expert_layer_oracle_test)
+
+add_executable(
+  mamba_layer_oracle_test
+  backend/mamba_layer_oracle_test.cpp
+)
+
+target_link_libraries(mamba_layer_oracle_test PRIVATE nemotron_runtime_api)
+target_compile_features(mamba_layer_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  mamba_layer_oracle_test
+  PRIVATE
+    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/testing/oracle/mamba_layer0_decode_block"
+)
+
+nemotron_add_test(mamba_layer_oracle_test)

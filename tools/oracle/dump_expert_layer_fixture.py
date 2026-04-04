@@ -74,6 +74,16 @@ def load_named_tensor(
     return tensor
 
 
+def load_scale_scalar(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    name: str,
+    device: torch.device | None = None,
+) -> float:
+    tensor = load_named_tensor(model_dir, weight_map, name, device=device).to(torch.float32)
+    return float(tensor.max().item())
+
+
 def deterministic_pattern(shape: tuple[int, ...], scale: float, offset: int) -> torch.Tensor:
     total = 1
     for dim in shape:
@@ -107,10 +117,29 @@ def clamp_scale(value: float) -> float:
     return value
 
 
+def bf16_roundtrip(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to(torch.bfloat16).to(torch.float32)
+
+
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
     hidden_states = hidden_states.to(torch.float32)
     variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
     return hidden_states * torch.rsqrt(variance + epsilon) * weight.to(torch.float32)
+
+
+def fused_add_rms_norm_bf16(
+    hidden_input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    combined = hidden_input.to(torch.float32) + residual.to(torch.float32)
+    variance = combined.pow(2).mean(dim=-1, keepdim=True)
+    updated_residual = bf16_roundtrip(combined)
+    normalized = bf16_roundtrip(
+        combined * torch.rsqrt(variance + epsilon) * weight.to(torch.float32)
+    )
+    return updated_residual, normalized
 
 
 def scaled_fp8_linear(
@@ -247,8 +276,8 @@ def load_nvfp4_linear_metadata(model_dir: Path, weight_map: dict[str, str], pref
         "prefix": prefix,
         "weight": weight.contiguous().view(torch.uint8).flatten().cpu(),
         "weight_scales": weight_scales.contiguous().view(torch.uint8).flatten().cpu(),
-        "weight_scale_2": float(load_named_tensor(model_dir, weight_map, tensor_scale_name).item()),
-        "input_scale": float(load_named_tensor(model_dir, weight_map, prefix + ".input_scale").item()),
+        "weight_scale_2": load_scale_scalar(model_dir, weight_map, tensor_scale_name),
+        "input_scale": load_scale_scalar(model_dir, weight_map, prefix + ".input_scale"),
         "input_cols": int(weight_scales.shape[1] * 16),
         "rows": int(weight.shape[0]),
         "cols": int(weight_scales.shape[1] * 16),
@@ -262,6 +291,8 @@ def load_dense_or_scaled_fp8_linear_metadata(
     prefix: str,
     device: torch.device | None = None,
 ) -> dict[str, object]:
+    if prefix + ".weight_scale_2" in weight_map:
+        return load_nvfp4_linear_metadata(model_dir, weight_map, prefix)
     weight = load_named_tensor(model_dir, weight_map, prefix + ".weight", device=device)
     weight_scale_name = prefix + ".weight_scale"
     input_scale_name = prefix + ".input_scale"
@@ -270,8 +301,8 @@ def load_dense_or_scaled_fp8_linear_metadata(
             "family": "scaled_fp8",
             "prefix": prefix,
             "weight": weight,
-            "weight_scale": float(load_named_tensor(model_dir, weight_map, weight_scale_name, device=device).item()),
-            "input_scale": float(load_named_tensor(model_dir, weight_map, input_scale_name, device=device).item()),
+            "weight_scale": load_scale_scalar(model_dir, weight_map, weight_scale_name, device=device),
+            "input_scale": load_scale_scalar(model_dir, weight_map, input_scale_name, device=device),
         }
     return {
         "family": "dense",
@@ -292,6 +323,8 @@ def load_shared_down_metadata(
 
 
 def run_dense_or_scaled_fp8_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) -> torch.Tensor:
+    if linear_metadata["family"] == "nvfp4":
+        return nvfp4_linear(activations, linear_metadata).to(torch.float32)
     if linear_metadata["family"] == "scaled_fp8":
         return scaled_fp8_linear(
             activations,
@@ -367,6 +400,26 @@ def nvfp4_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) 
     return activation_dequant.to(device=activations.device) @ weight_dequant.transpose(0, 1)
 
 
+def nvfp4_linear_host(activations: torch.Tensor, linear_metadata: dict[str, object]) -> torch.Tensor:
+    device_key = str(activations.device)
+    device_cache = linear_metadata.setdefault("dequantized_weight_by_device", {})
+    weight_dequant = device_cache.get(device_key)
+    if weight_dequant is None:
+        host_weight = linear_metadata.get("dequantized_weight_host")
+        if host_weight is None:
+            host_weight = dequantize_nvfp4_matrix(
+                linear_metadata["weight"],
+                linear_metadata["weight_scales"],
+                float(linear_metadata["weight_scale_2"]),
+                int(linear_metadata["rows"]),
+                int(linear_metadata["cols"]),
+            )
+            linear_metadata["dequantized_weight_host"] = host_weight
+        weight_dequant = host_weight.to(device=activations.device)
+        device_cache[device_key] = weight_dequant
+    return torch.nn.functional.linear(activations.to(torch.float32), weight_dequant)
+
+
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(torch.relu(x))
 
@@ -391,7 +444,9 @@ def main() -> int:
     mixer_prefix = prefix + ".mixer"
 
     hidden_size = int(config["hidden_size"])
-    moe_latent_size = int(config.get("moe_latent_size", 0))
+    latent_size_value = config.get("moe_latent_size")
+    uses_latent_projection = latent_size_value is not None
+    moe_latent_size = int(latent_size_value) if uses_latent_projection else hidden_size
     moe_intermediate_size = int(config["moe_intermediate_size"])
     shared_intermediate_size = int(config["moe_shared_expert_intermediate_size"])
     n_routed_experts = int(config["n_routed_experts"])
@@ -406,23 +461,38 @@ def main() -> int:
         input_hidden = load_float32_matrix(Path(args.input_hidden_bin), hidden_size).to(device=device, dtype=torch.float32)
     else:
         input_hidden = deterministic_pattern((1, hidden_size), 2.0e-3, 211).to(device=device)
+    input_hidden_bf16 = bf16_roundtrip(input_hidden)
+    residual = torch.zeros_like(input_hidden_bf16, dtype=torch.float32, device=device)
     norm_weight = load_named_tensor(model_dir, weight_map, prefix + ".norm.weight", device=device).to(torch.float32)
     gate_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".gate.weight", device=device).to(torch.float32)
     gate_score_correction_bias = load_named_tensor(
         model_dir, weight_map, mixer_prefix + ".gate.e_score_correction_bias", device=device
     ).to(torch.float32)
 
-    fc1_latent = load_dense_or_scaled_fp8_linear_metadata(
-        model_dir, weight_map, mixer_prefix + ".fc1_latent_proj", device=device
-    )
-    fc2_latent_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".fc2_latent_proj.weight", device=device).to(torch.float32)
+    fc1_latent = None
+    fc2_latent_weight = None
+    if uses_latent_projection:
+        fc1_latent = load_dense_or_scaled_fp8_linear_metadata(
+            model_dir, weight_map, mixer_prefix + ".fc1_latent_proj", device=device
+        )
+        fc2_latent_weight = load_named_tensor(
+            model_dir,
+            weight_map,
+            mixer_prefix + ".fc2_latent_proj.weight",
+            device=device,
+        ).to(torch.float32)
 
     shared_up = load_dense_or_scaled_fp8_linear_metadata(
         model_dir, weight_map, mixer_prefix + ".shared_experts.up_proj", device=device
     )
     shared_down = load_shared_down_metadata(model_dir, weight_map, mixer_prefix + ".shared_experts.down_proj", device=device)
 
-    norm_output = rms_norm(input_hidden, norm_weight, layer_norm_eps)
+    _, norm_output = fused_add_rms_norm_bf16(
+        input_hidden_bf16,
+        residual,
+        norm_weight,
+        layer_norm_eps,
+    )
     router_logits = F.linear(norm_output.to(torch.float32), gate_weight.to(torch.float32))
     selected_indices, selected_weights = compute_router_selections(
         router_logits,
@@ -434,7 +504,10 @@ def main() -> int:
         norm_topk_prob,
     )
 
-    latent_states = run_dense_or_scaled_fp8_linear(norm_output, fc1_latent).to(torch.float32)
+    if uses_latent_projection:
+        latent_states = run_dense_or_scaled_fp8_linear(norm_output, fc1_latent).to(torch.float32)
+    else:
+        latent_states = norm_output.to(torch.float32)
 
     routed_output = torch.zeros((input_hidden.shape[0], moe_latent_size), dtype=torch.float32, device=device)
     selected_expert_ids_per_row: list[list[int]] = []
@@ -495,42 +568,58 @@ def main() -> int:
             torch.tensor([down_proj["weight_scale_2"]], dtype=torch.float32),
         )
 
-    routed_projected = F.linear(routed_output.to(torch.float32), fc2_latent_weight.to(torch.float32))
-    shared_up_output = run_dense_or_scaled_fp8_linear(norm_output, shared_up).to(torch.float32)
+    if uses_latent_projection:
+        routed_projected = F.linear(routed_output.to(torch.float32), fc2_latent_weight.to(torch.float32))
+    else:
+        routed_projected = routed_output.to(torch.float32)
+    if shared_up["family"] == "nvfp4":
+        shared_up_output = nvfp4_linear(norm_output, shared_up)
+    else:
+        shared_up_output = run_dense_or_scaled_fp8_linear(norm_output, shared_up).to(torch.float32)
     if shared_down["family"] == "nvfp4":
         shared_output = nvfp4_linear(relu2(shared_up_output), shared_down)
     else:
         shared_output = run_dense_or_scaled_fp8_linear(relu2(shared_up_output), shared_down).to(torch.float32)
     mixer_output = routed_projected + shared_output
-    final_output = input_hidden.to(torch.float32) + mixer_output
+    final_output = input_hidden.to(torch.float32) + bf16_roundtrip(mixer_output)
 
     write_tensor(output_dir / "input_hidden_fp32.bin", input_hidden)
     write_tensor(output_dir / "expected_norm_output_fp32.bin", norm_output)
     write_tensor(output_dir / "norm_weight_fp32.bin", norm_weight)
     write_tensor(output_dir / "gate_weight_fp32.bin", gate_weight)
     write_tensor(output_dir / "gate_score_correction_bias_fp32.bin", gate_score_correction_bias)
-    if fc1_latent["family"] == "scaled_fp8":
-        write_raw_uint8(output_dir / "fc1_latent_weight_fp8.bin", fc1_latent["weight"].to(torch.float8_e4m3fn))
-        write_tensor(
-            output_dir / "fc1_latent_weight_scale_fp32.bin",
-            torch.tensor([fc1_latent["weight_scale"]], dtype=torch.float32),
+    if uses_latent_projection:
+        if fc1_latent["family"] == "scaled_fp8":
+            write_raw_uint8(output_dir / "fc1_latent_weight_fp8.bin", fc1_latent["weight"].to(torch.float8_e4m3fn))
+            write_tensor(
+                output_dir / "fc1_latent_weight_scale_fp32.bin",
+                torch.tensor([fc1_latent["weight_scale"]], dtype=torch.float32),
+            )
+            write_tensor(
+                output_dir / "fc1_latent_input_scale_fp32.bin",
+                torch.tensor([fc1_latent["input_scale"]], dtype=torch.float32),
+            )
+            write_tensor(
+                output_dir / "expected_fc1_latent_quantized_input_fp32.bin",
+                scaled_fp8_roundtrip_input(norm_output, fc1_latent["input_scale"]),
+            )
+            write_tensor(
+                output_dir / "expected_fc1_latent_weight_dequant_fp32.bin",
+                scaled_fp8_dequantized_weight(fc1_latent["weight"], fc1_latent["weight_scale"]),
+            )
+        else:
+            write_tensor(output_dir / "fc1_latent_weight_fp32.bin", fc1_latent["weight"].to(torch.float32))
+        write_tensor(output_dir / "fc2_latent_weight_fp32.bin", fc2_latent_weight)
+    if shared_up["family"] == "nvfp4":
+        (output_dir / "shared_up_weight_packed.bin").write_bytes(shared_up["weight"].contiguous().numpy().tobytes())
+        (output_dir / "shared_up_weight_block_scales.bin").write_bytes(
+            shared_up["weight_scales"].contiguous().view(torch.uint8).numpy().tobytes()
         )
         write_tensor(
-            output_dir / "fc1_latent_input_scale_fp32.bin",
-            torch.tensor([fc1_latent["input_scale"]], dtype=torch.float32),
+            output_dir / "shared_up_weight_tensor_scale_fp32.bin",
+            torch.tensor([shared_up["weight_scale_2"]], dtype=torch.float32),
         )
-        write_tensor(
-            output_dir / "expected_fc1_latent_quantized_input_fp32.bin",
-            scaled_fp8_roundtrip_input(norm_output, fc1_latent["input_scale"]),
-        )
-        write_tensor(
-            output_dir / "expected_fc1_latent_weight_dequant_fp32.bin",
-            scaled_fp8_dequantized_weight(fc1_latent["weight"], fc1_latent["weight_scale"]),
-        )
-    else:
-        write_tensor(output_dir / "fc1_latent_weight_fp32.bin", fc1_latent["weight"].to(torch.float32))
-    write_tensor(output_dir / "fc2_latent_weight_fp32.bin", fc2_latent_weight)
-    if shared_up["family"] == "scaled_fp8":
+    elif shared_up["family"] == "scaled_fp8":
         write_raw_uint8(output_dir / "shared_up_weight_fp8.bin", shared_up["weight"].to(torch.float8_e4m3fn))
         write_tensor(
             output_dir / "shared_up_weight_scale_fp32.bin",
@@ -565,8 +654,9 @@ def main() -> int:
         write_tensor(output_dir / "shared_down_weight_fp32.bin", shared_down["weight"].to(torch.float32))
 
     write_tensor(output_dir / "expected_router_logits_fp32.bin", router_logits)
-    write_tensor(output_dir / "expected_fc1_latent_output_fp32.bin", latent_states)
-    write_tensor(output_dir / "expected_routed_latent_output_fp32.bin", routed_output)
+    if uses_latent_projection:
+        write_tensor(output_dir / "expected_fc1_latent_output_fp32.bin", latent_states)
+        write_tensor(output_dir / "expected_routed_latent_output_fp32.bin", routed_output)
     write_tensor(output_dir / "expected_shared_output_fp32.bin", shared_output)
     write_tensor(output_dir / "expected_mixer_output_fp32.bin", mixer_output)
     write_tensor(output_dir / "expected_final_output_fp32.bin", final_output)
@@ -609,7 +699,8 @@ def main() -> int:
         "routed_scaling_factor": routed_scaling_factor,
         "norm_topk_prob": norm_topk_prob,
         "rms_epsilon": layer_norm_eps,
-        "fc1_latent_family": fc1_latent["family"],
+        "uses_latent_projection": uses_latent_projection,
+        "fc1_latent_family": fc1_latent["family"] if uses_latent_projection else "none",
         "shared_up_family": shared_up["family"],
         "shared_down_family": shared_down["family"],
         "oracle_device": device.type,
@@ -618,18 +709,22 @@ def main() -> int:
             "norm_weight": prefix + ".norm.weight",
             "gate_weight": mixer_prefix + ".gate.weight",
             "gate_score_correction_bias": mixer_prefix + ".gate.e_score_correction_bias",
-            "fc1_latent_weight": mixer_prefix + ".fc1_latent_proj.weight",
-            "fc2_latent_weight": mixer_prefix + ".fc2_latent_proj.weight",
             "shared_up_weight": mixer_prefix + ".shared_experts.up_proj.weight",
             "shared_down_weight": mixer_prefix + ".shared_experts.down_proj.weight",
         },
         "notes": [
             "The input hidden state is deterministic unless --input-hidden-bin is provided.",
-            "Router, latent projections, shared expert, and selected routed experts all use real checkpoint weights.",
+            "Router, shared expert, and selected routed experts all use real checkpoint weights.",
             "The routed and shared expert paths mirror the current correctness-first runtime contract for the family actually present in the checkpoint.",
             "expected_final_output_fp32 includes the outer residual add.",
         ],
     }
+    if uses_latent_projection:
+        metadata["source_tensors"]["fc1_latent_weight"] = mixer_prefix + ".fc1_latent_proj.weight"
+        metadata["source_tensors"]["fc2_latent_weight"] = mixer_prefix + ".fc2_latent_proj.weight"
+        metadata["notes"].insert(1, "The latent projection path uses the real checkpoint fc1/fc2 latent weights.")
+    else:
+        metadata["notes"].insert(1, "Nano uses the direct MLP MoE topology, so latent projection files are intentionally omitted.")
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(metadata, indent=2))
     return 0

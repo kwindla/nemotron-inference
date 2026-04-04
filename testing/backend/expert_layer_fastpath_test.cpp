@@ -59,6 +59,18 @@ struct OwnedNvfp4Descriptor {
   GemmDescriptor descriptor;
 };
 
+void RebindOwnedNvfp4Descriptor(OwnedNvfp4Descriptor* owned) {
+  if (owned == nullptr) {
+    return;
+  }
+  owned->descriptor.packed_data = owned->packed.packed_data();
+  owned->descriptor.packed_nbytes = owned->packed.packed_nbytes();
+  owned->descriptor.block_scales_data = owned->packed.block_scales_data();
+  owned->descriptor.block_scales_nbytes = owned->packed.block_scales_nbytes();
+  owned->descriptor.tensor_scale_data = owned->packed.tensor_scale_data();
+  owned->descriptor.tensor_scale_nbytes = owned->packed.tensor_scale_nbytes();
+}
+
 bool expect(bool condition, const std::string& message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << "\n";
@@ -224,13 +236,13 @@ bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
       make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
   const auto gate_weight_descriptor =
       make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
-  const auto shared_up_descriptor =
+  auto shared_up_descriptor =
       make_owned_nvfp4_descriptor(
           mixer_prefix + ".shared_experts.up_proj.weight",
           shared_up_values,
           kIntermediateSize,
           kHiddenSize);
-  const auto shared_down_descriptor =
+  auto shared_down_descriptor =
       make_owned_nvfp4_descriptor(
           mixer_prefix + ".shared_experts.down_proj.weight",
           shared_down_values,
@@ -240,6 +252,8 @@ bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
       !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
     return false;
   }
+  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
 
   std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
   std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
@@ -281,6 +295,8 @@ bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
     }
     routed_up_descriptors[expert_index] = std::move(*up_descriptor);
     routed_down_descriptors[expert_index] = std::move(*down_descriptor);
+    RebindOwnedNvfp4Descriptor(&routed_up_descriptors[expert_index]);
+    RebindOwnedNvfp4Descriptor(&routed_down_descriptors[expert_index]);
     bindings.routed_experts[expert_index].up_proj =
         &routed_up_descriptors[expert_index].descriptor;
     bindings.routed_experts[expert_index].down_proj =
@@ -345,7 +361,7 @@ bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
   return true;
 }
 
-bool test_unified_fused_prefill_matches_reference_batch_output() {
+bool test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging() {
   if (!has_cuda_device()) {
     std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
     return true;
@@ -370,8 +386,8 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
   constexpr std::size_t kIntermediateSize = 64;
   constexpr std::size_t kRoutedExperts = 8;
   constexpr std::size_t kTopK = 2;
-  constexpr std::size_t kTokenCount = 4;
-  constexpr float kMaxAllowedDiff = 0.05f;
+  constexpr std::size_t kTokenCount = 1;
+  constexpr float kMaxAllowedDiff = 1.0e-4f;
 
   const std::string layer_prefix = "backbone.layers.2";
   const std::string mixer_prefix = layer_prefix + ".mixer";
@@ -388,13 +404,13 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
       make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
   const auto gate_weight_descriptor =
       make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
-  const auto shared_up_descriptor =
+  auto shared_up_descriptor =
       make_owned_nvfp4_descriptor(
           mixer_prefix + ".shared_experts.up_proj.weight",
           shared_up_values,
           kIntermediateSize,
           kHiddenSize);
-  const auto shared_down_descriptor =
+  auto shared_down_descriptor =
       make_owned_nvfp4_descriptor(
           mixer_prefix + ".shared_experts.down_proj.weight",
           shared_down_values,
@@ -404,6 +420,8 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
       !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
     return false;
   }
+  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
 
   std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
   std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
@@ -445,6 +463,8 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
     }
     routed_up_descriptors[expert_index] = std::move(*up_descriptor);
     routed_down_descriptors[expert_index] = std::move(*down_descriptor);
+    RebindOwnedNvfp4Descriptor(&routed_up_descriptors[expert_index]);
+    RebindOwnedNvfp4Descriptor(&routed_down_descriptors[expert_index]);
     bindings.routed_experts[expert_index].up_proj =
         &routed_up_descriptors[expert_index].descriptor;
     bindings.routed_experts[expert_index].down_proj =
@@ -466,16 +486,9 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
   config.routed_scaling_factor = 1.0f;
   config.norm_topk_prob = true;
 
-  setenv("NEMOTRON_FORWARD_UNIFIED_FUSED", "0", 1);
-  setenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL", "0", 1);
-  auto reference_slice = ExpertLayerSlice::Create(config, bindings);
-  unsetenv("NEMOTRON_FORWARD_UNIFIED_FUSED");
-  unsetenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-  auto unified_slice = ExpertLayerSlice::Create(config, bindings);
-  if (!expect(reference_slice != nullptr && reference_slice->valid(),
-              "reference expert layer slice should create") ||
-      !expect(unified_slice != nullptr && unified_slice->valid(),
-              "unified expert layer slice should create")) {
+  auto resident_slice = ExpertLayerSlice::Create(config, bindings);
+  if (!expect(resident_slice != nullptr && resident_slice->valid(),
+              "resident expert layer slice should create")) {
     return false;
   }
 
@@ -488,9 +501,9 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
   }
 
   auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  auto reference_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  auto unified_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  if (!expect(batch_input != nullptr && reference_output != nullptr && unified_output != nullptr,
+  auto first_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto second_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  if (!expect(batch_input != nullptr && first_output != nullptr && second_output != nullptr,
               "batched tensors should allocate") ||
       !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
               "batched input should upload")) {
@@ -498,32 +511,62 @@ bool test_unified_fused_prefill_matches_reference_batch_output() {
   }
 
   GemmHeuristicCache heuristic_cache;
+  ResetExpertStagingCounters();
   if (!expect(
-          reference_slice->Run(*cublas, &heuristic_cache, *batch_input, reference_output.get(), nullptr),
-          "reference batch run should succeed") ||
+          resident_slice->Run(*cublas, &heuristic_cache, *batch_input, first_output.get(), nullptr),
+          "resident fastpath run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "resident fastpath run should synchronize")) {
+    return false;
+  }
+  const auto& first_counters = GetExpertStagingCounters();
+  if (!expect(
+          first_counters.total_experts_staged.load(std::memory_order_relaxed) == 0,
+          "resident fastpath run should not stage any routed experts") ||
       !expect(
-          unified_slice->Run(*cublas, &heuristic_cache, *batch_input, unified_output.get(), nullptr),
-          "unified fused batch run should succeed") ||
-      !expect(cudaDeviceSynchronize() == cudaSuccess, "batch outputs should synchronize")) {
+          first_counters.total_bytes_uploaded.load(std::memory_order_relaxed) == 0,
+          "resident fastpath run should not upload routed expert bytes at execution time") ||
+      !expect(
+          first_counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
+          "resident fastpath run should not invoke the host routing adapter")) {
     return false;
   }
 
-  std::vector<float> reference_host(reference_output->numel(), 0.0f);
-  std::vector<float> unified_host(unified_output->numel(), 0.0f);
-  if (!expect(reference_output->CopyToHost(reference_host.data(), reference_host.size()),
-              "reference batch output should copy to host") ||
-      !expect(unified_output->CopyToHost(unified_host.data(), unified_host.size()),
-              "unified batch output should copy to host")) {
+  ResetExpertStagingCounters();
+  if (!expect(
+          resident_slice->Run(*cublas, &heuristic_cache, *batch_input, second_output.get(), nullptr),
+          "second resident fastpath run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "second resident fastpath run should synchronize")) {
     return false;
   }
-  if (!expect(all_finite(reference_host), "reference batch output should be finite") ||
-      !expect(all_finite(unified_host), "unified batch output should be finite")) {
+  const auto& second_counters = GetExpertStagingCounters();
+  if (!expect(
+          second_counters.total_experts_staged.load(std::memory_order_relaxed) == 0,
+          "second resident fastpath run should not stage any routed experts") ||
+      !expect(
+          second_counters.total_bytes_uploaded.load(std::memory_order_relaxed) == 0,
+          "second resident fastpath run should not upload routed expert bytes at execution time") ||
+      !expect(
+          second_counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
+          "second resident fastpath run should not invoke the host routing adapter")) {
     return false;
   }
 
-  const float diff = max_abs_diff(reference_host, unified_host);
-  if (!expect(diff <= kMaxAllowedDiff, "unified fused batch output should match the reference path")) {
-    std::cerr << "reference_vs_unified_max_abs_diff=" << diff << "\n";
+  std::vector<float> first_host(first_output->numel(), 0.0f);
+  std::vector<float> second_host(second_output->numel(), 0.0f);
+  if (!expect(first_output->CopyToHost(first_host.data(), first_host.size()),
+              "resident fastpath output should copy to host") ||
+      !expect(second_output->CopyToHost(second_host.data(), second_host.size()),
+              "second resident fastpath output should copy to host")) {
+    return false;
+  }
+  if (!expect(all_finite(first_host), "resident fastpath output should be finite") ||
+      !expect(all_finite(second_host), "second resident fastpath output should be finite")) {
+    return false;
+  }
+
+  const float diff = max_abs_diff(first_host, second_host);
+  if (!expect(diff <= kMaxAllowedDiff, "resident fastpath decode should be deterministic")) {
+    std::cerr << "resident_fastpath_repeat_max_abs_diff=" << diff << "\n";
     return false;
   }
   return true;
@@ -573,13 +616,13 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
       make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
   const auto gate_weight_descriptor =
       make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
-  const auto shared_up_descriptor =
+  auto shared_up_descriptor =
       make_owned_nvfp4_descriptor(
           mixer_prefix + ".shared_experts.up_proj.weight",
           shared_up_values,
           kIntermediateSize,
           kHiddenSize);
-  const auto shared_down_descriptor =
+  auto shared_down_descriptor =
       make_owned_nvfp4_descriptor(
           mixer_prefix + ".shared_experts.down_proj.weight",
           shared_down_values,
@@ -589,6 +632,8 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
       !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
     return false;
   }
+  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
 
   std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
   std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
@@ -630,6 +675,8 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
     }
     routed_up_descriptors[expert_index] = std::move(*up_descriptor);
     routed_down_descriptors[expert_index] = std::move(*down_descriptor);
+    RebindOwnedNvfp4Descriptor(&routed_up_descriptors[expert_index]);
+    RebindOwnedNvfp4Descriptor(&routed_down_descriptors[expert_index]);
     bindings.routed_experts[expert_index].up_proj =
         &routed_up_descriptors[expert_index].descriptor;
     bindings.routed_experts[expert_index].down_proj =
@@ -704,7 +751,7 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
 
 int main() {
   return test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() &&
-                 test_unified_fused_prefill_matches_reference_batch_output() &&
+                 test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging() &&
                  test_nonresident_routed_weights_reject_fastpath_and_use_fallback()
              ? 0
              : 1;

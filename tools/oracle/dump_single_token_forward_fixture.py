@@ -80,6 +80,16 @@ def load_named_tensor(
     return tensor
 
 
+def load_scale_scalar(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    name: str,
+    device: torch.device | None = None,
+) -> float:
+    tensor = load_named_tensor(model_dir, weight_map, name, device=device).to(torch.float32)
+    return float(tensor.max().item())
+
+
 def load_prompt_case(path: Path, prompt_name: str) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     for case in payload["cases"]:
@@ -88,8 +98,21 @@ def load_prompt_case(path: Path, prompt_name: str) -> dict[str, Any]:
     raise KeyError(f"prompt named {prompt_name!r} was not found in {path}")
 
 
+def detect_block_type(weight_map: dict[str, str], layer_index: int) -> str:
+    prefix = f"backbone.layers.{layer_index}.mixer."
+    if prefix + "gate.weight" in weight_map or prefix + "experts.0.up_proj.weight" in weight_map:
+        return "moe"
+    if prefix + "q_proj.weight" in weight_map:
+        return "attention"
+    return "mamba"
+
+
 def write_tensor(path: Path, tensor: torch.Tensor) -> None:
     path.write_bytes(tensor.contiguous().to(torch.float32).cpu().numpy().tobytes())
+
+
+def bf16_roundtrip(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to(torch.bfloat16).to(torch.float32)
 
 
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -114,6 +137,21 @@ def grouped_rms_norm_gated(
     variance = grouped.pow(2).mean(dim=-1, keepdim=True)
     normalized = grouped * torch.rsqrt(variance + epsilon)
     return normalized.view_as(gated) * weight
+
+
+def fused_add_rms_norm_bf16(
+    hidden_input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    combined = hidden_input.to(torch.float32) + residual.to(torch.float32)
+    variance = combined.pow(2).mean(dim=-1, keepdim=True)
+    updated_residual = bf16_roundtrip(combined)
+    normalized = bf16_roundtrip(
+        combined * torch.rsqrt(variance + epsilon) * weight.to(torch.float32)
+    )
+    return updated_residual, normalized
 
 
 def scaled_fp8_linear(
@@ -245,7 +283,7 @@ def load_nvfp4_linear_metadata(model_dir: Path, weight_map: dict[str, str], pref
     tensor_scale_name = prefix + ".weight_scale_2"
     if tensor_scale_name not in weight_map:
         tensor_scale_name = prefix + ".input_scale"
-    weight_scale_2 = float(load_named_tensor(model_dir, weight_map, tensor_scale_name).item())
+    weight_scale_2 = load_scale_scalar(model_dir, weight_map, tensor_scale_name)
     return {
         "family": "nvfp4",
         "prefix": prefix,
@@ -264,6 +302,8 @@ def load_dense_or_scaled_fp8_linear_metadata(
     prefix: str,
     device: torch.device | None = None,
 ) -> dict[str, object]:
+    if prefix + ".weight_scale_2" in weight_map:
+        return load_nvfp4_linear_metadata(model_dir, weight_map, prefix)
     weight = load_named_tensor(model_dir, weight_map, prefix + ".weight", device=device)
     weight_scale_name = prefix + ".weight_scale"
     input_scale_name = prefix + ".input_scale"
@@ -271,8 +311,8 @@ def load_dense_or_scaled_fp8_linear_metadata(
         return {
             "family": "scaled_fp8",
             "weight": weight,
-            "weight_scale": float(load_named_tensor(model_dir, weight_map, weight_scale_name, device=device).item()),
-            "input_scale": float(load_named_tensor(model_dir, weight_map, input_scale_name, device=device).item()),
+            "weight_scale": load_scale_scalar(model_dir, weight_map, weight_scale_name, device=device),
+            "input_scale": load_scale_scalar(model_dir, weight_map, input_scale_name, device=device),
         }
     return {
         "family": "dense",
@@ -292,6 +332,8 @@ def load_shared_down_metadata(
 
 
 def run_dense_or_scaled_fp8_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) -> torch.Tensor:
+    if linear_metadata["family"] == "nvfp4":
+        return nvfp4_linear(activations, linear_metadata).to(torch.float32)
     if linear_metadata["family"] == "scaled_fp8":
         return scaled_fp8_linear(
             activations,
@@ -366,12 +408,13 @@ def compute_router_selections(
 
 def run_attention_block(
     hidden_states: torch.Tensor,
+    residual: torch.Tensor,
     model_dir: Path,
     weight_map: dict[str, str],
     config: dict[str, Any],
     layer_index: int,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     prefix = f"backbone.layers.{layer_index}"
     norm_weight = load_named_tensor(model_dir, weight_map, prefix + ".norm.weight", device=device).to(torch.float32)
     q_weight = load_named_tensor(model_dir, weight_map, prefix + ".mixer.q_proj.weight", device=device).to(torch.float32)
@@ -383,47 +426,68 @@ def run_attention_block(
     num_heads = int(config["num_attention_heads"])
     kv_heads = int(config["num_key_value_heads"])
     head_dim = int(config["head_dim"])
+    attention_hidden_size = num_heads * head_dim
     epsilon = float(config["layer_norm_epsilon"])
 
-    norm_output = rms_norm(hidden_states, norm_weight, epsilon)
-    q = F.linear(norm_output, q_weight).to(torch.float32)
-    k = F.linear(norm_output, k_weight).to(torch.float32)
-    v = F.linear(norm_output, v_weight).to(torch.float32)
-
     token_count = hidden_states.shape[0]
-    query_states = q.view(1, token_count, num_heads, head_dim).transpose(1, 2).contiguous()
-    key_states = k.view(1, token_count, kv_heads, head_dim).transpose(1, 2).contiguous()
-    value_states = v.view(1, token_count, kv_heads, head_dim).transpose(1, 2).contiguous()
+    output_delta = torch.empty_like(hidden_states, dtype=torch.float32, device=device)
+    updated_residual = torch.empty_like(residual, dtype=torch.float32, device=device)
+    cached_keys: list[torch.Tensor] = []
+    cached_values: list[torch.Tensor] = []
 
-    expanded_key = key_states[:, :, None, :, :].expand(1, kv_heads, num_heads // kv_heads, token_count, head_dim)
-    expanded_key = expanded_key.reshape(1, num_heads, token_count, head_dim)
-    expanded_value = value_states[:, :, None, :, :].expand(1, kv_heads, num_heads // kv_heads, token_count, head_dim)
-    expanded_value = expanded_value.reshape(1, num_heads, token_count, head_dim)
+    for token_index in range(token_count):
+        token_hidden = hidden_states[token_index : token_index + 1, :]
+        token_residual = residual[token_index : token_index + 1, :]
+        token_residual_updated, norm_output = fused_add_rms_norm_bf16(
+            token_hidden,
+            token_residual,
+            norm_weight,
+            epsilon,
+        )
+        updated_residual[token_index : token_index + 1, :] = token_residual_updated
 
-    attn_weights = torch.matmul(
-        query_states.to(torch.float32),
-        expanded_key.transpose(2, 3).to(torch.float32),
-    ) * (head_dim ** -0.5)
-    causal_mask = torch.triu(
-        torch.ones((token_count, token_count), dtype=torch.bool, device=attn_weights.device),
-        diagonal=1,
-    )
-    attn_weights = attn_weights.masked_fill(causal_mask.view(1, 1, token_count, token_count), float("-inf"))
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32)
-    attention_output = torch.matmul(attn_weights.to(torch.bfloat16), expanded_value.to(torch.bfloat16))
-    attention_output = attention_output.transpose(1, 2).contiguous().view(1, token_count, hidden_size).to(torch.float32)
-    projected_output = F.linear(attention_output, o_weight).to(torch.float32)
-    return hidden_states.to(torch.float32) + projected_output.view(token_count, hidden_size)
+        q = bf16_roundtrip(F.linear(norm_output, q_weight))
+        k = bf16_roundtrip(F.linear(norm_output, k_weight))
+        v = bf16_roundtrip(F.linear(norm_output, v_weight))
+
+        cached_keys.append(k.view(kv_heads, head_dim))
+        cached_values.append(v.view(kv_heads, head_dim))
+
+        key_states = torch.stack(cached_keys, dim=0).to(torch.float32)
+        value_states = torch.stack(cached_values, dim=0).to(torch.float32)
+        expanded_key = key_states[:, :, None, :].expand(
+            token_index + 1,
+            kv_heads,
+            num_heads // kv_heads,
+            head_dim,
+        ).reshape(token_index + 1, num_heads, head_dim)
+        expanded_value = value_states[:, :, None, :].expand(
+            token_index + 1,
+            kv_heads,
+            num_heads // kv_heads,
+            head_dim,
+        ).reshape(token_index + 1, num_heads, head_dim)
+
+        query_states = q.view(num_heads, head_dim).to(torch.float32)
+        attn_scores = torch.einsum("hd,thd->ht", query_states, expanded_key) * (head_dim ** -0.5)
+        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32)
+        attention_output = torch.einsum("ht,thd->hd", attn_weights, expanded_value)
+        attention_output = bf16_roundtrip(attention_output.reshape(1, attention_hidden_size))
+        projected_output = bf16_roundtrip(F.linear(attention_output, o_weight))
+        output_delta[token_index : token_index + 1, :] = projected_output
+
+    return output_delta, updated_residual
 
 
 def run_mamba_block(
     hidden_states: torch.Tensor,
+    residual: torch.Tensor,
     model_dir: Path,
     weight_map: dict[str, str],
     config: dict[str, Any],
     layer_index: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     prefix = f"backbone.layers.{layer_index}"
     mixer_prefix = prefix + ".mixer"
 
@@ -440,53 +504,46 @@ def run_mamba_block(
 
     input_norm_weight = load_named_tensor(model_dir, weight_map, prefix + ".norm.weight", device=device).to(torch.float32)
     mixer_norm_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".norm.weight", device=device).to(torch.float32)
-    in_proj_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".in_proj.weight", device=device)
-    in_proj_scaled_fp8 = (
-        (mixer_prefix + ".in_proj.weight_scale") in weight_map and
-        (mixer_prefix + ".in_proj.input_scale") in weight_map
+    in_proj = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir,
+        weight_map,
+        mixer_prefix + ".in_proj",
+        device=device,
     )
-    if in_proj_scaled_fp8:
-        in_proj_weight_scale = float(load_named_tensor(model_dir, weight_map, mixer_prefix + ".in_proj.weight_scale", device=device).item())
-        in_proj_input_scale = float(load_named_tensor(model_dir, weight_map, mixer_prefix + ".in_proj.input_scale", device=device).item())
-    else:
-        in_proj_weight_scale = 0.0
-        in_proj_input_scale = 0.0
     conv_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".conv1d.weight", device=device).to(torch.float32)
     conv_bias = load_named_tensor(model_dir, weight_map, mixer_prefix + ".conv1d.bias", device=device).to(torch.float32)
     A_log = load_named_tensor(model_dir, weight_map, mixer_prefix + ".A_log", device=device).to(torch.float32)
     D = load_named_tensor(model_dir, weight_map, mixer_prefix + ".D", device=device).to(torch.float32)
     dt_bias = load_named_tensor(model_dir, weight_map, mixer_prefix + ".dt_bias", device=device).to(torch.float32)
-    out_proj_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".out_proj.weight", device=device)
-    out_proj_scaled_fp8 = (
-        (mixer_prefix + ".out_proj.weight_scale") in weight_map and
-        (mixer_prefix + ".out_proj.input_scale") in weight_map
+    out_proj = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir,
+        weight_map,
+        mixer_prefix + ".out_proj",
+        device=device,
     )
-    if out_proj_scaled_fp8:
-        out_proj_weight_scale = float(load_named_tensor(model_dir, weight_map, mixer_prefix + ".out_proj.weight_scale", device=device).item())
-        out_proj_input_scale = float(load_named_tensor(model_dir, weight_map, mixer_prefix + ".out_proj.input_scale", device=device).item())
-    else:
-        out_proj_weight_scale = 0.0
-        out_proj_input_scale = 0.0
 
     token_count = hidden_states.shape[0]
     conv_state = torch.zeros((1, conv_dim, conv_kernel), dtype=torch.float32, device=device)
     ssm_state = torch.zeros((1, num_heads, head_dim, state_size), dtype=torch.float32, device=device)
 
-    norm_output = rms_norm(hidden_states, input_norm_weight, layer_norm_eps)
-    if in_proj_scaled_fp8:
-        in_proj_output = scaled_fp8_linear(norm_output, in_proj_weight, in_proj_weight_scale, in_proj_input_scale)
-    else:
-        in_proj_output = F.linear(norm_output.to(torch.float32), in_proj_weight.to(torch.float32))
-
-    gate = in_proj_output[:, :intermediate_size]
-    hidden_states_B_C = in_proj_output[:, intermediate_size : intermediate_size + conv_dim]
-    dt_pre = in_proj_output[:, intermediate_size + conv_dim :]
-    scan_rows: list[torch.Tensor] = []
+    output_delta = torch.empty_like(hidden_states, dtype=torch.float32, device=device)
+    updated_residual = torch.empty_like(residual, dtype=torch.float32, device=device)
 
     for token_index in range(token_count):
-        token_hidden_states_B_C = hidden_states_B_C[token_index : token_index + 1, :]
-        token_gate = gate[token_index : token_index + 1, :]
-        token_dt_pre = dt_pre[token_index : token_index + 1, :]
+        token_hidden = hidden_states[token_index : token_index + 1, :]
+        token_residual = residual[token_index : token_index + 1, :]
+        token_residual_updated, norm_output = fused_add_rms_norm_bf16(
+            token_hidden,
+            token_residual,
+            input_norm_weight,
+            layer_norm_eps,
+        )
+        updated_residual[token_index : token_index + 1, :] = token_residual_updated
+        in_proj_output = run_dense_or_scaled_fp8_linear(norm_output, in_proj).to(torch.float32)
+
+        token_gate = in_proj_output[:, :intermediate_size]
+        token_hidden_states_B_C = in_proj_output[:, intermediate_size : intermediate_size + conv_dim]
+        token_dt_pre = in_proj_output[:, intermediate_size + conv_dim :]
 
         conv_state = torch.roll(conv_state, shifts=-1, dims=-1)
         conv_state[:, :, -1] = token_hidden_states_B_C.view(1, conv_dim)
@@ -520,29 +577,18 @@ def run_mamba_block(
         ).view(1, num_heads, head_dim)
         y = y + hidden_ssm * D_expanded
         y_flat = y.view(1, intermediate_size)
-
-        scan_rows.append(
-            grouped_rms_norm_gated(
-                y_flat,
-                token_gate,
-                mixer_norm_weight,
-                layer_norm_eps,
-                n_groups,
-            )
+        scan_output = grouped_rms_norm_gated(
+            y_flat,
+            token_gate,
+            mixer_norm_weight,
+            layer_norm_eps,
+            n_groups,
         )
-
-    scan_output = torch.cat(scan_rows, dim=0)
-    if out_proj_scaled_fp8:
-        projected_output = scaled_fp8_linear(
-            scan_output,
-            out_proj_weight,
-            out_proj_weight_scale,
-            out_proj_input_scale,
-        )
-    else:
-        projected_output = F.linear(scan_output.to(torch.float32), out_proj_weight.to(torch.float32))
+        projected_output = run_dense_or_scaled_fp8_linear(scan_output, out_proj).to(torch.float32)
+        output_delta[token_index : token_index + 1, :] = bf16_roundtrip(projected_output)
     return (
-        hidden_states.to(torch.float32) + projected_output,
+        output_delta,
+        updated_residual,
         conv_state.to(torch.float32),
         ssm_state.to(torch.float32),
     )
@@ -550,16 +596,19 @@ def run_mamba_block(
 
 def run_expert_block(
     hidden_states: torch.Tensor,
+    residual: torch.Tensor,
     model_dir: Path,
     weight_map: dict[str, str],
     config: dict[str, Any],
     layer_index: int,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     prefix = f"backbone.layers.{layer_index}"
     mixer_prefix = prefix + ".mixer"
 
-    moe_latent_size = int(config["moe_latent_size"])
+    latent_size_value = config.get("moe_latent_size")
+    uses_latent_projection = latent_size_value is not None
+    moe_latent_size = int(latent_size_value) if uses_latent_projection else int(config["hidden_size"])
     top_k = int(config["num_experts_per_tok"])
     n_group = int(config["n_group"])
     topk_group = int(config["topk_group"])
@@ -573,10 +622,18 @@ def run_expert_block(
         model_dir, weight_map, mixer_prefix + ".gate.e_score_correction_bias", device=device
     ).to(torch.float32)
 
-    fc1_latent = load_dense_or_scaled_fp8_linear_metadata(
-        model_dir, weight_map, mixer_prefix + ".fc1_latent_proj", device=device
-    )
-    fc2_latent_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".fc2_latent_proj.weight", device=device).to(torch.float32)
+    fc1_latent = None
+    fc2_latent_weight = None
+    if uses_latent_projection:
+        fc1_latent = load_dense_or_scaled_fp8_linear_metadata(
+            model_dir, weight_map, mixer_prefix + ".fc1_latent_proj", device=device
+        )
+        fc2_latent_weight = load_named_tensor(
+            model_dir,
+            weight_map,
+            mixer_prefix + ".fc2_latent_proj.weight",
+            device=device,
+        ).to(torch.float32)
 
     shared_up = load_dense_or_scaled_fp8_linear_metadata(
         model_dir, weight_map, mixer_prefix + ".shared_experts.up_proj", device=device
@@ -585,7 +642,12 @@ def run_expert_block(
         model_dir, weight_map, mixer_prefix + ".shared_experts.down_proj", device=device
     )
 
-    norm_output = rms_norm(hidden_states, norm_weight, layer_norm_eps)
+    updated_residual, norm_output = fused_add_rms_norm_bf16(
+        hidden_states,
+        residual,
+        norm_weight,
+        layer_norm_eps,
+    )
     router_logits = F.linear(norm_output.to(torch.float32), gate_weight.to(torch.float32))
     selected_indices, selected_weights = compute_router_selections(
         router_logits,
@@ -597,7 +659,10 @@ def run_expert_block(
         norm_topk_prob,
     )
 
-    latent_states = run_dense_or_scaled_fp8_linear(norm_output, fc1_latent).to(torch.float32)
+    if uses_latent_projection:
+        latent_states = run_dense_or_scaled_fp8_linear(norm_output, fc1_latent).to(torch.float32)
+    else:
+        latent_states = norm_output.to(torch.float32)
 
     token_count = hidden_states.shape[0]
     routed_output = torch.zeros((token_count, moe_latent_size), dtype=torch.float32, device=device)
@@ -621,7 +686,10 @@ def run_expert_block(
                 expert_output * float(selected_weights[token_index, slot].item())
             )
 
-    routed_projected = F.linear(routed_output.to(torch.float32), fc2_latent_weight.to(torch.float32))
+    if uses_latent_projection:
+        routed_projected = F.linear(routed_output.to(torch.float32), fc2_latent_weight.to(torch.float32))
+    else:
+        routed_projected = routed_output.to(torch.float32)
     shared_up_output = run_dense_or_scaled_fp8_linear(norm_output, shared_up).to(torch.float32)
     shared_up_activated = relu2(shared_up_output)
     if shared_down["family"] == "nvfp4":
@@ -629,7 +697,7 @@ def run_expert_block(
     else:
         shared_output = run_dense_or_scaled_fp8_linear(shared_up_activated, shared_down).to(torch.float32)
     mixer_output = routed_projected + shared_output
-    return hidden_states.to(torch.float32) + mixer_output
+    return bf16_roundtrip(mixer_output), updated_residual
 
 
 def main() -> int:
@@ -679,7 +747,8 @@ def main() -> int:
     stop_layer = args.stop_layer if args.stop_layer >= 0 else int(config["num_hidden_layers"]) - 1
 
     embeddings = load_named_tensor(model_dir, weight_map, "backbone.embeddings.weight", device=device).to(torch.float32)
-    hidden_states = embeddings[runtime_token_ids, :].to(torch.float32)
+    hidden_states = bf16_roundtrip(embeddings[runtime_token_ids, :].to(torch.float32))
+    residual = torch.zeros_like(hidden_states, dtype=torch.float32, device=device)
     write_tensor(output_dir / "expected_embedding_output_fp32.bin", hidden_states)
 
     captured_outputs: dict[int, torch.Tensor] = {}
@@ -688,15 +757,24 @@ def main() -> int:
     for layer_index in range(num_layers):
         if layer_index > stop_layer:
             break
-        block_type = config["layers_block_type"][layer_index]
+        block_type = detect_block_type(weight_map, layer_index)
         layer_kinds.append(block_type)
         final_mamba_conv_state = None
         final_mamba_ssm_state = None
         if block_type == "attention":
-            hidden_states = run_attention_block(hidden_states, model_dir, weight_map, config, layer_index, device)
-        elif block_type == "mamba":
-            hidden_states, final_mamba_conv_state, final_mamba_ssm_state = run_mamba_block(
+            hidden_states, residual = run_attention_block(
                 hidden_states,
+                residual,
+                model_dir,
+                weight_map,
+                config,
+                layer_index,
+                device,
+            )
+        elif block_type == "mamba":
+            hidden_states, residual, final_mamba_conv_state, final_mamba_ssm_state = run_mamba_block(
+                hidden_states,
+                residual,
                 model_dir,
                 weight_map,
                 config,
@@ -704,13 +782,22 @@ def main() -> int:
                 device,
             )
         elif block_type == "moe":
-            hidden_states = run_expert_block(hidden_states, model_dir, weight_map, config, layer_index, device)
+            hidden_states, residual = run_expert_block(
+                hidden_states,
+                residual,
+                model_dir,
+                weight_map,
+                config,
+                layer_index,
+                device,
+            )
         else:
             raise ValueError(f"unsupported block type {block_type!r} at layer {layer_index}")
 
         if layer_index in capture_layers:
-            captured_outputs[layer_index] = hidden_states.detach().clone()
-            write_tensor(output_dir / f"expected_layer_{layer_index:03d}_output_fp32.bin", hidden_states)
+            combined_hidden = hidden_states.to(torch.float32) + residual.to(torch.float32)
+            captured_outputs[layer_index] = combined_hidden.detach().clone()
+            write_tensor(output_dir / f"expected_layer_{layer_index:03d}_output_fp32.bin", combined_hidden)
             if final_mamba_conv_state is not None and final_mamba_ssm_state is not None:
                 write_tensor(
                     output_dir / f"expected_layer_{layer_index:03d}_mamba_conv_state_fp32.bin",
@@ -722,7 +809,6 @@ def main() -> int:
                 )
 
     final_hidden = hidden_states.to(torch.float32)
-    write_tensor(output_dir / "expected_final_hidden_fp32.bin", final_hidden)
 
     final_norm_name = None
     for candidate in ("backbone.norm_f.weight", "norm_f.weight", "backbone.final_norm.weight", "final_norm.weight"):
@@ -731,15 +817,20 @@ def main() -> int:
             break
     if final_norm_name is not None:
         final_norm_weight = load_named_tensor(model_dir, weight_map, final_norm_name, device=device).to(torch.float32)
-        final_hidden_normed = rms_norm(final_hidden, final_norm_weight, float(config["layer_norm_epsilon"]))
+        final_hidden = bf16_roundtrip(final_hidden + residual.to(torch.float32))
+        final_hidden_normed = bf16_roundtrip(
+            rms_norm(final_hidden, final_norm_weight, float(config["layer_norm_epsilon"]))
+        )
     else:
+        final_hidden = bf16_roundtrip(hidden_states.to(torch.float32) + residual.to(torch.float32))
         final_hidden_normed = final_hidden
+    write_tensor(output_dir / "expected_final_hidden_fp32.bin", final_hidden)
     write_tensor(output_dir / "expected_final_hidden_normed_fp32.bin", final_hidden_normed)
 
     logits = None
     if stop_layer >= num_layers - 1:
         lm_head_weight = load_named_tensor(model_dir, weight_map, "lm_head.weight", device=device).to(torch.float32)
-        logits = F.linear(final_hidden_normed, lm_head_weight).to(torch.float32)
+        logits = bf16_roundtrip(F.linear(final_hidden_normed, lm_head_weight).to(torch.float32))
         write_tensor(output_dir / "expected_logits_fp32.bin", logits)
 
     metadata = {
