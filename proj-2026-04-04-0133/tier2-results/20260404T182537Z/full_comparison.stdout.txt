@@ -1,0 +1,246 @@
+bench_full_comparison.sh: running decode case default
+nano_fused_decode_bench: starting mode=steady-state prompt_tokens=16 decode_tokens=16 device_token_select=enabled
+nano_fused_decode_bench: steady-state prefill start prompt_tokens=16 decode_tokens=16
+nano_fused_decode_bench: steady-state prefill complete elapsed_ms=226.157 seed_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 start consume_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 elapsed_ms=24.2693 next_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 elapsed_ms=15.8418 next_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 start consume_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 elapsed_ms=15.7246 next_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 elapsed_ms=15.7107 next_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 start consume_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 elapsed_ms=15.6993 next_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 start consume_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 elapsed_ms=15.6628 next_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 start consume_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 elapsed_ms=15.7781 next_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 start consume_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 elapsed_ms=15.7762 next_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 start consume_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 elapsed_ms=15.6014 next_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 start consume_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 elapsed_ms=15.6979 next_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 elapsed_ms=15.8667 next_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 elapsed_ms=15.7348 next_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 start consume_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 elapsed_ms=15.7775 next_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 elapsed_ms=15.7488 next_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 start consume_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 elapsed_ms=15.6778 next_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 elapsed_ms=15.7072 next_token=1917
+nano_fused_decode_bench: mode=steady-state prompt_tokens=16 decode_tokens=16 prefill_ms=226.157 decode_mean_ms=16.267 decode_min_ms=15.601 decode_max_ms=24.269 device_token_select=enabled decode_tokens_per_second=61.473
+nano_fused_decode_bench: mode=steady-state per_step_ms=24.269,15.842,15.725,15.711,15.699,15.663,15.778,15.776,15.601,15.698,15.867,15.735,15.778,15.749,15.678,15.707
+linear_op_counters dense_fastpath_plan_success=1020 dense_fastpath_plan_fail=0 dense_fastpath_execute=1020 dense_fastpath_execute_fail=0 dense_reference_fallback=0 nvfp4_fastpath_plan_success=578 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=578 nvfp4_fastpath_execute_fail=0 nvfp4_reference_fallback=0 scaled_fp8_fastpath_execute=0 scaled_fp8_reference_fallback=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=368 monolithic_layers=368 staging_elapsed_us=0 host_routing_adapter_calls=0 host_routing_tensor_copies=0
+bench_full_comparison.sh: running decode case unified_fused
+nano_fused_decode_bench: starting mode=steady-state prompt_tokens=16 decode_tokens=16 device_token_select=enabled
+nano_fused_decode_bench: steady-state prefill start prompt_tokens=16 decode_tokens=16
+nano_fused_decode_bench: steady-state prefill complete elapsed_ms=222.817 seed_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 start consume_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 elapsed_ms=22.3032 next_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 elapsed_ms=15.2162 next_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 start consume_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 elapsed_ms=15.1375 next_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 elapsed_ms=15.0958 next_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 start consume_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 elapsed_ms=15.154 next_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 start consume_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 elapsed_ms=15.135 next_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 start consume_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 elapsed_ms=15.1567 next_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 start consume_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 elapsed_ms=15.2497 next_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 start consume_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 elapsed_ms=15.3977 next_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 start consume_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 elapsed_ms=15.5873 next_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 elapsed_ms=15.597 next_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 elapsed_ms=15.4683 next_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 start consume_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 elapsed_ms=15.7039 next_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 elapsed_ms=15.7013 next_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 start consume_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 elapsed_ms=15.6558 next_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 elapsed_ms=15.6013 next_token=1917
+nano_fused_decode_bench: mode=steady-state prompt_tokens=16 decode_tokens=16 prefill_ms=222.817 decode_mean_ms=15.823 decode_min_ms=15.096 decode_max_ms=22.303 device_token_select=enabled decode_tokens_per_second=63.201
+nano_fused_decode_bench: mode=steady-state per_step_ms=22.303,15.216,15.137,15.096,15.154,15.135,15.157,15.250,15.398,15.587,15.597,15.468,15.704,15.701,15.656,15.601
+linear_op_counters dense_fastpath_plan_success=1020 dense_fastpath_plan_fail=0 dense_fastpath_execute=1020 dense_fastpath_execute_fail=0 dense_reference_fallback=0 nvfp4_fastpath_plan_success=578 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=578 nvfp4_fastpath_execute_fail=0 nvfp4_reference_fallback=0 scaled_fp8_fastpath_execute=0 scaled_fp8_reference_fallback=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=368 monolithic_layers=368 staging_elapsed_us=0 host_routing_adapter_calls=0 host_routing_tensor_copies=0
+bench_full_comparison.sh: running decode case fallback_disable_override
+nano_fused_decode_bench: starting mode=steady-state prompt_tokens=16 decode_tokens=16 device_token_select=enabled
+nano_fused_decode_bench: steady-state prefill start prompt_tokens=16 decode_tokens=16
+nano_fused_decode_bench: steady-state prefill complete elapsed_ms=222.207 seed_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 start consume_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 elapsed_ms=22.4676 next_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 elapsed_ms=15.1475 next_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 start consume_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 elapsed_ms=15.1958 next_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 elapsed_ms=15.2487 next_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 start consume_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 elapsed_ms=15.104 next_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 start consume_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 elapsed_ms=15.225 next_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 start consume_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 elapsed_ms=15.2003 next_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 start consume_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 elapsed_ms=14.9599 next_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 start consume_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 elapsed_ms=15.1599 next_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 start consume_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 elapsed_ms=15.3954 next_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 elapsed_ms=15.454 next_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 elapsed_ms=15.5248 next_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 start consume_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 elapsed_ms=15.5505 next_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 elapsed_ms=15.5999 next_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 start consume_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 elapsed_ms=15.5428 next_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 elapsed_ms=15.6795 next_token=1917
+nano_fused_decode_bench: mode=steady-state prompt_tokens=16 decode_tokens=16 prefill_ms=222.207 decode_mean_ms=15.778 decode_min_ms=14.960 decode_max_ms=22.468 device_token_select=enabled decode_tokens_per_second=63.378
+nano_fused_decode_bench: mode=steady-state per_step_ms=22.468,15.148,15.196,15.249,15.104,15.225,15.200,14.960,15.160,15.395,15.454,15.525,15.551,15.600,15.543,15.679
+linear_op_counters dense_fastpath_plan_success=1020 dense_fastpath_plan_fail=0 dense_fastpath_execute=1020 dense_fastpath_execute_fail=0 dense_reference_fallback=0 nvfp4_fastpath_plan_success=578 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=578 nvfp4_fastpath_execute_fail=0 nvfp4_reference_fallback=0 scaled_fp8_fastpath_execute=0 scaled_fp8_reference_fallback=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=368 monolithic_layers=368 staging_elapsed_us=0 host_routing_adapter_calls=23 host_routing_tensor_copies=46
+bench_full_comparison.sh: running prefix case default
+nano_prefix_cache_ttft_bench: manifest="/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json" model_id=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 warmup_iterations=1 measured_iterations=5 tail_token_count=32 moe_prefill_window_tokens=32
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix256
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix256 (total_prompt_tokens=256)
+  cold TTFT                   : median=1521.085 ms p95=1526.417 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+  attention native multi-token runs: median=6 runs p95=6 runs
+  attention native multi-token tokens: median=1536 tokens p95=1536 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=184 runs p95=184 runs
+  expert native multi-token tokens: median=5888 tokens p95=5888 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=23 runs p95=23 runs
+  mamba native multi-token tokens: median=5888 tokens p95=5888 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix1024
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix1024 (total_prompt_tokens=1024)
+  cold TTFT                   : median=10008.009 ms p95=10028.773 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+  attention native multi-token runs: median=6 runs p95=6 runs
+  attention native multi-token tokens: median=6144 tokens p95=6144 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=736 runs p95=736 runs
+  expert native multi-token tokens: median=23552 tokens p95=23552 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=23 runs p95=23 runs
+  mamba native multi-token tokens: median=23552 tokens p95=23552 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix4096
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix4096 (total_prompt_tokens=4096)
+  cold TTFT                   : median=149495.773 ms p95=149538.655 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+  attention native multi-token runs: median=6 runs p95=6 runs
+  attention native multi-token tokens: median=24576 tokens p95=24576 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=2944 runs p95=2944 runs
+  expert native multi-token tokens: median=94208 tokens p95=94208 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=23 runs p95=23 runs
+  mamba native multi-token tokens: median=94208 tokens p95=94208 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix256_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix256_tail32 (total_prompt_tokens=288)
+  cold TTFT                   : median=1762.852 ms p95=1769.673 ms
+  restore latency             : median=0.352 ms p95=0.360 ms
+  tail prefill latency        : median=266.481 ms p95=270.862 ms
+  first-token decode latency  : median=17.023 ms p95=17.113 ms
+  commit/snapshot latency     : median=0.195 ms p95=0.239 ms
+  hot-prefix TTFT             : median=283.895 ms p95=288.253 ms
+  speedup factor              : median=6.226x p95=6.240x
+  prefix snapshot size        : median=109047405 bytes p95=109047405 bytes
+  matched prefix token count  : median=256 tokens p95=256 tokens
+  attention native multi-token runs: median=18 runs p95=18 runs
+  attention native multi-token tokens: median=3456 tokens p95=3456 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=414 runs p95=414 runs
+  expert native multi-token tokens: median=13248 tokens p95=13248 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=13248 tokens p95=13248 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix1024_tail32
+  iteration 1/6 warmup
+single_token_forward_model: layer 0 kind=1 execution failed
+nano_prefix_cache_ttft_bench: timed operation failed: cold RunPrefill

@@ -1,0 +1,9 @@
+Decode backend comparison
+mode=steady_state decode_tokens=16
+
+default: decode_mean_ms=16.038967 delta_vs_default_pct=+0.00 tokens_per_second=62.348 prefill_ms=236.017646 json=proj-2026-04-04-0133/tier2-results/20260404T182537Z/decode_backends/20260404T194743Z/default.json
+unified_fused: decode_mean_ms=16.045417 delta_vs_default_pct=+0.04 tokens_per_second=62.323 prefill_ms=226.373566 json=proj-2026-04-04-0133/tier2-results/20260404T182537Z/decode_backends/20260404T194743Z/unified_fused.json
+decode_cublaslt: decode_mean_ms=15.617828 delta_vs_default_pct=-2.63 tokens_per_second=64.029 prefill_ms=222.865071 json=proj-2026-04-04-0133/tier2-results/20260404T182537Z/decode_backends/20260404T194743Z/decode_cublaslt.json
+
+winner=decode_cublaslt decode_mean_ms=15.617828
+decision=default_matches_explicit_unified_within_noise

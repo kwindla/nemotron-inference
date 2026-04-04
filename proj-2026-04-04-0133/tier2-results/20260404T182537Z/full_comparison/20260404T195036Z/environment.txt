@@ -1,0 +1,61 @@
+timestamp_utc=2026-04-04T19:50:36Z
+repo_root=/home/khkramer/src/nemotron-inference
+bench_build_dir=/home/khkramer/src/nemotron-inference/build
+test_build_dir=/home/khkramer/src/nemotron-inference/build
+decode_binary=/home/khkramer/src/nemotron-inference/build/benchmarks/nano_fused_decode/nano_fused_decode_bench
+prefix_binary=/home/khkramer/src/nemotron-inference/build/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench
+oracle_binary=/home/khkramer/src/nemotron-inference/build/testing/nano_save_prompt_oracle
+manifest=/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json
+model_id=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+artifact_dir=/home/khkramer/src/nemotron-inference/proj-2026-04-04-0133/tier2-results/20260404T182537Z/full_comparison/20260404T195036Z
+decode_tokens=16
+prefix_warmup=1
+prefix_iters=5
+vllm_warmup_iters=2
+vllm_iters=5
+vllm_decode_prefix_tokens=256
+vllm_python=/home/khkramer/src/nemotron-inference/vllm-env-cu128/bin/python
+vllm_source_tree=/home/khkramer/src/nemotron-inference/third_party/vllm
+vllm_git_revision=2a69949bdadf0e8942b7a1619b229cb475beef20
+vllm_git_tag=v0.19.0
+uname=Linux boule 6.14.0-37-generic #37-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 22:10:32 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+
+[nvcc]
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Wed_Jul_16_07:30:01_PM_PDT_2025
+Cuda compilation tools, release 13.0, V13.0.48
+Build cuda_13.0.r13.0/compiler.36260728_0
+
+[nvidia-smi]
+Sat Apr  4 12:50:36 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5090        Off |   00000000:01:00.0  On |                  N/A |
+|  0%   49C    P8             36W /  575W |    1215MiB /  32607MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A           38635      G   /usr/bin/gnome-shell                    637MiB |
+|    0   N/A  N/A           38773      G   /usr/bin/Xwayland                        12MiB |
+|    0   N/A  N/A           39168      G   ...exec/xdg-desktop-portal-gnome         12MiB |
+|    0   N/A  N/A          620208      G   ...rack-uuid=3190708988185955192        209MiB |
+|    0   N/A  N/A         1924167      G   /usr/bin/nautilus                        41MiB |
++-----------------------------------------------------------------------------------------+
+
+[env]
+LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/local/cuda-12.8/lib64:/usr/local/cuda-13.0/lib64:/usr/local/cuda-12.8/lib64:
+NEMOTRON_FORWARD_MANIFEST=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json
+
+[vllm-backend-env-json]
+{"PYTHONPATH": "/home/khkramer/src/nemotron-inference/third_party/vllm", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True", "VLLM_ALLOW_INSECURE_SERIALIZATION": "1", "VLLM_FLASHINFER_MOE_BACKEND": "throughput", "VLLM_USE_FLASHINFER_MOE_FP4": "1"}

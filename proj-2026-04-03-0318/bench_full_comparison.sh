@@ -232,7 +232,7 @@ import pathlib
 import sys
 
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(payload["runtime"]["model_id"])
+print(payload.get("runtime", payload).get("model_id", payload.get("model_id", "unknown")))
 PY
 )"
 

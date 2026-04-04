@@ -1,0 +1,39 @@
+nano_fused_decode_bench: starting mode=steady-state prompt_tokens=16 decode_tokens=16 device_token_select=enabled
+nano_fused_decode_bench: steady-state prefill start prompt_tokens=16 decode_tokens=16
+nano_fused_decode_bench: steady-state prefill complete elapsed_ms=226.157 seed_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 start consume_token=1010
+nano_fused_decode_bench: steady-state decode step 1/16 elapsed_ms=24.2693 next_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 2/16 elapsed_ms=15.8418 next_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 start consume_token=5165
+nano_fused_decode_bench: steady-state decode step 3/16 elapsed_ms=15.7246 next_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 4/16 elapsed_ms=15.7107 next_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 start consume_token=8857
+nano_fused_decode_bench: steady-state decode step 5/16 elapsed_ms=15.6993 next_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 start consume_token=2902
+nano_fused_decode_bench: steady-state decode step 6/16 elapsed_ms=15.6628 next_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 start consume_token=3791
+nano_fused_decode_bench: steady-state decode step 7/16 elapsed_ms=15.7781 next_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 start consume_token=7294
+nano_fused_decode_bench: steady-state decode step 8/16 elapsed_ms=15.7762 next_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 start consume_token=15144
+nano_fused_decode_bench: steady-state decode step 9/16 elapsed_ms=15.6014 next_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 start consume_token=97445
+nano_fused_decode_bench: steady-state decode step 10/16 elapsed_ms=15.6979 next_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 11/16 elapsed_ms=15.8667 next_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 start consume_token=1060
+nano_fused_decode_bench: steady-state decode step 12/16 elapsed_ms=15.7348 next_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 start consume_token=31960
+nano_fused_decode_bench: steady-state decode step 13/16 elapsed_ms=15.7775 next_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 start consume_token=1061
+nano_fused_decode_bench: steady-state decode step 14/16 elapsed_ms=15.7488 next_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 start consume_token=6154
+nano_fused_decode_bench: steady-state decode step 15/16 elapsed_ms=15.6778 next_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 start consume_token=1561
+nano_fused_decode_bench: steady-state decode step 16/16 elapsed_ms=15.7072 next_token=1917
+nano_fused_decode_bench: mode=steady-state prompt_tokens=16 decode_tokens=16 prefill_ms=226.157 decode_mean_ms=16.267 decode_min_ms=15.601 decode_max_ms=24.269 device_token_select=enabled decode_tokens_per_second=61.473
+nano_fused_decode_bench: mode=steady-state per_step_ms=24.269,15.842,15.725,15.711,15.699,15.663,15.778,15.776,15.601,15.698,15.867,15.735,15.778,15.749,15.678,15.707
+linear_op_counters dense_fastpath_plan_success=1020 dense_fastpath_plan_fail=0 dense_fastpath_execute=1020 dense_fastpath_execute_fail=0 dense_reference_fallback=0 nvfp4_fastpath_plan_success=578 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=578 nvfp4_fastpath_execute_fail=0 nvfp4_reference_fallback=0 scaled_fp8_fastpath_execute=0 scaled_fp8_reference_fallback=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=368 monolithic_layers=368 staging_elapsed_us=0 host_routing_adapter_calls=0 host_routing_tensor_copies=0

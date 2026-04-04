@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--moe-backend", default="flashinfer_cutlass")
+    parser.add_argument("--kv-cache-memory-bytes", type=int, default=None,
+                        help="Override vLLM KV cache budget in bytes (for tight-VRAM cards)")
     parser.add_argument("--decode-token-count", type=int, default=16)
     parser.add_argument("--runtime-oracle-output", type=pathlib.Path)
     parser.add_argument("--artifact-output", type=pathlib.Path)
@@ -223,8 +225,7 @@ def main() -> int:
     max_model_len = max(args.max_model_len or 0, min_context)
     max_num_batched_tokens = max(args.max_num_batched_tokens or 0, min_context)
 
-    llm = LLM(
-        args.model,
+    llm_kwargs = dict(
         trust_remote_code=True,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -232,6 +233,9 @@ def main() -> int:
         enforce_eager=True,
         moe_backend=args.moe_backend,
     )
+    if args.kv_cache_memory_bytes is not None:
+        llm_kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
+    llm = LLM(args.model, **llm_kwargs)
     tokenizer = llm.get_tokenizer()
     worker_moe_layers = collect_worker_moe_metadata(llm)
     selected_backends = sorted(
