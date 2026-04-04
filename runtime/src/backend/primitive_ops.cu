@@ -128,9 +128,65 @@ __global__ void RmsNormKernel(
   }
 }
 
+__global__ void FusedAddRmsNormBf16Kernel(
+    const __nv_bfloat16* hidden_input,
+    __nv_bfloat16* residual,
+    const float* weight,
+    __nv_bfloat16* normalized_output,
+    std::size_t rows,
+    std::size_t hidden_size,
+    float epsilon) {
+  const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float shared_sum[kThreadsPerBlock];
+  float local_sum = 0.0f;
+  const std::size_t row_offset = row * hidden_size;
+  for (std::size_t column = threadIdx.x; column < hidden_size; column += blockDim.x) {
+    const float hidden_value = __bfloat162float(hidden_input[row_offset + column]);
+    const float residual_value = __bfloat162float(residual[row_offset + column]);
+    const float combined = hidden_value + residual_value;
+    local_sum += combined * combined;
+  }
+  shared_sum[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv_rms = rsqrtf((shared_sum[0] / static_cast<float>(hidden_size)) + epsilon);
+  for (std::size_t column = threadIdx.x; column < hidden_size; column += blockDim.x) {
+    const float hidden_value = __bfloat162float(hidden_input[row_offset + column]);
+    const float residual_value = __bfloat162float(residual[row_offset + column]);
+    const float combined = hidden_value + residual_value;
+    residual[row_offset + column] = __float2bfloat16_rn(combined);
+    normalized_output[row_offset + column] =
+        __float2bfloat16_rn(combined * inv_rms * weight[column]);
+  }
+}
+
 bool HasCompatibleMatrixShape(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& output,
+    std::size_t* rows,
+    std::size_t* hidden_size) {
+  if (!input.valid() || !output.valid() || input.shape().size() != 2 || output.shape() != input.shape()) {
+    return false;
+  }
+  *rows = input.shape()[0];
+  *hidden_size = input.shape()[1];
+  return *rows != 0 && *hidden_size != 0;
+}
+
+bool HasCompatibleMatrixShape(
+    const DeviceTensorBf16& input,
+    const DeviceTensorBf16& output,
     std::size_t* rows,
     std::size_t* hidden_size) {
   if (!input.valid() || !output.valid() || input.shape().size() != 2 || output.shape() != input.shape()) {
@@ -264,6 +320,40 @@ bool RmsNormFp32(
   const dim3 block(kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>(rows));
   RmsNormKernel<<<grid, block>>>(input.data(), weight.data(), output->data(), rows, hidden_size, epsilon);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool FusedAddRmsNormBf16(
+    const DeviceTensorBf16& hidden_input,
+    DeviceTensorBf16* residual,
+    const DeviceTensorFp32& weight,
+    float epsilon,
+    DeviceTensorBf16* normalized_output) {
+  std::size_t rows = 0;
+  std::size_t hidden_size = 0;
+  if (residual == nullptr ||
+      normalized_output == nullptr ||
+      !HasCompatibleMatrixShape(hidden_input, *normalized_output, &rows, &hidden_size) ||
+      !HasCompatibleMatrixShape(hidden_input, *residual, &rows, &hidden_size) ||
+      !weight.valid() ||
+      weight.shape().size() != 1 ||
+      weight.shape()[0] != hidden_size ||
+      epsilon <= 0.0f ||
+      hidden_input.data() == residual->data() ||
+      residual->data() == normalized_output->data()) {
+    return false;
+  }
+
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>(rows));
+  FusedAddRmsNormBf16Kernel<<<grid, block>>>(
+      hidden_input.data(),
+      residual->data(),
+      weight.data(),
+      normalized_output->data(),
+      rows,
+      hidden_size,
+      epsilon);
   return CheckCuda(cudaGetLastError());
 }
 
