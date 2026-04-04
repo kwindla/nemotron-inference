@@ -28,6 +28,7 @@ The GB10 performance history log is in [docs/gb10_performance_progress.md](/home
 The Blackwell inference progress log is in [docs/blackwell_inference_progress.md](docs/blackwell_inference_progress.md).
 The short GB10 operator policy note is in [docs/gb10_execution_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_execution_policy.md).
 The provisional startup-residency note is in [docs/startup_residency_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/startup_residency_policy.md).
+The local vLLM runbook for Nemotron Nano NVFP4 on RTX 5090 is in [docs/vllm_rtx5090.md](docs/vllm_rtx5090.md).
 
 ## Build
 
@@ -49,6 +50,9 @@ Generate a local Nano manifest for RTX 5090:
 
 That wrapper expects the Nano checkpoint under
 `artifacts/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` by default.
+
+For the working local vLLM setup and benchmark path on RTX 5090, see
+[docs/vllm_rtx5090.md](docs/vllm_rtx5090.md).
 
 Generate the existing GB10-oriented manifest explicitly:
 

@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument(
         "--moe-backend",
         default=None,
@@ -104,8 +104,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--trust-remote-code",
-        action="store_true",
-        help="Pass trust_remote_code=True to vLLM if the local environment requires it.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pass trust_remote_code=True to vLLM. Enabled by default for the "
+            "official Nemotron Nano NVFP4 checkpoint."
+        ),
     )
     parser.add_argument(
         "--enforce-eager",
@@ -114,6 +118,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Force eager execution. Enabled by default; pass "
             "--no-enforce-eager to use vLLM's normal hybrid mode."
+        ),
+    )
+    parser.add_argument(
+        "--capture-routed-experts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Request routed expert IDs from vLLM. Disabled by default because "
+            "current vLLM can crash on larger prefill cases on this setup."
         ),
     )
     return parser.parse_args()
@@ -628,7 +641,7 @@ def main() -> int:
         "max_num_batched_tokens": max_num_batched_tokens,
         "max_model_len": max_prompt_tokens + 8,
         "enable_prefix_caching": True,
-        "enable_return_routed_experts": True,
+        "enable_return_routed_experts": args.capture_routed_experts,
         "enforce_eager": args.enforce_eager,
         "profiler_config": profiler_config,
     }
@@ -721,7 +734,7 @@ def main() -> int:
                 "max_num_batched_tokens": max_num_batched_tokens,
                 "max_model_len": max_prompt_tokens + 8,
                 "enable_prefix_caching": True,
-                "enable_return_routed_experts": True,
+                "enable_return_routed_experts": args.capture_routed_experts,
                 "enforce_eager": args.enforce_eager,
             },
             "environment": {
@@ -735,6 +748,7 @@ def main() -> int:
                 "Prefill cases use unique prompt IDs per iteration to keep prefix caching from changing TTFT.",
                 "Decode uses a seeded prefix-cache hit on a fixed prompt rather than a 1-token uncached prompt.",
                 "MoE timing is best-effort from vLLM torch-profiler summaries and may be null if the trace does not expose MoE rows.",
+                "Routed expert capture is disabled by default because vLLM can crash on larger prefill cases on this setup.",
             ],
         }
 

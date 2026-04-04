@@ -3,16 +3,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VLLM_PYTHON="${REPO_ROOT}/vllm-env/bin/python"
+DEFAULT_VLLM_PYTHON="${REPO_ROOT}/vllm-env-cu128/bin/python"
+VLLM_PYTHON="${VLLM_PYTHON:-${DEFAULT_VLLM_PYTHON}}"
+export PYTHONPATH="${REPO_ROOT}/third_party/vllm${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 if [[ ! -x "${VLLM_PYTHON}" ]]; then
-  echo "run-vllm.sh: vllm-env not found at ${REPO_ROOT}/vllm-env" >&2
-  echo "  Build it with: TORCH_CUDA_ARCH_LIST=\"12.0\" MAX_JOBS=6 uv pip install --python vllm-env/bin/python -e third_party/vllm --torch-backend=auto" >&2
+  echo "run-vllm.sh: python not found at ${VLLM_PYTHON}" >&2
+  echo "  Expected working env: ${REPO_ROOT}/vllm-env-cu128/bin/python" >&2
   exit 1
 fi
 
-# SM120 (RTX 5090) environment:
-# - Do NOT set VLLM_FLASH_ATTN_VERSION (no-op in v0.19.0, FA2 is default on SM120)
-# - Do NOT set VLLM_USE_FLASHINFER_MOE_FP4 (FlashInfer NVFP4 MoE is broken on SM120)
+# Local RTX 5090 path:
+# - Use the cu128-based Python env. The cu130 env trips lower-level GEMM failures.
+# - Keep PYTHONPATH pointed at the local third_party/vllm checkout.
 
 exec "${VLLM_PYTHON}" "$@"

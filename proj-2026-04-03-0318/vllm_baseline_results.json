@@ -1,0 +1,516 @@
+{
+  "benchmark_name": "vllm_nemotron_nano_ttft",
+  "cases": [
+    {
+      "benchmark_token_count": 1,
+      "decode_prefix_prompt_token_count": 256,
+      "generated_token_count": 1,
+      "iterations": [
+        {
+          "generated_token_ids": [
+            1032
+          ],
+          "iteration": 0,
+          "num_cached_tokens": 0,
+          "ttft_ms": 36.897021
+        }
+      ],
+      "label": "decode_1",
+      "mode": "decode",
+      "moe_profile": null,
+      "notes": [
+        "Decode is measured as a repeated full-prefix-cache hit on a fixed prompt, then first-token generation.",
+        "The cached-token summary should be inspected to confirm the request stayed on the cache-hit path."
+      ],
+      "num_cached_tokens_summary": {
+        "count": 1.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "median_ms": 0.0,
+        "min_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "routing_histogram": null,
+      "ttft_summary_ms": {
+        "count": 1.0,
+        "max_ms": 36.897021,
+        "mean_ms": 36.897021,
+        "median_ms": 36.897021,
+        "min_ms": 36.897021,
+        "p95_ms": 36.897021
+      }
+    },
+    {
+      "benchmark_token_count": 32,
+      "generated_token_count": 1,
+      "iterations": [
+        {
+          "generated_token_ids": [
+            7366
+          ],
+          "iteration": 0,
+          "num_cached_tokens": 0,
+          "ttft_ms": 36.293276
+        }
+      ],
+      "label": "prefill_32",
+      "mode": "prefill",
+      "moe_profile": null,
+      "notes": [
+        "Prefix caching remains enabled globally but per-iteration prompt IDs are salted to avoid cache hits.",
+        "TTFT is wall-clock from add_request() to the first emitted output token."
+      ],
+      "num_cached_tokens_summary": {
+        "count": 1.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "median_ms": 0.0,
+        "min_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "prompt_token_count": 32,
+      "routing_histogram": null,
+      "ttft_summary_ms": {
+        "count": 1.0,
+        "max_ms": 36.293276,
+        "mean_ms": 36.293276,
+        "median_ms": 36.293276,
+        "min_ms": 36.293276,
+        "p95_ms": 36.293276
+      }
+    },
+    {
+      "benchmark_token_count": 64,
+      "generated_token_count": 1,
+      "iterations": [
+        {
+          "generated_token_ids": [
+            1311
+          ],
+          "iteration": 0,
+          "num_cached_tokens": 0,
+          "ttft_ms": 35.515713
+        }
+      ],
+      "label": "prefill_64",
+      "mode": "prefill",
+      "moe_profile": null,
+      "notes": [
+        "Prefix caching remains enabled globally but per-iteration prompt IDs are salted to avoid cache hits.",
+        "TTFT is wall-clock from add_request() to the first emitted output token."
+      ],
+      "num_cached_tokens_summary": {
+        "count": 1.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "median_ms": 0.0,
+        "min_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "prompt_token_count": 64,
+      "routing_histogram": null,
+      "ttft_summary_ms": {
+        "count": 1.0,
+        "max_ms": 35.515713,
+        "mean_ms": 35.515713,
+        "median_ms": 35.515713,
+        "min_ms": 35.515713,
+        "p95_ms": 35.515713
+      }
+    },
+    {
+      "benchmark_token_count": 128,
+      "generated_token_count": 1,
+      "iterations": [
+        {
+          "generated_token_ids": [
+            1345
+          ],
+          "iteration": 0,
+          "num_cached_tokens": 0,
+          "ttft_ms": 31.264965
+        }
+      ],
+      "label": "prefill_128",
+      "mode": "prefill",
+      "moe_profile": null,
+      "notes": [
+        "Prefix caching remains enabled globally but per-iteration prompt IDs are salted to avoid cache hits.",
+        "TTFT is wall-clock from add_request() to the first emitted output token."
+      ],
+      "num_cached_tokens_summary": {
+        "count": 1.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "median_ms": 0.0,
+        "min_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "prompt_token_count": 128,
+      "routing_histogram": null,
+      "ttft_summary_ms": {
+        "count": 1.0,
+        "max_ms": 31.264965,
+        "mean_ms": 31.264965,
+        "median_ms": 31.264965,
+        "min_ms": 31.264965,
+        "p95_ms": 31.264965
+      }
+    },
+    {
+      "benchmark_token_count": 256,
+      "generated_token_count": 1,
+      "iterations": [
+        {
+          "generated_token_ids": [
+            1621
+          ],
+          "iteration": 0,
+          "num_cached_tokens": 0,
+          "ttft_ms": 31.582297
+        }
+      ],
+      "label": "prefill_256",
+      "mode": "prefill",
+      "moe_profile": null,
+      "notes": [
+        "Prefix caching remains enabled globally but per-iteration prompt IDs are salted to avoid cache hits.",
+        "TTFT is wall-clock from add_request() to the first emitted output token."
+      ],
+      "num_cached_tokens_summary": {
+        "count": 1.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "median_ms": 0.0,
+        "min_ms": 0.0,
+        "p95_ms": 0.0
+      },
+      "prompt_token_count": 256,
+      "routing_histogram": null,
+      "ttft_summary_ms": {
+        "count": 1.0,
+        "max_ms": 31.582297,
+        "mean_ms": 31.582297,
+        "median_ms": 31.582297,
+        "min_ms": 31.582297,
+        "p95_ms": 31.582297
+      }
+    }
+  ],
+  "engine_config": {
+    "enable_prefix_caching": true,
+    "enable_return_routed_experts": false,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.8,
+    "max_model_len": 264,
+    "max_num_batched_tokens": 256,
+    "tensor_parallel_size": 1
+  },
+  "environment": {
+    "VLLM_FLASHINFER_MOE_BACKEND": "throughput",
+    "VLLM_MOE_PADDING": null,
+    "VLLM_NVFP4_GEMM_BACKEND": null,
+    "VLLM_USE_FLASHINFER_MOE_FP4": "1"
+  },
+  "generated_at_utc": "2026-04-04T13:31:19Z",
+  "model": {
+    "hidden_size": 2688,
+    "id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "routed_experts": 128,
+    "top_k": 6
+  },
+  "notes": [
+    "Prefill cases use unique prompt IDs per iteration to keep prefix caching from changing TTFT.",
+    "Decode uses a seeded prefix-cache hit on a fixed prompt rather than a 1-token uncached prompt.",
+    "MoE timing is best-effort from vLLM torch-profiler summaries and may be null if the trace does not expose MoE rows.",
+    "Routed expert capture is disabled by default because vLLM can crash on larger prefill cases on this setup."
+  ],
+  "project_dir": "/home/khkramer/src/nemotron-inference/proj-2026-04-03-0318",
+  "repo_root": "/home/khkramer/src/nemotron-inference",
+  "vllm": {
+    "git_commit": "2a69949bdadf0e8942b7a1619b229cb475beef20",
+    "git_tag": "v0.19.0",
+    "local_path": "/home/khkramer/src/nemotron-inference/third_party/vllm",
+    "selected_nvfp4_backends": [
+      "FLASHINFER_CUTLASS"
+    ],
+    "worker_moe_layers": [
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 1,
+        "layer_name": "model.layers.1.mixer.experts",
+        "module_name": "model.layers.1.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 3,
+        "layer_name": "model.layers.3.mixer.experts",
+        "module_name": "model.layers.3.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 6,
+        "layer_name": "model.layers.6.mixer.experts",
+        "module_name": "model.layers.6.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 8,
+        "layer_name": "model.layers.8.mixer.experts",
+        "module_name": "model.layers.8.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 10,
+        "layer_name": "model.layers.10.mixer.experts",
+        "module_name": "model.layers.10.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 13,
+        "layer_name": "model.layers.13.mixer.experts",
+        "module_name": "model.layers.13.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 15,
+        "layer_name": "model.layers.15.mixer.experts",
+        "module_name": "model.layers.15.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 17,
+        "layer_name": "model.layers.17.mixer.experts",
+        "module_name": "model.layers.17.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 20,
+        "layer_name": "model.layers.20.mixer.experts",
+        "module_name": "model.layers.20.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 22,
+        "layer_name": "model.layers.22.mixer.experts",
+        "module_name": "model.layers.22.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 24,
+        "layer_name": "model.layers.24.mixer.experts",
+        "module_name": "model.layers.24.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 27,
+        "layer_name": "model.layers.27.mixer.experts",
+        "module_name": "model.layers.27.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 29,
+        "layer_name": "model.layers.29.mixer.experts",
+        "module_name": "model.layers.29.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 31,
+        "layer_name": "model.layers.31.mixer.experts",
+        "module_name": "model.layers.31.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 34,
+        "layer_name": "model.layers.34.mixer.experts",
+        "module_name": "model.layers.34.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 36,
+        "layer_name": "model.layers.36.mixer.experts",
+        "module_name": "model.layers.36.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 38,
+        "layer_name": "model.layers.38.mixer.experts",
+        "module_name": "model.layers.38.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 40,
+        "layer_name": "model.layers.40.mixer.experts",
+        "module_name": "model.layers.40.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 43,
+        "layer_name": "model.layers.43.mixer.experts",
+        "module_name": "model.layers.43.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 45,
+        "layer_name": "model.layers.45.mixer.experts",
+        "module_name": "model.layers.45.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 47,
+        "layer_name": "model.layers.47.mixer.experts",
+        "module_name": "model.layers.47.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 49,
+        "layer_name": "model.layers.49.mixer.experts",
+        "module_name": "model.layers.49.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      },
+      {
+        "experts_cls": "FlashInferExperts",
+        "global_num_experts": 128,
+        "hidden_size": 2688,
+        "layer_id": 51,
+        "layer_name": "model.layers.51.mixer.experts",
+        "module_name": "model.layers.51.mixer.experts",
+        "quant_method": "ModelOptNvFp4FusedMoE",
+        "requested_moe_backend": "flashinfer_cutlass",
+        "selected_nvfp4_backend": "FLASHINFER_CUTLASS",
+        "top_k": 6
+      }
+    ]
+  }
+}
