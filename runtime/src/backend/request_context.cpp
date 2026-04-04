@@ -3,6 +3,35 @@
 #include <utility>
 
 namespace nemotron {
+namespace {
+
+bool HandlesSatisfyLayerInvariant(
+    const AttentionKvCacheConfig& config,
+    const std::vector<KvPageHandle>& pages,
+    std::size_t layer_index) {
+  const auto geometry = BuildAttentionKvPageGeometry(config);
+  if (!geometry.has_value() || layer_index >= config.layer_count) {
+    return false;
+  }
+
+  std::size_t previous_page_id = 0;
+  bool have_previous_page = false;
+  for (const KvPageHandle& handle : pages) {
+    const std::size_t expected_byte_offset = handle.page_id * geometry->bytes_per_page;
+    if (handle.layer_index != layer_index ||
+        handle.tokens_per_page != config.tokens_per_page ||
+        handle.byte_offset != expected_byte_offset ||
+        (have_previous_page && handle.page_id <= previous_page_id)) {
+      return false;
+    }
+    previous_page_id = handle.page_id;
+    have_previous_page = true;
+  }
+  return true;
+}
+
+}  // namespace
+
 std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
     const RequestExecutionConfig& config) {
   if (config.hidden_size == 0 || config.max_tokens == 0) {
@@ -206,6 +235,9 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
       RequiredPagesForTokens(config_.attention_kv_cache, token_count);
   for (std::size_t layer_index = 0; layer_index < kv_pages_by_layer_.size(); ++layer_index) {
     std::vector<KvPageHandle>& pages = kv_pages_by_layer_[layer_index];
+    if (!HandlesSatisfyLayerInvariant(config_.attention_kv_cache, pages, layer_index)) {
+      return false;
+    }
     if (pages.size() >= required_pages) {
       continue;
     }
@@ -215,6 +247,9 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
       return false;
     }
     pages.insert(pages.end(), allocated->begin(), allocated->end());
+    if (!HandlesSatisfyLayerInvariant(config_.attention_kv_cache, pages, layer_index)) {
+      return false;
+    }
   }
   return true;
 }
@@ -282,7 +317,9 @@ bool RequestExecutionContext::ResetForNewRequest() {
   if (kv_arena_.has_value()) {
     std::vector<std::size_t> page_ids;
     page_ids.reserve(allocated_kv_pages());
-    for (const auto& layer_pages : kv_pages_by_layer_) {
+    for (std::size_t layer_index = 0; layer_index < kv_pages_by_layer_.size(); ++layer_index) {
+      const auto& layer_pages = kv_pages_by_layer_[layer_index];
+      ok = ok && HandlesSatisfyLayerInvariant(config_.attention_kv_cache, layer_pages, layer_index);
       for (const KvPageHandle& handle : layer_pages) {
         page_ids.push_back(handle.page_id);
       }

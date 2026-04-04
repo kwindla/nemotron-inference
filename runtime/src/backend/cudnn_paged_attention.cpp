@@ -5,9 +5,11 @@
 #include <cudnn_frontend.h>
 
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +47,17 @@ bool FitsInt64(std::size_t value) {
   return value <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
 }
 
+std::uint32_t FloatBits(float value) {
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value), "float bit cast requires 32-bit float");
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+void HashCombine(std::size_t* seed, std::size_t value) {
+  *seed ^= value + 0x9e3779b97f4a7c15ull + (*seed << 6) + (*seed >> 2);
+}
+
 std::vector<std::int64_t> MakeDims(std::initializer_list<std::size_t> dims) {
   std::vector<std::int64_t> result;
   result.reserve(dims.size());
@@ -57,13 +70,21 @@ std::vector<std::int64_t> MakeDims(std::initializer_list<std::size_t> dims) {
 }  // namespace
 
 bool CudnnPagedAttentionConfig::valid() const {
-  return BuildAttentionKvPageGeometry(cache_config).has_value() &&
-         batch_size > 0 &&
+  const auto geometry = BuildAttentionKvPageGeometry(cache_config);
+  if (!geometry.has_value()) {
+    return false;
+  }
+
+  const std::size_t required_pages = RequiredPagesForTokens(cache_config, max_kv_tokens);
+  return batch_size > 0 &&
+         required_pages > 0 &&
          query_head_count > 0 &&
          max_query_tokens > 0 &&
          max_kv_tokens > 0 &&
          container_page_count > 0 &&
          page_table_entries > 0 &&
+         container_page_count >= required_pages &&
+         page_table_entries >= required_pages &&
          FitsInt64(batch_size) &&
          FitsInt64(query_head_count) &&
          FitsInt64(cache_config.kv_head_count) &&
@@ -73,6 +94,43 @@ bool CudnnPagedAttentionConfig::valid() const {
          FitsInt64(cache_config.tokens_per_page) &&
          FitsInt64(container_page_count) &&
          FitsInt64(page_table_entries);
+}
+
+bool CudnnPagedAttentionConfig::operator==(const CudnnPagedAttentionConfig& other) const {
+  return cache_config.layer_count == other.cache_config.layer_count &&
+         cache_config.kv_head_count == other.cache_config.kv_head_count &&
+         cache_config.head_dim == other.cache_config.head_dim &&
+         cache_config.tokens_per_page == other.cache_config.tokens_per_page &&
+         cache_config.dtype == other.cache_config.dtype &&
+         batch_size == other.batch_size &&
+         query_head_count == other.query_head_count &&
+         max_query_tokens == other.max_query_tokens &&
+         max_kv_tokens == other.max_kv_tokens &&
+         container_page_count == other.container_page_count &&
+         page_table_entries == other.page_table_entries &&
+         FloatBits(attn_scale) == FloatBits(other.attn_scale) &&
+         causal == other.causal &&
+         generate_stats == other.generate_stats;
+}
+
+std::size_t CudnnPagedAttentionConfigHash::operator()(
+    const CudnnPagedAttentionConfig& config) const {
+  std::size_t seed = 0;
+  HashCombine(&seed, config.cache_config.layer_count);
+  HashCombine(&seed, config.cache_config.kv_head_count);
+  HashCombine(&seed, config.cache_config.head_dim);
+  HashCombine(&seed, config.cache_config.tokens_per_page);
+  HashCombine(&seed, static_cast<std::size_t>(config.cache_config.dtype));
+  HashCombine(&seed, config.batch_size);
+  HashCombine(&seed, config.query_head_count);
+  HashCombine(&seed, config.max_query_tokens);
+  HashCombine(&seed, config.max_kv_tokens);
+  HashCombine(&seed, config.container_page_count);
+  HashCombine(&seed, config.page_table_entries);
+  HashCombine(&seed, FloatBits(config.attn_scale));
+  HashCombine(&seed, static_cast<std::size_t>(config.causal));
+  HashCombine(&seed, static_cast<std::size_t>(config.generate_stats));
+  return seed;
 }
 
 std::optional<CudnnPagedAttentionConfig> BuildCudnnPagedAttentionConfig(
@@ -361,6 +419,53 @@ bool CudnnPagedAttentionPlan::Execute(
              variant_pack,
              impl_->workspace).is_good() &&
          CheckCuda(cudaDeviceSynchronize());
+}
+
+CudnnPagedAttentionPlanCache& CudnnPagedAttentionPlanCache::Global() {
+  static CudnnPagedAttentionPlanCache cache;
+  return cache;
+}
+
+std::shared_ptr<const CudnnPagedAttentionPlan> CudnnPagedAttentionPlanCache::GetOrCreate(
+    const CudnnHandle& handle,
+    const CudnnPagedAttentionConfig& config) {
+  if (!handle.valid() || !config.valid()) {
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = cache_.find(config);
+  if (found != cache_.end()) {
+    ++hits_;
+    return found->second;
+  }
+
+  auto plan = CudnnPagedAttentionPlan::Create(handle, config);
+  if (!plan || !plan->valid()) {
+    return nullptr;
+  }
+
+  auto shared_plan =
+      std::shared_ptr<const CudnnPagedAttentionPlan>(plan.release());
+  cache_.emplace(config, shared_plan);
+  ++misses_;
+  return shared_plan;
+}
+
+CudnnPagedAttentionPlanCacheStats CudnnPagedAttentionPlanCache::stats() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return CudnnPagedAttentionPlanCacheStats{
+      hits_,
+      misses_,
+      cache_.size(),
+  };
+}
+
+void CudnnPagedAttentionPlanCache::Clear() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  cache_.clear();
+  hits_ = 0;
+  misses_ = 0;
 }
 
 }  // namespace nemotron

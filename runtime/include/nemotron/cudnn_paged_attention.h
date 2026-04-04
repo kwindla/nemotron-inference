@@ -2,8 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 
 #include "nemotron/cudnn_handle.h"
 #include "nemotron/paged_attention_plan.h"
@@ -23,6 +25,11 @@ struct CudnnPagedAttentionConfig {
   bool generate_stats = false;
 
   bool valid() const;
+  bool operator==(const CudnnPagedAttentionConfig& other) const;
+};
+
+struct CudnnPagedAttentionConfigHash {
+  std::size_t operator()(const CudnnPagedAttentionConfig& config) const;
 };
 
 std::optional<CudnnPagedAttentionConfig> BuildCudnnPagedAttentionConfig(
@@ -70,6 +77,34 @@ class CudnnPagedAttentionPlan {
   explicit CudnnPagedAttentionPlan(std::unique_ptr<Impl> impl);
 
   std::unique_ptr<Impl> impl_;
+};
+
+struct CudnnPagedAttentionPlanCacheStats {
+  std::size_t hits = 0;
+  std::size_t misses = 0;
+  std::size_t size = 0;
+};
+
+class CudnnPagedAttentionPlanCache {
+ public:
+  static CudnnPagedAttentionPlanCache& Global();
+
+  std::shared_ptr<const CudnnPagedAttentionPlan> GetOrCreate(
+      const CudnnHandle& handle,
+      const CudnnPagedAttentionConfig& config);
+
+  CudnnPagedAttentionPlanCacheStats stats() const;
+  void Clear();
+
+ private:
+  mutable std::mutex mutex_;
+  std::unordered_map<
+      CudnnPagedAttentionConfig,
+      std::shared_ptr<const CudnnPagedAttentionPlan>,
+      CudnnPagedAttentionConfigHash>
+      cache_;
+  std::size_t hits_ = 0;
+  std::size_t misses_ = 0;
 };
 
 }  // namespace nemotron

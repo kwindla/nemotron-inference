@@ -15,6 +15,44 @@
 
 namespace nemotron {
 
+enum class AttentionBackend {
+  kUnavailable = 0,
+  kCudnnPaged,
+  kNanoDecode,
+  kDeviceFallback,
+};
+
+const char* AttentionBackendName(AttentionBackend backend);
+
+struct AttentionBackendSelectorConfig {
+  AttentionKvCacheConfig cache_config;
+  std::size_t batch_size = 0;
+  std::size_t query_head_count = 0;
+  std::size_t max_query_tokens = 0;
+  std::size_t max_kv_tokens = 0;
+  std::size_t container_page_count = 0;
+  std::size_t page_table_entries = 0;
+  long long cudnn_version = 0;
+  bool cudnn_available = false;
+  bool causal = false;
+  bool generate_stats = false;
+
+  bool valid() const;
+};
+
+class AttentionBackendPolicy {
+ public:
+  bool Supports(
+      AttentionBackend backend,
+      const AttentionBackendSelectorConfig& config,
+      std::size_t token_count,
+      int device_sm) const;
+
+  AttentionBackend Select(
+      const AttentionBackendSelectorConfig& config,
+      std::size_t token_count) const;
+};
+
 struct AttentionLayerConfig {
   std::size_t layer_index = 0;
   std::size_t hidden_size = 0;

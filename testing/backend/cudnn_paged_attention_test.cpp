@@ -24,6 +24,7 @@ using nemotron::BuildPagedAttentionBatchPlan;
 using nemotron::CudnnHandle;
 using nemotron::CudnnPagedAttentionExecution;
 using nemotron::CudnnPagedAttentionPlan;
+using nemotron::CudnnPagedAttentionPlanCache;
 using nemotron::KvCacheDataType;
 using nemotron::PagedKvCacheArena;
 
@@ -293,6 +294,92 @@ bool test_build_cudnn_paged_attention_config_from_batch_plan() {
          expect(std::fabs(config->attn_scale - 0.125f) < 1e-6f, "default attention scale should be 1/sqrt(head_dim)");
 }
 
+bool test_build_cudnn_paged_attention_config_rejects_invalid_page_table_bounds() {
+  AttentionKvCacheConfig cache_config;
+  cache_config.layer_count = 1;
+  cache_config.kv_head_count = 2;
+  cache_config.head_dim = 64;
+  cache_config.tokens_per_page = 16;
+  cache_config.dtype = KvCacheDataType::kBf16;
+
+  const auto kv_plan = BuildPagedAttentionBatchPlan(
+      cache_config,
+      0,
+      {
+          AttentionSequencePages{16, {1}},
+          AttentionSequencePages{31, {2, 3}},
+      },
+      nullptr);
+  if (!expect(kv_plan.has_value(), "synthetic KV plan should build without an arena")) {
+    return false;
+  }
+
+  return expect(
+      !BuildCudnnPagedAttentionConfig(*kv_plan, 4, 1, /*container_page_count=*/3).has_value(),
+      "cuDNN config should reject page-table entries that exceed the declared page container");
+}
+
+bool test_cudnn_paged_attention_plan_cache_hits_exact_config() {
+  const auto handle = CudnnHandle::Create();
+  if (!handle || !handle->valid() || handle->version() < 90500) {
+    std::cout << "cudnn_paged_attention_test: SKIP (no CUDA device or cuDNN >= 9.5 unavailable)\n";
+    return true;
+  }
+
+  AttentionKvCacheConfig cache_config;
+  cache_config.layer_count = 1;
+  cache_config.kv_head_count = 2;
+  cache_config.head_dim = 64;
+  cache_config.tokens_per_page = 16;
+  cache_config.dtype = KvCacheDataType::kBf16;
+
+  const auto kv_plan = BuildPagedAttentionBatchPlan(
+      cache_config,
+      0,
+      {
+          AttentionSequencePages{16, {0}},
+          AttentionSequencePages{31, {1, 2}},
+      },
+      nullptr);
+  if (!expect(kv_plan.has_value(), "KV plan should build for cache-hit test")) {
+    return false;
+  }
+
+  const auto config = BuildCudnnPagedAttentionConfig(*kv_plan, 4, 1, 8);
+  if (!expect(config.has_value(), "cuDNN config should build for cache-hit test")) {
+    return false;
+  }
+
+  CudnnPagedAttentionPlanCache cache;
+  const auto first = cache.GetOrCreate(*handle, *config);
+  const auto second = cache.GetOrCreate(*handle, *config);
+  if (!expect(first != nullptr && second != nullptr, "cache should return a plan for a valid config")) {
+    return false;
+  }
+  if (!expect(first.get() == second.get(), "exact config lookups should return the cached cuDNN plan")) {
+    return false;
+  }
+
+  auto stats = cache.stats();
+  if (!expect(stats.misses == 1 && stats.hits == 1 && stats.size == 1,
+              "cache stats should report one miss, one hit, and one resident plan after an exact repeat")) {
+    return false;
+  }
+
+  auto stats_variant = *config;
+  stats_variant.generate_stats = true;
+  const auto third = cache.GetOrCreate(*handle, stats_variant);
+  if (!expect(third != nullptr && third.get() != first.get(),
+              "changing a graph-defining flag should build a distinct cuDNN plan")) {
+    return false;
+  }
+
+  stats = cache.stats();
+  return expect(
+      stats.misses == 2 && stats.hits == 1 && stats.size == 2,
+      "cache key should distinguish graph-defining config changes exactly");
+}
+
 bool run_paged_attention_reference_case(
     std::size_t batch_size,
     std::size_t max_query_tokens,
@@ -491,6 +578,12 @@ bool test_cudnn_paged_attention_executes_causal_prefill_against_cpu_reference() 
 
 int main() {
   if (!test_build_cudnn_paged_attention_config_from_batch_plan()) {
+    return 1;
+  }
+  if (!test_build_cudnn_paged_attention_config_rejects_invalid_page_table_bounds()) {
+    return 1;
+  }
+  if (!test_cudnn_paged_attention_plan_cache_hits_exact_config()) {
     return 1;
   }
   if (!test_cudnn_paged_attention_executes_decode_against_cpu_reference()) {

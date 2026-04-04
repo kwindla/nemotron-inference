@@ -149,11 +149,62 @@ bool test_request_context_reset_releases_pages_and_clears_positions() {
                 "reset should leave empty per-layer page vectors behind");
 }
 
+bool test_request_context_reset_restores_exact_page_allocation_order() {
+  auto context = RequestExecutionContext::Create(make_config());
+  if (!context || !context->valid()) {
+    std::cout << "request_context_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  if (!expect(context->SetSequenceLength(5), "initial sequence setup should succeed")) {
+    return false;
+  }
+
+  std::vector<std::size_t> first_layer0_ids;
+  std::vector<std::size_t> first_layer1_ids;
+  for (const auto& handle : *context->kv_pages(0)) {
+    first_layer0_ids.push_back(handle.page_id);
+  }
+  for (const auto& handle : *context->kv_pages(1)) {
+    first_layer1_ids.push_back(handle.page_id);
+  }
+  if (!expect(first_layer0_ids == std::vector<std::size_t>({0, 1}),
+              "first layer should receive the lowest available page ids first") ||
+      !expect(first_layer1_ids == std::vector<std::size_t>({2, 3}),
+              "second layer should receive the next page-id range")) {
+    return false;
+  }
+
+  if (!expect(context->ResetForNewRequest(), "reset should succeed before exact restore allocation")) {
+    return false;
+  }
+  if (!expect(context->SetSequenceLength(5), "same-length restore allocation should succeed after reset")) {
+    return false;
+  }
+
+  std::vector<std::size_t> second_layer0_ids;
+  std::vector<std::size_t> second_layer1_ids;
+  for (const auto& handle : *context->kv_pages(0)) {
+    second_layer0_ids.push_back(handle.page_id);
+  }
+  for (const auto& handle : *context->kv_pages(1)) {
+    second_layer1_ids.push_back(handle.page_id);
+  }
+
+  return expect(
+             second_layer0_ids == first_layer0_ids,
+             "reset plus same-token restore should reproduce the exact layer-0 page allocation") &&
+         expect(
+             second_layer1_ids == first_layer1_ids,
+             "reset plus same-token restore should reproduce the exact layer-1 page allocation");
+}
+
 }  // namespace
 
 int main() {
   if (!test_request_context_allocates_buffers_and_kv_pages() ||
-      !test_request_context_reset_releases_pages_and_clears_positions()) {
+      !test_request_context_reset_releases_pages_and_clears_positions() ||
+      !test_request_context_reset_restores_exact_page_allocation_order()) {
     return 1;
   }
   std::cout << "request_context_test: PASS\n";

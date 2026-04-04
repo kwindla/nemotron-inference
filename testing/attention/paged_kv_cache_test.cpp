@@ -117,11 +117,47 @@ bool test_kv_page_arena_allocates_and_reuses_pages() {
   return expect((*second)[0].page_id == 0, "released low page ids should be reused first");
 }
 
+bool test_kv_page_geometry_and_release_reject_invalid_inputs() {
+  AttentionKvCacheConfig invalid_config = make_test_config();
+  invalid_config.tokens_per_page = 0;
+  if (!expect(
+          !BuildAttentionKvPageGeometry(invalid_config).has_value(),
+          "invalid page geometry should be rejected")) {
+    return false;
+  }
+  if (!expect(
+          !PagedKvCacheArena::Create(invalid_config, 4).has_value(),
+          "arena creation should reject invalid page geometry")) {
+    return false;
+  }
+
+  auto arena = PagedKvCacheArena::Create(make_test_config(), 4);
+  if (!expect(arena.has_value(), "valid arena should build for release validation")) {
+    return false;
+  }
+  auto mutable_arena = std::move(*arena);
+  const auto pages = mutable_arena.AllocatePages(0, 2);
+  if (!expect(pages.has_value(), "test pages should allocate")) {
+    return false;
+  }
+
+  return expect(
+             !mutable_arena.ReleasePages({4}),
+             "release should reject page ids outside the arena") &&
+         expect(
+             !mutable_arena.ReleasePages({3}),
+             "release should reject pages that were never allocated") &&
+         expect(
+             mutable_arena.ReleasePages({(*pages)[0].page_id, (*pages)[1].page_id}),
+             "release should succeed for the allocated page set");
+}
+
 }  // namespace
 
 int main() {
   if (!test_kv_page_geometry_matches_gb10_attention_budget() ||
-      !test_kv_page_arena_allocates_and_reuses_pages()) {
+      !test_kv_page_arena_allocates_and_reuses_pages() ||
+      !test_kv_page_geometry_and_release_reject_invalid_inputs()) {
     return 1;
   }
   std::cout << "paged_kv_cache_test: PASS\n";

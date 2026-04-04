@@ -6,6 +6,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -116,14 +117,56 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
-bool ProductionAttentionEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_ATTENTION_PRODUCTION");
-  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
+bool LegacyAttentionPolicyEnvSet(const char* name) {
+  return std::getenv(name) != nullptr;
 }
 
-bool ScalarAttentionFallbackForced() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_ATTENTION_SCALAR_FALLBACK");
-  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+void AcknowledgeLegacyAttentionPolicyEnvOverrides(bool debug) {
+  static const bool production_env_set =
+      LegacyAttentionPolicyEnvSet("NEMOTRON_FORWARD_ATTENTION_PRODUCTION");
+  static const bool scalar_fallback_env_set =
+      LegacyAttentionPolicyEnvSet("NEMOTRON_FORWARD_ATTENTION_SCALAR_FALLBACK");
+
+  if (!debug || (!production_env_set && !scalar_fallback_env_set)) {
+    return;
+  }
+
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    std::cerr
+        << "attention_layer: ignoring legacy production selection env vars "
+        << "(NEMOTRON_FORWARD_ATTENTION_PRODUCTION, "
+        << "NEMOTRON_FORWARD_ATTENTION_SCALAR_FALLBACK); "
+        << "backend selection is now deterministic from the validated config\n";
+  }
+}
+
+int GetCurrentDeviceSmVersion() {
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    return 0;
+  }
+
+  int major = 0;
+  int minor = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+    return 0;
+  }
+  return major * 10 + minor;
+}
+
+bool IsNanoDecodeShape(const AttentionBackendSelectorConfig& config) {
+  return config.batch_size == 1 &&
+         config.query_head_count == 32 &&
+         config.max_query_tokens == 1 &&
+         config.cache_config.dtype == KvCacheDataType::kBf16 &&
+         config.cache_config.kv_head_count == 2 &&
+         config.cache_config.head_dim == 128 &&
+         config.cache_config.tokens_per_page == 16 &&
+         config.causal &&
+         !config.generate_stats;
 }
 
 const KernelTensorDescriptor* FindKernelBinding(
@@ -391,8 +434,82 @@ std::optional<std::vector<__nv_bfloat16>> RunPagedAttentionHost(
 
 }  // namespace
 
+const char* AttentionBackendName(AttentionBackend backend) {
+  switch (backend) {
+    case AttentionBackend::kCudnnPaged:
+      return "cudnn_paged";
+    case AttentionBackend::kNanoDecode:
+      return "nano_decode";
+    case AttentionBackend::kDeviceFallback:
+      return "device_fallback";
+    case AttentionBackend::kUnavailable:
+      break;
+  }
+  return "unavailable";
+}
+
+bool AttentionBackendSelectorConfig::valid() const {
+  if (!BuildAttentionKvPageGeometry(cache_config).has_value() ||
+      batch_size == 0 ||
+      query_head_count == 0 ||
+      max_query_tokens == 0 ||
+      max_kv_tokens == 0 ||
+      container_page_count == 0 ||
+      page_table_entries == 0) {
+    return false;
+  }
+
+  const std::size_t required_pages = RequiredPagesForTokens(cache_config, max_kv_tokens);
+  return required_pages > 0 &&
+         page_table_entries >= required_pages &&
+         container_page_count >= required_pages;
+}
+
+bool AttentionBackendPolicy::Supports(
+    AttentionBackend backend,
+    const AttentionBackendSelectorConfig& config,
+    std::size_t token_count,
+    int device_sm) const {
+  if (!config.valid() ||
+      token_count == 0 ||
+      token_count > config.max_query_tokens ||
+      config.cache_config.dtype != KvCacheDataType::kBf16) {
+    return false;
+  }
+
+  switch (backend) {
+    case AttentionBackend::kCudnnPaged:
+      return config.cudnn_available && config.cudnn_version >= 90500;
+    case AttentionBackend::kNanoDecode:
+      return token_count == 1 && device_sm >= 100 && IsNanoDecodeShape(config);
+    case AttentionBackend::kDeviceFallback:
+      return !config.generate_stats;
+    case AttentionBackend::kUnavailable:
+      break;
+  }
+  return false;
+}
+
+AttentionBackend AttentionBackendPolicy::Select(
+    const AttentionBackendSelectorConfig& config,
+    std::size_t token_count) const {
+  const int device_sm = GetCurrentDeviceSmVersion();
+  constexpr std::array<AttentionBackend, 3> kPriorityOrder = {
+      AttentionBackend::kCudnnPaged,
+      AttentionBackend::kNanoDecode,
+      AttentionBackend::kDeviceFallback,
+  };
+  for (const AttentionBackend backend : kPriorityOrder) {
+    if (Supports(backend, config, token_count, device_sm)) {
+      return backend;
+    }
+  }
+  return AttentionBackend::kUnavailable;
+}
+
 struct AttentionLayerSlice::Impl {
   AttentionLayerConfig config;
+  AttentionBackendPolicy backend_policy;
   std::unique_ptr<DeviceTensorFp32> norm_weight;
   std::unique_ptr<UploadedLinearOp> q_proj;
   std::unique_ptr<UploadedLinearOp> k_proj;
@@ -442,6 +559,7 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
     const AttentionLayerConfig& config,
     const AttentionLayerBindings& bindings) {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  AcknowledgeLegacyAttentionPolicyEnvOverrides(debug);
   const auto debug_fail = [&](const char* message) -> std::unique_ptr<AttentionLayerSlice> {
     if (debug) {
       std::cerr << "attention_layer: create failed for layer "
@@ -831,7 +949,37 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  if (cudnn_handle.valid()) {
+  AttentionBackendSelectorConfig backend_selector_config;
+  backend_selector_config.cache_config = request_context.config().attention_kv_cache;
+  backend_selector_config.batch_size = impl_->batch_plan.batch_size;
+  backend_selector_config.query_head_count = impl_->config.query_head_count;
+  backend_selector_config.max_query_tokens = token_count;
+  backend_selector_config.max_kv_tokens = total_sequence_length;
+  backend_selector_config.container_page_count = request_context.config().attention_total_pages;
+  backend_selector_config.page_table_entries = impl_->batch_plan.max_pages_per_sequence;
+  backend_selector_config.cudnn_version = cudnn_handle.version();
+  backend_selector_config.cudnn_available = cudnn_handle.valid();
+  backend_selector_config.causal = true;
+  backend_selector_config.generate_stats = false;
+  if (!backend_selector_config.valid()) {
+    if (debug) {
+      std::cout << "attention_layer: invalid attention backend selector config\n";
+    }
+    return false;
+  }
+
+  const AttentionBackend selected_backend =
+      impl_->backend_policy.Select(backend_selector_config, token_count);
+  if (selected_backend == AttentionBackend::kUnavailable) {
+    if (debug) {
+      std::cout << "attention_layer: no supported attention backend for token_count="
+                << token_count
+                << " max_kv_tokens=" << total_sequence_length << "\n";
+    }
+    return false;
+  }
+
+  if (selected_backend == AttentionBackend::kCudnnPaged) {
     const auto attention_config = BuildCudnnPagedAttentionConfig(
         impl_->batch_plan,
         impl_->config.query_head_count,
@@ -846,10 +994,11 @@ bool AttentionLayerSlice::Run(
       }
       return false;
     }
-    const auto attention_plan = CudnnPagedAttentionPlan::Create(cudnn_handle, *attention_config);
+    const auto attention_plan =
+        CudnnPagedAttentionPlanCache::Global().GetOrCreate(cudnn_handle, *attention_config);
     if (!attention_plan || !attention_plan->valid()) {
       if (debug) {
-        std::cout << "attention_layer: cuDNN attention plan creation failed\n";
+        std::cout << "attention_layer: cuDNN attention plan lookup failed\n";
       }
       return false;
     }
@@ -871,11 +1020,12 @@ bool AttentionLayerSlice::Run(
       }
       return false;
     }
+    if (debug) {
+      std::cout << "attention_layer: using " << AttentionBackendName(selected_backend) << "\n";
+    }
   } else {
-    const bool use_production_decode_attention =
-        token_count == 1 && ProductionAttentionEnabled() && !ScalarAttentionFallbackForced();
     const bool attention_ok =
-        use_production_decode_attention
+        selected_backend == AttentionBackend::kNanoDecode
             ? RunPagedAttentionDecodeProduction(
                   *query_bf16,
                   *request_context.key_cache(),
@@ -915,10 +1065,7 @@ bool AttentionLayerSlice::Run(
       return false;
     }
     if (debug) {
-      std::cout << "attention_layer: using device paged attention "
-                << (use_production_decode_attention ? "decode production kernel"
-                                                    : "fallback")
-                << "\n";
+      std::cout << "attention_layer: using " << AttentionBackendName(selected_backend) << "\n";
     }
   }
 
@@ -934,7 +1081,7 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  if (!cudnn_handle.valid() && DeviceAttentionCompareEnabled()) {
+  if (selected_backend != AttentionBackend::kCudnnPaged && DeviceAttentionCompareEnabled()) {
     std::vector<float> q_host(q->numel(), 0.0f);
     std::vector<__nv_bfloat16> key_cache_host(request_context.key_cache()->numel());
     std::vector<__nv_bfloat16> value_cache_host(request_context.value_cache()->numel());

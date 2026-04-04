@@ -400,6 +400,16 @@ target_compile_features(request_context_test PRIVATE cxx_std_17)
 nemotron_add_test(request_context_test)
 
 add_executable(
+  attention_backend_policy_test
+  backend/attention_backend_policy_test.cpp
+)
+
+target_link_libraries(attention_backend_policy_test PRIVATE nemotron_runtime_backend)
+target_compile_features(attention_backend_policy_test PRIVATE cxx_std_17)
+
+nemotron_add_test(attention_backend_policy_test)
+
+add_executable(
   primitive_ops_test
   backend/primitive_ops_test.cpp
 )

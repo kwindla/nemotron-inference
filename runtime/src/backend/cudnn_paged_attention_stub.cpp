@@ -9,6 +9,17 @@ bool CudnnPagedAttentionConfig::valid() const {
   return false;
 }
 
+bool CudnnPagedAttentionConfig::operator==(const CudnnPagedAttentionConfig& other) const {
+  (void)other;
+  return false;
+}
+
+std::size_t CudnnPagedAttentionConfigHash::operator()(
+    const CudnnPagedAttentionConfig& config) const {
+  (void)config;
+  return 0;
+}
+
 std::optional<CudnnPagedAttentionConfig> BuildCudnnPagedAttentionConfig(
     const PagedAttentionBatchPlan&,
     std::size_t,
@@ -56,5 +67,22 @@ bool CudnnPagedAttentionPlan::Execute(
     const CudnnPagedAttentionExecution&) const {
   return false;
 }
+
+CudnnPagedAttentionPlanCache& CudnnPagedAttentionPlanCache::Global() {
+  static CudnnPagedAttentionPlanCache cache;
+  return cache;
+}
+
+std::shared_ptr<const CudnnPagedAttentionPlan> CudnnPagedAttentionPlanCache::GetOrCreate(
+    const CudnnHandle&,
+    const CudnnPagedAttentionConfig&) {
+  return nullptr;
+}
+
+CudnnPagedAttentionPlanCacheStats CudnnPagedAttentionPlanCache::stats() const {
+  return CudnnPagedAttentionPlanCacheStats{};
+}
+
+void CudnnPagedAttentionPlanCache::Clear() {}
 
 }  // namespace nemotron

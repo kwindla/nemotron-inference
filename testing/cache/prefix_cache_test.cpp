@@ -124,6 +124,30 @@ bool test_conversation_head_hit() {
          expect(match.matched_token_count == 4, "matched token count should equal cached prefix length");
 }
 
+bool test_exact_conversation_cache_hit_reports_full_length() {
+  PrefixCache cache(/*max_bytes=*/1 << 20);
+  const auto node_id = cache.PublishConversationHead(
+      "conv-exact",
+      ConversationCheckpointKind::kCommittedHead,
+      make_identity({42, 43, 44, 45}),
+      make_state(111, 222));
+
+  CacheLookupRequest request;
+  request.identity = make_identity({42, 43, 44, 45});
+  request.conversation_id = "conv-exact";
+  const auto match = cache.Lookup(request);
+
+  return expect(node_id != 0, "exact committed-head publish should succeed") &&
+         expect(match.hit(), "exact committed-head lookup should hit") &&
+         expect(match.node_id == node_id, "exact lookup should return the published node") &&
+         expect(
+             match.source == CacheMatchSource::kConversationCommittedHead,
+             "exact lookup should keep the committed-head source") &&
+         expect(
+             match.matched_token_count == request.identity.token_ids.size(),
+             "exact lookup should report the full cached token count");
+}
+
 bool test_prompt_head_preferred() {
   PrefixCache cache(/*max_bytes=*/1 << 20);
   cache.PublishConversationHead(
@@ -469,6 +493,7 @@ bool test_snapshot_publish_and_restore_round_trip() {
 int main() {
   const bool ok =
       test_conversation_head_hit() &&
+      test_exact_conversation_cache_hit_reports_full_length() &&
       test_prompt_head_preferred() &&
       test_global_root_fallback() &&
       test_conversation_fallback_to_global_root() &&

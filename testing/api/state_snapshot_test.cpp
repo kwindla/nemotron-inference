@@ -158,6 +158,14 @@ bool test_snapshot_restore_round_trips_request_state() {
           "restored request should allocate the same number of KV pages for the cached prefix")) {
     return false;
   }
+  if (!expect(
+          (*source->kv_pages(0))[0].page_id == (*restored->kv_pages(0))[0].page_id &&
+              (*source->kv_pages(0))[1].page_id == (*restored->kv_pages(0))[1].page_id &&
+              (*source->kv_pages(1))[0].page_id == (*restored->kv_pages(1))[0].page_id &&
+              (*source->kv_pages(1))[1].page_id == (*restored->kv_pages(1))[1].page_id,
+          "restore should reproduce the exact allocated KV page ids required by the snapshot ABI")) {
+    return false;
+  }
 
   std::vector<__nv_bfloat16> restored_key(key_host.size());
   std::vector<__nv_bfloat16> restored_value(value_host.size());
