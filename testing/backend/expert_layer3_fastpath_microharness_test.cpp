@@ -28,6 +28,8 @@ using nemotron::GemmDescriptor;
 using nemotron::GemmHeuristicCache;
 using nemotron::GemmKernelFamily;
 using nemotron::KernelTensorDescriptor;
+using nemotron::RequestExecutionConfig;
+using nemotron::RequestExecutionContext;
 
 struct FixtureMetadata {
   std::size_t layer_index = 0;
@@ -108,6 +110,21 @@ std::vector<std::int32_t> read_int32_file(const std::filesystem::path& path) {
   std::vector<std::int32_t> values(bytes.size() / sizeof(std::int32_t), 0);
   std::memcpy(values.data(), bytes.data(), bytes.size());
   return values;
+}
+
+template <typename T>
+std::vector<T> slice_vector(
+    const std::vector<T>& values,
+    std::size_t offset,
+    std::size_t count) {
+  if (offset > values.size() || count > values.size() - offset) {
+    return {};
+  }
+  return std::vector<T>(values.begin() + offset, values.begin() + offset + count);
+}
+
+std::string two_digit_stem(std::size_t value) {
+  return std::string(value < 10 ? "0" : "") + std::to_string(value);
 }
 
 void write_float_file(const std::filesystem::path& path, const std::vector<float>& values) {
@@ -360,6 +377,33 @@ GemmDescriptor make_nvfp4_descriptor(
   return descriptor;
 }
 
+std::optional<RequestExecutionConfig> make_expert_request_config(
+    const FixtureMetadata& metadata,
+    std::size_t max_tokens) {
+  if (metadata.hidden_size == 0 ||
+      max_tokens == 0 ||
+      metadata.top_k == 0 ||
+      metadata.routed_expert_intermediate_size == 0 ||
+      metadata.moe_latent_size == 0 ||
+      metadata.shared_expert_intermediate_size == 0 ||
+      metadata.n_routed_experts == 0) {
+    return std::nullopt;
+  }
+  RequestExecutionConfig config;
+  config.hidden_size = metadata.hidden_size;
+  config.max_tokens = max_tokens;
+  config.scratch_tokens = max_tokens;
+  config.expert_selection_capacity = max_tokens * metadata.top_k;
+  config.expert_intermediate_scratch_numel =
+      metadata.top_k * metadata.routed_expert_intermediate_size;
+  config.expert_aux_scratch_numel =
+      (4 * metadata.hidden_size) +
+      (3 * metadata.moe_latent_size) +
+      metadata.shared_expert_intermediate_size +
+      metadata.n_routed_experts;
+  return config;
+}
+
 float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
   if (lhs.size() != rhs.size()) {
     return std::numeric_limits<float>::infinity();
@@ -382,8 +426,17 @@ void print_diff_report(
   std::cerr << "within_tolerance: " << (diff <= tolerance ? "yes" : "no") << "\n";
 }
 
+void print_diff_summary(const std::string& comparison, float diff, float tolerance) {
+  std::cerr << "comparison: " << comparison << "\n";
+  std::cerr << "max_abs_diff: " << diff << "\n";
+  std::cerr << "within_tolerance: " << (diff <= tolerance ? "yes" : "no") << "\n";
+}
+
 bool run_expert_layer3_fastpath_microharness() {
   constexpr float kTolerance = 1.0e-3f;
+  if (::setenv("NEMOTRON_FORWARD_DEBUG", "1", 1) != 0) {
+    return expect(false, "NEMOTRON_FORWARD_DEBUG should be set");
+  }
 
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
@@ -442,6 +495,10 @@ bool run_expert_layer3_fastpath_microharness() {
       read_float_file(fixture_root / "shared_down_weight_scale_fp32.bin");
   const std::vector<float> shared_down_input_scale =
       read_float_file(fixture_root / "shared_down_input_scale_fp32.bin");
+  const std::vector<float> expected_fc1_latent_output =
+      read_float_file(fixture_root / "expected_fc1_latent_output_fp32.bin");
+  const std::vector<float> expected_routed_latent_output =
+      read_float_file(fixture_root / "expected_routed_latent_output_fp32.bin");
   const std::vector<float> expected_final_output =
       read_float_file(fixture_root / "expected_final_output_fp32.bin");
   const std::vector<std::int32_t> expected_selected_expert_indices =
@@ -472,6 +529,13 @@ bool run_expert_layer3_fastpath_microharness() {
       !expect(
           expected_selected_expert_indices.size() == metadata->input_rows * metadata->top_k,
           "selected expert count should match top-k") ||
+      !expect(
+          expected_fc1_latent_output.size() == metadata->input_rows * metadata->moe_latent_size,
+          "expected fc1 latent output size should match metadata") ||
+      !expect(
+          expected_routed_latent_output.size() ==
+              metadata->input_rows * metadata->moe_latent_size,
+          "expected routed latent output size should match metadata") ||
       !expect(
           expected_final_output.size() == metadata->input_rows * metadata->hidden_size,
           "expected final output size should match metadata") ||
@@ -866,6 +930,209 @@ bool run_expert_layer3_fastpath_microharness() {
         row_output_host.end(),
         sequential_output_host.begin() + (row * metadata->hidden_size));
   }
+
+  const auto row_request_config = make_expert_request_config(*metadata, 1);
+  if (!expect(row_request_config.has_value(), "row request config should build")) {
+    return false;
+  }
+  auto row_request_context = RequestExecutionContext::Create(*row_request_config);
+  if (!expect(
+          row_request_context != nullptr && row_request_context->valid(),
+          "row request context should allocate")) {
+    return false;
+  }
+
+  std::copy_n(input_hidden.data(), metadata->hidden_size, row_input_host.data());
+  if (!expect(
+          row_input->CopyFromHost(row_input_host.data(), row_input_host.size()),
+          "row0 request-context input hidden should upload") ||
+      !expect(
+          slice->RunWithRequestContext(
+              *cublas,
+              &heuristic_cache,
+              *row_request_context,
+              *row_input,
+              row_output.get(),
+              nullptr),
+          "row0 request-context fastpath expert layer run should succeed")) {
+    return false;
+  }
+
+  std::vector<float> row0_request_output(metadata->hidden_size, 0.0f);
+  if (!expect(
+          row_output->CopyToHost(row0_request_output.data(), row0_request_output.size()),
+          "row0 request-context output should download")) {
+    return false;
+  }
+
+  const std::size_t grouped_up_count =
+      metadata->top_k * metadata->routed_expert_intermediate_size;
+  if (!expect(
+          row_request_context->expert_intermediate_scratch() != nullptr &&
+              row_request_context->expert_intermediate_scratch()->valid() &&
+              row_request_context->expert_intermediate_scratch()->numel() >= grouped_up_count,
+          "row0 grouped-up scratch should be available")) {
+    return false;
+  }
+  std::vector<float> grouped_up_host(grouped_up_count, 0.0f);
+  if (!expect(
+          row_request_context->expert_intermediate_scratch()->CopyToHost(
+              grouped_up_host.data(),
+              grouped_up_host.size()),
+          "row0 grouped-up scratch should download")) {
+    return false;
+  }
+
+  if (!expect(
+          row_request_context->expert_aux_scratch() != nullptr &&
+              row_request_context->expert_aux_scratch()->valid(),
+          "row0 expert aux scratch should be available")) {
+    return false;
+  }
+  std::vector<float> expert_aux_host(
+      row_request_context->expert_aux_scratch()->numel(),
+      0.0f);
+  if (!expect(
+          row_request_context->expert_aux_scratch()->CopyToHost(
+              expert_aux_host.data(),
+              expert_aux_host.size()),
+          "row0 expert aux scratch should download")) {
+    return false;
+  }
+
+  const auto* row0_selected_indices_host = row_request_context->expert_selection_indices_host();
+  if (!expect(
+          row0_selected_indices_host != nullptr &&
+              row0_selected_indices_host->size() >= metadata->top_k,
+          "row0 selected expert host buffer should be populated")) {
+    return false;
+  }
+
+  const std::size_t aux_normalized_offset = metadata->n_routed_experts;
+  const std::size_t aux_latent_offset = aux_normalized_offset + metadata->hidden_size;
+  const std::size_t aux_routed_latent_offset =
+      aux_latent_offset + metadata->moe_latent_size;
+  const std::vector<float> row0_latent_host =
+      slice_vector(expert_aux_host, aux_latent_offset, metadata->moe_latent_size);
+  const std::vector<float> row0_routed_latent_host =
+      slice_vector(expert_aux_host, aux_routed_latent_offset, metadata->moe_latent_size);
+  const std::vector<float> expected_row0_fc1_latent =
+      slice_vector(expected_fc1_latent_output, 0, metadata->moe_latent_size);
+  const std::vector<float> expected_row0_routed_latent =
+      slice_vector(expected_routed_latent_output, 0, metadata->moe_latent_size);
+  const std::vector<float> expected_row0_final_output =
+      slice_vector(expected_final_output, 0, metadata->hidden_size);
+  if (!expect(
+          row0_latent_host.size() == metadata->moe_latent_size,
+          "row0 latent scratch view should match metadata") ||
+      !expect(
+          row0_routed_latent_host.size() == metadata->moe_latent_size,
+          "row0 routed latent scratch view should match metadata") ||
+      !expect(
+          expected_row0_fc1_latent.size() == metadata->moe_latent_size,
+          "row0 expected fc1 latent slice should match metadata") ||
+      !expect(
+          expected_row0_routed_latent.size() == metadata->moe_latent_size,
+          "row0 expected routed latent slice should match metadata") ||
+      !expect(
+          expected_row0_final_output.size() == metadata->hidden_size,
+          "row0 expected final output slice should match metadata")) {
+    return false;
+  }
+
+  std::cerr << std::fixed << std::setprecision(9);
+  std::cerr << "row00_request_selected_experts=[";
+  for (std::size_t slot = 0; slot < metadata->top_k; ++slot) {
+    if (slot > 0) {
+      std::cerr << ",";
+    }
+    std::cerr << (*row0_selected_indices_host)[slot];
+  }
+  std::cerr << "]\n";
+
+  print_diff_report(
+      "row00_fc1_latent_vs_oracle_expected",
+      row0_latent_host,
+      expected_row0_fc1_latent,
+      kTolerance);
+
+  float row0_grouped_up_diff = 0.0f;
+  float row0_activated_hidden_diff = 0.0f;
+  for (std::size_t oracle_slot = 0; oracle_slot < metadata->top_k; ++oracle_slot) {
+    const std::int32_t expected_expert_index =
+        expected_selected_expert_indices[oracle_slot];
+    const auto actual_it = std::find(
+        row0_selected_indices_host->begin(),
+        row0_selected_indices_host->begin() + metadata->top_k,
+        expected_expert_index);
+    if (!expect(
+            actual_it != row0_selected_indices_host->begin() + metadata->top_k,
+            "row0 expected expert should be present in actual selected experts")) {
+      return false;
+    }
+    const std::size_t actual_slot =
+        static_cast<std::size_t>(actual_it - row0_selected_indices_host->begin());
+    const std::string slot_stem = two_digit_stem(oracle_slot);
+    const std::vector<float> actual_grouped_up = slice_vector(
+        grouped_up_host,
+        actual_slot * metadata->routed_expert_intermediate_size,
+        metadata->routed_expert_intermediate_size);
+    const std::vector<float> expected_grouped_up =
+        read_float_file(
+            fixture_root /
+            ("expected_routed_up_proj_output_row00_slot" + slot_stem + "_fp32.bin"));
+    const std::vector<float> expected_activated_hidden =
+        read_float_file(
+            fixture_root /
+            ("expected_routed_activated_hidden_row00_slot" + slot_stem + "_fp32.bin"));
+    if (!expect(
+            actual_grouped_up.size() == metadata->routed_expert_intermediate_size,
+            "row0 grouped-up slot shape should match metadata") ||
+        !expect(
+            expected_grouped_up.size() == metadata->routed_expert_intermediate_size,
+            "row0 expected grouped-up slot shape should match metadata") ||
+        !expect(
+            expected_activated_hidden.size() ==
+                metadata->routed_expert_intermediate_size,
+            "row0 expected activated-hidden slot shape should match metadata")) {
+      return false;
+    }
+    std::vector<float> actual_activated_hidden = actual_grouped_up;
+    for (float& value : actual_activated_hidden) {
+      value = value > 0.0f ? (value * value) : 0.0f;
+    }
+    const float grouped_up_diff =
+        max_abs_diff(actual_grouped_up, expected_grouped_up);
+    const float activated_hidden_diff =
+        max_abs_diff(actual_activated_hidden, expected_activated_hidden);
+    row0_grouped_up_diff = std::max(row0_grouped_up_diff, grouped_up_diff);
+    row0_activated_hidden_diff =
+        std::max(row0_activated_hidden_diff, activated_hidden_diff);
+    std::cerr << "boundary_check: row=00 oracle_slot=" << slot_stem
+              << " actual_slot=" << two_digit_stem(actual_slot)
+              << " expert=" << expected_expert_index
+              << " grouped_up_max_abs_diff=" << grouped_up_diff
+              << " activated_hidden_max_abs_diff=" << activated_hidden_diff
+              << "\n";
+  }
+  print_diff_summary(
+      "row00_grouped_up_vs_oracle_expected",
+      row0_grouped_up_diff,
+      kTolerance);
+  print_diff_summary(
+      "row00_activated_hidden_vs_oracle_expected",
+      row0_activated_hidden_diff,
+      kTolerance);
+  print_diff_report(
+      "row00_routed_latent_vs_oracle_expected",
+      row0_routed_latent_host,
+      expected_row0_routed_latent,
+      kTolerance);
+  print_diff_report(
+      "row00_request_context_final_vs_oracle_expected",
+      row0_request_output,
+      expected_row0_final_output,
+      kTolerance);
 
   std::cerr << "grouped_fastpath: all tokens used direct fused path\n";
   std::cerr << std::fixed << std::setprecision(9);

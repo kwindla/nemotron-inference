@@ -4461,6 +4461,29 @@ bool RunExpertLayerImpl(
             std::to_string(expert_index));
       }
     }
+    if (debug) {
+      std::cerr << "expert_layer: layer " << impl.config.layer_index
+                << " serving_path=" << impl.GetServingPathIdentity()
+                << " graph_replay=disabled"
+                << " batch_count=" << batch_count
+                << " token=" << token_index << "\n";
+      std::vector<std::int32_t> indices_host(batch_count, 0);
+      if (cudaMemcpy(
+              indices_host.data(),
+              selected_indices_device,
+              batch_count * sizeof(std::int32_t),
+              cudaMemcpyDeviceToHost) == cudaSuccess) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " selected_experts=[";
+        for (std::size_t i = 0; i < batch_count; ++i) {
+          if (i > 0) {
+            std::cerr << ",";
+          }
+          std::cerr << indices_host[i];
+        }
+        std::cerr << "]\n";
+      }
+    }
 
     // FROZEN: direct custom grouped fused kernels only -- graph replay disabled.
 #if 0
@@ -4919,6 +4942,26 @@ bool RunExpertLayerImpl(
           " intermediate=" +
           std::to_string(impl.config.routed_expert_intermediate_size));
     }
+    if (debug && up_ok) {
+      std::vector<float> grouped_up_host(
+          batch_count * impl.config.routed_expert_intermediate_size,
+          0.0f);
+      if (grouped_up->CopyToHost(grouped_up_host.data(), grouped_up_host.size())) {
+        for (std::size_t slot = 0; slot < batch_count; ++slot) {
+          const float* slot_data =
+              grouped_up_host.data() +
+              slot * impl.config.routed_expert_intermediate_size;
+          float slot_max = 0.0f;
+          for (std::size_t i = 0; i < impl.config.routed_expert_intermediate_size; ++i) {
+            slot_max = std::max(slot_max, std::abs(slot_data[i]));
+          }
+          std::cerr << "expert_layer: layer " << impl.config.layer_index
+                    << " grouped_up_proj token=" << token_index
+                    << " slot=" << slot
+                    << " max_abs=" << slot_max << "\n";
+        }
+      }
+    }
 
     bool relu2_pack_ok = false;
     if (!GatherIndexedFloatsInPlace(
@@ -5111,6 +5154,23 @@ bool RunExpertLayerImpl(
           " intermediate=" +
           std::to_string(impl.config.routed_expert_intermediate_size));
     }
+    if (debug && down_ok) {
+      std::vector<float> down_output_host(batch_count * impl.config.moe_latent_size, 0.0f);
+      if (down_output->CopyToHost(down_output_host.data(), down_output_host.size())) {
+        for (std::size_t slot = 0; slot < batch_count; ++slot) {
+          const float* slot_data =
+              down_output_host.data() + slot * impl.config.moe_latent_size;
+          float slot_max = 0.0f;
+          for (std::size_t i = 0; i < impl.config.moe_latent_size; ++i) {
+            slot_max = std::max(slot_max, std::abs(slot_data[i]));
+          }
+          std::cerr << "expert_layer: layer " << impl.config.layer_index
+                    << " grouped_down_proj token=" << token_index
+                    << " slot=" << slot
+                    << " max_abs=" << slot_max << "\n";
+        }
+      }
+    }
 
     if (!cutlass_down_ok) {
       if (use_strided_contiguous_weights &&
@@ -5155,6 +5215,18 @@ bool RunExpertLayerImpl(
         return grouped_fatal(
             std::string("routed weighted merge failed: batch_count=") +
             std::to_string(batch_count));
+      }
+    }
+    if (debug) {
+      std::vector<float> routed_acc_host(impl.config.moe_latent_size, 0.0f);
+      if (CopyToHost(*routed_accumulator, &routed_acc_host)) {
+        float acc_max = 0.0f;
+        for (std::size_t i = 0; i < impl.config.moe_latent_size; ++i) {
+          acc_max = std::max(acc_max, std::abs(routed_acc_host[i]));
+        }
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " routed_accumulator token=" << token_index
+                  << " max_abs=" << acc_max << "\n";
       }
     }
 
