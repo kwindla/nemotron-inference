@@ -165,15 +165,10 @@ __global__ void MambaSsdPrefillGenericKernel(
 
 bool RunMambaSsdPrefill(
     const MambaSsdPrefillParams& params,
-    RequestExecutionContext& request_context,
     const DeviceTensorFp32& projected,
     const DeviceTensorFp32& conv_output,
-    DeviceTensorFp32* ssm_output,
-    const DeviceTensorFp32* initial_ssm_state) {
-  if (!request_context.valid() ||
-      request_context.mamba_state() == nullptr ||
-      !request_context.mamba_state()->valid() ||
-      !projected.valid() ||
+    DeviceTensorFp32* ssm_output) {
+  if (!projected.valid() ||
       projected.shape().size() != 2 ||
       projected.shape()[0] == 0 ||
       !conv_output.valid() ||
@@ -187,11 +182,12 @@ bool RunMambaSsdPrefill(
       params.state_size == 0 ||
       params.state_size > kMaxSupportedStateSize ||
       params.n_groups == 0 ||
+      params.ssm_state_elems == 0 ||
+      params.final_ssm_state == nullptr ||
+      params.initial_ssm_state == nullptr ||
       params.A_log == nullptr ||
       params.D == nullptr ||
-      params.dt_bias == nullptr ||
-      (initial_ssm_state != nullptr &&
-       (!initial_ssm_state->valid() || initial_ssm_state->shape().empty()))) {
+      params.dt_bias == nullptr) {
     return false;
   }
 
@@ -209,22 +205,9 @@ bool RunMambaSsdPrefill(
       conv_output.shape()[1] != conv_dim ||
       ssm_output->shape()[0] != token_count ||
       ssm_output->shape()[1] != params.intermediate_size ||
-      request_context.mamba_state()->numel() <
-          params.ssm_state_offset_elems + ssm_state_elems) {
+      params.ssm_state_elems != ssm_state_elems) {
     return false;
   }
-
-  if (initial_ssm_state != nullptr &&
-      initial_ssm_state->numel() < params.ssm_state_offset_elems + ssm_state_elems) {
-    return false;
-  }
-
-  float* layer_ssm_state =
-      request_context.mamba_state()->data() + params.ssm_state_offset_elems;
-  const float* initial_layer_ssm_state =
-      (initial_ssm_state != nullptr ? initial_ssm_state->data()
-                                    : request_context.mamba_state()->data()) +
-      params.ssm_state_offset_elems;
 
   const dim3 block(kHiddenThreadsPerBlock);
   const dim3 grid(static_cast<unsigned>((params.intermediate_size + block.x - 1) / block.x));
@@ -244,8 +227,8 @@ bool RunMambaSsdPrefill(
           params.A_log,
           params.D,
           params.dt_bias,
-          initial_layer_ssm_state,
-          layer_ssm_state,
+          params.initial_ssm_state,
+          params.final_ssm_state,
           ssm_output->data());
       break;
     default:
@@ -264,8 +247,8 @@ bool RunMambaSsdPrefill(
           params.A_log,
           params.D,
           params.dt_bias,
-          initial_layer_ssm_state,
-          layer_ssm_state,
+          params.initial_ssm_state,
+          params.final_ssm_state,
           ssm_output->data());
       break;
   }

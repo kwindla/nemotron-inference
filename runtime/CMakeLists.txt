@@ -227,3 +227,16 @@ target_link_libraries(
 )
 
 target_compile_features(nemotron_runtime_api PUBLIC cxx_std_17)
+
+if(NEMOTRON_PRODUCTION_BUILD)
+  foreach(
+      target
+      nemotron_runtime_state
+      nemotron_runtime_cache
+      nemotron_runtime_planning
+      nemotron_runtime_loader
+      nemotron_runtime_backend
+      nemotron_runtime_api)
+    target_compile_definitions(${target} PUBLIC NEMOTRON_PRODUCTION_BUILD=1)
+  endforeach()
+endif()

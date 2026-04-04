@@ -152,11 +152,15 @@ def main() -> int:
         in_proj_input_scale_name in weight_map
     )
     if in_proj_scaled_fp8:
-        in_proj_weight_scale = float(load_named_tensor(model_dir, weight_map, in_proj_weight_scale_name).item())
-        in_proj_input_scale = float(load_named_tensor(model_dir, weight_map, in_proj_input_scale_name).item())
+        in_proj_weight_scale_tensor = load_named_tensor(model_dir, weight_map, in_proj_weight_scale_name).to(torch.float32)
+        in_proj_input_scale_tensor = load_named_tensor(model_dir, weight_map, in_proj_input_scale_name).to(torch.float32)
+        in_proj_weight_scale = float(in_proj_weight_scale_tensor.max().item())
+        in_proj_input_scale = float(in_proj_input_scale_tensor.max().item())
     else:
         in_proj_weight_scale = 0.0
         in_proj_input_scale = 0.0
+        in_proj_weight_scale_tensor = None
+        in_proj_input_scale_tensor = None
     conv_weight = load_named_tensor(model_dir, weight_map, conv_weight_name).to(torch.float32)
     conv_bias = load_named_tensor(model_dir, weight_map, conv_bias_name).to(torch.float32)
     A_log = load_named_tensor(model_dir, weight_map, A_log_name).to(torch.float32)
@@ -168,11 +172,15 @@ def main() -> int:
         out_proj_input_scale_name in weight_map
     )
     if out_proj_scaled_fp8:
-        out_proj_weight_scale = float(load_named_tensor(model_dir, weight_map, out_proj_weight_scale_name).item())
-        out_proj_input_scale = float(load_named_tensor(model_dir, weight_map, out_proj_input_scale_name).item())
+        out_proj_weight_scale_tensor = load_named_tensor(model_dir, weight_map, out_proj_weight_scale_name).to(torch.float32)
+        out_proj_input_scale_tensor = load_named_tensor(model_dir, weight_map, out_proj_input_scale_name).to(torch.float32)
+        out_proj_weight_scale = float(out_proj_weight_scale_tensor.max().item())
+        out_proj_input_scale = float(out_proj_input_scale_tensor.max().item())
     else:
         out_proj_weight_scale = 0.0
         out_proj_input_scale = 0.0
+        out_proj_weight_scale_tensor = None
+        out_proj_input_scale_tensor = None
 
     if args.input_hidden_bin is not None:
         input_hidden = load_float32_matrix(Path(args.input_hidden_bin), hidden_size)

@@ -1,4 +1,5 @@
 #include "nemotron/mamba_ssd_prefill.h"
+#include "nemotron/request_context.h"
 
 #include <cuda_runtime.h>
 
@@ -239,20 +240,20 @@ bool RunParityCase(std::size_t token_count, bool use_external_initial_state) {
   params.head_dim = kHeadDim;
   params.state_size = kStateSize;
   params.n_groups = kNGroups;
-  params.ssm_state_offset_elems = kSsmStateOffsetElems;
+  params.ssm_state_elems = ssm_state_elems;
+  params.final_ssm_state =
+      request_context->mamba_state()->data() + kSsmStateOffsetElems;
+  params.initial_ssm_state =
+      (initial_state_arg != nullptr ? initial_state_arg->data()
+                                    : request_context->mamba_state()->data()) +
+      kSsmStateOffsetElems;
   params.time_step_min = kTimeStepMin;
   params.A_log = A_log->data();
   params.D = D->data();
   params.dt_bias = dt_bias->data();
 
   if (!Expect(
-          RunMambaSsdPrefill(
-              params,
-              *request_context,
-              *projected,
-              *conv_output,
-              ssm_output.get(),
-              initial_state_arg),
+          RunMambaSsdPrefill(params, *projected, *conv_output, ssm_output.get()),
           "RunMambaSsdPrefill should succeed") ||
       !Expect(
           cudaDeviceSynchronize() == cudaSuccess,

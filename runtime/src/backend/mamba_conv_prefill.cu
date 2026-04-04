@@ -124,14 +124,9 @@ __global__ void MambaConvPrefillGenericKernel(
 
 bool RunMambaConvPrefill(
     const MambaConvPrefillParams& params,
-    RequestExecutionContext& request_context,
     const DeviceTensorFp32& projected,
-    DeviceTensorFp32* conv_output,
-    const DeviceTensorFp32* initial_conv_state) {
-  if (!request_context.valid() ||
-      request_context.mamba_conv_state() == nullptr ||
-      !request_context.mamba_conv_state()->valid() ||
-      !projected.valid() ||
+    DeviceTensorFp32* conv_output) {
+  if (!projected.valid() ||
       projected.shape().size() != 2 ||
       projected.shape()[0] == 0 ||
       conv_output == nullptr ||
@@ -142,10 +137,11 @@ bool RunMambaConvPrefill(
       params.n_groups == 0 ||
       params.conv_kernel_size == 0 ||
       params.conv_kernel_size > kMaxSupportedConvKernelSize ||
+      params.conv_state_elems == 0 ||
+      params.final_conv_state == nullptr ||
+      params.initial_conv_state == nullptr ||
       params.conv1d_weight == nullptr ||
-      params.conv1d_bias == nullptr ||
-      (initial_conv_state != nullptr &&
-       (!initial_conv_state->valid() || initial_conv_state->shape().empty()))) {
+      params.conv1d_bias == nullptr) {
     return false;
   }
 
@@ -156,22 +152,9 @@ bool RunMambaConvPrefill(
   if (projected.shape()[1] < required_projection_cols ||
       conv_output->shape()[0] != projected.shape()[0] ||
       conv_output->shape()[1] != conv_dim ||
-      request_context.mamba_conv_state()->numel() <
-          params.conv_state_offset_elems + conv_state_elems) {
+      params.conv_state_elems != conv_state_elems) {
     return false;
   }
-
-  if (initial_conv_state != nullptr &&
-      initial_conv_state->numel() < params.conv_state_offset_elems + conv_state_elems) {
-    return false;
-  }
-
-  float* layer_conv_state =
-      request_context.mamba_conv_state()->data() + params.conv_state_offset_elems;
-  const float* initial_layer_conv_state =
-      (initial_conv_state != nullptr ? initial_conv_state->data()
-                                     : request_context.mamba_conv_state()->data()) +
-      params.conv_state_offset_elems;
 
   const dim3 block(kChannelsPerBlock);
   const dim3 grid(static_cast<unsigned>((conv_dim + block.x - 1) / block.x));
@@ -185,8 +168,8 @@ bool RunMambaConvPrefill(
           conv_dim,
           params.conv1d_weight,
           params.conv1d_bias,
-          initial_layer_conv_state,
-          layer_conv_state,
+          params.initial_conv_state,
+          params.final_conv_state,
           conv_output->data());
       break;
     case 3:
@@ -198,8 +181,8 @@ bool RunMambaConvPrefill(
           conv_dim,
           params.conv1d_weight,
           params.conv1d_bias,
-          initial_layer_conv_state,
-          layer_conv_state,
+          params.initial_conv_state,
+          params.final_conv_state,
           conv_output->data());
       break;
     case 2:
@@ -211,8 +194,8 @@ bool RunMambaConvPrefill(
           conv_dim,
           params.conv1d_weight,
           params.conv1d_bias,
-          initial_layer_conv_state,
-          layer_conv_state,
+          params.initial_conv_state,
+          params.final_conv_state,
           conv_output->data());
       break;
     case 1:
@@ -224,8 +207,8 @@ bool RunMambaConvPrefill(
           conv_dim,
           params.conv1d_weight,
           params.conv1d_bias,
-          initial_layer_conv_state,
-          layer_conv_state,
+          params.initial_conv_state,
+          params.final_conv_state,
           conv_output->data());
       break;
     default:
@@ -238,8 +221,8 @@ bool RunMambaConvPrefill(
           params.conv_kernel_size,
           params.conv1d_weight,
           params.conv1d_bias,
-          initial_layer_conv_state,
-          layer_conv_state,
+          params.initial_conv_state,
+          params.final_conv_state,
           conv_output->data());
       break;
   }

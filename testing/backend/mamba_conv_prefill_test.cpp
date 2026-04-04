@@ -1,4 +1,5 @@
 #include "nemotron/mamba_conv_prefill.h"
+#include "nemotron/request_context.h"
 
 #include <cuda_runtime.h>
 
@@ -211,17 +212,18 @@ bool RunParityCase(std::size_t token_count, bool use_external_initial_state) {
   params.state_size = kStateSize;
   params.n_groups = kNGroups;
   params.conv_kernel_size = kConvKernelSize;
-  params.conv_state_offset_elems = kConvStateOffsetElems;
+  params.conv_state_elems = conv_state_elems;
+  params.final_conv_state =
+      request_context->mamba_conv_state()->data() + kConvStateOffsetElems;
+  params.initial_conv_state =
+      (initial_state_arg != nullptr ? initial_state_arg->data()
+                                    : request_context->mamba_conv_state()->data()) +
+      kConvStateOffsetElems;
   params.conv1d_weight = conv1d_weight->data();
   params.conv1d_bias = conv1d_bias->data();
 
   if (!Expect(
-          RunMambaConvPrefill(
-              params,
-              *request_context,
-              *projected,
-              conv_output.get(),
-              initial_state_arg),
+          RunMambaConvPrefill(params, *projected, conv_output.get()),
           "RunMambaConvPrefill should succeed") ||
       !Expect(
           cudaDeviceSynchronize() == cudaSuccess,

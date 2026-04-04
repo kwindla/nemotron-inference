@@ -284,110 +284,9 @@ target_compile_features(scaled_fp8_linear_compare_test PRIVATE cxx_std_17)
 
 nemotron_add_test(scaled_fp8_linear_compare_test)
 
-add_executable(
-  expert_layer_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer1_decode_block"
-)
-target_compile_features(expert_layer_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer_oracle_test)
-
-add_executable(
-  expert_layer3_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer3_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer3_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_decode_block"
-)
-target_compile_features(expert_layer3_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer3_oracle_test)
-
-add_executable(
-  expert_layer3_prefix_input_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer3_prefix_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer3_prefix_input_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_prefix_input_block_cuda"
-)
-target_compile_features(expert_layer3_prefix_input_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer3_prefix_input_oracle_test)
-
-add_executable(
-  expert_layer19_decode_input_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer19_decode_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer19_decode_input_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer19_decode_input_block_cuda"
-)
-target_compile_features(expert_layer19_decode_input_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer19_decode_input_oracle_test)
-
-add_executable(
-  expert_layer19_runtime_input_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer19_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer19_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer19_runtime_input_block_cuda"
-)
-target_compile_features(expert_layer19_runtime_input_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer19_runtime_input_oracle_test)
-
-add_executable(
-  expert_layer8_runtime_input_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer8_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer8_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer8_runtime_input_block_cuda"
-)
-target_compile_features(expert_layer8_runtime_input_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer8_runtime_input_oracle_test)
-
-add_executable(
-  expert_layer14_runtime_input_oracle_test
-  backend/expert_layer_oracle_test.cpp
-)
-
-target_link_libraries(expert_layer14_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_definitions(
-  expert_layer14_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer14_runtime_input_block_cuda"
-)
-target_compile_features(expert_layer14_runtime_input_oracle_test PRIVATE cxx_std_17)
-
-nemotron_add_test(expert_layer14_runtime_input_oracle_test)
+# Super-model oracle fixtures were removed from this Nano branch because they
+# were generated from incompatible Super checkpoints. Regenerate them from a
+# Super checkpoint if those oracle tests are needed again.
 
 add_executable(
   request_context_test
@@ -429,36 +328,6 @@ if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   target_compile_features(attention_layer_test PRIVATE cxx_std_17)
 
   nemotron_add_test(attention_layer_test)
-
-  add_executable(
-    attention_layer_oracle_test
-    backend/attention_layer_oracle_test.cpp
-  )
-
-  target_link_libraries(attention_layer_oracle_test PRIVATE nemotron_runtime_backend)
-  target_compile_features(attention_layer_oracle_test PRIVATE cxx_std_17)
-  target_compile_definitions(
-    attention_layer_oracle_test
-    PRIVATE
-      NEMOTRON_ATTENTION_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/attention_layer7_short_chat"
-  )
-
-  nemotron_add_test(attention_layer_oracle_test)
-
-  add_executable(
-    attention_layer7_runtime_input_oracle_test
-    backend/attention_layer_oracle_test.cpp
-  )
-
-  target_link_libraries(attention_layer7_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-  target_compile_features(attention_layer7_runtime_input_oracle_test PRIVATE cxx_std_17)
-  target_compile_definitions(
-    attention_layer7_runtime_input_oracle_test
-    PRIVATE
-      NEMOTRON_ATTENTION_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/attention_layer7_runtime_input_block_cuda"
-  )
-
-  nemotron_add_test(attention_layer7_runtime_input_oracle_test)
 endif()
 
 add_executable(
@@ -532,36 +401,6 @@ add_test(
 )
 
 add_executable(
-  nvfp4_oracle_fixture_test
-  backend/nvfp4_oracle_fixture_test.cpp
-)
-
-target_link_libraries(nvfp4_oracle_fixture_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_oracle_fixture_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  nvfp4_oracle_fixture_test
-  PRIVATE
-    NEMOTRON_NVFP4_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle"
-)
-
-nemotron_add_test(nvfp4_oracle_fixture_test)
-
-add_executable(
-  mamba_update_fixture_test
-  backend/mamba_update_fixture_test.cu
-)
-
-target_link_libraries(mamba_update_fixture_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_update_fixture_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  mamba_update_fixture_test
-  PRIVATE
-    NEMOTRON_MAMBA_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer0_decode_update"
-)
-
-nemotron_add_test(mamba_update_fixture_test)
-
-add_executable(
   mamba_conv_prefill_test
   backend/mamba_conv_prefill_test.cpp
 )
@@ -590,81 +429,6 @@ target_link_libraries(mamba_gated_group_norm_test PRIVATE nemotron_runtime_backe
 target_compile_features(mamba_gated_group_norm_test PRIVATE cxx_std_17)
 
 nemotron_add_test(mamba_gated_group_norm_test)
-
-add_executable(
-  mamba_layer_oracle_test
-  backend/mamba_layer_oracle_test.cpp
-)
-
-target_link_libraries(mamba_layer_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_layer_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  mamba_layer_oracle_test
-  PRIVATE
-    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer0_decode_block"
-)
-
-nemotron_add_test(mamba_layer_oracle_test)
-
-add_executable(
-  mamba_layer18_runtime_input_oracle_test
-  backend/mamba_layer_oracle_test.cpp
-)
-
-target_link_libraries(mamba_layer18_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_layer18_runtime_input_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  mamba_layer18_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer18_runtime_input_block_cuda"
-)
-
-nemotron_add_test(mamba_layer18_runtime_input_oracle_test)
-
-add_executable(
-  mamba_layer13_runtime_input_oracle_test
-  backend/mamba_layer_oracle_test.cpp
-)
-
-target_link_libraries(mamba_layer13_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_layer13_runtime_input_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  mamba_layer13_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer13_runtime_input_block_cuda"
-)
-
-nemotron_add_test(mamba_layer13_runtime_input_oracle_test)
-
-add_executable(
-  mamba_layer9_runtime_input_oracle_test
-  backend/mamba_layer_oracle_test.cpp
-)
-
-target_link_libraries(mamba_layer9_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_layer9_runtime_input_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  mamba_layer9_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer9_runtime_input_block_cuda"
-)
-
-nemotron_add_test(mamba_layer9_runtime_input_oracle_test)
-
-add_executable(
-  mamba_layer15_runtime_input_oracle_test
-  backend/mamba_layer_oracle_test.cpp
-)
-
-target_link_libraries(mamba_layer15_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_layer15_runtime_input_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  mamba_layer15_runtime_input_oracle_test
-  PRIVATE
-    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer15_runtime_input_block_cuda"
-)
-
-nemotron_add_test(mamba_layer15_runtime_input_oracle_test)
 
 add_executable(
   embedding_lookup_test
@@ -802,66 +566,6 @@ target_link_libraries(nano_save_prompt_oracle PRIVATE nemotron_runtime_api)
 target_compile_features(nano_save_prompt_oracle PRIVATE cxx_std_17)
 
 nemotron_add_test(nano_save_prompt_oracle)
-
-add_executable(
-  prefill_prefix_oracle_test
-  api/prefill_prefix_oracle_test.cpp
-)
-
-target_link_libraries(prefill_prefix_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(prefill_prefix_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  prefill_prefix_oracle_test
-  PRIVATE
-    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle"
-)
-
-nemotron_add_test(prefill_prefix_oracle_test)
-
-add_executable(
-  single_token_decode_oracle_test
-  api/single_token_decode_oracle_test.cpp
-)
-
-target_link_libraries(single_token_decode_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(single_token_decode_oracle_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  single_token_decode_oracle_test
-  PRIVATE
-    NEMOTRON_SINGLE_TOKEN_DECODE_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/full_model_single_token_short_chat_cuda_v3"
-)
-
-nemotron_add_test(single_token_decode_oracle_test)
-
-add_executable(
-  expert_layer3_prefix_replay_test
-  api/expert_layer3_prefix_replay_test.cpp
-)
-
-target_link_libraries(expert_layer3_prefix_replay_test PRIVATE nemotron_runtime_api nemotron_runtime_backend)
-target_compile_features(expert_layer3_prefix_replay_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  expert_layer3_prefix_replay_test
-  PRIVATE
-    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle"
-)
-
-nemotron_add_test(expert_layer3_prefix_replay_test)
-
-add_executable(
-  expert_layer3_manifest_binding_compare_test
-  api/expert_layer3_manifest_binding_compare_test.cpp
-)
-
-target_link_libraries(expert_layer3_manifest_binding_compare_test PRIVATE nemotron_runtime_api nemotron_runtime_backend)
-target_compile_features(expert_layer3_manifest_binding_compare_test PRIVATE cxx_std_17)
-target_compile_definitions(
-  expert_layer3_manifest_binding_compare_test
-  PRIVATE
-    NEMOTRON_EXPERT_LAYER_PREFIX_INPUT_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_prefix_input_block_cuda"
-)
-
-nemotron_add_test(expert_layer3_manifest_binding_compare_test)
 
 add_executable(
   single_token_forward_model_test

@@ -1,4 +1,6 @@
 #include "nemotron/mamba_layer.h"
+#include "nemotron/reusable_state.h"
+#include "nemotron/state_snapshot.h"
 
 #include <cuda_runtime.h>
 
@@ -28,8 +30,10 @@ using nemotron::MambaLayerBindings;
 using nemotron::MambaLayerConfig;
 using nemotron::MambaLayerRunTrace;
 using nemotron::MambaLayerSlice;
+using nemotron::KvCacheDataType;
 using nemotron::RequestExecutionConfig;
 using nemotron::RequestExecutionContext;
+using nemotron::ReusableStateArena;
 
 struct FixtureMetadata {
   std::size_t layer_index = 0;
@@ -52,38 +56,6 @@ bool expect(bool condition, const std::string& message) {
   }
   return true;
 }
-
-class ScopedEnvOverride {
- public:
-  ScopedEnvOverride(const char* name, const char* value) : name_(name) {
-    const char* existing = std::getenv(name_.c_str());
-    if (existing != nullptr) {
-      had_original_ = true;
-      original_value_ = existing;
-    }
-    if (value == nullptr) {
-      unsetenv(name_.c_str());
-    } else {
-      setenv(name_.c_str(), value, 1);
-    }
-  }
-
-  ~ScopedEnvOverride() {
-    if (had_original_) {
-      setenv(name_.c_str(), original_value_.c_str(), 1);
-    } else {
-      unsetenv(name_.c_str());
-    }
-  }
-
-  ScopedEnvOverride(const ScopedEnvOverride&) = delete;
-  ScopedEnvOverride& operator=(const ScopedEnvOverride&) = delete;
-
- private:
-  std::string name_;
-  std::string original_value_;
-  bool had_original_ = false;
-};
 
 std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
@@ -239,6 +211,35 @@ float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs)
   return max_diff;
 }
 
+std::vector<float> make_sequence_inputs(
+    const std::vector<float>& base_input,
+    std::size_t hidden_size,
+    std::size_t token_count,
+    float token_scale,
+    float feature_scale) {
+  std::vector<float> sequence(token_count * hidden_size, 0.0f);
+  for (std::size_t token = 0; token < token_count; ++token) {
+    for (std::size_t i = 0; i < hidden_size; ++i) {
+      sequence[token * hidden_size + i] =
+          base_input[i] +
+          (token_scale * static_cast<float>(token)) -
+          (feature_scale * static_cast<float>((i + (3 * token)) % 17));
+    }
+  }
+  return sequence;
+}
+
+bool fixture_files_present(
+    const std::filesystem::path& root,
+    const std::vector<std::string>& file_names) {
+  for (const std::string& file_name : file_names) {
+    if (!std::filesystem::exists(root / file_name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool run_mamba_layer_fixture() {
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
@@ -252,6 +253,29 @@ bool run_mamba_layer_fixture() {
   const auto metadata = load_metadata(fixture_root);
   if (!expect(metadata.has_value(), "mamba layer oracle fixture metadata should load")) {
     return false;
+  }
+  if (!fixture_files_present(
+          fixture_root,
+          {
+              "input_hidden_fp32.bin",
+              "initial_conv_state_fp32.bin",
+              "initial_ssm_state_fp32.bin",
+              "input_norm_weight_fp32.bin",
+              "mixer_norm_weight_fp32.bin",
+              "conv1d_weight_fp32.bin",
+              "conv1d_bias_fp32.bin",
+              "A_log_fp32.bin",
+              "D_fp32.bin",
+              "dt_bias_fp32.bin",
+              "expected_norm_output_fp32.bin",
+              "expected_in_proj_output_fp32.bin",
+              "expected_next_ssm_state_fp32.bin",
+              "expected_updated_conv_state_fp32.bin",
+              "expected_final_output_fp32.bin",
+          })) {
+    std::cout << "mamba_layer_oracle_test: SKIP (fixture payload missing under "
+              << fixture_root << ")\n";
+    return true;
   }
 
   const std::vector<float> input_hidden = read_float_file(fixture_root / "input_hidden_fp32.bin");
@@ -633,26 +657,23 @@ bool run_mamba_layer_fixture() {
     return false;
   }
 
-  {
-    ScopedEnvOverride fused_decode("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
-    if (!expect(
-            slice->Run(
-                *cublas,
-                &heuristic_cache,
-                *batch_request,
-                *continuation_input_tensor,
-                batch_continuation_output.get()),
-            "batched continuation should execute through fused decode") ||
-        !expect(
-            slice->Run(
-                *cublas,
-                &heuristic_cache,
-                *sequential_request,
-                *continuation_input_tensor,
-                sequential_continuation_output.get()),
-            "sequential continuation should execute through fused decode")) {
-      return false;
-    }
+  if (!expect(
+          slice->Run(
+              *cublas,
+              &heuristic_cache,
+              *batch_request,
+              *continuation_input_tensor,
+              batch_continuation_output.get()),
+          "batched continuation should execute through production decode") ||
+      !expect(
+          slice->Run(
+              *cublas,
+              &heuristic_cache,
+              *sequential_request,
+              *continuation_input_tensor,
+              sequential_continuation_output.get()),
+          "sequential continuation should execute through production decode")) {
+    return false;
   }
 
   std::vector<float> batch_continuation_host(continuation_input.size(), 0.0f);
@@ -696,17 +717,265 @@ bool run_mamba_layer_fixture() {
 
   if (!expect(
           max_abs_diff(batch_continuation_host, sequential_continuation_host) <= 2.0e-3f,
-          "fused decode continuation output should match sequential baseline after batched prefill") ||
+          "production decode continuation output should match sequential baseline after batched prefill") ||
       !expect(
           max_abs_diff(
               batch_post_continuation_conv_state,
               sequential_post_continuation_conv_state) <= 1.0e-5f,
-          "fused decode continuation conv state should match sequential baseline after batched prefill") ||
+          "production decode continuation conv state should match sequential baseline after batched prefill") ||
       !expect(
           max_abs_diff(
               batch_post_continuation_ssm_state,
               sequential_post_continuation_ssm_state) <= 5.0e-5f,
-          "fused decode continuation ssm state should match sequential baseline after batched prefill")) {
+          "production decode continuation ssm state should match sequential baseline after batched prefill")) {
+    return false;
+  }
+
+  constexpr std::size_t kCachedPrefixTokens = 3;
+  constexpr std::size_t kCachedTailTokens = 2;
+  const std::vector<float> cached_inputs = make_sequence_inputs(
+      input_hidden,
+      metadata->hidden_size,
+      kCachedPrefixTokens + kCachedTailTokens,
+      0.00125f,
+      0.00007f);
+  const std::vector<float> cached_prefix_inputs(
+      cached_inputs.begin(),
+      cached_inputs.begin() + static_cast<std::ptrdiff_t>(kCachedPrefixTokens * metadata->hidden_size));
+  const std::vector<float> cached_tail_inputs(
+      cached_inputs.begin() + static_cast<std::ptrdiff_t>(kCachedPrefixTokens * metadata->hidden_size),
+      cached_inputs.end());
+
+  RequestExecutionConfig cached_request_config;
+  cached_request_config.hidden_size = metadata->hidden_size;
+  cached_request_config.max_tokens = kCachedPrefixTokens + kCachedTailTokens;
+  cached_request_config.scratch_tokens = kCachedPrefixTokens + kCachedTailTokens;
+  cached_request_config.mamba_conv_state_bytes_fp32 = conv_state_elems * sizeof(float);
+  cached_request_config.mamba_state_bytes_fp32 = ssm_state_elems * sizeof(float);
+  cached_request_config.attention_kv_cache.layer_count = 1;
+  cached_request_config.attention_kv_cache.kv_head_count = 1;
+  cached_request_config.attention_kv_cache.head_dim = 4;
+  cached_request_config.attention_kv_cache.tokens_per_page = 4;
+  cached_request_config.attention_kv_cache.dtype = KvCacheDataType::kBf16;
+  cached_request_config.attention_total_pages = 2;
+
+  auto cached_request = RequestExecutionContext::Create(cached_request_config);
+  auto restored_request = RequestExecutionContext::Create(cached_request_config);
+  auto cached_prefix_tensor =
+      DeviceTensorFp32::Create({kCachedPrefixTokens, metadata->hidden_size});
+  auto cached_tail_tensor =
+      DeviceTensorFp32::Create({kCachedTailTokens, metadata->hidden_size});
+  auto cached_prefix_output =
+      DeviceTensorFp32::Create({kCachedPrefixTokens, metadata->hidden_size});
+  auto cached_tail_output =
+      DeviceTensorFp32::Create({kCachedTailTokens, metadata->hidden_size});
+  auto restored_tail_output =
+      DeviceTensorFp32::Create({kCachedTailTokens, metadata->hidden_size});
+  if (!expect(
+          cached_request != nullptr && cached_request->valid(),
+          "cached-prefix request context should create for mamba oracle") ||
+      !expect(
+          restored_request != nullptr && restored_request->valid(),
+          "restored request context should create for mamba oracle") ||
+      !expect(
+          cached_prefix_tensor != nullptr && cached_prefix_tensor->valid(),
+          "cached-prefix input tensor should create for mamba oracle") ||
+      !expect(
+          cached_tail_tensor != nullptr && cached_tail_tensor->valid(),
+          "cached-tail input tensor should create for mamba oracle") ||
+      !expect(
+          cached_prefix_output != nullptr && cached_prefix_output->valid(),
+          "cached-prefix output tensor should create for mamba oracle") ||
+      !expect(
+          cached_tail_output != nullptr && cached_tail_output->valid(),
+          "cached-tail output tensor should create for mamba oracle") ||
+      !expect(
+          restored_tail_output != nullptr && restored_tail_output->valid(),
+          "restored-tail output tensor should create for mamba oracle") ||
+      !expect(
+          cached_request->SetSequenceLength(kCachedPrefixTokens),
+          "cached-prefix request should allocate the cached boundary") ||
+      !expect(
+          cached_prefix_tensor->CopyFromHost(
+              cached_prefix_inputs.data(),
+              cached_prefix_inputs.size()),
+          "cached-prefix input should upload") ||
+      !expect(
+          cached_tail_tensor->CopyFromHost(
+              cached_tail_inputs.data(),
+              cached_tail_inputs.size()),
+          "cached-tail input should upload") ||
+      !expect(
+          cached_request->mamba_conv_state()->CopyFromHost(
+              initial_conv_state.data(),
+              initial_conv_state.size()),
+          "cached-prefix initial conv state should upload") ||
+      !expect(
+          cached_request->mamba_state()->CopyFromHost(
+              initial_ssm_state.data(),
+              initial_ssm_state.size()),
+          "cached-prefix initial ssm state should upload")) {
+    return false;
+  }
+
+  if (!expect(
+          slice->Run(
+              *cublas,
+              &heuristic_cache,
+              *cached_request,
+              *cached_prefix_tensor,
+              cached_prefix_output.get()),
+          "oracle cached prefix should execute")) {
+    return false;
+  }
+
+  std::vector<float> prefix_conv_state(initial_conv_state.size(), 0.0f);
+  std::vector<float> prefix_ssm_state(initial_ssm_state.size(), 0.0f);
+  if (!expect(
+          cached_request->mamba_conv_state()->CopyToHost(
+              prefix_conv_state.data(),
+              prefix_conv_state.size()),
+          "oracle cached prefix conv state should download") ||
+      !expect(
+          cached_request->mamba_state()->CopyToHost(
+              prefix_ssm_state.data(),
+              prefix_ssm_state.size()),
+          "oracle cached prefix ssm state should download")) {
+    return false;
+  }
+
+  ReusableStateArena arena(
+      nemotron::RequiredKvSnapshotBytes(*cached_request) +
+      nemotron::RequiredMambaSnapshotBytes(*cached_request));
+  const auto descriptor =
+      nemotron::SnapshotRequestState(arena, *cached_request, "mamba-layer-oracle-restore");
+  if (!expect(
+          descriptor.has_value() && descriptor->valid(),
+          "oracle cached prefix snapshot should allocate")) {
+    return false;
+  }
+
+  if (!expect(
+          slice->Run(
+              *cublas,
+              &heuristic_cache,
+              *cached_request,
+              *cached_tail_tensor,
+              cached_tail_output.get()),
+          "oracle cached-tail continuation should execute")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+
+  if (!expect(
+          nemotron::RestoreRequestState(
+              arena,
+              *descriptor,
+              kCachedPrefixTokens,
+              *restored_request),
+          "oracle restored request should accept the cached prefix")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+  if (!expect(
+          restored_request->sequence_length() == kCachedPrefixTokens &&
+              restored_request->decode_position() == kCachedPrefixTokens,
+          "oracle restored request should resume at the cached prompt boundary")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+
+  std::vector<float> restored_prefix_conv_state(initial_conv_state.size(), 0.0f);
+  std::vector<float> restored_prefix_ssm_state(initial_ssm_state.size(), 0.0f);
+  if (!expect(
+          restored_request->mamba_conv_state()->CopyToHost(
+              restored_prefix_conv_state.data(),
+              restored_prefix_conv_state.size()),
+          "oracle restored prefix conv state should download") ||
+      !expect(
+          restored_request->mamba_state()->CopyToHost(
+              restored_prefix_ssm_state.data(),
+              restored_prefix_ssm_state.size()),
+          "oracle restored prefix ssm state should download")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+
+  if (!expect(
+          max_abs_diff(prefix_conv_state, restored_prefix_conv_state) <= 1.0e-5f,
+          "oracle restored prefix conv state should round-trip through snapshot restore") ||
+      !expect(
+          max_abs_diff(prefix_ssm_state, restored_prefix_ssm_state) <= 5.0e-5f,
+          "oracle restored prefix ssm state should round-trip through snapshot restore")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+
+  if (!expect(
+          slice->Run(
+              *cublas,
+              &heuristic_cache,
+              *restored_request,
+              *cached_tail_tensor,
+              restored_tail_output.get()),
+          "oracle restored-tail continuation should execute")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+
+  std::vector<float> cached_tail_output_host(cached_tail_inputs.size(), 0.0f);
+  std::vector<float> restored_tail_output_host(cached_tail_inputs.size(), 0.0f);
+  std::vector<float> cached_final_conv_state(initial_conv_state.size(), 0.0f);
+  std::vector<float> cached_final_ssm_state(initial_ssm_state.size(), 0.0f);
+  std::vector<float> restored_final_conv_state(initial_conv_state.size(), 0.0f);
+  std::vector<float> restored_final_ssm_state(initial_ssm_state.size(), 0.0f);
+  if (!expect(
+          cached_tail_output->CopyToHost(
+              cached_tail_output_host.data(),
+              cached_tail_output_host.size()),
+          "oracle cached-tail output should download") ||
+      !expect(
+          restored_tail_output->CopyToHost(
+              restored_tail_output_host.data(),
+              restored_tail_output_host.size()),
+          "oracle restored-tail output should download") ||
+      !expect(
+          cached_request->mamba_conv_state()->CopyToHost(
+              cached_final_conv_state.data(),
+              cached_final_conv_state.size()),
+          "oracle cached-tail conv state should download") ||
+      !expect(
+          cached_request->mamba_state()->CopyToHost(
+              cached_final_ssm_state.data(),
+              cached_final_ssm_state.size()),
+          "oracle cached-tail ssm state should download") ||
+      !expect(
+          restored_request->mamba_conv_state()->CopyToHost(
+              restored_final_conv_state.data(),
+              restored_final_conv_state.size()),
+          "oracle restored-tail conv state should download") ||
+      !expect(
+          restored_request->mamba_state()->CopyToHost(
+              restored_final_ssm_state.data(),
+              restored_final_ssm_state.size()),
+          "oracle restored-tail ssm state should download")) {
+    arena.Release(*descriptor);
+    return false;
+  }
+
+  arena.Release(*descriptor);
+  if (!expect(
+          max_abs_diff(cached_tail_output_host, restored_tail_output_host) <= 2.0e-3f,
+          "oracle restored-prefix continuation output should match cold execution") ||
+      !expect(
+          max_abs_diff(cached_final_conv_state, restored_final_conv_state) <= 1.0e-5f,
+          "oracle restored-prefix continuation conv state should match cold execution") ||
+      !expect(
+          max_abs_diff(cached_final_ssm_state, restored_final_ssm_state) <= 5.0e-5f,
+          "oracle restored-prefix continuation ssm state should match cold execution") ||
+      !expect(
+          arena.current_bytes() == 0,
+          "oracle restore descriptor release should free arena bytes")) {
     return false;
   }
 

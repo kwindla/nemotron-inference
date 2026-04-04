@@ -3,6 +3,7 @@ add_subdirectory(gb10_loader_modes)
 add_subdirectory(gb10_mamba_cache)
 add_subdirectory(gb10_nvfp4_gemm)
 add_subdirectory(gb10_nvfp4_contract)
+add_subdirectory(nano_mamba)
 add_subdirectory(nano_fused_decode)
 add_subdirectory(nano_prefix_cache_ttft)
 

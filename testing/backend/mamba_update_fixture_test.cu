@@ -108,6 +108,24 @@ float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
 
 int RunFixtureTest() {
   const std::filesystem::path root(NEMOTRON_MAMBA_ORACLE_FIXTURE_ROOT);
+  for (const char* file_name : {
+           "ssm_state_fp32.bin",
+           "hidden_fp32.bin",
+           "dt_fp32.bin",
+           "A_fp32.bin",
+           "B_fp32.bin",
+           "C_fp32.bin",
+           "D_fp32.bin",
+           "expected_next_state_fp32.bin",
+           "expected_output_fp32.bin",
+       }) {
+    if (!std::filesystem::exists(root / file_name)) {
+      std::cout << "mamba_update_fixture_test: SKIP (fixture payload missing under "
+                << root << ")\n";
+      return 0;
+    }
+  }
+
   const std::size_t hidden_count = kBatchSize * kNumHeads * kHeadDim;
   const std::size_t state_count = hidden_count * kStateSize;
   const std::size_t bc_count = kBatchSize * kNumHeads * kStateSize;

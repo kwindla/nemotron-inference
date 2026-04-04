@@ -391,7 +391,7 @@ def main() -> int:
     mixer_prefix = prefix + ".mixer"
 
     hidden_size = int(config["hidden_size"])
-    moe_latent_size = int(config["moe_latent_size"])
+    moe_latent_size = int(config.get("moe_latent_size", 0))
     moe_intermediate_size = int(config["moe_intermediate_size"])
     shared_intermediate_size = int(config["moe_shared_expert_intermediate_size"])
     n_routed_experts = int(config["n_routed_experts"])

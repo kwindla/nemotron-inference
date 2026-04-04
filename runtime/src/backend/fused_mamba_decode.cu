@@ -19,11 +19,6 @@ bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
 
-bool EnvEnabled(const char* env_var) {
-  const char* value = std::getenv(env_var);
-  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
 bool EnvEnabledByDefault(const char* env_var, bool default_value) {
   const char* value = std::getenv(env_var);
   if (value == nullptr || value[0] == '\0') {
@@ -97,8 +92,8 @@ __global__ void FusedMambaDecodeLegacyKernel(
   const float* gate = projected;
   const float* conv_input = projected + params.intermediate_size;
   const float* dt_pre = conv_input + conv_dim;
-  float* layer_conv_state = conv_state + params.conv_state_offset_elems;
-  float* layer_ssm_state = ssm_state + params.ssm_state_offset_elems;
+  float* layer_conv_state = conv_state;
+  float* layer_ssm_state = ssm_state;
 
   for (std::size_t channel = tid; channel < conv_dim; channel += blockDim.x) {
     float* state_row = layer_conv_state + (channel * params.conv_kernel_size);
@@ -180,7 +175,7 @@ __global__ void UpdateMambaConvStateKernel(
   const std::size_t conv_dim =
       params.intermediate_size + (2 * params.n_groups * params.state_size);
   const float* conv_input = projected + params.intermediate_size;
-  float* layer_conv_state = conv_state + params.conv_state_offset_elems;
+  float* layer_conv_state = conv_state;
 
   for (std::size_t channel = tid; channel < conv_dim; channel += stride) {
     float* state_row = layer_conv_state + (channel * params.conv_kernel_size);
@@ -216,8 +211,8 @@ __global__ void FusedMambaDecodeHeadKernel(
   const std::size_t conv_dim =
       params.intermediate_size + (2 * params.n_groups * params.state_size);
   const float* dt_pre = projected + params.intermediate_size + conv_dim;
-  const float* layer_conv_state = conv_state + params.conv_state_offset_elems;
-  float* layer_ssm_state = ssm_state + params.ssm_state_offset_elems;
+  const float* layer_conv_state = conv_state;
+  float* layer_ssm_state = ssm_state;
 
   for (std::size_t idx = tid; idx < bc_elements; idx += blockDim.x) {
     const bool is_b = idx < params.state_size;
@@ -317,22 +312,11 @@ bool MambaOptimizedEnabled() {
 
 }  // namespace
 
-bool FusedMambaDecodeEnabled() {
-  return EnvEnabled("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE");
-}
-
 bool RunFusedMambaDecode(
     const FusedMambaLayerParams& params,
-    RequestExecutionContext& request_context,
     const DeviceTensorFp32& projected,
     DeviceTensorFp32* scan_output) {
-  if (!FusedMambaDecodeEnabled() ||
-      !request_context.valid() ||
-      request_context.mamba_conv_state() == nullptr ||
-      request_context.mamba_state() == nullptr ||
-      !request_context.mamba_conv_state()->valid() ||
-      !request_context.mamba_state()->valid() ||
-      !projected.valid() ||
+  if (!projected.valid() ||
       projected.shape().size() != 2 ||
       projected.shape()[0] != 1 ||
       scan_output == nullptr ||
@@ -347,6 +331,10 @@ bool RunFusedMambaDecode(
       params.n_groups == 0 ||
       params.n_groups > kMaxMambaGroups ||
       params.conv_kernel_size == 0 ||
+      params.conv_state_elems == 0 ||
+      params.ssm_state_elems == 0 ||
+      params.conv_state == nullptr ||
+      params.ssm_state == nullptr ||
       params.mixer_norm_weight == nullptr ||
       params.conv1d_weight == nullptr ||
       params.conv1d_bias == nullptr ||
@@ -360,10 +348,15 @@ bool RunFusedMambaDecode(
       params.intermediate_size + (2 * params.n_groups * params.state_size);
   const std::size_t projection_size =
       params.intermediate_size + conv_dim + params.num_heads;
+  const std::size_t conv_state_elems = conv_dim * params.conv_kernel_size;
+  const std::size_t ssm_state_elems =
+      params.num_heads * params.head_dim * params.state_size;
   if (projected.shape()[1] != projection_size ||
       params.intermediate_size != params.num_heads * params.head_dim ||
       (params.intermediate_size % params.n_groups) != 0 ||
-      (params.num_heads % params.n_groups) != 0) {
+      (params.num_heads % params.n_groups) != 0 ||
+      params.conv_state_elems != conv_state_elems ||
+      params.ssm_state_elems != ssm_state_elems) {
     return false;
   }
 
@@ -374,8 +367,8 @@ bool RunFusedMambaDecode(
     FusedMambaDecodeLegacyKernel<<<legacy_grid, block, legacy_shared_bytes>>>(
         params,
         projected.data(),
-        request_context.mamba_conv_state()->data(),
-        request_context.mamba_state()->data(),
+        params.conv_state,
+        params.ssm_state,
         scan_output->data());
     return CheckCuda(cudaGetLastError());
   }
@@ -385,7 +378,7 @@ bool RunFusedMambaDecode(
   UpdateMambaConvStateKernel<<<conv_grid, block>>>(
       params,
       projected.data(),
-      request_context.mamba_conv_state()->data());
+      params.conv_state);
   if (!CheckCuda(cudaGetLastError())) {
     return false;
   }
@@ -395,8 +388,8 @@ bool RunFusedMambaDecode(
   FusedMambaDecodeHeadKernel<<<head_grid, block, head_shared_bytes>>>(
       params,
       projected.data(),
-      request_context.mamba_conv_state()->data(),
-      request_context.mamba_state()->data(),
+      params.conv_state,
+      params.ssm_state,
       scan_output->data());
   if (!CheckCuda(cudaGetLastError())) {
     return false;

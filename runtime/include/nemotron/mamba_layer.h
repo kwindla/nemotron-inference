@@ -29,6 +29,17 @@ struct MambaLayerConfig {
   float time_step_min = 1.0e-3f;
 };
 
+struct MambaLayerStateLayout {
+  std::size_t conv_state_offset_elems = 0;
+  std::size_t conv_state_elems = 0;
+  std::size_t ssm_state_offset_elems = 0;
+  std::size_t ssm_state_elems = 0;
+
+  bool valid() const {
+    return conv_state_elems != 0 && ssm_state_elems != 0;
+  }
+};
+
 struct MambaLayerBindings {
   const KernelTensorDescriptor* input_norm_weight = nullptr;
   const KernelTensorDescriptor* mixer_norm_weight = nullptr;
@@ -59,6 +70,9 @@ std::optional<MambaLayerBindings> BuildMambaLayerBindings(
     const KernelCatalog& kernel_catalog,
     const GemmCatalog& gemm_catalog);
 
+std::optional<MambaLayerStateLayout> BuildMambaLayerStateLayout(
+    const MambaLayerConfig& config);
+
 class MambaLayerSlice {
  public:
   static std::unique_ptr<MambaLayerSlice> Create(
@@ -74,6 +88,7 @@ class MambaLayerSlice {
 
   bool valid() const;
   const MambaLayerConfig& config() const;
+  const MambaLayerStateLayout& state_layout() const;
 
   bool Run(
       CublasLtHandle& cublas_handle,

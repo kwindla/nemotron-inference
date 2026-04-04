@@ -18,6 +18,7 @@ endif()
 option(NEMOTRON_RUNTIME_ENABLE_PROBES "Build pre-implementation feasibility probes" ON)
 option(NEMOTRON_RUNTIME_BUILD_TESTING "Build runtime tests" ON)
 option(NEMOTRON_RUNTIME_BUILD_BENCHMARKS "Build runtime benchmarks" ON)
+option(NEMOTRON_PRODUCTION_BUILD "Compile out debug-only runtime scaffolding" OFF)
 
 add_subdirectory(runtime)
 
