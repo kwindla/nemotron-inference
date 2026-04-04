@@ -115,14 +115,6 @@ ReusableStateArena::ReusableStateArena(std::size_t max_bytes)
   if (max_bytes_ != 0) {
     impl_->free_regions.emplace(0, max_bytes_);
   }
-
-  if (!HasCudaDevice() || max_bytes_ == 0) {
-    return;
-  }
-
-  if (!CheckCuda(cudaMalloc(&impl_->device_slab, max_bytes_))) {
-    impl_->device_storage_init_failed = true;
-  }
 }
 
 ReusableStateArena::~ReusableStateArena() {
@@ -143,6 +135,30 @@ ReusableStateHandle ReusableStateArena::Allocate(
       impl_->current_bytes + bytes > max_bytes_ ||
       impl_->device_storage_init_failed) {
     return {};
+  }
+
+  // Lazy slab allocation: defer cudaMalloc until the first real allocation so
+  // the slab does not compete with model weight uploads for VRAM.
+  if (impl_->device_slab == nullptr && !impl_->device_storage_init_failed &&
+      max_bytes_ != 0 && HasCudaDevice()) {
+    // Cap the slab to actual free VRAM minus headroom for execution scratch.
+    constexpr std::size_t kExecutionHeadroomBytes = 512ull * 1024 * 1024;  // 512 MiB
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (CheckCuda(cudaMemGetInfo(&free_bytes, &total_bytes)) &&
+        free_bytes > kExecutionHeadroomBytes) {
+      const std::size_t available = free_bytes - kExecutionHeadroomBytes;
+      if (available < max_bytes_) {
+        max_bytes_ = available;
+        impl_->free_regions.clear();
+        impl_->free_regions.emplace(0, max_bytes_);
+        impl_->current_bytes = 0;
+      }
+    }
+    if (max_bytes_ < bytes || !CheckCuda(cudaMalloc(&impl_->device_slab, max_bytes_))) {
+      impl_->device_storage_init_failed = true;
+      return {};
+    }
   }
 
   auto free_it = FindFirstFit(impl_->free_regions, bytes);
