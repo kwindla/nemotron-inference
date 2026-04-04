@@ -36,6 +36,8 @@ FP8_E4M3_MAX_FINITE = 448.0
 MIN_SCALE = 1.0 / 1024.0
 FP4_LEVELS_TENSOR = torch.tensor(FP4_POSITIVE_VALUES, dtype=torch.float32)
 FP4_DECODE_TENSOR = torch.tensor(FP4_DECODE_TABLE, dtype=torch.float32)
+RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "tensor_scale = weight_scale_2"
+EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_tensor_scale = input_scale * weight_scale_2"
 
 
 def configure_torch_precision() -> None:
@@ -51,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--prompts", required=True)
     parser.add_argument("--prompt-name", required=True)
+    parser.add_argument("--manifest-path", default=None)
     parser.add_argument("--mode", choices=("single_token", "prefix_prefill"), default="single_token")
     parser.add_argument("--token-index", type=int, default=0)
     parser.add_argument("--prompt-token-count", type=int, default=0)
@@ -64,6 +67,13 @@ def parse_args() -> argparse.Namespace:
 def build_weight_map(index_path: Path) -> dict[str, str]:
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     return payload["weight_map"]
+
+
+def load_manifest_tensor_names(manifest_path: Path | None) -> set[str] | None:
+    if manifest_path is None:
+        return None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return {tensor["name"] for tensor in payload.get("tensors", [])}
 
 
 def load_named_tensor(
@@ -131,6 +141,12 @@ def scaled_fp8_linear(
 def clamp_scale(value: float) -> float:
     if not math.isfinite(value) or value < MIN_SCALE:
         return MIN_SCALE
+    return value
+
+
+def require_positive_finite(value: float, label: str) -> float:
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{label} must be positive and finite, got {value}")
     return value
 
 
@@ -239,29 +255,55 @@ def dequantize_nvfp4_matrix(
     return (decoded * scales.unsqueeze(-1)).view(rows, cols)
 
 
-def load_nvfp4_linear_metadata(model_dir: Path, weight_map: dict[str, str], prefix: str) -> dict[str, object]:
+def load_nvfp4_linear_metadata(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    prefix: str,
+    manifest_tensor_names: set[str] | None = None,
+    *,
+    require_input_scale: bool,
+    fuse_input_scale: bool,
+) -> dict[str, object]:
     weight = load_named_tensor(model_dir, weight_map, prefix + ".weight")
     weight_scales = load_named_tensor(model_dir, weight_map, prefix + ".weight_scale")
     weight_scale_2_name = prefix + ".weight_scale_2"
+    if weight_scale_2_name not in weight_map:
+        raise KeyError(f"NVFP4 linear is missing {weight_scale_2_name}")
     input_scale_name = prefix + ".input_scale"
-    has_weight_scale_2 = weight_scale_2_name in weight_map
-    has_input_scale = input_scale_name in weight_map
-    if not has_weight_scale_2 and not has_input_scale:
-        raise KeyError(
-            f"{prefix} is missing both .weight_scale_2 and .input_scale; "
-            "expected at least one NVFP4 tensor scale input"
+    input_scale = None
+    if input_scale_name in weight_map:
+        input_scale = require_positive_finite(
+            float(load_named_tensor(model_dir, weight_map, input_scale_name).item()),
+            input_scale_name,
         )
-    weight_scale_2 = (
-        float(load_named_tensor(model_dir, weight_map, weight_scale_2_name).item())
-        if has_weight_scale_2
-        else 1.0
+    elif require_input_scale:
+        raise KeyError(f"NVFP4 linear is missing {input_scale_name}")
+    weight_scale_2 = require_positive_finite(
+        float(load_named_tensor(model_dir, weight_map, weight_scale_2_name).item()),
+        weight_scale_2_name,
     )
-    input_scale = (
-        float(load_named_tensor(model_dir, weight_map, input_scale_name).item())
-        if has_input_scale
-        else 1.0
+    tensor_scale = weight_scale_2
+    tensor_scale_contract = RAW_WEIGHT_TENSOR_SCALE_CONTRACT
+    if fuse_input_scale:
+        if input_scale is None:
+            raise KeyError(f"NVFP4 linear is missing {input_scale_name}")
+        tensor_scale = require_positive_finite(
+            input_scale * weight_scale_2,
+            f"{prefix} effective tensor_scale",
+        )
+        tensor_scale_contract = EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT
+
+    manifest_weight_name = prefix + ".weight"
+    manifest_weight_present = manifest_tensor_names is None or manifest_weight_name in manifest_tensor_names
+    manifest_input_scale_present = (
+        input_scale_name in manifest_tensor_names if manifest_tensor_names is not None and input_scale is not None else False
     )
-    effective_tensor_scale = weight_scale_2 * input_scale
+    if manifest_tensor_names is not None:
+        if not manifest_weight_present:
+            raise KeyError(f"{manifest_weight_name} is missing from manifest")
+        if require_input_scale and not manifest_input_scale_present:
+            raise KeyError(f"{input_scale_name} is missing from manifest")
+
     return {
         "family": "nvfp4",
         "prefix": prefix,
@@ -269,12 +311,14 @@ def load_nvfp4_linear_metadata(model_dir: Path, weight_map: dict[str, str], pref
         "weight_scales": weight_scales.contiguous().view(torch.uint8).flatten().cpu(),
         "weight_scale_2": weight_scale_2,
         "input_scale": input_scale,
-        "effective_tensor_scale": effective_tensor_scale,
+        "tensor_scale": tensor_scale,
         "rows": int(weight.shape[0]),
         "cols": int(weight_scales.shape[1] * 16),
-        "weight_scale_2_name": weight_scale_2_name if has_weight_scale_2 else None,
-        "input_scale_name": input_scale_name if has_input_scale else None,
-        "tensor_scale_contract": "effective_tensor_scale = input_scale * weight_scale_2",
+        "weight_scale_2_name": weight_scale_2_name,
+        "input_scale_name": input_scale_name if input_scale is not None else None,
+        "tensor_scale_contract": tensor_scale_contract,
+        "manifest_weight_present": manifest_weight_present,
+        "manifest_input_scale_present": manifest_input_scale_present,
     }
 
 
@@ -304,10 +348,18 @@ def load_shared_down_metadata(
     model_dir: Path,
     weight_map: dict[str, str],
     prefix: str,
+    manifest_tensor_names: set[str] | None = None,
     device: torch.device | None = None,
 ) -> dict[str, object]:
     if prefix + ".weight_scale_2" in weight_map:
-        return load_nvfp4_linear_metadata(model_dir, weight_map, prefix)
+        return load_nvfp4_linear_metadata(
+            model_dir,
+            weight_map,
+            prefix,
+            manifest_tensor_names=manifest_tensor_names,
+            require_input_scale=False,
+            fuse_input_scale=False,
+        )
     return load_dense_or_scaled_fp8_linear_metadata(model_dir, weight_map, prefix, device=device)
 
 
@@ -342,7 +394,7 @@ def nvfp4_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) 
             host_weight = dequantize_nvfp4_matrix(
                 linear_metadata["weight"],
                 linear_metadata["weight_scales"],
-                float(linear_metadata["effective_tensor_scale"]),
+                float(linear_metadata["tensor_scale"]),
                 linear_metadata["rows"],
                 linear_metadata["cols"],
             )
@@ -583,6 +635,8 @@ def run_expert_block(
     config: dict[str, Any],
     layer_index: int,
     device: torch.device,
+    manifest_tensor_names: set[str] | None = None,
+    nvfp4_contracts: dict[str, set[str]] | None = None,
 ) -> torch.Tensor:
     prefix = f"backbone.layers.{layer_index}"
     mixer_prefix = prefix + ".mixer"
@@ -612,8 +666,14 @@ def run_expert_block(
         model_dir, weight_map, mixer_prefix + ".shared_experts.up_proj", device=device
     )
     shared_down = load_shared_down_metadata(
-        model_dir, weight_map, mixer_prefix + ".shared_experts.down_proj", device=device
+        model_dir,
+        weight_map,
+        mixer_prefix + ".shared_experts.down_proj",
+        manifest_tensor_names=manifest_tensor_names,
+        device=device,
     )
+    if shared_down["family"] == "nvfp4" and nvfp4_contracts is not None:
+        nvfp4_contracts["shared_down"].add(str(shared_down["tensor_scale_contract"]))
 
     norm_output = rms_norm(hidden_states, norm_weight, layer_norm_eps)
     router_logits = F.linear(norm_output.to(torch.float32), gate_weight.to(torch.float32))
@@ -639,11 +699,28 @@ def run_expert_block(
             expert_entry = expert_linear_cache.get(expert_prefix)
             if expert_entry is None:
                 expert_entry = (
-                    load_nvfp4_linear_metadata(model_dir, weight_map, expert_prefix + ".up_proj"),
-                    load_nvfp4_linear_metadata(model_dir, weight_map, expert_prefix + ".down_proj"),
+                    load_nvfp4_linear_metadata(
+                        model_dir,
+                        weight_map,
+                        expert_prefix + ".up_proj",
+                        manifest_tensor_names=manifest_tensor_names,
+                        require_input_scale=True,
+                        fuse_input_scale=True,
+                    ),
+                    load_nvfp4_linear_metadata(
+                        model_dir,
+                        weight_map,
+                        expert_prefix + ".down_proj",
+                        manifest_tensor_names=manifest_tensor_names,
+                        require_input_scale=True,
+                        fuse_input_scale=True,
+                    ),
                 )
                 expert_linear_cache[expert_prefix] = expert_entry
             up_proj, down_proj = expert_entry
+            if nvfp4_contracts is not None:
+                nvfp4_contracts["routed"].add(str(up_proj["tensor_scale_contract"]))
+                nvfp4_contracts["routed"].add(str(down_proj["tensor_scale_contract"]))
             expert_hidden = nvfp4_linear(token_latent, up_proj)
             expert_hidden = relu2(expert_hidden)
             expert_output = nvfp4_linear(expert_hidden, down_proj)
@@ -667,6 +744,7 @@ def main() -> int:
     args = parse_args()
     model_dir = Path(args.model_dir)
     prompts_path = Path(args.prompts)
+    manifest_path = Path(args.manifest_path) if args.manifest_path else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -679,6 +757,7 @@ def main() -> int:
 
     config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     weight_map = build_weight_map(model_dir / "model.safetensors.index.json")
+    manifest_tensor_names = load_manifest_tensor_names(manifest_path)
     prompt_case = load_prompt_case(prompts_path, args.prompt_name)
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_dir),
@@ -715,6 +794,7 @@ def main() -> int:
     captured_outputs: dict[int, torch.Tensor] = {}
     layer_kinds: list[str] = []
     num_layers = int(config["num_hidden_layers"])
+    nvfp4_contracts: dict[str, set[str]] = {"routed": set(), "shared_down": set()}
     for layer_index in range(num_layers):
         if layer_index > stop_layer:
             break
@@ -734,7 +814,16 @@ def main() -> int:
                 device,
             )
         elif block_type == "moe":
-            hidden_states = run_expert_block(hidden_states, model_dir, weight_map, config, layer_index, device)
+            hidden_states = run_expert_block(
+                hidden_states,
+                model_dir,
+                weight_map,
+                config,
+                layer_index,
+                device,
+                manifest_tensor_names=manifest_tensor_names,
+                nvfp4_contracts=nvfp4_contracts,
+            )
         else:
             raise ValueError(f"unsupported block type {block_type!r} at layer {layer_index}")
 
@@ -776,6 +865,7 @@ def main() -> int:
         "fixture_kind": "single_token_full_model_oracle_v1" if args.mode == "single_token" else "prefix_prefill_prefix_oracle_v1",
         "mode": args.mode,
         "prompt_name": args.prompt_name,
+        "manifest_path": None if manifest_path is None else str(manifest_path),
         "prompt_token_count": len(prompt_token_ids),
         "runtime_token_count": len(runtime_token_ids),
         "selected_token_index": args.token_index if args.mode == "single_token" else None,
@@ -797,11 +887,22 @@ def main() -> int:
             "single_token mode runs one token from scratch with zeroed cache/state.",
             "prefix_prefill mode runs a short prompt prefix from scratch and can stop after an early capture layer to keep fixture generation practical.",
             "Attention, Mamba, and MoE blocks mirror the current correctness-first runtime contracts already used by the layer-level oracle fixtures.",
-            "Routed and shared NVFP4 weights use the corrected effective runtime tensor scale contract: input_scale * weight_scale_2.",
+            "Routed expert NVFP4 tensor scales use effective_tensor_scale = input_scale * weight_scale_2.",
+            "Shared-down NVFP4 tensor scales remain raw checkpoint weight_scale_2.",
             "Captured per-layer outputs are intended for the composed registry-backed forward-path validation.",
             "Captured Mamba layers also include final conv/SSM state snapshots for decode-boundary localization.",
         ],
     }
+    if nvfp4_contracts["routed"]:
+        routed_contracts = sorted(nvfp4_contracts["routed"])
+        metadata["routed_nvfp4_weight_tensor_scale_contract"] = (
+            routed_contracts[0] if len(routed_contracts) == 1 else "mixed"
+        )
+    if nvfp4_contracts["shared_down"]:
+        shared_down_contracts = sorted(nvfp4_contracts["shared_down"])
+        metadata["shared_down_nvfp4_weight_tensor_scale_contract"] = (
+            shared_down_contracts[0] if len(shared_down_contracts) == 1 else "mixed"
+        )
     (output_dir / "prompt_token_ids.json").write_text(json.dumps(prompt_token_ids, indent=2) + "\n", encoding="utf-8")
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(metadata, indent=2))
