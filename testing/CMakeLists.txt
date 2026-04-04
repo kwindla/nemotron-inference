@@ -661,6 +661,22 @@ target_compile_features(runtime_environment_test PRIVATE cxx_std_17)
 nemotron_add_test(runtime_environment_test)
 
 add_executable(
+  manifest_backed_test_gate
+  api/manifest_backed_test_gate.cpp
+)
+
+target_compile_features(manifest_backed_test_gate PRIVATE cxx_std_17)
+
+if(NEMOTRON_RUNTIME_ENFORCE_MANIFEST_BACKED_TESTS)
+  nemotron_add_test(manifest_backed_test_gate)
+  set_tests_properties(
+    manifest_backed_test_gate
+    PROPERTIES
+      FIXTURES_SETUP manifest_backed_forward_manifest_ready
+  )
+endif()
+
+add_executable(
   full_forward_manifest_smoke_test
   api/full_forward_manifest_smoke_test.cpp
 )
@@ -669,6 +685,13 @@ target_link_libraries(full_forward_manifest_smoke_test PRIVATE nemotron_runtime_
 target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_17)
 
 nemotron_add_test(full_forward_manifest_smoke_test)
+if(NEMOTRON_RUNTIME_ENFORCE_MANIFEST_BACKED_TESTS)
+  set_tests_properties(
+    full_forward_manifest_smoke_test
+    PROPERTIES
+      FIXTURES_REQUIRED manifest_backed_forward_manifest_ready
+  )
+endif()
 
 add_executable(
   cache_backed_dense_regression_test
@@ -709,6 +732,13 @@ target_compile_definitions(
 )
 
 nemotron_add_test(single_token_decode_oracle_test)
+if(NEMOTRON_RUNTIME_ENFORCE_MANIFEST_BACKED_TESTS)
+  set_tests_properties(
+    single_token_decode_oracle_test
+    PROPERTIES
+      FIXTURES_REQUIRED manifest_backed_forward_manifest_ready
+  )
+endif()
 
 add_executable(
   expert_layer3_prefix_replay_test
