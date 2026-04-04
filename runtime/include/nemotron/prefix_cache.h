@@ -24,22 +24,15 @@ struct SerializedPromptIdentity {
   bool reasoning_mode = false;
 };
 
-enum class ConversationCheckpointKind {
-  kCommittedHead,
-  kPromptHead,
-};
-
 enum class CacheMatchSource {
   kNone,
   kConversationCommittedHead,
-  kConversationPromptHead,
   kGlobalRoot,
 };
 
 struct CacheLookupRequest {
   SerializedPromptIdentity identity;
   std::optional<std::string> conversation_id;
-  bool allow_prompt_head = false;
 };
 
 struct CacheMatch {
@@ -57,7 +50,6 @@ struct CacheEntryView {
   ReusableStateDescriptor state;
   bool is_global_root = false;
   std::vector<std::string> committed_conversations;
-  std::vector<std::string> prompt_conversations;
   std::uint64_t last_access_tick = 0;
   std::size_t total_bytes = 0;
   bool has_boundary_logits = false;
@@ -75,15 +67,16 @@ class PrefixCache {
   PrefixCache(PrefixCache&&) noexcept;
   PrefixCache& operator=(PrefixCache&&) noexcept;
 
+  // Conversation heads are committed boundaries only. Uncommitted prompt-head
+  // lookups were removed from the production API because the runtime does not
+  // use them on the hot path.
   PrefixNodeId PublishConversationHead(
       const std::string& conversation_id,
-      ConversationCheckpointKind checkpoint_kind,
       const SerializedPromptIdentity& identity,
       const ReusableStateDescriptor& state,
       const std::vector<float>* boundary_logits = nullptr);
   PrefixNodeId PublishConversationHeadSnapshot(
       const std::string& conversation_id,
-      ConversationCheckpointKind checkpoint_kind,
       const SerializedPromptIdentity& identity,
       const RequestExecutionContext& request_context,
       const std::string& state_label,
@@ -107,7 +100,6 @@ class PrefixCache {
   void Clear();
 
   std::optional<PrefixNodeId> CommittedHeadForConversation(const std::string& conversation_id) const;
-  std::optional<PrefixNodeId> PromptHeadForConversation(const std::string& conversation_id) const;
   std::optional<CacheEntryView> Describe(PrefixNodeId node_id) const;
 
   std::size_t current_bytes() const;
@@ -123,15 +115,9 @@ class PrefixCache {
       const ReusableStateDescriptor& state,
       const std::vector<float>* boundary_logits);
   void Touch(PrefixNodeId node_id);
-  void AssignConversationHead(
-      PrefixNodeId node_id,
-      const std::string& conversation_id,
-      ConversationCheckpointKind checkpoint_kind);
+  void AssignConversationHead(PrefixNodeId node_id, const std::string& conversation_id);
   void AssignGlobalRoot(PrefixNodeId node_id);
-  void RemoveConversationRole(
-      PrefixNodeId node_id,
-      const std::string& conversation_id,
-      ConversationCheckpointKind checkpoint_kind);
+  void RemoveConversationRole(PrefixNodeId node_id, const std::string& conversation_id);
   void EvictToBudget();
   bool PrefixMatches(const SerializedPromptIdentity& cached, const SerializedPromptIdentity& request) const;
   std::size_t PrefixMatchLength(

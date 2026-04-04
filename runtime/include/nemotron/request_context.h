@@ -54,6 +54,8 @@ class RequestExecutionContext {
   bool EnsureAttentionTokens(std::size_t token_count);
   std::size_t allocated_kv_pages() const;
   std::size_t allocated_kv_pages(std::size_t layer_index) const;
+  // These page handles are the live request-owned KV allocation. Snapshots copy
+  // the bytes out of these pages; they do not share or retain page ownership.
   const std::vector<KvPageHandle>* kv_pages(std::size_t layer_index) const;
 
   bool SetSequenceLength(std::size_t sequence_length);

@@ -15,7 +15,6 @@ namespace {
 using nemotron::AttentionKvCacheConfig;
 using nemotron::CacheLookupRequest;
 using nemotron::CacheMatchSource;
-using nemotron::ConversationCheckpointKind;
 using nemotron::KvCacheDataType;
 using nemotron::PrefixCache;
 using nemotron::RequestExecutionConfig;
@@ -108,7 +107,6 @@ bool test_conversation_head_hit() {
   PrefixCache cache(/*max_bytes=*/1 << 20);
   const auto node_id = cache.PublishConversationHead(
       "conv-1",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({1, 2, 3, 4}),
       make_state(11, 21));
 
@@ -128,7 +126,6 @@ bool test_exact_conversation_cache_hit_reports_full_length() {
   PrefixCache cache(/*max_bytes=*/1 << 20);
   const auto node_id = cache.PublishConversationHead(
       "conv-exact",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({42, 43, 44, 45}),
       make_state(111, 222));
 
@@ -146,31 +143,6 @@ bool test_exact_conversation_cache_hit_reports_full_length() {
          expect(
              match.matched_token_count == request.identity.token_ids.size(),
              "exact lookup should report the full cached token count");
-}
-
-bool test_prompt_head_preferred() {
-  PrefixCache cache(/*max_bytes=*/1 << 20);
-  cache.PublishConversationHead(
-      "conv-2",
-      ConversationCheckpointKind::kCommittedHead,
-      make_identity({10, 20, 30}),
-      make_state(12, 22));
-  const auto prompt_node = cache.PublishConversationHead(
-      "conv-2",
-      ConversationCheckpointKind::kPromptHead,
-      make_identity({10, 20, 30, 40, 50}),
-      make_state(13, 23));
-
-  CacheLookupRequest request;
-  request.identity = make_identity({10, 20, 30, 40, 50});
-  request.conversation_id = "conv-2";
-  request.allow_prompt_head = true;
-  const auto match = cache.Lookup(request);
-
-  return expect(prompt_node != 0, "prompt head publish should succeed") &&
-         expect(match.hit(), "prompt head should hit") &&
-         expect(match.source == CacheMatchSource::kConversationPromptHead, "match source should be prompt head") &&
-         expect(match.node_id == prompt_node, "matched node should be prompt head");
 }
 
 bool test_global_root_fallback() {
@@ -197,7 +169,6 @@ bool test_conversation_fallback_to_global_root() {
       make_state(30, 40));
   cache.PublishConversationHead(
       "conv-lookup",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({9, 9, 9}),
       make_state(31, 41));
 
@@ -232,29 +203,36 @@ bool test_global_root_longest_prefix() {
          expect(match.matched_token_count == 4, "lookup should report the longest prefix length");
 }
 
-bool test_prompt_head_requires_opt_in() {
-  PrefixCache cache(/*max_bytes=*/1 << 20);
-  const auto committed_node = cache.PublishConversationHead(
-      "conv-2b",
-      ConversationCheckpointKind::kCommittedHead,
+bool test_lookup_refreshes_lru_eviction_order() {
+  PrefixCache cache(/*max_bytes=*/13000);
+  const auto first_node = cache.PublishConversationHead(
+      "conv-lru-1",
       make_identity({10, 20, 30}),
-      make_state(34, 44));
-  cache.PublishConversationHead(
-      "conv-2b",
-      ConversationCheckpointKind::kPromptHead,
-      make_identity({10, 20, 30, 40, 50}),
-      make_state(35, 45));
+      make_state(34, 44, 3000, 3000));
+  const auto second_node = cache.PublishConversationHead(
+      "conv-lru-2",
+      make_identity({40, 50, 60}),
+      make_state(35, 45, 3000, 3000));
 
-  CacheLookupRequest request;
-  request.identity = make_identity({10, 20, 30, 40, 50});
-  request.conversation_id = "conv-2b";
-  const auto match = cache.Lookup(request);
+  CacheLookupRequest refresh_request;
+  refresh_request.identity = make_identity({10, 20, 30, 99});
+  refresh_request.conversation_id = "conv-lru-1";
+  const auto refreshed_match = cache.Lookup(refresh_request);
 
-  return expect(committed_node != 0, "committed head publish should succeed") &&
-         expect(match.hit(), "committed head should still hit when prompt head opt-in is off") &&
-         expect(match.source == CacheMatchSource::kConversationCommittedHead,
-                "prompt head should not be used unless explicitly allowed") &&
-         expect(match.node_id == committed_node, "lookup should fall back to committed head without opt-in");
+  const auto third_node = cache.PublishConversationHead(
+      "conv-lru-3",
+      make_identity({70, 80, 90}),
+      make_state(36, 46, 3000, 3000));
+
+  return expect(first_node != 0 && second_node != 0 && third_node != 0, "LRU test publishes should succeed") &&
+         expect(refreshed_match.hit(), "lookup should refresh the oldest node") &&
+         expect(cache.node_count() == 2, "budget pressure should evict exactly one node") &&
+         expect(cache.CommittedHeadForConversation("conv-lru-1").has_value(),
+                "recently touched node should survive eviction") &&
+         expect(!cache.CommittedHeadForConversation("conv-lru-2").has_value(),
+                "least recently used node should be evicted") &&
+         expect(cache.CommittedHeadForConversation("conv-lru-3").has_value(),
+                "newest node should remain resident");
 }
 
 bool test_serializer_miss() {
@@ -289,7 +267,6 @@ bool test_dedup_identity_across_roles() {
   const auto identity = make_identity({42, 43, 44});
   const auto conversation_node = cache.PublishConversationHead(
       "conv-3",
-      ConversationCheckpointKind::kCommittedHead,
       identity,
       make_state(16, 26));
   const auto global_node = cache.PublishGlobalRoot(identity, make_state(17, 27));
@@ -306,12 +283,10 @@ bool test_eviction_by_bytes_clears_mappings() {
   PrefixCache cache(/*max_bytes=*/7000);
   const auto first_node = cache.PublishConversationHead(
       "conv-4",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({1, 1, 1}),
       make_state(18, 28, 3000, 3000));
   const auto second_node = cache.PublishConversationHead(
       "conv-5",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({2, 2, 2}),
       make_state(19, 29, 3000, 3000));
 
@@ -330,7 +305,6 @@ bool test_cache_eviction_releases_owned_state() {
   const auto first_state = arena.AllocateDescriptor(3000, 3000, "conv-6");
   const auto first_node = cache.PublishConversationHead(
       "conv-6",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({3, 3, 3}),
       first_state);
   arena.Release(first_state);
@@ -338,7 +312,6 @@ bool test_cache_eviction_releases_owned_state() {
   const auto second_state = arena.AllocateDescriptor(3000, 3000, "conv-7");
   const auto second_node = cache.PublishConversationHead(
       "conv-7",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({4, 4, 4}),
       second_state);
   arena.Release(second_state);
@@ -357,7 +330,6 @@ bool test_replacing_node_state_releases_old_owned_state() {
   const auto first_state = arena.AllocateDescriptor(1024, 2048, "conv-8-first");
   const auto node_id = cache.PublishConversationHead(
       "conv-8",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({8, 8, 8}),
       first_state);
   arena.Release(first_state);
@@ -365,7 +337,6 @@ bool test_replacing_node_state_releases_old_owned_state() {
   const auto second_state = arena.AllocateDescriptor(2048, 4096, "conv-8-second");
   const auto updated_node_id = cache.PublishConversationHead(
       "conv-8",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({8, 8, 8}),
       second_state);
   arena.Release(second_state);
@@ -424,7 +395,6 @@ bool test_snapshot_publish_and_restore_round_trip() {
   const std::vector<float> boundary_logits = {0.5f, -1.25f, 3.75f, 2.0f};
   const auto node_id = cache.PublishConversationHeadSnapshot(
       "conv-snapshot",
-      ConversationCheckpointKind::kCommittedHead,
       identity,
       *source,
       "prefix-cache-test",
@@ -476,6 +446,9 @@ bool test_snapshot_publish_and_restore_round_trip() {
   return expect(
              restored->sequence_length() == kTokenCount && restored->decode_position() == kTokenCount,
              "restored snapshot should resume at the cached token boundary") &&
+         expect(
+             source->allocated_kv_pages(0) == 2 && source->allocated_kv_pages(1) == 2,
+             "clearing cached snapshots should not release the live request's KV pages") &&
          expect(same_bf16(restored_key, key_host), "restored key cache should match the cached snapshot exactly") &&
          expect(
              same_bf16(restored_value, value_host),
@@ -494,11 +467,10 @@ int main() {
   const bool ok =
       test_conversation_head_hit() &&
       test_exact_conversation_cache_hit_reports_full_length() &&
-      test_prompt_head_preferred() &&
       test_global_root_fallback() &&
       test_conversation_fallback_to_global_root() &&
       test_global_root_longest_prefix() &&
-      test_prompt_head_requires_opt_in() &&
+      test_lookup_refreshes_lru_eviction_order() &&
       test_serializer_miss() &&
       test_namespace_isolation() &&
       test_dedup_identity_across_roles() &&

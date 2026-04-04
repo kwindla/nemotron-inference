@@ -1194,7 +1194,6 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
         result->generated_token_ids.end());
     impl_->prefix_cache->PublishConversationHeadSnapshot(
         conversation_id,
-        ConversationCheckpointKind::kCommittedHead,
         committed_identity,
         request_context,
         conversation_id + "/committed",

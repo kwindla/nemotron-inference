@@ -383,8 +383,6 @@ const char* MatchSourceName(nemotron::CacheMatchSource source) {
       return "none";
     case nemotron::CacheMatchSource::kConversationCommittedHead:
       return "conversation_committed_head";
-    case nemotron::CacheMatchSource::kConversationPromptHead:
-      return "conversation_prompt_head";
     case nemotron::CacheMatchSource::kGlobalRoot:
       return "global_root";
   }
@@ -684,7 +682,6 @@ std::optional<SeededCacheState> SeedPrefixCache(
   if (scenario == Scenario::kCommittedHead) {
     node_id = prefix_cache.PublishConversationHeadSnapshot(
         conversation_id,
-        nemotron::ConversationCheckpointKind::kCommittedHead,
         prefix_identity,
         *request_context,
         conversation_id + "/seed",
@@ -841,7 +838,6 @@ std::optional<IterationMetrics> RunResumeIteration(
           [&]() {
             return prefix_cache.PublishConversationHeadSnapshot(
                        conversation_id,
-                       nemotron::ConversationCheckpointKind::kCommittedHead,
                        committed_identity,
                        *request_context,
                        conversation_id + "/committed",

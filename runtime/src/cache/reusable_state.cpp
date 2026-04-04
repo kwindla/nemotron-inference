@@ -2,6 +2,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <limits>
+#include <map>
 #include <unordered_map>
 #include <utility>
 
@@ -17,6 +20,52 @@ bool HasCudaDevice() {
   return CheckCuda(cudaGetDeviceCount(&device_count)) && device_count > 0;
 }
 
+void* ByteOffset(void* base, std::size_t offset) {
+  return static_cast<std::byte*>(base) + offset;
+}
+
+const void* ByteOffset(const void* base, std::size_t offset) {
+  return static_cast<const std::byte*>(base) + offset;
+}
+
+std::map<std::size_t, std::size_t>::iterator FindFirstFit(
+    std::map<std::size_t, std::size_t>& free_regions,
+    std::size_t bytes) {
+  for (auto it = free_regions.begin(); it != free_regions.end(); ++it) {
+    if (it->second >= bytes) {
+      return it;
+    }
+  }
+  return free_regions.end();
+}
+
+void InsertFreeRegion(
+    std::map<std::size_t, std::size_t>& free_regions,
+    std::size_t offset,
+    std::size_t bytes) {
+  if (bytes == 0) {
+    return;
+  }
+
+  auto next = free_regions.lower_bound(offset);
+  if (next != free_regions.begin()) {
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == offset) {
+      offset = prev->first;
+      bytes += prev->second;
+      free_regions.erase(prev);
+    }
+  }
+
+  next = free_regions.lower_bound(offset);
+  if (next != free_regions.end() && offset + bytes == next->first) {
+    bytes += next->second;
+    free_regions.erase(next);
+  }
+
+  free_regions.emplace(offset, bytes);
+}
+
 }  // namespace
 
 struct ReusableStateArena::Impl {
@@ -26,20 +75,35 @@ struct ReusableStateArena::Impl {
     std::string label;
     std::size_t bytes = 0;
     std::size_t ref_count = 0;
-    void* device_ptr = nullptr;
+    std::size_t slab_offset = 0;
   };
 
   ReusableStateId next_id = 1;
   std::size_t current_bytes = 0;
+  void* device_slab = nullptr;
+  bool device_storage_init_failed = false;
   std::unordered_map<ReusableStateId, StateAllocation> allocations;
+  std::map<std::size_t, std::size_t> free_regions;
 };
 
 bool ReusableStateHandle::valid() const {
   return id != 0 && bytes != 0;
 }
 
+bool ReusableStateSnapshotLayout::valid() const {
+  return prefix_token_count != 0 &&
+         live_kv_pages_per_layer != 0 &&
+         hidden_bytes != 0 &&
+         residual_bytes != 0 &&
+         BuildAttentionKvPageGeometry(attention_kv_cache).has_value();
+}
+
 bool ReusableStateDescriptor::valid() const {
   return kv_state.valid() && mamba_state.valid();
+}
+
+bool ReusableStateDescriptor::has_snapshot_layout() const {
+  return snapshot_layout.valid();
 }
 
 std::size_t ReusableStateDescriptor::total_bytes() const {
@@ -47,9 +111,26 @@ std::size_t ReusableStateDescriptor::total_bytes() const {
 }
 
 ReusableStateArena::ReusableStateArena(std::size_t max_bytes)
-    : max_bytes_(max_bytes), impl_(std::make_unique<Impl>()) {}
+    : max_bytes_(max_bytes), impl_(std::make_unique<Impl>()) {
+  if (max_bytes_ != 0) {
+    impl_->free_regions.emplace(0, max_bytes_);
+  }
 
-ReusableStateArena::~ReusableStateArena() = default;
+  if (!HasCudaDevice() || max_bytes_ == 0) {
+    return;
+  }
+
+  if (!CheckCuda(cudaMalloc(&impl_->device_slab, max_bytes_))) {
+    impl_->device_storage_init_failed = true;
+  }
+}
+
+ReusableStateArena::~ReusableStateArena() {
+  if (impl_ != nullptr && impl_->device_slab != nullptr) {
+    cudaFree(impl_->device_slab);
+  }
+}
+
 ReusableStateArena::ReusableStateArena(ReusableStateArena&&) noexcept = default;
 ReusableStateArena& ReusableStateArena::operator=(ReusableStateArena&&) noexcept = default;
 
@@ -57,7 +138,28 @@ ReusableStateHandle ReusableStateArena::Allocate(
     ReusableStateKind kind,
     std::size_t bytes,
     const std::string& label) {
-  if (bytes == 0 || impl_->current_bytes + bytes > max_bytes_) {
+  if (bytes == 0 ||
+      bytes > max_bytes_ ||
+      impl_->current_bytes + bytes > max_bytes_ ||
+      impl_->device_storage_init_failed) {
+    return {};
+  }
+
+  auto free_it = FindFirstFit(impl_->free_regions, bytes);
+  if (free_it == impl_->free_regions.end()) {
+    return {};
+  }
+
+  const std::size_t slab_offset = free_it->first;
+  const std::size_t free_bytes = free_it->second;
+  impl_->free_regions.erase(free_it);
+  if (free_bytes > bytes) {
+    impl_->free_regions.emplace(slab_offset + bytes, free_bytes - bytes);
+  }
+
+  if (impl_->device_slab != nullptr &&
+      !CheckCuda(cudaMemset(ByteOffset(impl_->device_slab, slab_offset), 0, bytes))) {
+    InsertFreeRegion(impl_->free_regions, slab_offset, bytes);
     return {};
   }
 
@@ -66,25 +168,14 @@ ReusableStateHandle ReusableStateArena::Allocate(
   handle.kind = kind;
   handle.bytes = bytes;
 
-  void* device_ptr = nullptr;
-  if (HasCudaDevice()) {
-    if (!CheckCuda(cudaMalloc(&device_ptr, bytes))) {
-      return {};
-    }
-    if (!CheckCuda(cudaMemset(device_ptr, 0, bytes))) {
-      cudaFree(device_ptr);
-      return {};
-    }
-  }
-
   impl_->allocations.emplace(handle.id, Impl::StateAllocation{
-                                        handle.id,
-                                        kind,
-                                        label,
-                                        bytes,
-                                        1,
-                                        device_ptr,
-                                    });
+                                            handle.id,
+                                            kind,
+                                            label,
+                                            bytes,
+                                            1,
+                                            slab_offset,
+                                        });
   impl_->current_bytes += bytes;
   return handle;
 }
@@ -113,6 +204,7 @@ ReusableStateDescriptor ReusableStateArena::AllocateDescriptor(
   return ReusableStateDescriptor{
       kv_state,
       mamba_state,
+      {},
   };
 }
 
@@ -162,9 +254,7 @@ void ReusableStateArena::Release(const ReusableStateHandle& handle) {
 
   --it->second.ref_count;
   if (it->second.ref_count == 0) {
-    if (it->second.device_ptr != nullptr) {
-      cudaFree(it->second.device_ptr);
-    }
+    InsertFreeRegion(impl_->free_regions, it->second.slab_offset, it->second.bytes);
     impl_->current_bytes -= it->second.bytes;
     impl_->allocations.erase(it);
   }
@@ -187,10 +277,10 @@ bool ReusableStateArena::CopyFromDevice(
   if (it == impl_->allocations.end() ||
       it->second.kind != handle.kind ||
       it->second.bytes != handle.bytes ||
-      it->second.device_ptr == nullptr) {
+      impl_->device_slab == nullptr) {
     return false;
   }
-  auto* device_dst = static_cast<std::byte*>(it->second.device_ptr) + offset_bytes;
+  void* device_dst = ByteOffset(impl_->device_slab, it->second.slab_offset + offset_bytes);
   return CheckCuda(cudaMemcpy(device_dst, device_src, bytes, cudaMemcpyDeviceToDevice));
 }
 
@@ -206,10 +296,10 @@ bool ReusableStateArena::CopyToDevice(
   if (it == impl_->allocations.end() ||
       it->second.kind != handle.kind ||
       it->second.bytes != handle.bytes ||
-      it->second.device_ptr == nullptr) {
+      impl_->device_slab == nullptr) {
     return false;
   }
-  const auto* device_src = static_cast<const std::byte*>(it->second.device_ptr) + offset_bytes;
+  const void* device_src = ByteOffset(impl_->device_slab, it->second.slab_offset + offset_bytes);
   return CheckCuda(cudaMemcpy(device_dst, device_src, bytes, cudaMemcpyDeviceToDevice));
 }
 
@@ -224,7 +314,7 @@ std::optional<ReusableStateView> ReusableStateArena::Describe(ReusableStateId id
       it->second.label,
       it->second.bytes,
       it->second.ref_count,
-      it->second.device_ptr != nullptr,
+      impl_->device_slab != nullptr,
   };
 }
 

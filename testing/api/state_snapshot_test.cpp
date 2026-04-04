@@ -546,6 +546,17 @@ bool test_snapshot_restore_round_trips_request_state() {
     return false;
   }
   if (!expect(
+          descriptor->has_snapshot_layout(),
+          "snapshot descriptor should record prefix-layout metadata") ||
+      !expect(
+          descriptor->snapshot_layout.prefix_token_count == kTokenCount,
+          "snapshot descriptor should record the cached prefix length") ||
+      !expect(
+          descriptor->snapshot_layout.live_kv_pages_per_layer == 2,
+          "snapshot descriptor should record the live KV-page count per layer")) {
+    return false;
+  }
+  if (!expect(
           live_kv_bytes < full_kv_bytes,
           "KV snapshot should shrink below the full cache footprint for partial prefixes") ||
       !expect(
@@ -620,11 +631,72 @@ bool test_snapshot_restore_round_trips_request_state() {
          expect(arena.current_bytes() == 0, "releasing the descriptor should free arena bytes");
 }
 
+bool test_snapshot_restore_rejects_mismatched_prefix_length() {
+  auto source = RequestExecutionContext::Create(make_config());
+  auto restored = RequestExecutionContext::Create(make_config());
+  if (!source || !restored || !source->valid() || !restored->valid()) {
+    std::cout << "state_snapshot_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  constexpr std::size_t kTokenCount = 5;
+  if (!expect(source->SetSequenceLength(kTokenCount), "source request should allocate the cached prefix")) {
+    return false;
+  }
+
+  ReusableStateArena arena(
+      nemotron::RequiredKvSnapshotBytes(*source) +
+      nemotron::RequiredMambaSnapshotBytes(*source));
+  const auto descriptor =
+      nemotron::SnapshotRequestState(arena, *source, "state-snapshot-prefix-mismatch");
+  if (!expect(descriptor.has_value() && descriptor->valid(), "snapshot descriptor should allocate")) {
+    return false;
+  }
+
+  const bool restored_ok =
+      nemotron::RestoreRequestState(arena, *descriptor, kTokenCount + 1, *restored);
+  arena.Release(*descriptor);
+  return expect(!restored_ok, "restore should reject a mismatched cached prefix length");
+}
+
+bool test_snapshot_restore_rejects_mismatched_kv_geometry() {
+  auto source = RequestExecutionContext::Create(make_config());
+  RequestExecutionConfig mismatched_config = make_config();
+  mismatched_config.attention_kv_cache.tokens_per_page = 2;
+  mismatched_config.attention_total_pages = 12;
+  auto restored = RequestExecutionContext::Create(mismatched_config);
+  if (!source || !restored || !source->valid() || !restored->valid()) {
+    std::cout << "state_snapshot_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  constexpr std::size_t kTokenCount = 5;
+  if (!expect(source->SetSequenceLength(kTokenCount), "source request should allocate the cached prefix")) {
+    return false;
+  }
+
+  ReusableStateArena arena(
+      nemotron::RequiredKvSnapshotBytes(*source) +
+      nemotron::RequiredMambaSnapshotBytes(*source));
+  const auto descriptor =
+      nemotron::SnapshotRequestState(arena, *source, "state-snapshot-geometry-mismatch");
+  if (!expect(descriptor.has_value() && descriptor->valid(), "snapshot descriptor should allocate")) {
+    return false;
+  }
+
+  const bool restored_ok =
+      nemotron::RestoreRequestState(arena, *descriptor, kTokenCount, *restored);
+  arena.Release(*descriptor);
+  return expect(!restored_ok, "restore should reject a target request with mismatched KV geometry");
+}
+
 }  // namespace
 
 int main() {
   if (!test_snapshot_restore_round_trips_request_state() ||
-      !test_mamba_snapshot_restore_continuation_matches_cold_execution()) {
+      !test_mamba_snapshot_restore_continuation_matches_cold_execution() ||
+      !test_snapshot_restore_rejects_mismatched_prefix_length() ||
+      !test_snapshot_restore_rejects_mismatched_kv_geometry()) {
     return 1;
   }
   std::cout << "state_snapshot_test: PASS\n";

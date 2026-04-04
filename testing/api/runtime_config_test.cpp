@@ -10,7 +10,6 @@
 namespace {
 
 using nemotron::CacheLookupRequest;
-using nemotron::ConversationCheckpointKind;
 using nemotron::PrefixCache;
 using nemotron::ReusableStateArena;
 using nemotron::RuntimeConfig;
@@ -92,7 +91,6 @@ bool test_disabled_cache_bypasses_lookup_and_publish() {
 
   const auto node_id = cache.PublishConversationHead(
       "conv-disabled",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({1, 2, 3}),
       {});
   CacheLookupRequest request;
@@ -113,7 +111,6 @@ bool test_disabling_cache_clears_owned_state() {
   const auto descriptor = arena.AllocateDescriptor(1024, 2048, "runtime-config");
   const auto node_id = cache.PublishConversationHead(
       "conv-owned",
-      ConversationCheckpointKind::kCommittedHead,
       make_identity({9, 9, 9}),
       descriptor);
   arena.Release(descriptor);

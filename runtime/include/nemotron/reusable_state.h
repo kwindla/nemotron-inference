@@ -6,6 +6,8 @@
 #include <optional>
 #include <string>
 
+#include "nemotron/paged_kv_cache.h"
+
 namespace nemotron {
 
 using ReusableStateId = std::uint64_t;
@@ -29,17 +31,48 @@ inline bool operator==(const ReusableStateHandle& lhs, const ReusableStateHandle
          lhs.bytes == rhs.bytes;
 }
 
+struct ReusableStateSnapshotLayout {
+  std::size_t prefix_token_count = 0;
+  AttentionKvCacheConfig attention_kv_cache;
+  std::size_t live_kv_pages_per_layer = 0;
+  std::size_t hidden_bytes = 0;
+  std::size_t residual_bytes = 0;
+  std::size_t mamba_conv_bytes = 0;
+  std::size_t mamba_ssm_bytes = 0;
+
+  bool valid() const;
+};
+
+inline bool operator==(
+    const ReusableStateSnapshotLayout& lhs,
+    const ReusableStateSnapshotLayout& rhs) {
+  return lhs.prefix_token_count == rhs.prefix_token_count &&
+         lhs.attention_kv_cache.layer_count == rhs.attention_kv_cache.layer_count &&
+         lhs.attention_kv_cache.kv_head_count == rhs.attention_kv_cache.kv_head_count &&
+         lhs.attention_kv_cache.head_dim == rhs.attention_kv_cache.head_dim &&
+         lhs.attention_kv_cache.tokens_per_page == rhs.attention_kv_cache.tokens_per_page &&
+         lhs.attention_kv_cache.dtype == rhs.attention_kv_cache.dtype &&
+         lhs.live_kv_pages_per_layer == rhs.live_kv_pages_per_layer &&
+         lhs.hidden_bytes == rhs.hidden_bytes &&
+         lhs.residual_bytes == rhs.residual_bytes &&
+         lhs.mamba_conv_bytes == rhs.mamba_conv_bytes &&
+         lhs.mamba_ssm_bytes == rhs.mamba_ssm_bytes;
+}
+
 struct ReusableStateDescriptor {
   ReusableStateHandle kv_state;
   ReusableStateHandle mamba_state;
+  ReusableStateSnapshotLayout snapshot_layout;
 
   bool valid() const;
+  bool has_snapshot_layout() const;
   std::size_t total_bytes() const;
 };
 
 inline bool operator==(const ReusableStateDescriptor& lhs, const ReusableStateDescriptor& rhs) {
   return lhs.kv_state == rhs.kv_state &&
-         lhs.mamba_state == rhs.mamba_state;
+         lhs.mamba_state == rhs.mamba_state &&
+         lhs.snapshot_layout == rhs.snapshot_layout;
 }
 
 struct ReusableStateView {
@@ -53,6 +86,9 @@ struct ReusableStateView {
 
 class ReusableStateArena {
  public:
+  // The arena owns a recycled slab of snapshot storage. RequestExecutionContext
+  // keeps ownership of live KV page tables and tensors; snapshots are copied
+  // into this arena and restored back into freshly allocated live pages.
   explicit ReusableStateArena(std::size_t max_bytes);
   ~ReusableStateArena();
 

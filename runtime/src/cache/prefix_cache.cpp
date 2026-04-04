@@ -3,10 +3,14 @@
 #include "nemotron/state_snapshot.h"
 
 #include <algorithm>
-#include <limits>
+#include <cstdint>
+#include <iostream>
+#include <list>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace nemotron {
 namespace {
@@ -49,6 +53,45 @@ bool same_identity(const SerializedPromptIdentity& lhs, const SerializedPromptId
          lhs.token_ids == rhs.token_ids;
 }
 
+struct IdentityScopeKey {
+  std::string tenant_namespace;
+  std::string tokenizer_revision;
+  std::string serializer_revision;
+  std::string model_revision;
+  bool reasoning_mode = false;
+};
+
+bool operator==(const IdentityScopeKey& lhs, const IdentityScopeKey& rhs) {
+  return lhs.reasoning_mode == rhs.reasoning_mode &&
+         lhs.tenant_namespace == rhs.tenant_namespace &&
+         lhs.tokenizer_revision == rhs.tokenizer_revision &&
+         lhs.serializer_revision == rhs.serializer_revision &&
+         lhs.model_revision == rhs.model_revision;
+}
+
+struct IdentityScopeKeyHash {
+  std::size_t operator()(const IdentityScopeKey& key) const {
+    constexpr std::uint64_t kFnvOffsetBasis = 1469598103934665603ull;
+    std::uint64_t hash = kFnvOffsetBasis;
+    hash = hash_string(hash, key.tenant_namespace);
+    hash = hash_string(hash, key.tokenizer_revision);
+    hash = hash_string(hash, key.serializer_revision);
+    hash = hash_string(hash, key.model_revision);
+    hash = fnv1a_append(hash, key.reasoning_mode ? 1u : 0u);
+    return static_cast<std::size_t>(hash);
+  }
+};
+
+IdentityScopeKey make_identity_scope_key(const SerializedPromptIdentity& identity) {
+  return IdentityScopeKey{
+      identity.tenant_namespace,
+      identity.tokenizer_revision,
+      identity.serializer_revision,
+      identity.model_revision,
+      identity.reasoning_mode,
+  };
+}
+
 std::vector<std::string> sorted_strings(const std::unordered_set<std::string>& values) {
   std::vector<std::string> result(values.begin(), values.end());
   std::sort(result.begin(), result.end());
@@ -68,9 +111,21 @@ std::size_t node_bytes(
          (boundary_logits.size() * sizeof(float));
 }
 
+bool snapshot_prefix_matches_identity(
+    const SerializedPromptIdentity& identity,
+    const ReusableStateDescriptor& state) {
+  return !state.has_snapshot_layout() ||
+         state.snapshot_layout.prefix_token_count == identity.token_ids.size();
+}
+
 }  // namespace
 
 struct PrefixCache::Impl {
+  struct GlobalRootTrieNode {
+    PrefixNodeId terminal_node_id = 0;
+    std::unordered_map<TokenId, std::unique_ptr<GlobalRootTrieNode>> children;
+  };
+
   struct CacheNode {
     PrefixNodeId id = 0;
     SerializedPromptIdentity identity;
@@ -79,18 +134,20 @@ struct PrefixCache::Impl {
     bool is_global_root = false;
     std::vector<float> boundary_logits;
     std::unordered_set<std::string> committed_conversations;
-    std::unordered_set<std::string> prompt_conversations;
     std::uint64_t last_access_tick = 0;
     std::size_t total_bytes = 0;
+    std::list<PrefixNodeId>::iterator lru_it;
   };
 
   std::size_t current_bytes = 0;
+  std::size_t global_root_count = 0;
   std::uint64_t tick = 1;
   PrefixNodeId next_node_id = 1;
   std::unordered_map<PrefixNodeId, CacheNode> nodes;
   std::unordered_multimap<std::uint64_t, PrefixNodeId> nodes_by_fingerprint;
   std::unordered_map<std::string, PrefixNodeId> committed_heads;
-  std::unordered_map<std::string, PrefixNodeId> prompt_heads;
+  std::unordered_map<IdentityScopeKey, GlobalRootTrieNode, IdentityScopeKeyHash> global_root_tries;
+  std::list<PrefixNodeId> lru_nodes;
   ReusableStateArena* state_arena = nullptr;
   bool enabled = true;
 
@@ -105,16 +162,16 @@ struct PrefixCache::Impl {
       }
     }
     current_bytes = 0;
+    global_root_count = 0;
     nodes.clear();
     nodes_by_fingerprint.clear();
     committed_heads.clear();
-    prompt_heads.clear();
+    global_root_tries.clear();
+    lru_nodes.clear();
   }
 
   bool NodeHasRoles(const CacheNode& node) const {
-    return node.is_global_root ||
-           !node.committed_conversations.empty() ||
-           !node.prompt_conversations.empty();
+    return node.is_global_root || !node.committed_conversations.empty();
   }
 
   void EraseFromFingerprintIndex(const CacheNode& node) {
@@ -125,6 +182,78 @@ struct PrefixCache::Impl {
         return;
       }
     }
+  }
+
+  void InsertGlobalRoot(const CacheNode& node) {
+    auto& trie = global_root_tries[make_identity_scope_key(node.identity)];
+    GlobalRootTrieNode* current = &trie;
+    for (TokenId token : node.identity.token_ids) {
+      auto& child = current->children[token];
+      if (child == nullptr) {
+        child = std::make_unique<GlobalRootTrieNode>();
+      }
+      current = child.get();
+    }
+    current->terminal_node_id = node.id;
+  }
+
+  void RemoveGlobalRoot(const CacheNode& node) {
+    auto root_it = global_root_tries.find(make_identity_scope_key(node.identity));
+    if (root_it == global_root_tries.end()) {
+      return;
+    }
+
+    GlobalRootTrieNode* current = &root_it->second;
+    std::vector<std::pair<GlobalRootTrieNode*, TokenId>> path;
+    path.reserve(node.identity.token_ids.size());
+    for (TokenId token : node.identity.token_ids) {
+      auto child_it = current->children.find(token);
+      if (child_it == current->children.end()) {
+        return;
+      }
+      path.emplace_back(current, token);
+      current = child_it->second.get();
+    }
+    if (current->terminal_node_id != node.id) {
+      return;
+    }
+    current->terminal_node_id = 0;
+
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+      auto child_it = it->first->children.find(it->second);
+      if (child_it == it->first->children.end()) {
+        continue;
+      }
+      if (child_it->second->terminal_node_id != 0 || !child_it->second->children.empty()) {
+        break;
+      }
+      it->first->children.erase(child_it);
+    }
+
+    if (root_it->second.terminal_node_id == 0 && root_it->second.children.empty()) {
+      global_root_tries.erase(root_it);
+    }
+  }
+
+  PrefixNodeId LookupGlobalRoot(const SerializedPromptIdentity& identity) const {
+    auto root_it = global_root_tries.find(make_identity_scope_key(identity));
+    if (root_it == global_root_tries.end()) {
+      return 0;
+    }
+
+    const GlobalRootTrieNode* current = &root_it->second;
+    PrefixNodeId best_node_id = current->terminal_node_id;
+    for (TokenId token : identity.token_ids) {
+      auto child_it = current->children.find(token);
+      if (child_it == current->children.end()) {
+        break;
+      }
+      current = child_it->second.get();
+      if (current->terminal_node_id != 0) {
+        best_node_id = current->terminal_node_id;
+      }
+    }
+    return best_node_id;
   }
 
   void RemoveNode(PrefixNodeId node_id) {
@@ -140,17 +269,16 @@ struct PrefixCache::Impl {
         committed_heads.erase(head_it);
       }
     }
-    for (const std::string& conversation_id : node.prompt_conversations) {
-      auto head_it = prompt_heads.find(conversation_id);
-      if (head_it != prompt_heads.end() && head_it->second == node_id) {
-        prompt_heads.erase(head_it);
-      }
+    if (node.is_global_root) {
+      RemoveGlobalRoot(node);
+      --global_root_count;
     }
 
     if (state_arena != nullptr) {
       state_arena->Release(node.state);
     }
     EraseFromFingerprintIndex(node);
+    lru_nodes.erase(node.lru_it);
     current_bytes -= node.total_bytes;
     nodes.erase(node_it);
   }
@@ -181,25 +309,30 @@ PrefixCache& PrefixCache::operator=(PrefixCache&&) noexcept = default;
 
 PrefixNodeId PrefixCache::PublishConversationHead(
     const std::string& conversation_id,
-    ConversationCheckpointKind checkpoint_kind,
     const SerializedPromptIdentity& identity,
     const ReusableStateDescriptor& state,
     const std::vector<float>* boundary_logits) {
   if (!impl_->enabled) {
     return 0;
   }
+  if (!snapshot_prefix_matches_identity(identity, state)) {
+    std::cerr << "prefix_cache: rejecting conversation head publish: snapshot prefix length "
+              << state.snapshot_layout.prefix_token_count
+              << " does not match identity token count "
+              << identity.token_ids.size() << "\n";
+    return 0;
+  }
   const PrefixNodeId node_id = FindOrCreateNode(identity, state, boundary_logits);
   if (node_id == 0) {
     return 0;
   }
-  AssignConversationHead(node_id, conversation_id, checkpoint_kind);
+  AssignConversationHead(node_id, conversation_id);
   EvictToBudget();
   return Describe(node_id).has_value() ? node_id : 0;
 }
 
 PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
     const std::string& conversation_id,
-    ConversationCheckpointKind checkpoint_kind,
     const SerializedPromptIdentity& identity,
     const RequestExecutionContext& request_context,
     const std::string& state_label,
@@ -211,9 +344,16 @@ PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
   if (!state.has_value()) {
     return 0;
   }
+  if (!snapshot_prefix_matches_identity(identity, *state)) {
+    std::cerr << "prefix_cache: rejecting conversation snapshot publish: snapshot prefix length "
+              << state->snapshot_layout.prefix_token_count
+              << " does not match identity token count "
+              << identity.token_ids.size() << "\n";
+    impl_->state_arena->Release(*state);
+    return 0;
+  }
   const PrefixNodeId node_id = PublishConversationHead(
       conversation_id,
-      checkpoint_kind,
       identity,
       *state,
       boundary_logits);
@@ -226,6 +366,13 @@ PrefixNodeId PrefixCache::PublishGlobalRoot(
     const ReusableStateDescriptor& state,
     const std::vector<float>* boundary_logits) {
   if (!impl_->enabled) {
+    return 0;
+  }
+  if (!snapshot_prefix_matches_identity(identity, state)) {
+    std::cerr << "prefix_cache: rejecting global-root publish: snapshot prefix length "
+              << state.snapshot_layout.prefix_token_count
+              << " does not match identity token count "
+              << identity.token_ids.size() << "\n";
     return 0;
   }
   const PrefixNodeId node_id = FindOrCreateNode(identity, state, boundary_logits);
@@ -249,6 +396,14 @@ PrefixNodeId PrefixCache::PublishGlobalRootSnapshot(
   if (!state.has_value()) {
     return 0;
   }
+  if (!snapshot_prefix_matches_identity(identity, *state)) {
+    std::cerr << "prefix_cache: rejecting global-root snapshot publish: snapshot prefix length "
+              << state->snapshot_layout.prefix_token_count
+              << " does not match identity token count "
+              << identity.token_ids.size() << "\n";
+    impl_->state_arena->Release(*state);
+    return 0;
+  }
   const PrefixNodeId node_id = PublishGlobalRoot(identity, *state, boundary_logits);
   impl_->state_arena->Release(*state);
   return node_id;
@@ -270,14 +425,6 @@ CacheMatch PrefixCache::Lookup(const CacheLookupRequest& request) {
   };
 
   if (request.conversation_id.has_value()) {
-    if (request.allow_prompt_head) {
-      auto prompt_it = impl_->prompt_heads.find(*request.conversation_id);
-      if (prompt_it != impl_->prompt_heads.end() &&
-          PrefixMatches(impl_->nodes.at(prompt_it->second).identity, request.identity)) {
-        return build_match(prompt_it->second, CacheMatchSource::kConversationPromptHead);
-      }
-    }
-
     auto committed_it = impl_->committed_heads.find(*request.conversation_id);
     if (committed_it != impl_->committed_heads.end() &&
         PrefixMatches(impl_->nodes.at(committed_it->second).identity, request.identity)) {
@@ -285,22 +432,7 @@ CacheMatch PrefixCache::Lookup(const CacheLookupRequest& request) {
     }
   }
 
-  PrefixNodeId best_node_id = 0;
-  std::size_t best_match_length = 0;
-  for (const auto& [node_id, node] : impl_->nodes) {
-    if (!node.is_global_root) {
-      continue;
-    }
-    if (!PrefixMatches(node.identity, request.identity)) {
-      continue;
-    }
-    const std::size_t match_length = node.identity.token_ids.size();
-    if (match_length > best_match_length) {
-      best_match_length = match_length;
-      best_node_id = node_id;
-    }
-  }
-
+  const PrefixNodeId best_node_id = impl_->LookupGlobalRoot(request.identity);
   if (best_node_id != 0) {
     return build_match(best_node_id, CacheMatchSource::kGlobalRoot);
   }
@@ -313,6 +445,21 @@ bool PrefixCache::RestoreMatchState(const CacheMatch& match, RequestExecutionCon
       !match.hit() ||
       !match.state.valid() ||
       match.matched_token_count == 0) {
+    return false;
+  }
+  if (!match.state.has_snapshot_layout()) {
+    std::cerr << "prefix_cache: restore rejected for node "
+              << match.node_id
+              << ": cached state does not carry snapshot layout metadata\n";
+    return false;
+  }
+  if (match.state.snapshot_layout.prefix_token_count != match.matched_token_count) {
+    std::cerr << "prefix_cache: restore rejected for node "
+              << match.node_id
+              << ": cached snapshot prefix length "
+              << match.state.snapshot_layout.prefix_token_count
+              << " does not match cache identity length "
+              << match.matched_token_count << "\n";
     return false;
   }
   return RestoreRequestState(
@@ -356,14 +503,6 @@ std::optional<PrefixNodeId> PrefixCache::CommittedHeadForConversation(const std:
   return it->second;
 }
 
-std::optional<PrefixNodeId> PrefixCache::PromptHeadForConversation(const std::string& conversation_id) const {
-  auto it = impl_->prompt_heads.find(conversation_id);
-  if (it == impl_->prompt_heads.end()) {
-    return std::nullopt;
-  }
-  return it->second;
-}
-
 std::optional<CacheEntryView> PrefixCache::Describe(PrefixNodeId node_id) const {
   auto it = impl_->nodes.find(node_id);
   if (it == impl_->nodes.end()) {
@@ -376,7 +515,6 @@ std::optional<CacheEntryView> PrefixCache::Describe(PrefixNodeId node_id) const 
       node.state,
       node.is_global_root,
       sorted_strings(node.committed_conversations),
-      sorted_strings(node.prompt_conversations),
       node.last_access_tick,
       node.total_bytes,
       !node.boundary_logits.empty(),
@@ -397,13 +535,7 @@ std::size_t PrefixCache::node_count() const {
 }
 
 std::size_t PrefixCache::global_root_count() const {
-  std::size_t count = 0;
-  for (const auto& [_, node] : impl_->nodes) {
-    if (node.is_global_root) {
-      ++count;
-    }
-  }
-  return count;
+  return impl_->global_root_count;
 }
 
 PrefixNodeId PrefixCache::FindOrCreateNode(
@@ -458,6 +590,9 @@ PrefixNodeId PrefixCache::FindOrCreateNode(
   node.last_access_tick = impl_->tick++;
   impl_->current_bytes += node.total_bytes;
 
+  impl_->lru_nodes.push_back(node.id);
+  node.lru_it = std::prev(impl_->lru_nodes.end());
+
   impl_->nodes_by_fingerprint.emplace(node.fingerprint, node.id);
   impl_->nodes.emplace(node.id, std::move(node));
   return node.id;
@@ -469,68 +604,46 @@ void PrefixCache::Touch(PrefixNodeId node_id) {
     return;
   }
   it->second.last_access_tick = impl_->tick++;
+  impl_->lru_nodes.splice(impl_->lru_nodes.end(), impl_->lru_nodes, it->second.lru_it);
 }
 
-void PrefixCache::AssignConversationHead(
-    PrefixNodeId node_id,
-    const std::string& conversation_id,
-    ConversationCheckpointKind checkpoint_kind) {
-  auto* head_map =
-      checkpoint_kind == ConversationCheckpointKind::kCommittedHead ? &impl_->committed_heads : &impl_->prompt_heads;
-  auto existing_it = head_map->find(conversation_id);
-  if (existing_it != head_map->end() && existing_it->second != node_id) {
-    RemoveConversationRole(existing_it->second, conversation_id, checkpoint_kind);
+void PrefixCache::AssignConversationHead(PrefixNodeId node_id, const std::string& conversation_id) {
+  auto existing_it = impl_->committed_heads.find(conversation_id);
+  if (existing_it != impl_->committed_heads.end() && existing_it->second != node_id) {
+    RemoveConversationRole(existing_it->second, conversation_id);
   }
-  (*head_map)[conversation_id] = node_id;
+  impl_->committed_heads[conversation_id] = node_id;
 
   Impl::CacheNode& node = impl_->nodes.at(node_id);
-  if (checkpoint_kind == ConversationCheckpointKind::kCommittedHead) {
-    node.committed_conversations.insert(conversation_id);
-  } else {
-    node.prompt_conversations.insert(conversation_id);
-  }
+  node.committed_conversations.insert(conversation_id);
   Touch(node_id);
 }
 
 void PrefixCache::AssignGlobalRoot(PrefixNodeId node_id) {
   Impl::CacheNode& node = impl_->nodes.at(node_id);
-  node.is_global_root = true;
+  if (!node.is_global_root) {
+    node.is_global_root = true;
+    impl_->InsertGlobalRoot(node);
+    ++impl_->global_root_count;
+  }
   Touch(node_id);
 }
 
-void PrefixCache::RemoveConversationRole(
-    PrefixNodeId node_id,
-    const std::string& conversation_id,
-    ConversationCheckpointKind checkpoint_kind) {
+void PrefixCache::RemoveConversationRole(PrefixNodeId node_id, const std::string& conversation_id) {
   auto node_it = impl_->nodes.find(node_id);
   if (node_it == impl_->nodes.end()) {
     return;
   }
   Impl::CacheNode& node = node_it->second;
-  if (checkpoint_kind == ConversationCheckpointKind::kCommittedHead) {
-    node.committed_conversations.erase(conversation_id);
-  } else {
-    node.prompt_conversations.erase(conversation_id);
-  }
+  node.committed_conversations.erase(conversation_id);
   if (!impl_->NodeHasRoles(node)) {
     impl_->RemoveNode(node_id);
   }
 }
 
 void PrefixCache::EvictToBudget() {
-  while (impl_->current_bytes > max_bytes_ && !impl_->nodes.empty()) {
-    auto victim_it = impl_->nodes.end();
-    std::uint64_t oldest_tick = std::numeric_limits<std::uint64_t>::max();
-    for (auto it = impl_->nodes.begin(); it != impl_->nodes.end(); ++it) {
-      if (it->second.last_access_tick < oldest_tick) {
-        oldest_tick = it->second.last_access_tick;
-        victim_it = it;
-      }
-    }
-    if (victim_it == impl_->nodes.end()) {
-      break;
-    }
-    impl_->RemoveNode(victim_it->first);
+  while (impl_->current_bytes > max_bytes_ && !impl_->lru_nodes.empty()) {
+    impl_->RemoveNode(impl_->lru_nodes.front());
   }
 }
 
