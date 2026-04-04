@@ -1,0 +1,9 @@
+nano_save_prompt_oracle: wrote oracle to proj-2026-04-04-0133/tier2-results/20260404T182537Z/nano_oracle.json prompt_token_count=40 boundary_token_id=1784 generated_token_count=16
+oracle_path=proj-2026-04-04-0133/tier2-results/20260404T182537Z/nano_oracle.json
+prompt_source=prompt_name:short_chat
+prompt_token_count=40
+prompt_token_ids=[10, 25708, 1010, 4568, 1584, 1261, 25399, 27089, 1046, 50856, 15776, 10693, 1046, 11, 1010, 10, 3263, 1010, 15773, 10693, 1278, 3403, 1464, 15187, 6918, 1082, 2918, 46103, 1321, 7545, 2849, 1046, 11, 1010, 10, 1503, 19464, 1010, 12, 1010]
+manifest_path=/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json
+build_dir=/home/khkramer/src/nemotron-inference/build
+git_revision=3accc5abdc93c5c477535553d5eb41aee395c27b
+backend_flags={"NEMOTRON_FORWARD_FUSED_MAMBA_DECODE":"0","NEMOTRON_FORWARD_FUSED_MOE_DECODE":"0","NEMOTRON_FORWARD_MANIFEST":"/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json"}

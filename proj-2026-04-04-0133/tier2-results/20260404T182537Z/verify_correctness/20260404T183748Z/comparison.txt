@@ -1,0 +1,11 @@
+Unified correctness comparison
+baseline=proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/default_backend.oracle.json
+candidate=proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/unified_fused_backend.oracle.json
+atol=0.001
+generated_tokens_match=True
+boundary_token_match=True
+boundary_top5_length_match=True
+boundary_top5_index_match=True
+boundary_top5_max_abs_diff=0.0
+boundary_max_logit_diff=0.0
+pass=True

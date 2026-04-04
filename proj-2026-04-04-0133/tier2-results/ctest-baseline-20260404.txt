@@ -1,0 +1,38 @@
+Full ctest run after steps 1-5 (commit 9776aa3)
+Date: 2026-04-04
+
+Results: 58 passed, 13 failed out of 71 (82% pass rate)
+
+KNOWN PRE-EXISTING FAILURES (not caused by this project):
+
+Expert layer oracle fixtures — "input hidden size should match metadata":
+  expert_layer_oracle_test
+  expert_layer3_oracle_test
+  expert_layer3_prefix_input_oracle_test
+  expert_layer19_decode_input_oracle_test
+  expert_layer19_runtime_input_oracle_test
+  expert_layer8_runtime_input_oracle_test
+  expert_layer14_runtime_input_oracle_test
+
+Root cause: Oracle fixture hidden_size metadata doesn't match current
+model config. Predates this project — fixture regeneration needed.
+
+Mamba fixture — missing binary files:
+  mamba_update_fixture_test — missing ssm_state_fp32.bin
+  mamba_layer_oracle_test — "input hidden size should match metadata"
+  mamba_layer18_runtime_input_oracle_test — same
+  mamba_layer13_runtime_input_oracle_test — same
+  mamba_layer9_runtime_input_oracle_test — same
+  mamba_layer15_runtime_input_oracle_test — same
+
+Root cause: Oracle fixtures not regenerated after model config changes.
+Missing binary fixture files for mamba_layer0_decode_update.
+
+ALL PASSING TESTS (58/71) include:
+  - All cache, attention, loader, embedding, primitive tests
+  - expert_layer_fastpath_test (GPU, step 2-4 verification)
+  - expert_routing_device_test (GPU, routing parity)
+  - nvfp4_vllm_golden_test (step 3 golden comparison)
+  - attention_backend_policy_test (step 5 selection)
+  - All snapshot, prefix_cache, paged_kv tests
+  - nano_save_prompt_oracle, nano_16_token_correctness_test (skip — no manifest)

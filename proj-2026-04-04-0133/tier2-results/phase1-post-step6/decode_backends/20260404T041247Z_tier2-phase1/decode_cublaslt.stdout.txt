@@ -1,0 +1,23 @@
+nano_fused_decode_bench: starting mode=steady-state prompt_tokens=16 decode_tokens=8 device_token_select=enabled
+nano_fused_decode_bench: steady-state prefill start prompt_tokens=16 decode_tokens=8
+nano_fused_decode_bench: steady-state prefill complete elapsed_ms=230.572 seed_token=1047
+nano_fused_decode_bench: steady-state decode step 1/8 start consume_token=1047
+nano_fused_decode_bench: steady-state decode step 1/8 elapsed_ms=70.2216 next_token=1329
+nano_fused_decode_bench: steady-state decode step 2/8 start consume_token=1329
+nano_fused_decode_bench: steady-state decode step 2/8 elapsed_ms=69.6315 next_token=32420
+nano_fused_decode_bench: steady-state decode step 3/8 start consume_token=32420
+nano_fused_decode_bench: steady-state decode step 3/8 elapsed_ms=70.2078 next_token=16925
+nano_fused_decode_bench: steady-state decode step 4/8 start consume_token=16925
+nano_fused_decode_bench: steady-state decode step 4/8 elapsed_ms=68.5941 next_token=1058
+nano_fused_decode_bench: steady-state decode step 5/8 start consume_token=1058
+nano_fused_decode_bench: steady-state decode step 5/8 elapsed_ms=68.5137 next_token=1766
+nano_fused_decode_bench: steady-state decode step 6/8 start consume_token=1766
+nano_fused_decode_bench: steady-state decode step 6/8 elapsed_ms=68.3992 next_token=1049
+nano_fused_decode_bench: steady-state decode step 7/8 start consume_token=1049
+nano_fused_decode_bench: steady-state decode step 7/8 elapsed_ms=68.6008 next_token=3605
+nano_fused_decode_bench: steady-state decode step 8/8 start consume_token=3605
+nano_fused_decode_bench: steady-state decode step 8/8 elapsed_ms=68.3688 next_token=1766
+nano_fused_decode_bench: mode=steady-state prompt_tokens=16 decode_tokens=8 prefill_ms=230.572 decode_mean_ms=69.067 decode_min_ms=68.369 decode_max_ms=70.222 device_token_select=enabled decode_tokens_per_second=14.479
+nano_fused_decode_bench: mode=steady-state per_step_ms=70.222,69.632,70.208,68.594,68.514,68.399,68.601,68.369
+linear_op_counters dense_fastpath_plan_success=0 dense_fastpath_plan_fail=0 dense_fastpath_execute=0 dense_fastpath_execute_fail=0 dense_reference_fallback=540 nvfp4_fastpath_plan_success=0 nvfp4_fastpath_plan_fail=306 nvfp4_fastpath_execute=0 nvfp4_fastpath_execute_fail=0 nvfp4_reference_fallback=306 scaled_fp8_fastpath_execute=0 scaled_fp8_reference_fallback=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=184 monolithic_layers=184 staging_elapsed_us=0 host_routing_adapter_calls=23 host_routing_tensor_copies=46

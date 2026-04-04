@@ -1,0 +1,67 @@
+verify_correctness.sh: running oracle case default_backend
+nano_save_prompt_oracle: wrote oracle to proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/default_backend.oracle.json prompt_token_count=16 boundary_token_id=1010 generated_token_count=16
+verify_correctness.sh: running oracle case unified_fused_backend
+nano_save_prompt_oracle: wrote oracle to proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/unified_fused_backend.oracle.json prompt_token_count=16 boundary_token_id=1010 generated_token_count=16
+Unified correctness comparison
+baseline=proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/default_backend.oracle.json
+candidate=proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/unified_fused_backend.oracle.json
+atol=0.001
+generated_tokens_match=True
+boundary_token_match=True
+boundary_top5_length_match=True
+boundary_top5_index_match=True
+boundary_top5_max_abs_diff=0.0
+boundary_max_logit_diff=0.0
+pass=True
+verify_correctness.sh: running nano_16_token_correctness_test against baseline oracle
+nano_16_token_correctness_test: using saved oracle from proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/default_backend.oracle.json
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) prefill start prompt_tokens=16
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) prefill complete elapsed_ms=238.85 first_token=1010
+nano_16_token_correctness_test: prefill route legend A=(sequential single-token baseline), C=(batched prefill (GPU Mamba prefill) + fused decode)
+nano_16_token_correctness_test: prefill comparison matrix
+pair    lhs_token   rhs_token   max_abs_diff    token_match
+A<->C   1010        1010        0.000000        yes
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 1/15 start consume_token=1010
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 1/15 complete elapsed_ms=22.2243 next_token=1060
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 2/15 start consume_token=1060
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 2/15 complete elapsed_ms=15.6763 next_token=5165
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 3/15 start consume_token=5165
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 3/15 complete elapsed_ms=15.612 next_token=1061
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 4/15 start consume_token=1061
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 4/15 complete elapsed_ms=15.5963 next_token=8857
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 5/15 start consume_token=8857
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 5/15 complete elapsed_ms=15.9085 next_token=2902
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 6/15 start consume_token=2902
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 6/15 complete elapsed_ms=15.6609 next_token=3791
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 7/15 start consume_token=3791
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 7/15 complete elapsed_ms=15.5353 next_token=7294
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 8/15 start consume_token=7294
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 8/15 complete elapsed_ms=15.3871 next_token=15144
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 9/15 start consume_token=15144
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 9/15 complete elapsed_ms=15.1999 next_token=97445
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 10/15 start consume_token=97445
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 10/15 complete elapsed_ms=15.1517 next_token=1561
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 11/15 start consume_token=1561
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 11/15 complete elapsed_ms=15.225 next_token=1060
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 12/15 start consume_token=1060
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 12/15 complete elapsed_ms=15.2707 next_token=31960
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 13/15 start consume_token=31960
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 13/15 complete elapsed_ms=15.2384 next_token=1061
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 14/15 start consume_token=1061
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 14/15 complete elapsed_ms=15.1997 next_token=6154
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 15/15 start consume_token=6154
+nano_16_token_correctness_test: Route C (batched prefill (GPU Mamba prefill) + fused decode) decode step 15/15 complete elapsed_ms=15.1467 next_token=1561
+nano_16_token_correctness_test: PASS generated_tokens=[1010,1060,5165,1061,8857,2902,3791,7294,15144,97445,1561,1060,31960,1061,6154,1561]
+linear_op_counters dense_fastpath_plan_success=960 dense_fastpath_plan_fail=0 dense_fastpath_execute=960 dense_fastpath_execute_fail=0 dense_reference_fallback=0 nvfp4_fastpath_plan_success=544 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=544 nvfp4_fastpath_execute_fail=0 nvfp4_reference_fallback=0 scaled_fp8_fastpath_execute=0 scaled_fp8_reference_fallback=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=345 monolithic_layers=345 staging_elapsed_us=0 host_routing_adapter_calls=0 host_routing_tensor_copies=0
+Correctness verification
+oracle_compare_pass=True
+oracle_compare_exit_status=0
+generated_tokens_match=True
+boundary_token_match=True
+boundary_top5_index_match=True
+boundary_top5_max_abs_diff=0.0
+boundary_max_logit_diff=0.0
+nano_16_token_correctness_test_pass=True
+nano_16_token_correctness_test_exit_status=0
+verify_correctness.sh: artifacts written to proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z

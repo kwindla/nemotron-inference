@@ -1,0 +1,5 @@
+expert_layer_create: skipping residency for layer 45: free_vram_mib=637 minimum_headroom_mib=2560
+expert_layer_create: skipping residency for layer 47: free_vram_mib=597 minimum_headroom_mib=2560
+expert_layer_create: skipping residency for layer 49: free_vram_mib=555 minimum_headroom_mib=2560
+expert_layer_create: skipping residency for layer 51: free_vram_mib=513 minimum_headroom_mib=2560
+FAIL: Route A request context should create

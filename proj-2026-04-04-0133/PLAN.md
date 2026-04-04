@@ -307,7 +307,7 @@ NEMOTRON_FORWARD_MANIFEST="${NEMOTRON_FORWARD_MANIFEST}" \
 | 7g | Resolve the multi-token BF16 execution contract | done | 59aee9b | All three row-replay bridges removed; native multi-token paths confirmed via per-layer execution counters in benchmark; Tier 2 verification pending |
 | 8 | Port oracle fixture generation to Nano (against BF16 pipeline) | done | f8bc644 | Added expert_layer8_decode_block and mamba_layer9_decode_block fixtures; 59/59 tests pass. Layer-8 expert uses runtime-derived input for tighter NVFP4 envelope match. |
 | 9 | Revisit cache allocator and page/snapshot ownership | done | 275459c | Removed prompt_head; LRU eviction + trie global-root lookup; slab allocator; snapshot layout metadata + restore validation |
-| 10 | Multi-turn prefix reuse regression and final verification sweep | done | PENDING | multi_turn_prefix_reuse_test (60/60 green); docs/intentional_divergences.md; Tier 2 verification pending |
+| 10 | Multi-turn prefix reuse regression and final verification sweep | done | 3ad38d3 | multi_turn_prefix_reuse_test (60/60 green); docs/intentional_divergences.md; Tier 2 verification pending |
 
 ## Current Synthesis (2026-04-04 post-fix rerun)
 

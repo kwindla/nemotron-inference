@@ -1,0 +1,16 @@
+timestamp_utc=2026-04-04T18:37:48Z
+repo_root=/home/khkramer/src/nemotron-inference
+build_dir=build
+save_oracle_binary=/home/khkramer/src/nemotron-inference/build/testing/nano_save_prompt_oracle
+correctness_binary=/home/khkramer/src/nemotron-inference/build/testing/nano_16_token_correctness_test
+manifest=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json
+artifact_dir=proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z
+atol=1e-3
+uname=Linux boule 6.14.0-37-generic #37-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 22:10:32 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+
+[env]
+LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/local/cuda-12.8/lib64:/usr/local/cuda-13.0/lib64:/usr/local/cuda-12.8/lib64:
+NEMOTRON_BENCH_BUILD_DIR=build
+NEMOTRON_BUILD_DIR=build
+NEMOTRON_FORWARD_MANIFEST=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json
+NEMOTRON_TEST_BUILD_DIR=build

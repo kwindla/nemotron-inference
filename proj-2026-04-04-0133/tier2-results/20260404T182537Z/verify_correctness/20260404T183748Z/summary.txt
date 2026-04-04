@@ -1,0 +1,10 @@
+Correctness verification
+oracle_compare_pass=True
+oracle_compare_exit_status=0
+generated_tokens_match=True
+boundary_token_match=True
+boundary_top5_index_match=True
+boundary_top5_max_abs_diff=0.0
+boundary_max_logit_diff=0.0
+nano_16_token_correctness_test_pass=True
+nano_16_token_correctness_test_exit_status=0

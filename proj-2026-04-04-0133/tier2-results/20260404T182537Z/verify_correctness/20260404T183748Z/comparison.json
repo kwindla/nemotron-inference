@@ -1,0 +1,12 @@
+{
+  "atol": 0.001,
+  "baseline_json": "proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/default_backend.oracle.json",
+  "boundary_max_logit_diff": 0.0,
+  "boundary_token_match": true,
+  "boundary_top5_index_match": true,
+  "boundary_top5_length_match": true,
+  "boundary_top5_max_abs_diff": 0.0,
+  "candidate_json": "proj-2026-04-04-0133/tier2-results/20260404T182537Z/verify_correctness/20260404T183748Z/unified_fused_backend.oracle.json",
+  "generated_tokens_match": true,
+  "pass": true
+}

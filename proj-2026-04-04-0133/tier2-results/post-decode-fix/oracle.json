@@ -1,0 +1,21 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+  "manifest_path": "/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json",
+  "build_dir": "/home/khkramer/src/nemotron-inference/build",
+  "backend_flags": {
+    "NEMOTRON_FORWARD_FUSED_MAMBA_DECODE": "0",
+    "NEMOTRON_FORWARD_FUSED_MOE_DECODE": "0",
+    "NEMOTRON_FORWARD_MANIFEST": "artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json"
+  },
+  "git_revision": "cdd2c13618fd5ccc0c1283dfa9453e841abd5aa5",
+  "prompt_token_ids": [10, 25708, 1010, 4568, 1584, 1261, 25399, 27089, 1046, 50856, 15776, 10693, 1046, 11, 1010, 10],
+  "prompt_token_count": 16,
+  "decode_token_count": 16,
+  "boundary_token_id": 1010,
+  "boundary_top5": [{"index": 1010, "value": 20.4538708}, {"index": 2030, "value": 18.8243427}, {"index": 1123, "value": 17.5981903}, {"index": 1060, "value": 15.6806641}, {"index": 1064, "value": 15.5894785}],
+  "boundary_max_logit": 20.4538708,
+  "generated_token_ids": [1010, 4268, 2534, 1317, 9470, 1261, 4005, 1455, 16896, 1454, 1429, 16860, 1034, 1505, 1429, 4753],
+  "route": "A",
+  "route_description": "batched prefill + reference decode",
+  "timestamp_utc": "2026-04-04T05:50:46Z"
+}

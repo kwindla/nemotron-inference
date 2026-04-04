@@ -1,0 +1,9 @@
+vLLM parity gate blocked by VRAM pressure on RTX 5090 (32 GiB) with desktop
+compositor using ~1.8 GiB. vLLM needs ~30.3 GiB (model + KV cache) which
+exceeds what's available after desktop overhead.
+
+Prior verified parity (plan synthesis, 2026-04-04):
+  runtime_generated_token_ids == vllm_generated_token_ids == [1784, 3330, 17000, 10693]
+  prompt: short_chat, boundary_token_id=1784
+
+To re-run: stop the desktop compositor or use a headless session to free ~1.8 GiB.

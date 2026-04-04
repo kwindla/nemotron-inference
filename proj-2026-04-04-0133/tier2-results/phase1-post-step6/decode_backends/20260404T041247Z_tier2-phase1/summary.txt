@@ -1,0 +1,9 @@
+Decode backend comparison
+mode=steady_state decode_tokens=8
+
+default: decode_mean_ms=75.579102 delta_vs_default_pct=+0.00 tokens_per_second=13.231 prefill_ms=233.082539 json=/home/khkramer/src/nemotron-inference/proj-2026-04-04-0133/tier2-results/phase1-post-step6/decode_backends/20260404T041247Z_tier2-phase1/default.json
+unified_fused: decode_mean_ms=75.311808 delta_vs_default_pct=-0.35 tokens_per_second=13.278 prefill_ms=231.632109 json=/home/khkramer/src/nemotron-inference/proj-2026-04-04-0133/tier2-results/phase1-post-step6/decode_backends/20260404T041247Z_tier2-phase1/unified_fused.json
+decode_cublaslt: decode_mean_ms=69.067180 delta_vs_default_pct=-8.62 tokens_per_second=14.479 prefill_ms=230.571688 json=/home/khkramer/src/nemotron-inference/proj-2026-04-04-0133/tier2-results/phase1-post-step6/decode_backends/20260404T041247Z_tier2-phase1/decode_cublaslt.json
+
+winner=decode_cublaslt decode_mean_ms=69.067180
+decision=default_matches_explicit_unified_within_noise
