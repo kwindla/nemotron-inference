@@ -54,6 +54,22 @@ bool UnifiedFusedBackendEnabled() {
   return true;
 }
 
+bool ExperimentalFusedMoeDecodeEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_EXPERIMENTAL_FUSED_MOE_DECODE");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool FusedMoeDecodeBackendEnabled() {
+  if (!ExperimentalFusedMoeDecodeEnabled()) {
+    return false;
+  }
+  const char* value = std::getenv("NEMOTRON_FORWARD_FUSED_MOE_DECODE");
+  if (value != nullptr && value[0] != '\0') {
+    return std::strcmp(value, "0") != 0;
+  }
+  return UnifiedFusedBackendEnabled();
+}
+
 class CudaEventSpan {
  public:
   explicit CudaEventSpan(bool enabled) {
@@ -1385,8 +1401,8 @@ bool ExpertLayerSlice::Impl::SupportsUnifiedFusedBackend(
     int device_sm_version) const {
   (void)device_sm_version;
   return backend_dispatch_state.trace == nullptr &&
-         !backend_dispatch_state.compare_fused_debug &&
          unified_fused_enabled &&
+         (token_count != 1 || FusedMoeDecodeBackendEnabled()) &&
          SupportsResidentPreparedMoeBackend(backend_config, token_count) &&
          fused_prefill_routing != nullptr &&
          fused_prefill_routed_output_scratch != nullptr &&
@@ -2213,7 +2229,6 @@ class ExpertLayerSlice::Impl::UnifiedFusedBackend final : public PreparedResiden
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) override {
     (void)config;
-    (void)token_count;
     (void)trace;
     const bool ok = impl_->RunFusedMoePrefillPath(
         cublas_handle,
@@ -2225,6 +2240,35 @@ class ExpertLayerSlice::Impl::UnifiedFusedBackend final : public PreparedResiden
         topk_weights,
         output,
         &prepared_weights());
+    if (ok && impl_->backend_dispatch_state.compare_fused_debug) {
+      auto routed_output = DeviceTensorFp32::CreateView(
+          {token_count, impl_->config.hidden_size},
+          impl_->fused_prefill_routed_output_scratch->data());
+      std::vector<float> input_host;
+      std::vector<float> fused_output_host;
+      std::vector<float> fused_routed_host;
+      if (!routed_output ||
+          !CopyToHost(input, &input_host) ||
+          !CopyToHost(*output, &fused_output_host) ||
+          !CopyToHost(*routed_output, &fused_routed_host) ||
+          input_host.size() != fused_output_host.size() ||
+          fused_routed_host.size() != fused_output_host.size()) {
+        return false;
+      }
+      std::vector<float> fused_shared_host(fused_output_host.size(), 0.0f);
+      for (std::size_t i = 0; i < fused_output_host.size(); ++i) {
+        fused_shared_host[i] =
+            fused_output_host[i] - input_host[i] - fused_routed_host[i];
+      }
+      impl_->backend_dispatch_state.fused_debug_output_host =
+          std::move(fused_output_host);
+      impl_->backend_dispatch_state.fused_debug_routed_host =
+          std::move(fused_routed_host);
+      impl_->backend_dispatch_state.fused_debug_shared_host =
+          std::move(fused_shared_host);
+      impl_->backend_dispatch_state.collected_fused_debug = true;
+      impl_->backend_dispatch_state.live_fused_output_written = true;
+    }
     if (!ok && std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr) {
       std::cout << "expert_layer: unified fused MoE path failed, falling back\n";
     }

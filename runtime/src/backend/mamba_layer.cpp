@@ -40,6 +40,22 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
+bool ExperimentalFusedMambaDecodeEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_EXPERIMENTAL_FUSED_MAMBA_DECODE");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool FusedMambaDecodeEnabled() {
+  if (!ExperimentalFusedMambaDecodeEnabled()) {
+    return false;
+  }
+  const char* value = std::getenv("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE");
+  if (value == nullptr || value[0] == '\0') {
+    return true;
+  }
+  return std::strcmp(value, "0") != 0;
+}
+
 const KernelTensorDescriptor* FindExactKernelBinding(
     const LayerScheduleEntry& layer,
     const KernelCatalog& kernel_catalog,
@@ -887,8 +903,43 @@ bool MambaLayerSlice::Run(
           max_abs_diff,
           std::fabs(fused_scan_output_host[i] - reference_scan_output[i]));
     }
+
+    std::vector<float> device_conv_state_host(
+        request_context.mamba_conv_state()->numel(),
+        0.0f);
+    std::vector<float> device_ssm_state_host(
+        request_context.mamba_state()->numel(),
+        0.0f);
+    if (!request_context.mamba_conv_state()->CopyToHost(
+            device_conv_state_host.data(),
+            device_conv_state_host.size()) ||
+        !request_context.mamba_state()->CopyToHost(
+            device_ssm_state_host.data(),
+            device_ssm_state_host.size())) {
+      return false;
+    }
+
+    const float* device_layer_conv_state =
+        device_conv_state_host.data() + state_layout.conv_state_offset_elems;
+    const float* device_layer_ssm_state =
+        device_ssm_state_host.data() + state_layout.ssm_state_offset_elems;
+    float conv_state_max_abs_diff = 0.0f;
+    for (std::size_t i = 0; i < state_view.conv_state_elems; ++i) {
+      conv_state_max_abs_diff = std::max(
+          conv_state_max_abs_diff,
+          std::fabs(device_layer_conv_state[i] - layer_conv_state[i]));
+    }
+    float ssm_state_max_abs_diff = 0.0f;
+    for (std::size_t i = 0; i < state_view.ssm_state_elems; ++i) {
+      ssm_state_max_abs_diff = std::max(
+          ssm_state_max_abs_diff,
+          std::fabs(device_layer_ssm_state[i] - layer_ssm_state[i]));
+    }
+
     std::cerr << "fused_mamba_compare: layer=" << impl_->config.layer_index
               << " scan_max_abs_diff=" << max_abs_diff
+              << " conv_state_max_abs_diff=" << conv_state_max_abs_diff
+              << " ssm_state_max_abs_diff=" << ssm_state_max_abs_diff
               << " fused0="
               << (fused_scan_output_host.empty() ? 0.0f : fused_scan_output_host.front())
               << " host0="
@@ -899,7 +950,7 @@ bool MambaLayerSlice::Run(
   };
 #endif
 
-  if (token_count > 1 || trace != nullptr) {
+  if (token_count > 1 || trace != nullptr || !FusedMambaDecodeEnabled()) {
     return run_sequential_path();
   }
 

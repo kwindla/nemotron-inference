@@ -378,19 +378,48 @@ class ScopedEnvOverride {
 struct PrefillRouteConfig {
   const char* route_id = "";
   const char* description = "";
-  bool fused_enabled = false;
+  bool fused_mamba_decode_enabled = false;
+  bool fused_moe_decode_enabled = false;
   bool sequential_prefill_enabled = false;
 };
+
+std::string RouteFlagOverrideEnvName(
+    const PrefillRouteConfig& route,
+    const char* flag_name) {
+  return std::string("NEMOTRON_NANO_ROUTE_") + route.route_id + "_" + flag_name;
+}
+
+bool RouteFlagEnabled(
+    const PrefillRouteConfig& route,
+    const char* flag_name,
+    bool default_value) {
+  const std::string env_name = RouteFlagOverrideEnvName(route, flag_name);
+  const char* value = std::getenv(env_name.c_str());
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+  return std::strcmp(value, "0") != 0;
+}
 
 class ScopedRouteOverrides {
  public:
   explicit ScopedRouteOverrides(const PrefillRouteConfig& route)
       : fused_mamba_(
             "NEMOTRON_FORWARD_FUSED_MAMBA_DECODE",
-            route.fused_enabled ? "1" : "0"),
+            RouteFlagEnabled(
+                    route,
+                    "FUSED_MAMBA_DECODE",
+                    route.fused_mamba_decode_enabled)
+                ? "1"
+                : "0"),
         fused_moe_(
             "NEMOTRON_FORWARD_FUSED_MOE_DECODE",
-            route.fused_enabled ? "1" : "0") {}
+            RouteFlagEnabled(
+                    route,
+                    "FUSED_MOE_DECODE",
+                    route.fused_moe_decode_enabled)
+                ? "1"
+                : "0") {}
 
   ScopedRouteOverrides(const ScopedRouteOverrides&) = delete;
   ScopedRouteOverrides& operator=(const ScopedRouteOverrides&) = delete;
@@ -404,11 +433,13 @@ constexpr PrefillRouteConfig kRouteA = {
     "A",
     "sequential single-token baseline",
     false,
+    false,
     true,
 };
 constexpr PrefillRouteConfig kRouteC = {
     "C",
     "batched prefill (GPU Mamba prefill) + fused decode",
+    true,
     true,
     false,
 };
