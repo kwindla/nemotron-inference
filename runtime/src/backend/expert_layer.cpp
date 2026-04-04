@@ -3944,6 +3944,18 @@ bool RunExpertLayerImpl(
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
+    // DIAGNOSIS (Step 6): The fused up-proj numeric error (max_abs_diff=0.013)
+    // traces to PackLatentPerSelectedExpertToNvfp4Kernel in
+    // device_nvfp4_matrix.cu:311, which uses input_scale directly as
+    // tensor_scale instead of 1 / input_scale. When input_scale < kMinScale
+    // (1/1024), it is clamped to kMinScale, losing the checkpoint-driven
+    // quantization range. The same pattern affects
+    // ScaleRelu2PackRowsToNvfp4InPlace for the down path.
+    // Down-path nuance: expert_ops.cu:593-595 forwards down_input_scale
+    // directly into tensor_scales[row] without the kMinScale clamp used by the
+    // up-path packing kernel.
+    // Fix target: the caller should pass 1 / input_scale to the packing
+    // kernel, or the kernel should invert internally.
     const auto grouped_fatal =
         [&](const std::string& reason) -> GroupedRoutedResult {
       std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -4392,6 +4404,14 @@ bool RunExpertLayerImpl(
       const float tolerance =
           std::max(1.0e-6f, 1.0e-6f * std::max(std::abs(actual), std::abs(expected)));
       return std::abs(actual - expected) <= tolerance;
+    };
+    auto normalize_fixed_tensor_scale_for_diagnosis =
+        [](float value) -> float {
+      constexpr float kMinFixedTensorScale = 1.0f / 1024.0f;
+      if (!std::isfinite(value) || value <= 0.0f) {
+        return kMinFixedTensorScale;
+      }
+      return value < kMinFixedTensorScale ? kMinFixedTensorScale : value;
     };
     std::vector<float> debug_selected_up_input_scales_host;
     std::vector<float> debug_selected_up_tensor_scales_host;
@@ -4880,6 +4900,9 @@ bool RunExpertLayerImpl(
       for (std::size_t slot = 0; slot < batch_count; ++slot) {
         const float expected_latent_tensor_scale =
             1.0f / debug_selected_up_input_scales_host[slot];
+        const float direct_kernel_tensor_scale =
+            normalize_fixed_tensor_scale_for_diagnosis(
+                debug_selected_up_input_scales_host[slot]);
         const float fused_alpha =
             latent_tensor_scales_host[slot] * debug_selected_up_tensor_scales_host[slot];
         std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -4892,6 +4915,13 @@ bool RunExpertLayerImpl(
                   << (scale_contract_matches(
                           latent_tensor_scales_host[slot],
                           expected_latent_tensor_scale)
+                          ? "yes"
+                          : "no")
+                  << " direct_kernel_tensor_scale=" << direct_kernel_tensor_scale
+                  << " direct_kernel_match="
+                  << (scale_contract_matches(
+                          latent_tensor_scales_host[slot],
+                          direct_kernel_tensor_scale)
                           ? "yes"
                           : "no")
                   << " fused_alpha=" << fused_alpha
@@ -5129,6 +5159,8 @@ bool RunExpertLayerImpl(
       for (std::size_t slot = 0; slot < batch_count; ++slot) {
         const float expected_down_act_tensor_scale =
             1.0f / debug_selected_down_input_scales_host[slot];
+        const float direct_kernel_tensor_scale =
+            debug_selected_down_input_scales_host[slot];
         const float fused_alpha =
             down_act_tensor_scales_host[slot] *
             debug_selected_down_tensor_scales_host[slot];
@@ -5143,6 +5175,13 @@ bool RunExpertLayerImpl(
                   << (scale_contract_matches(
                           down_act_tensor_scales_host[slot],
                           expected_down_act_tensor_scale)
+                          ? "yes"
+                          : "no")
+                  << " direct_kernel_tensor_scale=" << direct_kernel_tensor_scale
+                  << " direct_kernel_match="
+                  << (scale_contract_matches(
+                          down_act_tensor_scales_host[slot],
+                          direct_kernel_tensor_scale)
                           ? "yes"
                           : "no")
                   << " fused_alpha=" << fused_alpha
