@@ -305,11 +305,26 @@ target_link_libraries(expert_layer3_prefix_input_oracle_test PRIVATE nemotron_ru
 target_compile_definitions(
   expert_layer3_prefix_input_oracle_test
   PRIVATE
-    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_prefix_input_block_cuda"
+    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_prefix_input_block_cuda_v2"
 )
 target_compile_features(expert_layer3_prefix_input_oracle_test PRIVATE cxx_std_17)
 
 nemotron_add_test(expert_layer3_prefix_input_oracle_test)
+
+add_executable(
+  expert_layer3_fastpath_microharness_test
+  backend/expert_layer3_fastpath_microharness_test.cpp
+)
+
+target_link_libraries(expert_layer3_fastpath_microharness_test PRIVATE nemotron_runtime_backend)
+target_compile_definitions(
+  expert_layer3_fastpath_microharness_test
+  PRIVATE
+    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/../proj-2026-04-04-nvfp4-activation-quant-alignment/layer3-prefix-oracle.tkvkh2"
+)
+target_compile_features(expert_layer3_fastpath_microharness_test PRIVATE cxx_std_17)
+
+nemotron_add_test(expert_layer3_fastpath_microharness_test)
 
 add_executable(
   expert_layer19_decode_input_oracle_test
@@ -713,7 +728,7 @@ target_compile_features(prefill_prefix_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   prefill_prefix_oracle_test
   PRIVATE
-    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle"
+    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle_v2"
 )
 
 nemotron_add_test(prefill_prefix_oracle_test)
@@ -728,7 +743,7 @@ target_compile_features(single_token_decode_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   single_token_decode_oracle_test
   PRIVATE
-    NEMOTRON_SINGLE_TOKEN_DECODE_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/full_model_single_token_short_chat_cuda_v3"
+    NEMOTRON_SINGLE_TOKEN_DECODE_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/full_model_single_token_short_chat_cuda_v4"
 )
 
 nemotron_add_test(single_token_decode_oracle_test)
@@ -750,7 +765,7 @@ target_compile_features(expert_layer3_prefix_replay_test PRIVATE cxx_std_17)
 target_compile_definitions(
   expert_layer3_prefix_replay_test
   PRIVATE
-    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle"
+    NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle_v2"
 )
 
 nemotron_add_test(expert_layer3_prefix_replay_test)
@@ -765,7 +780,7 @@ target_compile_features(expert_layer3_manifest_binding_compare_test PRIVATE cxx_
 target_compile_definitions(
   expert_layer3_manifest_binding_compare_test
   PRIVATE
-    NEMOTRON_EXPERT_LAYER_PREFIX_INPUT_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_prefix_input_block_cuda"
+    NEMOTRON_EXPERT_LAYER_PREFIX_INPUT_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/expert_layer3_prefix_input_block_cuda_v2"
 )
 
 nemotron_add_test(expert_layer3_manifest_binding_compare_test)
