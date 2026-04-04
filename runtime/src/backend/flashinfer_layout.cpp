@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 
 #include <cuda_fp8.h>
@@ -193,6 +194,7 @@ bool FlashInferPrepareShuffledBlockMajorWeight(
 
 std::optional<FlashInferPreparedNvfp4WeightHost> PrepareFlashInferNvfp4WeightHost(
     const GemmDescriptor& descriptor,
+    std::optional<float> tensor_scale_override,
     std::size_t epilogue_tile_m) {
   if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
       descriptor.packed_data == nullptr ||
@@ -219,10 +221,17 @@ std::optional<FlashInferPreparedNvfp4WeightHost> PrepareFlashInferNvfp4WeightHos
   FlashInferPreparedNvfp4WeightHost prepared;
   prepared.output_rows = descriptor.output_rows;
   prepared.input_cols = descriptor.input_cols;
-  std::memcpy(
-      &prepared.tensor_scale,
-      descriptor.tensor_scale_data,
-      sizeof(float));
+  if (tensor_scale_override.has_value()) {
+    prepared.tensor_scale = *tensor_scale_override;
+  } else {
+    std::memcpy(
+        &prepared.tensor_scale,
+        descriptor.tensor_scale_data,
+        sizeof(float));
+  }
+  if (!std::isfinite(prepared.tensor_scale) || prepared.tensor_scale <= 0.0f) {
+    return std::nullopt;
+  }
 
   if (!FlashInferShuffleMatrixA(
           descriptor.packed_data,
@@ -251,7 +260,8 @@ std::optional<FlashInferPreparedNvfp4WeightHost> PrepareFlashInferNvfp4WeightHos
 }
 
 std::optional<NemotronFlashInferNvfp4WeightView> BuildFlashInferRawNvfp4WeightView(
-    const GemmDescriptor& descriptor) {
+    const GemmDescriptor& descriptor,
+    std::optional<float> tensor_scale_override) {
   if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
       descriptor.packed_data == nullptr ||
       descriptor.block_scales_data == nullptr ||
@@ -269,8 +279,12 @@ std::optional<NemotronFlashInferNvfp4WeightView> BuildFlashInferRawNvfp4WeightVi
   }
 
   float tensor_scale = 0.0f;
-  std::memcpy(&tensor_scale, descriptor.tensor_scale_data, sizeof(float));
-  if (tensor_scale == 0.0f) {
+  if (tensor_scale_override.has_value()) {
+    tensor_scale = *tensor_scale_override;
+  } else {
+    std::memcpy(&tensor_scale, descriptor.tensor_scale_data, sizeof(float));
+  }
+  if (!std::isfinite(tensor_scale) || tensor_scale <= 0.0f) {
     return std::nullopt;
   }
 

@@ -35,6 +35,7 @@
 #include "nemotron/device_buffer.h"
 #include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/nvfp4_packing.h"
+#include "nemotron/nvfp4_scale_helpers.h"
 #include "nemotron/nvfp4_scale_layout.h"
 #include "nemotron/runtime_stats.h"
 #include "storage_conversion.h"
@@ -541,12 +542,14 @@ struct Nvfp4AlignedBuffers;
 bool EnsureNvfp4LookupBuffers(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
-    bool* buffers_ready);
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override = std::nullopt);
 
 bool EnsureNvfp4AlignedBuffers(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
-    bool* buffers_ready);
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override = std::nullopt);
 
 GemmDescriptor MakeAlignedNvfp4Descriptor(
     const GemmDescriptor& descriptor,
@@ -555,7 +558,8 @@ GemmDescriptor MakeAlignedNvfp4Descriptor(
 std::unique_ptr<UploadedLinearOp> MaterializeNvfp4AlignedViewOp(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
-    bool* buffers_ready);
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override = std::nullopt);
 
 std::unique_ptr<UploadedLinearOp> MaterializeRoutedExpertDenseFallbackOp(
     const GemmDescriptor& descriptor,
@@ -587,9 +591,14 @@ std::unique_ptr<UploadedLinearOp> MaterializeRoutedExpertDenseFallbackOp(
 std::unique_ptr<UploadedLinearOp> MaterializeRoutedExpertOp(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* nvfp4_buffers,
-    bool* buffers_ready) {
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override) {
   if (descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-    return MaterializeNvfp4AlignedViewOp(descriptor, nvfp4_buffers, buffers_ready);
+    return MaterializeNvfp4AlignedViewOp(
+        descriptor,
+        nvfp4_buffers,
+        buffers_ready,
+        tensor_scale_override);
   }
   return UploadedLinearOp::Create(descriptor);
 }
@@ -738,24 +747,37 @@ struct Nvfp4AlignedBuffers {
 
 bool UploadNvfp4LookupBuffers(
     const GemmDescriptor& descriptor,
-    Nvfp4AlignedBuffers* buffers) {
+    Nvfp4AlignedBuffers* buffers,
+    std::optional<float> tensor_scale_override) {
+  const std::uint8_t* tensor_scale_data = descriptor.tensor_scale_data;
+  std::size_t tensor_scale_nbytes = descriptor.tensor_scale_nbytes;
+  float effective_tensor_scale = 0.0f;
+  if (tensor_scale_override.has_value()) {
+    if (!std::isfinite(*tensor_scale_override) || *tensor_scale_override <= 0.0f) {
+      return false;
+    }
+    effective_tensor_scale = *tensor_scale_override;
+    tensor_scale_data = reinterpret_cast<const std::uint8_t*>(&effective_tensor_scale);
+    tensor_scale_nbytes = sizeof(effective_tensor_scale);
+  }
   if (buffers == nullptr ||
       descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
       descriptor.packed_data == nullptr ||
       descriptor.block_scales_data == nullptr ||
-      descriptor.tensor_scale_data == nullptr) {
+      tensor_scale_data == nullptr ||
+      tensor_scale_nbytes != sizeof(float)) {
     return false;
   }
   return buffers->packed.Resize(descriptor.packed_nbytes) &&
          buffers->block_scales.Resize(descriptor.block_scales_nbytes) &&
-         buffers->tensor_scale.Resize(descriptor.tensor_scale_nbytes) &&
+         buffers->tensor_scale.Resize(tensor_scale_nbytes) &&
          buffers->packed.CopyFromHost(descriptor.packed_data, descriptor.packed_nbytes) &&
          buffers->block_scales.CopyFromHost(
              descriptor.block_scales_data,
              descriptor.block_scales_nbytes) &&
          buffers->tensor_scale.CopyFromHost(
-             descriptor.tensor_scale_data,
-             descriptor.tensor_scale_nbytes);
+             tensor_scale_data,
+             tensor_scale_nbytes);
 }
 
 bool UploadNvfp4ExecutionScales(
@@ -780,14 +802,15 @@ bool UploadNvfp4ExecutionScales(
 bool EnsureNvfp4LookupBuffers(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
-    bool* buffers_ready) {
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override) {
   if (buffers == nullptr || buffers_ready == nullptr) {
     return false;
   }
   if (*buffers_ready) {
     return buffers->lookup_valid();
   }
-  if (!UploadNvfp4LookupBuffers(descriptor, buffers)) {
+  if (!UploadNvfp4LookupBuffers(descriptor, buffers, tensor_scale_override)) {
     return false;
   }
   *buffers_ready = true;
@@ -797,14 +820,16 @@ bool EnsureNvfp4LookupBuffers(
 bool EnsureNvfp4AlignedBuffers(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
-    bool* buffers_ready) {
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override) {
   if (buffers == nullptr || buffers_ready == nullptr) {
     return false;
   }
   if (*buffers_ready) {
     return buffers->valid();
   }
-  if ((!buffers->lookup_valid() && !UploadNvfp4LookupBuffers(descriptor, buffers)) ||
+  if ((!buffers->lookup_valid() &&
+       !UploadNvfp4LookupBuffers(descriptor, buffers, tensor_scale_override)) ||
       !UploadNvfp4ExecutionScales(descriptor, buffers)) {
     return false;
   }
@@ -820,15 +845,21 @@ GemmDescriptor MakeAlignedNvfp4Descriptor(
   aligned_descriptor.block_scales_data = buffers.matmul_block_scales.data();
   aligned_descriptor.block_scales_nbytes = buffers.matmul_block_scales.count();
   aligned_descriptor.tensor_scale_data = buffers.tensor_scale.data();
+  aligned_descriptor.tensor_scale_nbytes = buffers.tensor_scale.count();
   return aligned_descriptor;
 }
 
 std::unique_ptr<UploadedLinearOp> MaterializeNvfp4AlignedViewOp(
     const GemmDescriptor& descriptor,
     Nvfp4AlignedBuffers* buffers,
-    bool* buffers_ready) {
+    bool* buffers_ready,
+    std::optional<float> tensor_scale_override) {
   const bool debug = ForwardDebugEnabled();
-  if (!EnsureNvfp4AlignedBuffers(descriptor, buffers, buffers_ready)) {
+  if (!EnsureNvfp4AlignedBuffers(
+          descriptor,
+          buffers,
+          buffers_ready,
+          tensor_scale_override)) {
     if (debug) {
       std::cerr << "expert_layer: nvfp4 aligned buffer prep failed for "
                 << descriptor.tensor_name << "\n";
@@ -846,7 +877,7 @@ std::unique_ptr<UploadedLinearOp> MaterializeNvfp4AlignedViewOp(
       buffers->matmul_block_scales.data(),
       buffers->matmul_block_scales.count(),
       buffers->tensor_scale.data(),
-      descriptor.tensor_scale_nbytes);
+      buffers->tensor_scale.count());
   if (!weight_view || !weight_view->valid()) {
     if (debug) {
       std::cerr << "expert_layer: nvfp4 weight view create failed for "
@@ -967,7 +998,9 @@ struct ExpertLayerSlice::Impl {
   ProjectionFamily fc1_latent_family = ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> fc1_latent_dense;
   std::unique_ptr<ScaledFp8LinearOp> fc1_latent_scaled_fp8;
-  std::unique_ptr<UploadedLinearOp> fc2_latent;
+  ProjectionFamily fc2_latent_family = ProjectionFamily::kNone;
+  std::unique_ptr<UploadedLinearOp> fc2_latent_dense;
+  std::unique_ptr<ScaledFp8LinearOp> fc2_latent_scaled_fp8;
   ProjectionFamily shared_up_family = ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> shared_up_dense;
   std::unique_ptr<ScaledFp8LinearOp> shared_up_scaled_fp8;
@@ -1110,14 +1143,13 @@ bool CopyProjectionIntoContiguousBuffer(
     std::size_t matmul_scale_nbytes,
     float* fused_tensor_scale_out) {
   const GemmDescriptor& descriptor = up_projection ? entry.up_descriptor : entry.down_descriptor;
-  const std::optional<float>& input_scale = up_projection ? entry.up_input_scale : entry.down_input_scale;
   const std::optional<float>& tensor_scale = up_projection ? entry.up_tensor_scale : entry.down_tensor_scale;
   const std::unique_ptr<UploadedLinearOp>& op = up_projection ? entry.up_proj : entry.down_proj;
   if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
       !tensor_scale.has_value()) {
     return false;
   }
-  const float fused_tensor_scale = input_scale.value_or(1.0f) * (*tensor_scale);
+  const float fused_tensor_scale = *tensor_scale;
   if (fused_tensor_scale_out == nullptr ||
       !std::isfinite(fused_tensor_scale) ||
       fused_tensor_scale <= 0.0f) {
@@ -1493,13 +1525,19 @@ bool ConfigureRoutedMoEBackend(
     std::optional<NemotronFlashInferNvfp4WeightView> up_view;
     std::optional<NemotronFlashInferNvfp4WeightView> down_view;
     if (weight_surface == FlashInferWeightSurface::kCutlassRaw) {
-      up_view = BuildFlashInferRawNvfp4WeightView(routed_experts[expert_index].up_descriptor);
-      down_view = BuildFlashInferRawNvfp4WeightView(routed_experts[expert_index].down_descriptor);
+      up_view = BuildFlashInferRawNvfp4WeightView(
+          routed_experts[expert_index].up_descriptor,
+          routed_experts[expert_index].up_tensor_scale);
+      down_view = BuildFlashInferRawNvfp4WeightView(
+          routed_experts[expert_index].down_descriptor,
+          routed_experts[expert_index].down_tensor_scale);
     } else {
       const auto up_prepared_view = PrepareFlashInferNvfp4WeightHost(
-          routed_experts[expert_index].up_descriptor);
+          routed_experts[expert_index].up_descriptor,
+          routed_experts[expert_index].up_tensor_scale);
       const auto down_prepared_view = PrepareFlashInferNvfp4WeightHost(
-          routed_experts[expert_index].down_descriptor);
+          routed_experts[expert_index].down_descriptor,
+          routed_experts[expert_index].down_tensor_scale);
       if (up_prepared_view.has_value()) {
         up_prepared[expert_index] = std::move(*up_prepared_view);
         up_view = BuildFlashInferPreparedNvfp4WeightView(up_prepared[expert_index]);
@@ -1596,8 +1634,14 @@ std::optional<ExpertLayerBindings> BuildExpertLayerBindings(
       FindExactKernelBinding(layer, kernel_catalog, "mixer.fc1_latent_proj.weight_scale");
   bindings.fc1_latent_input_scale =
       FindExactKernelBinding(layer, kernel_catalog, "mixer.fc1_latent_proj.input_scale");
-  bindings.fc2_latent_weight =
+  bindings.fc2_latent_gemm_weight =
       FindExactGemmBinding(layer, gemm_catalog, "mixer.fc2_latent_proj.weight");
+  bindings.fc2_latent_kernel_weight =
+      FindExactKernelBinding(layer, kernel_catalog, "mixer.fc2_latent_proj.weight");
+  bindings.fc2_latent_weight_scale =
+      FindExactKernelBinding(layer, kernel_catalog, "mixer.fc2_latent_proj.weight_scale");
+  bindings.fc2_latent_input_scale =
+      FindExactKernelBinding(layer, kernel_catalog, "mixer.fc2_latent_proj.input_scale");
   bindings.shared_up_gemm_weight =
       FindExactGemmBinding(layer, gemm_catalog, "mixer.shared_experts.up_proj.weight");
   bindings.shared_up_kernel_weight =
@@ -1633,7 +1677,8 @@ std::optional<ExpertLayerBindings> BuildExpertLayerBindings(
       bindings.gate_score_correction_bias == nullptr ||
       (bindings.fc1_latent_gemm_weight == nullptr &&
        bindings.fc1_latent_kernel_weight == nullptr) ||
-      bindings.fc2_latent_weight == nullptr ||
+      (bindings.fc2_latent_gemm_weight == nullptr &&
+       bindings.fc2_latent_kernel_weight == nullptr) ||
       (bindings.shared_up_gemm_weight == nullptr &&
        bindings.shared_up_kernel_weight == nullptr) ||
       (bindings.shared_down_gemm_weight == nullptr &&
@@ -1680,7 +1725,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       bindings.gate_score_correction_bias == nullptr ||
       (bindings.fc1_latent_gemm_weight == nullptr &&
        bindings.fc1_latent_kernel_weight == nullptr) ||
-      bindings.fc2_latent_weight == nullptr ||
+      (bindings.fc2_latent_gemm_weight == nullptr &&
+       bindings.fc2_latent_kernel_weight == nullptr) ||
       (bindings.shared_up_gemm_weight == nullptr &&
        bindings.shared_up_kernel_weight == nullptr) ||
       (bindings.shared_down_gemm_weight == nullptr &&
@@ -1728,8 +1774,32 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     timing_sink("gate_weight_create", time_ms(gate_weight_begin, gate_weight_end));
   }
 
+  Impl::ProjectionFamily fc2_latent_family = Impl::ProjectionFamily::kNone;
+  std::unique_ptr<UploadedLinearOp> fc2_latent_dense;
+  std::unique_ptr<ScaledFp8LinearOp> fc2_latent_scaled_fp8;
   const auto fc2_begin = std::chrono::steady_clock::now();
-  auto fc2_latent = UploadedLinearOp::Create(*bindings.fc2_latent_weight);
+  if (bindings.fc2_latent_kernel_weight != nullptr &&
+      bindings.fc2_latent_weight_scale != nullptr &&
+      bindings.fc2_latent_input_scale != nullptr) {
+    const auto fc2_config = BuildScaledFp8LinearConfig(
+        *bindings.fc2_latent_kernel_weight,
+        *bindings.fc2_latent_weight_scale,
+        *bindings.fc2_latent_input_scale);
+    if (fc2_config.has_value()) {
+      fc2_latent_scaled_fp8 = ScaledFp8LinearOp::Create(*fc2_config);
+      if (!fc2_latent_scaled_fp8 || !fc2_latent_scaled_fp8->valid()) {
+        return debug_fail_with_cleanup("fc2_latent scaled-fp8 creation failed");
+      }
+      fc2_latent_family = Impl::ProjectionFamily::kScaledFp8;
+    }
+  }
+  if (fc2_latent_family == Impl::ProjectionFamily::kNone) {
+    fc2_latent_dense = UploadedLinearOp::Create(*bindings.fc2_latent_gemm_weight);
+    if (!fc2_latent_dense || !fc2_latent_dense->valid()) {
+      return debug_fail_with_cleanup("fc2_latent dense creation failed");
+    }
+    fc2_latent_family = Impl::ProjectionFamily::kDense;
+  }
   const auto fc2_end = std::chrono::steady_clock::now();
   if (timing_sink) {
     timing_sink("fc2_create", time_ms(fc2_begin, fc2_end));
@@ -1816,7 +1886,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     shared_down_nvfp4 = MaterializeRoutedExpertOp(
         *bindings.shared_down_gemm_weight,
         shared_down_nvfp4_buffers.get(),
-        &shared_down_nvfp4_buffers_ready);
+        &shared_down_nvfp4_buffers_ready,
+        ReadTensorScaleHost(*bindings.shared_down_gemm_weight));
     if (!shared_down_nvfp4 || !shared_down_nvfp4->valid()) {
       return debug_fail_with_cleanup("shared_down NVFP4 creation failed");
     }
@@ -1854,7 +1925,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       gate_score_correction_bias_device->shape().size() != 1 ||
       gate_score_correction_bias_device->shape()[0] != config.n_routed_experts ||
       !gate_weight || !gate_weight->valid() ||
-      !fc2_latent || !fc2_latent->valid() ||
+      fc2_latent_family == Impl::ProjectionFamily::kNone ||
       (fc1_latent_family == Impl::ProjectionFamily::kNone) ||
       (shared_up_family == Impl::ProjectionFamily::kNone)) {
     return debug_fail_with_cleanup("core weight materialization failed");
@@ -1868,6 +1939,14 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       fc1_latent_family == Impl::ProjectionFamily::kScaledFp8
           ? fc1_latent_scaled_fp8->input_cols()
           : fc1_latent_dense->input_cols();
+  const std::size_t fc2_output_rows =
+      fc2_latent_family == Impl::ProjectionFamily::kScaledFp8
+          ? fc2_latent_scaled_fp8->output_rows()
+          : fc2_latent_dense->output_rows();
+  const std::size_t fc2_input_cols =
+      fc2_latent_family == Impl::ProjectionFamily::kScaledFp8
+          ? fc2_latent_scaled_fp8->input_cols()
+          : fc2_latent_dense->input_cols();
   const std::size_t shared_up_output_rows =
       shared_up_family == Impl::ProjectionFamily::kScaledFp8
           ? shared_up_scaled_fp8->output_rows()
@@ -1881,8 +1960,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       bindings.gate_weight->input_cols != config.hidden_size ||
       fc1_output_rows != config.moe_latent_size ||
       fc1_input_cols != config.hidden_size ||
-      bindings.fc2_latent_weight->output_rows != config.hidden_size ||
-      bindings.fc2_latent_weight->input_cols != config.moe_latent_size ||
+      fc2_output_rows != config.hidden_size ||
+      fc2_input_cols != config.moe_latent_size ||
       shared_up_output_rows != config.shared_expert_intermediate_size ||
       shared_up_input_cols != config.hidden_size) {
     return debug_fail_with_cleanup("core shape validation failed");
@@ -1925,12 +2004,22 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     }
     routed_experts[expert_index].up_descriptor = *pair.up_proj;
     routed_experts[expert_index].down_descriptor = *pair.down_proj;
-    routed_experts[expert_index].up_tensor_scale = ReadTensorScaleHost(*pair.up_proj);
-    routed_experts[expert_index].down_tensor_scale = ReadTensorScaleHost(*pair.down_proj);
     routed_experts[expert_index].up_input_scale =
         ReadOptionalScalarTensorToHostFp32(pair.up_input_scale);
     routed_experts[expert_index].down_input_scale =
         ReadOptionalScalarTensorToHostFp32(pair.down_input_scale);
+    routed_experts[expert_index].up_tensor_scale = ResolveRoutedNvfp4RuntimeTensorScale(
+        *pair.up_proj,
+        routed_experts[expert_index].up_input_scale);
+    routed_experts[expert_index].down_tensor_scale = ResolveRoutedNvfp4RuntimeTensorScale(
+        *pair.down_proj,
+        routed_experts[expert_index].down_input_scale);
+    if ((pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+         !routed_experts[expert_index].up_tensor_scale.has_value()) ||
+        (pair.down_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+         !routed_experts[expert_index].down_tensor_scale.has_value())) {
+      return debug_fail_with_cleanup("routed expert NVFP4 scale resolution failed");
+    }
     if (pair.up_proj->kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
         pair.down_proj->kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
       routed_experts[expert_index].up_proj = UploadedLinearOp::Create(*pair.up_proj);
@@ -1991,11 +2080,13 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       if (!EnsureNvfp4AlignedBuffers(
               entry.up_descriptor,
               entry.up_nvfp4_buffers.get(),
-              &entry.up_nvfp4_buffers_ready) ||
+              &entry.up_nvfp4_buffers_ready,
+              entry.up_tensor_scale) ||
           !EnsureNvfp4AlignedBuffers(
               entry.down_descriptor,
               entry.down_nvfp4_buffers.get(),
-              &entry.down_nvfp4_buffers_ready)) {
+              &entry.down_nvfp4_buffers_ready,
+              entry.down_tensor_scale)) {
         return debug_fail_with_cleanup("eager routed NVFP4 lookup prep failed");
       }
       entry.up_nvfp4_lookup_ready = entry.up_nvfp4_buffers->lookup_valid();
@@ -2038,11 +2129,13 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
       if (!EnsureNvfp4AlignedBuffers(
               entry.up_descriptor,
               entry.up_nvfp4_buffers.get(),
-              &entry.up_nvfp4_buffers_ready) ||
+              &entry.up_nvfp4_buffers_ready,
+              entry.up_tensor_scale) ||
           !EnsureNvfp4AlignedBuffers(
               entry.down_descriptor,
               entry.down_nvfp4_buffers.get(),
-              &entry.down_nvfp4_buffers_ready)) {
+              &entry.down_nvfp4_buffers_ready,
+              entry.down_tensor_scale)) {
         return debug_fail_with_cleanup("bias-routed NVFP4 hotset prep failed");
       }
       entry.up_nvfp4_lookup_ready = entry.up_nvfp4_buffers->lookup_valid();
@@ -2062,7 +2155,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->fc1_latent_family = fc1_latent_family;
   impl->fc1_latent_dense = std::move(fc1_latent_dense);
   impl->fc1_latent_scaled_fp8 = std::move(fc1_latent_scaled_fp8);
-  impl->fc2_latent = std::move(fc2_latent);
+  impl->fc2_latent_family = fc2_latent_family;
+  impl->fc2_latent_dense = std::move(fc2_latent_dense);
+  impl->fc2_latent_scaled_fp8 = std::move(fc2_latent_scaled_fp8);
   impl->shared_up_family = shared_up_family;
   impl->shared_up_dense = std::move(shared_up_dense);
   impl->shared_up_scaled_fp8 = std::move(shared_up_scaled_fp8);
@@ -2276,8 +2371,6 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       !bindings.gate_score_correction_bias_device->valid() ||
       !bindings.gate_weight ||
       !bindings.gate_weight->valid() ||
-      !bindings.fc2_latent ||
-      !bindings.fc2_latent->valid() ||
       bindings.routed_experts.size() != config.n_routed_experts) {
     return nullptr;
   }
@@ -2287,6 +2380,12 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     fc1_latent_family = Impl::ProjectionFamily::kDense;
   } else if (bindings.fc1_latent_scaled_fp8 && bindings.fc1_latent_scaled_fp8->valid()) {
     fc1_latent_family = Impl::ProjectionFamily::kScaledFp8;
+  }
+  Impl::ProjectionFamily fc2_latent_family = Impl::ProjectionFamily::kNone;
+  if (bindings.fc2_latent_dense && bindings.fc2_latent_dense->valid()) {
+    fc2_latent_family = Impl::ProjectionFamily::kDense;
+  } else if (bindings.fc2_latent_scaled_fp8 && bindings.fc2_latent_scaled_fp8->valid()) {
+    fc2_latent_family = Impl::ProjectionFamily::kScaledFp8;
   }
   Impl::ProjectionFamily shared_up_family = Impl::ProjectionFamily::kNone;
   if (bindings.shared_up_dense && bindings.shared_up_dense->valid()) {
@@ -2303,6 +2402,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     shared_down_family = Impl::SharedDownFamily::kNvfp4;
   }
   if (fc1_latent_family == Impl::ProjectionFamily::kNone ||
+      fc2_latent_family == Impl::ProjectionFamily::kNone ||
       shared_up_family == Impl::ProjectionFamily::kNone ||
       shared_down_family == Impl::SharedDownFamily::kNone) {
     return nullptr;
@@ -2316,6 +2416,14 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       fc1_latent_family == Impl::ProjectionFamily::kScaledFp8
           ? bindings.fc1_latent_scaled_fp8->input_cols()
           : bindings.fc1_latent_dense->input_cols();
+  const std::size_t fc2_output_rows =
+      fc2_latent_family == Impl::ProjectionFamily::kScaledFp8
+          ? bindings.fc2_latent_scaled_fp8->output_rows()
+          : bindings.fc2_latent_dense->output_rows();
+  const std::size_t fc2_input_cols =
+      fc2_latent_family == Impl::ProjectionFamily::kScaledFp8
+          ? bindings.fc2_latent_scaled_fp8->input_cols()
+          : bindings.fc2_latent_dense->input_cols();
   const std::size_t shared_up_output_rows =
       shared_up_family == Impl::ProjectionFamily::kScaledFp8
           ? bindings.shared_up_scaled_fp8->output_rows()
@@ -2328,8 +2436,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       bindings.gate_weight->input_cols() != config.hidden_size ||
       fc1_output_rows != config.moe_latent_size ||
       fc1_input_cols != config.hidden_size ||
-      bindings.fc2_latent->output_rows() != config.hidden_size ||
-      bindings.fc2_latent->input_cols() != config.moe_latent_size ||
+      fc2_output_rows != config.hidden_size ||
+      fc2_input_cols != config.moe_latent_size ||
       shared_up_output_rows != config.shared_expert_intermediate_size ||
       shared_up_input_cols != config.hidden_size) {
     return nullptr;
@@ -2368,6 +2476,12 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
     routed_experts[expert_index].down_tensor_scale = prepared.down_tensor_scale;
     routed_experts[expert_index].up_input_scale = prepared.up_input_scale;
     routed_experts[expert_index].down_input_scale = prepared.down_input_scale;
+    if ((prepared.up_descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+         !prepared.up_tensor_scale.has_value()) ||
+        (prepared.down_descriptor.kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+         !prepared.down_tensor_scale.has_value())) {
+      return nullptr;
+    }
     if (prepared.up_proj != nullptr) {
       if (!prepared.up_proj->valid() ||
           !prepared.down_proj->valid() ||
@@ -2422,11 +2536,13 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       if (!EnsureNvfp4AlignedBuffers(
               entry.up_descriptor,
               entry.up_nvfp4_buffers.get(),
-              &entry.up_nvfp4_buffers_ready) ||
+              &entry.up_nvfp4_buffers_ready,
+              entry.up_tensor_scale) ||
           !EnsureNvfp4AlignedBuffers(
               entry.down_descriptor,
               entry.down_nvfp4_buffers.get(),
-              &entry.down_nvfp4_buffers_ready)) {
+              &entry.down_nvfp4_buffers_ready,
+              entry.down_tensor_scale)) {
         return nullptr;
       }
       entry.up_nvfp4_lookup_ready = entry.up_nvfp4_buffers->lookup_valid();
@@ -2467,11 +2583,13 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
       if (!EnsureNvfp4AlignedBuffers(
               entry.up_descriptor,
               entry.up_nvfp4_buffers.get(),
-              &entry.up_nvfp4_buffers_ready) ||
+              &entry.up_nvfp4_buffers_ready,
+              entry.up_tensor_scale) ||
           !EnsureNvfp4AlignedBuffers(
               entry.down_descriptor,
               entry.down_nvfp4_buffers.get(),
-              &entry.down_nvfp4_buffers_ready)) {
+              &entry.down_nvfp4_buffers_ready,
+              entry.down_tensor_scale)) {
         return nullptr;
       }
       entry.up_nvfp4_lookup_ready = entry.up_nvfp4_buffers->lookup_valid();
@@ -2487,7 +2605,9 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
   impl->fc1_latent_family = fc1_latent_family;
   impl->fc1_latent_dense = std::move(bindings.fc1_latent_dense);
   impl->fc1_latent_scaled_fp8 = std::move(bindings.fc1_latent_scaled_fp8);
-  impl->fc2_latent = std::move(bindings.fc2_latent);
+  impl->fc2_latent_family = fc2_latent_family;
+  impl->fc2_latent_dense = std::move(bindings.fc2_latent_dense);
+  impl->fc2_latent_scaled_fp8 = std::move(bindings.fc2_latent_scaled_fp8);
   impl->shared_up_family = shared_up_family;
   impl->shared_up_dense = std::move(bindings.shared_up_dense);
   impl->shared_up_scaled_fp8 = std::move(bindings.shared_up_scaled_fp8);
@@ -2789,8 +2909,12 @@ bool ExpertLayerSlice::valid() const {
           (impl_->fc1_latent_family == Impl::ProjectionFamily::kScaledFp8 &&
            impl_->fc1_latent_scaled_fp8 != nullptr &&
            impl_->fc1_latent_scaled_fp8->valid())) &&
-         impl_->fc2_latent != nullptr &&
-         impl_->fc2_latent->valid() &&
+         ((impl_->fc2_latent_family == Impl::ProjectionFamily::kDense &&
+           impl_->fc2_latent_dense != nullptr &&
+           impl_->fc2_latent_dense->valid()) ||
+          (impl_->fc2_latent_family == Impl::ProjectionFamily::kScaledFp8 &&
+           impl_->fc2_latent_scaled_fp8 != nullptr &&
+           impl_->fc2_latent_scaled_fp8->valid())) &&
          ((impl_->shared_up_family == Impl::ProjectionFamily::kDense &&
            impl_->shared_up_dense != nullptr &&
            impl_->shared_up_dense->valid()) ||
@@ -3449,7 +3573,8 @@ bool RunExpertLayerImpl(
       entry.up_proj = MaterializeRoutedExpertOp(
           entry.up_descriptor,
           entry.up_nvfp4_buffers.get(),
-          &entry.up_nvfp4_buffers_ready);
+          &entry.up_nvfp4_buffers_ready,
+          entry.up_tensor_scale);
       if (entry.up_proj != nullptr && entry.up_proj->valid()) {
         RecordRoutedExpertMaterialization();
       }
@@ -3462,7 +3587,8 @@ bool RunExpertLayerImpl(
       entry.down_proj = MaterializeRoutedExpertOp(
           entry.down_descriptor,
           entry.down_nvfp4_buffers.get(),
-          &entry.down_nvfp4_buffers_ready);
+          &entry.down_nvfp4_buffers_ready,
+          entry.down_tensor_scale);
       if (entry.down_proj != nullptr && entry.down_proj->valid()) {
         RecordRoutedExpertMaterialization();
       }
@@ -3510,11 +3636,13 @@ bool RunExpertLayerImpl(
     if (!EnsureNvfp4AlignedBuffers(
             entry.up_descriptor,
             entry.up_nvfp4_buffers.get(),
-            &entry.up_nvfp4_buffers_ready) ||
+            &entry.up_nvfp4_buffers_ready,
+            entry.up_tensor_scale) ||
         !EnsureNvfp4AlignedBuffers(
             entry.down_descriptor,
             entry.down_nvfp4_buffers.get(),
-            &entry.down_nvfp4_buffers_ready)) {
+            &entry.down_nvfp4_buffers_ready,
+            entry.down_tensor_scale)) {
       return false;
     }
     entry.up_nvfp4_lookup_ready = entry.up_nvfp4_buffers->lookup_valid();
@@ -3681,11 +3809,13 @@ bool RunExpertLayerImpl(
   const auto try_grouped_routed_single_token =
       [&](std::size_t token_index,
           const ActivationTensorT& latent_input_row,
+          ActivationTensorT* routed_accumulator,
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
     if (trace != nullptr ||
-        token_count != 1 ||
+        routed_accumulator == nullptr ||
+        !routed_accumulator->valid() ||
         batch_count == 0 ||
         !impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
       if (debug && !impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
@@ -3871,7 +4001,7 @@ bool RunExpertLayerImpl(
         if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
           graph_ok = graph_ok &&
                      cudaMemcpyAsync(
-                         routed_tensor->data(),
+                         routed_accumulator->data(),
                          impl.scratch_graph_output.data(),
                          latent_elements * sizeof(float),
                          cudaMemcpyDeviceToDevice,
@@ -3881,7 +4011,7 @@ bool RunExpertLayerImpl(
                      ConvertDeviceFp32ToBf16(
                          impl.scratch_graph_output.data(),
                          latent_elements,
-                         routed_tensor->data(),
+                         routed_accumulator->data(),
                          stream);
         }
         if (graph_ok) {
@@ -4233,7 +4363,7 @@ bool RunExpertLayerImpl(
                           impl.scratch_row_scales.data(),
                           selected_weights_device,
                           batch_count,
-                          routed_tensor.get(),
+                          routed_accumulator,
                           stream);
                     } else {
                       return ScaleWeightedAccumulateRowsBf16(
@@ -4242,7 +4372,7 @@ bool RunExpertLayerImpl(
                           impl.scratch_row_scales.data(),
                           selected_weights_device,
                           batch_count,
-                          routed_tensor.get(),
+                          routed_accumulator,
                           stream);
                     }
                   })) {
@@ -4332,7 +4462,7 @@ bool RunExpertLayerImpl(
                       impl.scratch_selected_down_tensor_scales.data(),
                       selected_weights_device,
                       batch_count,
-                      routed_tensor.get(),
+                      routed_accumulator,
                       stream);
                 } else {
                   return ScaleWeightedAccumulateRowsBf16(
@@ -4341,7 +4471,7 @@ bool RunExpertLayerImpl(
                       impl.scratch_selected_down_tensor_scales.data(),
                       selected_weights_device,
                       batch_count,
-                      routed_tensor.get(),
+                      routed_accumulator,
                       stream);
                 }
               })) {
@@ -4365,13 +4495,15 @@ bool RunExpertLayerImpl(
   const auto try_routed_fastpath_single_token =
       [&](std::size_t token_index,
           const ActivationTensorT& latent_input_row,
+          ActivationTensorT* routed_accumulator,
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
     if (!expert_sublayer_profile_enabled &&
         impl.routed_backend_kind == RoutedMoEBackendKind::kFlashInfer) {
       if (trace != nullptr ||
-          token_count != 1 ||
+          routed_accumulator == nullptr ||
+          !routed_accumulator->valid() ||
           batch_count == 0 ||
           impl.flashinfer_routed_backend == nullptr ||
           !impl.flashinfer_routed_backend->valid()) {
@@ -4384,7 +4516,7 @@ bool RunExpertLayerImpl(
                 1,
                 selected_indices_device,
                 selected_weights_device,
-                routed_tensor.get())) {
+                routed_accumulator)) {
           RecordFlashInferRoutedExpertUse();
           return GroupedRoutedResult::kUsed;
         }
@@ -4398,6 +4530,7 @@ bool RunExpertLayerImpl(
     return try_grouped_routed_single_token(
         token_index,
         latent_input_row,
+        routed_accumulator,
         selected_indices_device,
         selected_weights_device,
         batch_count);
@@ -4421,11 +4554,32 @@ bool RunExpertLayerImpl(
       }
       latent_input = latent_row.get();
     }
+    std::unique_ptr<ActivationTensorT> routed_accumulator_row;
+    ActivationTensorT* routed_accumulator = routed_tensor.get();
+    if (token_count != 1) {
+      if constexpr (std::is_same_v<ActivationTensorT, DeviceTensorFp32>) {
+        routed_accumulator_row = DeviceTensorFp32::CreateView(
+            {1, impl.config.moe_latent_size},
+            routed_tensor->data() + (token_index * impl.config.moe_latent_size));
+      } else {
+        routed_accumulator_row = DeviceTensorBf16::CreateView(
+            {1, impl.config.moe_latent_size},
+            routed_tensor->data() + (token_index * impl.config.moe_latent_size));
+      }
+      if (!routed_accumulator_row || !routed_accumulator_row->valid()) {
+        if (debug) {
+          std::cout << "expert_layer: routed accumulator row view failed\n";
+        }
+        return false;
+      }
+      routed_accumulator = routed_accumulator_row.get();
+    }
 
     const GroupedRoutedResult grouped_result =
         try_routed_fastpath_single_token(
             token_index,
             *latent_input,
+            routed_accumulator,
             selection_scratch.indices_device->data() + (token_index * impl.config.top_k),
             selection_scratch.weights_device->data() + (token_index * impl.config.top_k),
             impl.config.top_k);
@@ -4699,12 +4853,23 @@ bool RunExpertLayerImpl(
           ExpertSubLayerStage::kFc2LatentProjection,
           &fc2_ok,
           [&]() {
-            return impl.fc2_latent->Run(
-                cublas_handle,
-                heuristic_cache,
-                *routed_tensor,
-                projected_routed.get(),
-                stream);
+            if (impl.fc2_latent_family ==
+                ExpertLayerSlice::Impl::ProjectionFamily::kScaledFp8) {
+              return impl.fc2_latent_scaled_fp8 != nullptr &&
+                     impl.fc2_latent_scaled_fp8->Run(
+                         cublas_handle,
+                         heuristic_cache,
+                         *routed_tensor,
+                         projected_routed.get(),
+                         stream);
+            }
+            return impl.fc2_latent_dense != nullptr &&
+                   impl.fc2_latent_dense->Run(
+                       cublas_handle,
+                       heuristic_cache,
+                       *routed_tensor,
+                       projected_routed.get(),
+                       stream);
           })) {
     return false;
   }

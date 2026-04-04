@@ -30,6 +30,8 @@ ATTENTION_SUFFIXES = {
     "mixer.k_proj.weight",
     "mixer.v_proj.weight",
     "mixer.o_proj.weight",
+    "mixer.o_proj.weight_scale",
+    "mixer.o_proj.input_scale",
 }
 
 MAMBA_SUFFIXES = {
@@ -56,12 +58,21 @@ EXPERT_STANDALONE_SUFFIXES = {
     "mixer.fc1_latent_proj.weight_scale",
     "mixer.fc1_latent_proj.input_scale",
     "mixer.fc2_latent_proj.weight",
+    "mixer.fc2_latent_proj.weight_scale",
+    "mixer.fc2_latent_proj.input_scale",
     "mixer.shared_experts.up_proj.weight",
     "mixer.shared_experts.up_proj.weight_scale",
     "mixer.shared_experts.up_proj.input_scale",
     "mixer.shared_experts.down_proj.weight_scale",
     "mixer.shared_experts.down_proj.input_scale",
 }
+
+# Routed NVFP4 execution must match vLLM alpha semantics. The manifest stays
+# checkpoint-oriented at this boundary, so routed expert input_scale tensors
+# should remain explicit manifest tensors while raw checkpoint weight_scale_2
+# stays available on NVFP4 weight entries. Runtime/cache paths may later fuse
+# input_scale * weight_scale_2 into one effective tensor scale, but that is not
+# the manifest contract.
 
 NVFP4_WEIGHT_SUFFIXES = {
     "mixer.shared_experts.down_proj.weight",
@@ -204,6 +215,12 @@ def is_routed_expert_nvfp4_weight(suffix: str) -> bool:
     )
 
 
+def is_routed_expert_standalone_tensor(suffix: str) -> bool:
+    return suffix.startswith("mixer.experts.") and (
+        suffix.endswith(".up_proj.input_scale") or suffix.endswith(".down_proj.input_scale")
+    )
+
+
 def is_nvfp4_weight(name: str) -> bool:
     if not is_layer_tensor(name):
         return False
@@ -221,6 +238,7 @@ def is_needed_tensor(name: str) -> bool:
         suffix in ATTENTION_SUFFIXES
         or suffix in MAMBA_SUFFIXES
         or suffix in EXPERT_STANDALONE_SUFFIXES
+        or is_routed_expert_standalone_tensor(suffix)
         or suffix in NVFP4_WEIGHT_SUFFIXES
         or is_routed_expert_nvfp4_weight(suffix)
     )
@@ -350,6 +368,13 @@ def build_nvfp4_entry(
 ) -> dict[str, Any]:
     weight = tensor_record(model_dir, weight_map, shard_headers, tensor_name)
     block_scales_name = tensor_name[:-len(".weight")] + ".weight_scale"
+    # Keep the manifest checkpoint-oriented here. For routed NVFP4 weights this
+    # auxiliary names the raw checkpoint tensor_scale source (prefer
+    # weight_scale_2 when present, otherwise input_scale for the legacy/shared
+    # cases). Runtime/cache code that needs one scalar must treat routed expert
+    # tensor_scale as the effective fused value input_scale * weight_scale_2 to
+    # match vLLM alpha semantics, but that reinterpretation does not happen in
+    # the manifest artifact.
     tensor_scale_candidates = [
         tensor_name[:-len(".weight")] + ".weight_scale_2",
         tensor_name[:-len(".weight")] + ".input_scale",
@@ -413,10 +438,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             continue
 
         suffix = layer_suffix(tensor_name)
-        if suffix in {
-            "mixer.shared_experts.down_proj.weight_scale",
-            "mixer.shared_experts.down_proj.input_scale",
-        }:
+        if suffix == "mixer.shared_experts.down_proj.weight_scale":
             shared_down_weight = tensor_record(
                 model_dir,
                 weight_map,
@@ -424,6 +446,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 tensor_name.rsplit(".", 1)[0] + ".weight",
             )
             if shared_down_weight["dtype"] == "U8":
+                # Keep the standalone shared down_proj input_scale visible in
+                # the manifest so runtime/cache paths can fuse it with
+                # weight_scale_2. Only the block-scale tensor stays folded into
+                # the NVFP4 weight entry.
                 continue
 
         record = tensor_record(model_dir, weight_map, shard_headers, tensor_name)

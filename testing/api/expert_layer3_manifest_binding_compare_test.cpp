@@ -194,6 +194,19 @@ std::optional<std::vector<float>> read_gemm_descriptor_fp32(
   return std::nullopt;
 }
 
+std::optional<std::vector<float>> read_gemm_descriptor_fp32_scaled(
+    const nemotron::GemmDescriptor& descriptor,
+    float scale) {
+  auto values = read_gemm_descriptor_fp32(descriptor);
+  if (!values.has_value()) {
+    return std::nullopt;
+  }
+  for (float& value : *values) {
+    value *= scale;
+  }
+  return values;
+}
+
 std::optional<std::vector<float>> read_raw_fp32_bytes(
     const std::uint8_t* data,
     std::size_t nbytes) {
@@ -284,7 +297,10 @@ bool run_expert_layer3_manifest_binding_compare() {
       !expect(bindings->fc1_latent_kernel_weight != nullptr, "fc1 latent kernel binding should exist") ||
       !expect(bindings->fc1_latent_weight_scale != nullptr, "fc1 latent weight scale should exist") ||
       !expect(bindings->fc1_latent_input_scale != nullptr, "fc1 latent input scale should exist") ||
-      !expect(bindings->fc2_latent_weight != nullptr, "fc2 latent binding should exist") ||
+      !expect(bindings->fc2_latent_gemm_weight != nullptr, "fc2 latent gemm binding should exist") ||
+      !expect(bindings->fc2_latent_kernel_weight != nullptr, "fc2 latent kernel binding should exist") ||
+      !expect(bindings->fc2_latent_weight_scale != nullptr, "fc2 latent weight scale should exist") ||
+      !expect(bindings->fc2_latent_input_scale != nullptr, "fc2 latent input scale should exist") ||
       !expect(bindings->shared_up_kernel_weight != nullptr, "shared up kernel binding should exist") ||
       !expect(bindings->shared_up_weight_scale != nullptr, "shared up weight scale should exist") ||
       !expect(bindings->shared_up_input_scale != nullptr, "shared up input scale should exist") ||
@@ -326,7 +342,9 @@ bool run_expert_layer3_manifest_binding_compare() {
           0.0f) ||
       !compare_float_vectors(
           "fc2_latent_weight",
-          *read_gemm_descriptor_fp32(*bindings->fc2_latent_weight),
+          *read_gemm_descriptor_fp32_scaled(
+              *bindings->fc2_latent_gemm_weight,
+              (*read_kernel_descriptor_fp32(*bindings->fc2_latent_weight_scale))[0]),
           read_float_file(fixture_root / "fc2_latent_weight_fp32.bin"),
           0.0f) ||
       !compare_exact_bytes(

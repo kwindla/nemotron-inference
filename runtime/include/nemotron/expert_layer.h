@@ -49,7 +49,10 @@ struct ExpertLayerBindings {
   const KernelTensorDescriptor* fc1_latent_kernel_weight = nullptr;
   const KernelTensorDescriptor* fc1_latent_weight_scale = nullptr;
   const KernelTensorDescriptor* fc1_latent_input_scale = nullptr;
-  const GemmDescriptor* fc2_latent_weight = nullptr;
+  const GemmDescriptor* fc2_latent_gemm_weight = nullptr;
+  const KernelTensorDescriptor* fc2_latent_kernel_weight = nullptr;
+  const KernelTensorDescriptor* fc2_latent_weight_scale = nullptr;
+  const KernelTensorDescriptor* fc2_latent_input_scale = nullptr;
   const GemmDescriptor* shared_up_gemm_weight = nullptr;
   const KernelTensorDescriptor* shared_up_kernel_weight = nullptr;
   const KernelTensorDescriptor* shared_up_weight_scale = nullptr;
@@ -64,6 +67,8 @@ struct ExpertLayerBindings {
 struct ExpertLayerPreparedExpert {
   GemmDescriptor up_descriptor;
   GemmDescriptor down_descriptor;
+  // Routed NVFP4 runtime paths consume the fused effective tensor scale
+  // resolved as checkpoint-side input_scale * runtime weight_scale_2.
   std::optional<float> up_tensor_scale;
   std::optional<float> down_tensor_scale;
   std::optional<float> up_input_scale;
@@ -78,7 +83,8 @@ struct ExpertLayerPreparedBindings {
   std::unique_ptr<UploadedLinearOp> gate_weight;
   std::unique_ptr<UploadedLinearOp> fc1_latent_dense;
   std::unique_ptr<ScaledFp8LinearOp> fc1_latent_scaled_fp8;
-  std::unique_ptr<UploadedLinearOp> fc2_latent;
+  std::unique_ptr<UploadedLinearOp> fc2_latent_dense;
+  std::unique_ptr<ScaledFp8LinearOp> fc2_latent_scaled_fp8;
   std::unique_ptr<UploadedLinearOp> shared_up_dense;
   std::unique_ptr<ScaledFp8LinearOp> shared_up_scaled_fp8;
   std::unique_ptr<UploadedLinearOp> shared_down_dense;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -58,6 +59,44 @@ const GemmDescriptor* FindGemmBinding(
   return nullptr;
 }
 
+std::optional<float> ReadScalarTensorToHostFp32(const KernelTensorDescriptor& descriptor) {
+  if (descriptor.packed_data == nullptr) {
+    return std::nullopt;
+  }
+  if (descriptor.storage_dtype == "fp32" && descriptor.packed_nbytes == sizeof(float)) {
+    float value = 0.0f;
+    std::memcpy(&value, descriptor.packed_data, sizeof(float));
+    return value;
+  }
+  return std::nullopt;
+}
+
+std::optional<ScaledFp8LinearConfig> BuildScaledFp8LinearConfig(
+    const KernelTensorDescriptor& weight,
+    const KernelTensorDescriptor& weight_scale,
+    const KernelTensorDescriptor& input_scale) {
+  if (weight.logical_shape.size() != 2 ||
+      weight.packed_data == nullptr ||
+      weight.storage_dtype != "fp8_e4m3fn") {
+    return std::nullopt;
+  }
+  const auto weight_scale_value = ReadScalarTensorToHostFp32(weight_scale);
+  const auto input_scale_value = ReadScalarTensorToHostFp32(input_scale);
+  if (!weight_scale_value.has_value() || !input_scale_value.has_value()) {
+    return std::nullopt;
+  }
+
+  ScaledFp8LinearConfig config;
+  config.output_rows = weight.logical_shape[0];
+  config.input_cols = weight.logical_shape[1];
+  config.packed_weight_data = weight.packed_data;
+  config.packed_weight_nbytes = weight.packed_nbytes;
+  config.tensor_name = weight.tensor_name;
+  config.weight_scale = *weight_scale_value;
+  config.input_scale = *input_scale_value;
+  return config;
+}
+
 }  // namespace
 
 struct AttentionLayerSlice::Impl {
@@ -67,6 +106,7 @@ struct AttentionLayerSlice::Impl {
   std::unique_ptr<UploadedLinearOp> k_proj;
   std::unique_ptr<UploadedLinearOp> v_proj;
   std::unique_ptr<UploadedLinearOp> o_proj;
+  std::unique_ptr<ScaledFp8LinearOp> o_proj_scaled_fp8;
   mutable std::mutex decode_plan_mutex;
   mutable bool decode_plan_attempted = false;
   mutable std::size_t decode_plan_max_kv_tokens = 0;
@@ -87,6 +127,18 @@ std::optional<AttentionLayerBindings> BuildAttentionLayerBindings(
   bindings.k_proj = FindGemmBinding(layer, gemm_catalog, {"self_attn.k_proj.weight", "attention.k_proj.weight", "k_proj.weight"});
   bindings.v_proj = FindGemmBinding(layer, gemm_catalog, {"self_attn.v_proj.weight", "attention.v_proj.weight", "v_proj.weight"});
   bindings.o_proj = FindGemmBinding(layer, gemm_catalog, {"self_attn.o_proj.weight", "attention.o_proj.weight", "o_proj.weight"});
+  bindings.o_proj_kernel_weight = FindKernelBinding(
+      layer,
+      kernel_catalog,
+      {"self_attn.o_proj.weight", "attention.o_proj.weight", "o_proj.weight"});
+  bindings.o_proj_weight_scale = FindKernelBinding(
+      layer,
+      kernel_catalog,
+      {"self_attn.o_proj.weight_scale", "attention.o_proj.weight_scale", "o_proj.weight_scale"});
+  bindings.o_proj_input_scale = FindKernelBinding(
+      layer,
+      kernel_catalog,
+      {"self_attn.o_proj.input_scale", "attention.o_proj.input_scale", "o_proj.input_scale"});
   if (bindings.norm_weight == nullptr ||
       bindings.q_proj == nullptr ||
       bindings.k_proj == nullptr ||
@@ -118,13 +170,29 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   auto q_proj = UploadedLinearOp::Create(*bindings.q_proj);
   auto k_proj = UploadedLinearOp::Create(*bindings.k_proj);
   auto v_proj = UploadedLinearOp::Create(*bindings.v_proj);
-  auto o_proj = UploadedLinearOp::Create(*bindings.o_proj);
+  std::unique_ptr<UploadedLinearOp> o_proj;
+  std::unique_ptr<ScaledFp8LinearOp> o_proj_scaled_fp8;
+  if (bindings.o_proj_kernel_weight != nullptr &&
+      bindings.o_proj_weight_scale != nullptr &&
+      bindings.o_proj_input_scale != nullptr) {
+    const auto o_proj_config = BuildScaledFp8LinearConfig(
+        *bindings.o_proj_kernel_weight,
+        *bindings.o_proj_weight_scale,
+        *bindings.o_proj_input_scale);
+    if (o_proj_config.has_value()) {
+      o_proj_scaled_fp8 = ScaledFp8LinearOp::Create(*o_proj_config);
+    }
+  }
+  if (o_proj_scaled_fp8 == nullptr) {
+    o_proj = UploadedLinearOp::Create(*bindings.o_proj);
+  }
   AttentionLayerPreparedBindings prepared;
   prepared.norm_weight = std::move(norm_weight);
   prepared.q_proj = std::move(q_proj);
   prepared.k_proj = std::move(k_proj);
   prepared.v_proj = std::move(v_proj);
   prepared.o_proj = std::move(o_proj);
+  prepared.o_proj_scaled_fp8 = std::move(o_proj_scaled_fp8);
   return CreatePrepared(config, std::move(prepared));
 }
 
@@ -141,7 +209,8 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::CreatePrepared(
       !bindings.q_proj || !bindings.q_proj->valid() ||
       !bindings.k_proj || !bindings.k_proj->valid() ||
       !bindings.v_proj || !bindings.v_proj->valid() ||
-      !bindings.o_proj || !bindings.o_proj->valid()) {
+      ((bindings.o_proj == nullptr || !bindings.o_proj->valid()) &&
+       (bindings.o_proj_scaled_fp8 == nullptr || !bindings.o_proj_scaled_fp8->valid()))) {
     return nullptr;
   }
 
@@ -152,6 +221,7 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::CreatePrepared(
   impl->k_proj = std::move(bindings.k_proj);
   impl->v_proj = std::move(bindings.v_proj);
   impl->o_proj = std::move(bindings.o_proj);
+  impl->o_proj_scaled_fp8 = std::move(bindings.o_proj_scaled_fp8);
   return std::unique_ptr<AttentionLayerSlice>(new AttentionLayerSlice(std::move(impl)));
 }
 
@@ -170,8 +240,8 @@ bool AttentionLayerSlice::valid() const {
          impl_->k_proj->valid() &&
          impl_->v_proj != nullptr &&
          impl_->v_proj->valid() &&
-         impl_->o_proj != nullptr &&
-         impl_->o_proj->valid();
+         ((impl_->o_proj != nullptr && impl_->o_proj->valid()) ||
+          (impl_->o_proj_scaled_fp8 != nullptr && impl_->o_proj_scaled_fp8->valid()));
 }
 
 const AttentionLayerConfig& AttentionLayerSlice::config() const {
@@ -528,8 +598,19 @@ bool AttentionLayerSlice::Run(
         return false;
       }
 
-      const bool o_ok =
-          impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected, stream);
+      const bool o_ok = impl_->o_proj_scaled_fp8 != nullptr
+                            ? impl_->o_proj_scaled_fp8->Run(
+                                  cublas_handle,
+                                  heuristic_cache,
+                                  *attn_output_fp32,
+                                  projected,
+                                  stream)
+                            : impl_->o_proj->Run(
+                                  cublas_handle,
+                                  heuristic_cache,
+                                  *attn_output_fp32,
+                                  projected,
+                                  stream);
       const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output, stream);
       if (!o_ok || !residual_ok) {
         if (debug) {
@@ -646,8 +727,19 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  const bool o_ok =
-      impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected, stream);
+  const bool o_ok = impl_->o_proj_scaled_fp8 != nullptr
+                        ? impl_->o_proj_scaled_fp8->Run(
+                              cublas_handle,
+                              heuristic_cache,
+                              *attn_output_fp32,
+                              projected,
+                              stream)
+                        : impl_->o_proj->Run(
+                              cublas_handle,
+                              heuristic_cache,
+                              *attn_output_fp32,
+                              projected,
+                              stream);
   const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output, stream);
   if (!o_ok || !residual_ok) {
     if (debug) {

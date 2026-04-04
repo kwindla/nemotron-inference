@@ -14,6 +14,7 @@
 #include "nemotron/model_schedule.h"
 #include "nemotron/primitive_ops.h"
 #include "nemotron/request_context.h"
+#include "nemotron/scaled_fp8_linear.h"
 
 namespace nemotron {
 
@@ -32,6 +33,9 @@ struct AttentionLayerBindings {
   const GemmDescriptor* k_proj = nullptr;
   const GemmDescriptor* v_proj = nullptr;
   const GemmDescriptor* o_proj = nullptr;
+  const KernelTensorDescriptor* o_proj_kernel_weight = nullptr;
+  const KernelTensorDescriptor* o_proj_weight_scale = nullptr;
+  const KernelTensorDescriptor* o_proj_input_scale = nullptr;
 };
 
 struct AttentionLayerPreparedBindings {
@@ -40,6 +44,7 @@ struct AttentionLayerPreparedBindings {
   std::unique_ptr<UploadedLinearOp> k_proj;
   std::unique_ptr<UploadedLinearOp> v_proj;
   std::unique_ptr<UploadedLinearOp> o_proj;
+  std::unique_ptr<ScaledFp8LinearOp> o_proj_scaled_fp8;
 };
 
 std::optional<AttentionLayerBindings> BuildAttentionLayerBindings(

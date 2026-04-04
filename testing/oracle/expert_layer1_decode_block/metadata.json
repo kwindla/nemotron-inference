@@ -1,6 +1,9 @@
 {
   "fixture_kind": "expert_layer_oracle_v1",
+  "generator": "dump_expert_layer_fixture.py",
+  "manifest_path": "/workspace/nemotron-runtime/artifacts/manifests/forward_runtime_manifest_unverified.json",
   "layer_index": 1,
+  "input_rows": 1,
   "hidden_size": 4096,
   "moe_latent_size": 1024,
   "routed_expert_intermediate_size": 2688,
@@ -12,30 +15,37 @@
   "routed_scaling_factor": 5.0,
   "norm_topk_prob": true,
   "rms_epsilon": 1e-05,
+  "fc1_latent_family": "scaled_fp8",
+  "shared_up_family": "scaled_fp8",
   "shared_down_family": "nvfp4",
+  "oracle_device": "cuda",
+  "routed_nvfp4_activation_packing_mode": "dynamic_runtime",
+  "routed_nvfp4_weight_tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
   "selected_expert_indices": [
-    96,
-    42,
-    320,
-    39,
-    1,
-    311,
-    315,
-    378,
-    379,
-    381,
-    244,
-    26,
-    331,
-    442,
-    438,
-    89,
-    425,
-    230,
-    335,
-    482,
-    494,
-    122
+    [
+      1,
+      26,
+      39,
+      42,
+      89,
+      96,
+      230,
+      244,
+      311,
+      315,
+      320,
+      331,
+      335,
+      378,
+      379,
+      381,
+      425,
+      438,
+      442,
+      482,
+      494,
+      122
+    ]
   ],
   "source_tensors": {
     "norm_weight": "backbone.layers.1.norm.weight",
@@ -46,10 +56,561 @@
     "shared_up_weight": "backbone.layers.1.mixer.shared_experts.up_proj.weight",
     "shared_down_weight": "backbone.layers.1.mixer.shared_experts.down_proj.weight"
   },
+  "nvfp4_contracts": {
+    "routed_experts": {
+      "activation_packing_mode": "dynamic_runtime",
+      "selected_experts": {
+        "1": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.1.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.1.up_proj.weight_scale_2",
+            "weight_scale_2": 2.1434965674416162e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.1.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.7098313249449575e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.1.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.1.down_proj.weight_scale_2",
+            "weight_scale_2": 2.6884534236160107e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.1.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.850987018241512e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "26": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.26.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.26.up_proj.weight_scale_2",
+            "weight_scale_2": 2.1162488337722607e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.26.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.6499608163941275e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.26.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.26.down_proj.weight_scale_2",
+            "weight_scale_2": 2.742949072853662e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.26.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.969588044928178e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "39": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.39.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.39.up_proj.weight_scale_2",
+            "weight_scale_2": 2.3433140086126514e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.39.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 5.148883319705533e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.39.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.39.down_proj.weight_scale_2",
+            "weight_scale_2": 2.888270864787046e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.39.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.285857581383895e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "42": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.42.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.42.up_proj.weight_scale_2",
+            "weight_scale_2": 2.09808349609375e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.42.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.6100467443466187e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.42.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.42.down_proj.weight_scale_2",
+            "weight_scale_2": 2.779279566311743e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.42.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.048655528010563e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "89": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.89.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.89.up_proj.weight_scale_2",
+            "weight_scale_2": 2.1798270608996972e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.89.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.789659069359686e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.89.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.89.down_proj.weight_scale_2",
+            "weight_scale_2": 2.506801138224546e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.89.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.455649998703409e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "96": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.96.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.96.up_proj.weight_scale_2",
+            "weight_scale_2": 2.2797357814852148e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.96.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 5.009185066739974e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.96.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.96.down_proj.weight_scale_2",
+            "weight_scale_2": 2.4886358005460352e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.96.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.416116059225304e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "122": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.122.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.122.up_proj.weight_scale_2",
+            "weight_scale_2": 1.9618442820501514e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.122.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.310693002551602e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.122.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.122.down_proj.weight_scale_2",
+            "weight_scale_2": 2.742949072853662e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.122.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.969588044928178e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "230": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.230.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.230.up_proj.weight_scale_2",
+            "weight_scale_2": 2.061753002635669e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.230.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.53021899993189e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.230.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.230.down_proj.weight_scale_2",
+            "weight_scale_2": 2.6884534236160107e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.230.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.850987018241512e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "244": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.244.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.244.up_proj.weight_scale_2",
+            "weight_scale_2": 2.3796445020707324e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.244.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 5.2287110641202617e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.244.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.244.down_proj.weight_scale_2",
+            "weight_scale_2": 2.9427665140246972e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.244.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.404458608070561e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "311": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.311.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.311.up_proj.weight_scale_2",
+            "weight_scale_2": 2.5249662940041162e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.311.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 5.548021642098888e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.311.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.311.down_proj.weight_scale_2",
+            "weight_scale_2": 2.7974447220913135e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.311.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.088189071614844e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "315": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.315.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.315.up_proj.weight_scale_2",
+            "weight_scale_2": 2.207074976467993e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.315.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.849529977590805e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.315.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.315.down_proj.weight_scale_2",
+            "weight_scale_2": 2.6702880859375e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.315.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.811453078763407e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "320": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.320.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.320.up_proj.weight_scale_2",
+            "weight_scale_2": 2.061753002635669e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.320.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.53021899993189e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.320.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.320.down_proj.weight_scale_2",
+            "weight_scale_2": 2.6521229301579297e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.320.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.771919535159126e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "331": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.331.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.331.up_proj.weight_scale_2",
+            "weight_scale_2": 2.361479346291162e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.331.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 5.1887973917530417e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.331.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.331.down_proj.weight_scale_2",
+            "weight_scale_2": 2.7247837351751514e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.331.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.930054105450073e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "335": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.335.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.335.up_proj.weight_scale_2",
+            "weight_scale_2": 2.134413989551831e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.335.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.6898744887613475e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.335.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.335.down_proj.weight_scale_2",
+            "weight_scale_2": 2.543131631682627e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.335.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.534717481785794e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "378": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.378.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.378.up_proj.weight_scale_2",
+            "weight_scale_2": 2.2434052880271338e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.378.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.929357322325245e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.378.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.378.down_proj.weight_scale_2",
+            "weight_scale_2": 2.6884534236160107e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.378.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.850987018241512e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "379": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.379.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.379.up_proj.weight_scale_2",
+            "weight_scale_2": 2.2161575543577783e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.379.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.869486813774415e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.379.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.379.down_proj.weight_scale_2",
+            "weight_scale_2": 2.6884534236160107e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.379.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.850987018241512e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "381": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.381.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.381.up_proj.weight_scale_2",
+            "weight_scale_2": 2.0708357624243945e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.381.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.550176235795789e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.381.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.381.down_proj.weight_scale_2",
+            "weight_scale_2": 2.543131631682627e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.381.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.534717481785794e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "425": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.425.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.425.up_proj.weight_scale_2",
+            "weight_scale_2": 1.970927041838877e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.425.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.330650238415501e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.425.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.425.down_proj.weight_scale_2",
+            "weight_scale_2": 2.8156098778708838e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.425.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.127722615219124e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "438": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.438.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.438.up_proj.weight_scale_2",
+            "weight_scale_2": 2.252487865916919e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.438.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.949314158508855e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.438.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.438.down_proj.weight_scale_2",
+            "weight_scale_2": 2.742949072853662e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.438.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 5.969588044928178e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "442": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.442.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.442.up_proj.weight_scale_2",
+            "weight_scale_2": 2.506801138224546e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.442.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 5.508107969731668e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.442.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.442.down_proj.weight_scale_2",
+            "weight_scale_2": 2.8337752155493945e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.442.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.167256554697229e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "482": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.482.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.482.up_proj.weight_scale_2",
+            "weight_scale_2": 2.061753002635669e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.482.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.53021899993189e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.482.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.482.down_proj.weight_scale_2",
+            "weight_scale_2": 2.8701055271085352e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.482.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.24632364190579e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        },
+        "494": {
+          "up_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.494.up_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.494.up_proj.weight_scale_2",
+            "weight_scale_2": 2.1162488337722607e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.494.up_proj.input_scale",
+            "input_scale": 0.002197265625,
+            "fixture_tensor_scale": 4.6499608163941275e-08,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          },
+          "down_proj": {
+            "weight_tensor_name": "backbone.layers.1.mixer.experts.494.down_proj.weight",
+            "weight_scale_2_name": "backbone.layers.1.mixer.experts.494.down_proj.weight_scale_2",
+            "weight_scale_2": 2.8337752155493945e-05,
+            "input_scale_name": "backbone.layers.1.mixer.experts.494.down_proj.input_scale",
+            "input_scale": 0.02176339365541935,
+            "fixture_tensor_scale": 6.167256554697229e-07,
+            "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+            "manifest_weight_present": true,
+            "manifest_input_scale_present": true
+          }
+        }
+      }
+    },
+    "shared_down": {
+      "activation_packing_mode": "dynamic_runtime",
+      "weight_tensor_name": "backbone.layers.1.mixer.shared_experts.down_proj.weight",
+      "weight_scale_2_name": "backbone.layers.1.mixer.shared_experts.down_proj.weight_scale_2",
+      "weight_scale_2": 0.00017438616487197578,
+      "input_scale_name": "backbone.layers.1.mixer.shared_experts.down_proj.input_scale",
+      "input_scale": 0.0028483073692768812,
+      "fixture_tensor_scale": 4.967053985047818e-07,
+      "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+      "manifest_weight_present": true,
+      "manifest_input_scale_present": false
+    }
+  },
   "notes": [
-    "The input hidden state is deterministic with the real layer-1 hidden width.",
+    "The input hidden state is deterministic unless --input-hidden-bin is provided.",
     "Router, latent projections, shared expert, and selected routed experts all use real checkpoint weights.",
-    "The routed and shared NVFP4 paths mirror the current correctness-first runtime contract: activations are dynamically packed to NVFP4, dequantized, then multiplied by dequantized weights.",
+    "Routed NVFP4 activations are dynamically packed to mirror the runtime path.",
+    "Routed NVFP4 tensor scales stored in this fixture follow the runtime/cache contract: effective fused input_scale * weight_scale_2.",
     "expected_final_output_fp32 includes the outer residual add."
-  ]
+  ],
+  "shared_down_nvfp4_activation_packing_mode": "dynamic_runtime",
+  "shared_down_nvfp4_weight_tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+  "shared_down_nvfp4_input_scale_present": true
 }

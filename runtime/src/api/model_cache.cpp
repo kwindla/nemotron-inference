@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -28,7 +29,6 @@ namespace nemotron {
 namespace {
 
 constexpr char kMagic[] = "NEMO_MODEL_CACHE_V1";
-constexpr std::uint32_t kCurrentModelCacheFormatVersion = 3;
 constexpr std::size_t kAlignmentBytes = 256;
 
 template <typename T>
@@ -181,8 +181,57 @@ std::vector<std::uint8_t> CopyFloatBytes(const std::vector<float>& values) {
   return bytes;
 }
 
+bool EndsWith(const std::string& value, const char* suffix) {
+  if (suffix == nullptr) {
+    return false;
+  }
+  const std::size_t suffix_size = std::strlen(suffix);
+  return value.size() >= suffix_size &&
+         value.compare(value.size() - suffix_size, suffix_size, suffix) == 0;
+}
+
+bool IsRoutedExpertTensorName(const std::string& tensor_name) {
+  return tensor_name.find(".mixer.experts.") != std::string::npos;
+}
+
 bool IsRoutedExpertCacheEntry(const ModelCacheEntry& entry) {
-  return entry.tensor_name.find(".mixer.experts.") != std::string::npos;
+  return IsRoutedExpertTensorName(entry.tensor_name);
+}
+
+std::optional<std::string> BuildInputScaleTensorName(const std::string& weight_tensor_name) {
+  static constexpr char kWeightSuffix[] = ".weight";
+  static constexpr char kInputScaleSuffix[] = ".input_scale";
+  if (!EndsWith(weight_tensor_name, kWeightSuffix)) {
+    return std::nullopt;
+  }
+  std::string tensor_name = weight_tensor_name;
+  tensor_name.replace(
+      tensor_name.size() - (sizeof(kWeightSuffix) - 1u),
+      sizeof(kWeightSuffix) - 1u,
+      kInputScaleSuffix);
+  return tensor_name;
+}
+
+std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
+  if (descriptor.tensor_scale_data == nullptr || descriptor.tensor_scale_nbytes != sizeof(float)) {
+    return std::nullopt;
+  }
+  float value = 0.0f;
+  std::memcpy(&value, descriptor.tensor_scale_data, sizeof(float));
+  return value;
+}
+
+std::optional<float> ReadNvfp4CacheTensorScale(
+    const GemmDescriptor& descriptor,
+    const KernelCatalog& kernel_catalog) {
+  // The routed runtime uses the same NVFP4 weight tensor-scale contract as the
+  // generic runtime matmul path, so the cache stores the raw descriptor tensor
+  // scale for routed experts as well.
+  const auto weight_scale_2 = ReadTensorScaleHost(descriptor);
+  if (!weight_scale_2.has_value()) {
+    return std::nullopt;
+  }
+  return weight_scale_2;
 }
 
 bool ShouldPreloadCacheEntry(const ModelCacheEntry& entry) {
@@ -356,8 +405,7 @@ bool ReadHeader(std::ifstream& input, ModelCacheHeader* header) {
       !DeserializeConfig(input, &header->config)) {
     return false;
   }
-  if (header->format_version == 0 ||
-      header->format_version > kCurrentModelCacheFormatVersion) {
+  if (header->format_version != kModelCacheFormatVersion) {
     return false;
   }
   std::uint32_t entry_count = 0;
@@ -641,6 +689,8 @@ bool AddNvfp4Entry(
   entry.payload_nbytes = descriptor.packed_nbytes;
   entry.aux0_nbytes = descriptor.block_scales_nbytes;
   entry.aux1_nbytes = execution_scale_nbytes;
+  // Cache aux2 carries one tensor-scale scalar using the raw descriptor tensor
+  // scale contract for all NVFP4 weights.
   entry.aux2_nbytes = descriptor.tensor_scale_nbytes;
   entries->push_back(std::move(entry));
   return true;
@@ -707,8 +757,25 @@ bool WriteDeterministicModelCache(
             !AddTensorFp32Entry(*bindings->norm_weight, &seen, &entries) ||
             !AddDenseWeightEntry(*bindings->q_proj, &seen, &entries) ||
             !AddDenseWeightEntry(*bindings->k_proj, &seen, &entries) ||
-            !AddDenseWeightEntry(*bindings->v_proj, &seen, &entries) ||
-            !AddDenseWeightEntry(*bindings->o_proj, &seen, &entries)) {
+            !AddDenseWeightEntry(*bindings->v_proj, &seen, &entries)) {
+          return false;
+        }
+        if (bindings->o_proj_kernel_weight != nullptr &&
+            bindings->o_proj_weight_scale != nullptr &&
+            bindings->o_proj_input_scale != nullptr &&
+            bindings->o_proj_kernel_weight->storage_dtype == "fp8_e4m3fn") {
+          const auto weight_scale = ReadScalarFp32(*bindings->o_proj_weight_scale);
+          const auto input_scale = ReadScalarFp32(*bindings->o_proj_input_scale);
+          if (!weight_scale.has_value() || !input_scale.has_value() ||
+              !AddScaledFp8NativeEntry(
+                  *bindings->o_proj,
+                  *weight_scale,
+                  *input_scale,
+                  &seen,
+                  &entries)) {
+            return false;
+          }
+        } else if (!AddDenseWeightEntry(*bindings->o_proj, &seen, &entries)) {
           return false;
         }
         break;
@@ -768,8 +835,24 @@ bool WriteDeterministicModelCache(
         if (!bindings.has_value() ||
             !AddTensorFp32Entry(*bindings->input_norm_weight, &seen, &entries) ||
             !AddTensorFp32Entry(*bindings->gate_score_correction_bias, &seen, &entries) ||
-            !AddDenseWeightEntry(*bindings->gate_weight, &seen, &entries) ||
-            !AddDenseWeightEntry(*bindings->fc2_latent_weight, &seen, &entries)) {
+            !AddDenseWeightEntry(*bindings->gate_weight, &seen, &entries)) {
+          return false;
+        }
+        if (bindings->fc2_latent_kernel_weight != nullptr &&
+            bindings->fc2_latent_weight_scale != nullptr &&
+            bindings->fc2_latent_input_scale != nullptr) {
+          const auto weight_scale = ReadScalarFp32(*bindings->fc2_latent_weight_scale);
+          const auto input_scale = ReadScalarFp32(*bindings->fc2_latent_input_scale);
+          if (!weight_scale.has_value() || !input_scale.has_value() ||
+              !AddScaledFp8NativeEntry(
+                  *bindings->fc2_latent_gemm_weight,
+                  *weight_scale,
+                  *input_scale,
+                  &seen,
+                  &entries)) {
+            return false;
+          }
+        } else if (!AddDenseWeightEntry(*bindings->fc2_latent_gemm_weight, &seen, &entries)) {
           return false;
         }
         if (bindings->fc1_latent_kernel_weight != nullptr &&
@@ -845,7 +928,7 @@ bool WriteDeterministicModelCache(
   }
 
   ModelCacheHeader header;
-  header.format_version = kCurrentModelCacheFormatVersion;
+  header.format_version = kModelCacheFormatVersion;
   header.config = config;
   header.entries = std::move(entries);
   FinalizeOffsets(&header.entries, &header.payload_nbytes);
@@ -935,16 +1018,21 @@ bool WriteDeterministicModelCache(
       }
       case ModelCacheEntryKind::kNvfp4Aligned: {
         const GemmDescriptor* descriptor = gemm_catalog.FindDescriptor(entry.tensor_name);
+        const auto tensor_scale =
+            descriptor == nullptr ? std::nullopt : ReadNvfp4CacheTensorScale(*descriptor, kernel_catalog);
         if (descriptor == nullptr ||
             descriptor->packed_data == nullptr ||
             descriptor->block_scales_data == nullptr ||
             descriptor->tensor_scale_data == nullptr ||
+            !tensor_scale.has_value() ||
+            entry.aux2_nbytes != sizeof(float) ||
             !WriteByteSpan(output, descriptor->packed_data, descriptor->packed_nbytes, &payload_offset) ||
             !PadOutputToOffset(output, &payload_offset, entry.aux0_offset) ||
             !WriteByteSpan(output, descriptor->block_scales_data, descriptor->block_scales_nbytes, &payload_offset)) {
           return false;
         }
         std::vector<std::uint8_t> swizzled(entry.aux1_nbytes, 0u);
+        const float effective_tensor_scale = *tensor_scale;
         if (!SwizzleRowMajorNvfp4ScalesForExecutionInto(
                 descriptor->block_scales_data,
                 descriptor->output_rows,
@@ -954,7 +1042,11 @@ bool WriteDeterministicModelCache(
             !PadOutputToOffset(output, &payload_offset, entry.aux1_offset) ||
             !WriteByteSpan(output, swizzled.data(), swizzled.size(), &payload_offset) ||
             !PadOutputToOffset(output, &payload_offset, entry.aux2_offset) ||
-            !WriteByteSpan(output, descriptor->tensor_scale_data, descriptor->tensor_scale_nbytes, &payload_offset)) {
+            !WriteByteSpan(
+                output,
+                reinterpret_cast<const std::uint8_t*>(&effective_tensor_scale),
+                sizeof(effective_tensor_scale),
+                &payload_offset)) {
           return false;
         }
         break;
@@ -1281,12 +1373,21 @@ std::unique_ptr<ScaledFp8LinearOp> LoadedModelCache::CreateScaledFp8LinearView(
 }
 
 std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(
-    const GemmDescriptor& descriptor) const {
+    const GemmDescriptor& descriptor,
+    std::optional<float> tensor_scale_override) const {
   const ModelCacheEntry* entry = FindEntry(descriptor.tensor_name);
   if (entry == nullptr ||
       entry->kind != ModelCacheEntryKind::kNvfp4Aligned ||
       !EnsureEntryResident(entry)) {
     return nullptr;
+  }
+  if (tensor_scale_override.has_value()) {
+    const float value = *tensor_scale_override;
+    if (!std::isfinite(value) ||
+        value <= 0.0f ||
+        cudaMemcpy(Aux2Ptr(entry), &value, sizeof(value), cudaMemcpyHostToDevice) != cudaSuccess) {
+      return nullptr;
+    }
   }
   auto weight = DeviceNvfp4Weight::CreateView(
       entry->output_rows,

@@ -1,5 +1,6 @@
 #include "nemotron/expert_layer.h"
 #include "nemotron/linear_op.h"
+#include "nemotron/request_context.h"
 
 #include <cuda_runtime.h>
 
@@ -22,6 +23,7 @@ using nemotron::CublasLtHandle;
 using nemotron::DeviceTensorFp32;
 using nemotron::ExpertLayerBindings;
 using nemotron::ExpertLayerConfig;
+using nemotron::ExpertLayerPreparedBindings;
 using nemotron::ExpertLayerRunTrace;
 using nemotron::ExpertLayerSlice;
 using nemotron::ExpertSelection;
@@ -29,6 +31,8 @@ using nemotron::GemmDescriptor;
 using nemotron::GemmHeuristicCache;
 using nemotron::GemmKernelFamily;
 using nemotron::KernelTensorDescriptor;
+using nemotron::RequestExecutionConfig;
+using nemotron::RequestExecutionContext;
 using nemotron::ScaledFp8LinearConfig;
 using nemotron::ScaledFp8LinearOp;
 using nemotron::UploadedLinearOp;
@@ -50,6 +54,11 @@ struct FixtureMetadata {
   std::string fc1_latent_family = "scaled_fp8";
   std::string shared_up_family = "scaled_fp8";
   std::string shared_down_family;
+  std::string routed_nvfp4_activation_packing_mode;
+  std::string routed_nvfp4_weight_tensor_scale_contract;
+  std::string shared_down_nvfp4_activation_packing_mode;
+  std::string shared_down_nvfp4_weight_tensor_scale_contract;
+  bool shared_down_nvfp4_input_scale_present = false;
 };
 
 struct RoutedExpertFixture {
@@ -181,6 +190,16 @@ std::optional<FixtureMetadata> load_metadata(const std::filesystem::path& root) 
   const auto fc1_latent_family = parse_json_string_field(json, "fc1_latent_family");
   const auto shared_up_family = parse_json_string_field(json, "shared_up_family");
   const auto shared_down_family = parse_json_string_field(json, "shared_down_family");
+  const auto routed_nvfp4_activation_packing_mode =
+      parse_json_string_field(json, "routed_nvfp4_activation_packing_mode");
+  const auto routed_nvfp4_weight_tensor_scale_contract =
+      parse_json_string_field(json, "routed_nvfp4_weight_tensor_scale_contract");
+  const auto shared_down_nvfp4_activation_packing_mode =
+      parse_json_string_field(json, "shared_down_nvfp4_activation_packing_mode");
+  const auto shared_down_nvfp4_weight_tensor_scale_contract =
+      parse_json_string_field(json, "shared_down_nvfp4_weight_tensor_scale_contract");
+  const auto shared_down_nvfp4_input_scale_present =
+      parse_json_bool_field(json, "shared_down_nvfp4_input_scale_present");
   if (!layer_index || !hidden_size || !moe_latent_size || !routed_expert_intermediate_size ||
       !shared_expert_intermediate_size || !n_routed_experts || !top_k || !n_group ||
       !topk_group || !routed_scaling_factor || !rms_epsilon || !norm_topk_prob ||
@@ -207,6 +226,21 @@ std::optional<FixtureMetadata> load_metadata(const std::filesystem::path& root) 
     metadata.shared_up_family = *shared_up_family;
   }
   metadata.shared_down_family = *shared_down_family;
+  if (routed_nvfp4_activation_packing_mode) {
+    metadata.routed_nvfp4_activation_packing_mode = *routed_nvfp4_activation_packing_mode;
+  }
+  if (routed_nvfp4_weight_tensor_scale_contract) {
+    metadata.routed_nvfp4_weight_tensor_scale_contract = *routed_nvfp4_weight_tensor_scale_contract;
+  }
+  if (shared_down_nvfp4_activation_packing_mode) {
+    metadata.shared_down_nvfp4_activation_packing_mode = *shared_down_nvfp4_activation_packing_mode;
+  }
+  if (shared_down_nvfp4_weight_tensor_scale_contract) {
+    metadata.shared_down_nvfp4_weight_tensor_scale_contract = *shared_down_nvfp4_weight_tensor_scale_contract;
+  }
+  if (shared_down_nvfp4_input_scale_present) {
+    metadata.shared_down_nvfp4_input_scale_present = *shared_down_nvfp4_input_scale_present;
+  }
   return metadata;
 }
 
@@ -320,6 +354,31 @@ float relative_l2_diff(const std::vector<float>& lhs, const std::vector<float>& 
   return static_cast<float>(std::sqrt(diff_sq / ref_sq));
 }
 
+std::optional<RequestExecutionConfig> make_expert_request_config(const FixtureMetadata& metadata) {
+  if (metadata.hidden_size == 0 ||
+      metadata.input_rows == 0 ||
+      metadata.top_k == 0 ||
+      metadata.routed_expert_intermediate_size == 0 ||
+      metadata.moe_latent_size == 0 ||
+      metadata.shared_expert_intermediate_size == 0 ||
+      metadata.n_routed_experts == 0) {
+    return std::nullopt;
+  }
+  RequestExecutionConfig config;
+  config.hidden_size = metadata.hidden_size;
+  config.max_tokens = metadata.input_rows;
+  config.scratch_tokens = metadata.input_rows;
+  config.expert_selection_capacity = metadata.input_rows * metadata.top_k;
+  config.expert_intermediate_scratch_numel =
+      metadata.top_k * metadata.routed_expert_intermediate_size;
+  config.expert_aux_scratch_numel =
+      (4 * metadata.hidden_size) +
+      (3 * metadata.moe_latent_size) +
+      metadata.shared_expert_intermediate_size +
+      metadata.n_routed_experts;
+  return config;
+}
+
 std::vector<ExpertSelection> sorted_selections(std::vector<ExpertSelection> selections) {
   std::sort(
       selections.begin(),
@@ -412,6 +471,13 @@ bool run_expert_layer_fixture() {
   if (!expect(input_hidden.size() == metadata->input_rows * metadata->hidden_size, "input hidden size should match metadata") ||
       !expect(norm_weight.size() == metadata->hidden_size, "norm weight size should match metadata") ||
       !expect(
+          metadata->routed_nvfp4_activation_packing_mode == "dynamic_runtime",
+          "routed NVFP4 activation packing mode should be dynamic_runtime") ||
+      !expect(
+          metadata->routed_nvfp4_weight_tensor_scale_contract ==
+              "effective_fused_input_scale_x_weight_scale_2",
+          "routed NVFP4 tensor scale contract should be effective fused") ||
+      !expect(
           expected_norm_output.empty() ||
               expected_norm_output.size() == metadata->input_rows * metadata->hidden_size,
           "expected norm output size should match metadata when present") ||
@@ -455,6 +521,20 @@ bool run_expert_layer_fixture() {
       !expect(expected_selected_expert_indices.size() == metadata->input_rows * metadata->top_k, "selected expert count should match top-k") ||
       !expect(expected_selected_expert_weights.size() == metadata->input_rows * metadata->top_k, "selected expert weights size should match top-k")) {
     return false;
+  }
+  if (metadata->shared_down_family == "nvfp4") {
+    const std::string expected_shared_down_contract =
+        metadata->shared_down_nvfp4_input_scale_present
+            ? "effective_fused_input_scale_x_weight_scale_2"
+            : "raw_checkpoint_weight_scale_2";
+    if (!expect(
+            metadata->shared_down_nvfp4_activation_packing_mode == "dynamic_runtime",
+            "shared down NVFP4 activation packing mode should be dynamic_runtime") ||
+        !expect(
+            metadata->shared_down_nvfp4_weight_tensor_scale_contract == expected_shared_down_contract,
+            "shared down NVFP4 tensor scale contract should match input-scale availability")) {
+      return false;
+    }
   }
 
   const auto input_norm_descriptor =
@@ -523,7 +603,7 @@ bool run_expert_layer_fixture() {
   } else {
     return expect(false, "fc1 latent family should be supported");
   }
-  bindings.fc2_latent_weight = &fc2_latent_weight_descriptor;
+  bindings.fc2_latent_gemm_weight = &fc2_latent_weight_descriptor;
   if (metadata->shared_up_family == "scaled_fp8") {
     bindings.shared_up_kernel_weight = &shared_up_weight_descriptor;
     bindings.shared_up_weight_scale = &shared_up_weight_scale_descriptor;
@@ -623,7 +703,153 @@ bool run_expert_layer_fixture() {
   layer_config.norm_topk_prob = metadata->norm_topk_prob;
   layer_config.rms_epsilon = metadata->rms_epsilon;
 
-  auto slice = ExpertLayerSlice::Create(layer_config, bindings);
+  std::unique_ptr<ExpertLayerSlice> slice;
+  const char* force_create_env = std::getenv("NEMOTRON_EXPERT_LAYER_FORCE_CREATE");
+  const bool force_create =
+      force_create_env != nullptr && std::string(force_create_env).size() != 0;
+  if (!force_create &&
+      metadata->routed_nvfp4_weight_tensor_scale_contract ==
+      "effective_fused_input_scale_x_weight_scale_2") {
+    ExpertLayerPreparedBindings prepared_bindings;
+    prepared_bindings.input_norm_weight = DeviceTensorFp32::Create({metadata->hidden_size});
+    prepared_bindings.gate_score_correction_bias_device =
+        DeviceTensorFp32::Create({metadata->n_routed_experts});
+    if (!expect(
+            prepared_bindings.input_norm_weight != nullptr &&
+                prepared_bindings.gate_score_correction_bias_device != nullptr,
+            "prepared expert layer tensors should allocate") ||
+        !expect(
+            prepared_bindings.input_norm_weight->CopyFromHost(
+                norm_weight.data(),
+                norm_weight.size()),
+            "prepared norm weight should upload") ||
+        !expect(
+            prepared_bindings.gate_score_correction_bias_device->CopyFromHost(
+                gate_score_correction_bias.data(),
+                gate_score_correction_bias.size()),
+            "prepared gate correction bias should upload")) {
+      return false;
+    }
+    prepared_bindings.gate_weight = UploadedLinearOp::Create(gate_weight_descriptor);
+    prepared_bindings.fc2_latent_dense = UploadedLinearOp::Create(fc2_latent_weight_descriptor);
+    if (!expect(
+            prepared_bindings.gate_weight != nullptr &&
+                prepared_bindings.gate_weight->valid() &&
+                prepared_bindings.fc2_latent_dense != nullptr &&
+                prepared_bindings.fc2_latent_dense->valid(),
+            "prepared dense operators should upload")) {
+      return false;
+    }
+    if (metadata->fc1_latent_family == "scaled_fp8") {
+      ScaledFp8LinearConfig config;
+      config.output_rows = metadata->moe_latent_size;
+      config.input_cols = metadata->hidden_size;
+      config.packed_weight_data = fc1_latent_weight.data();
+      config.packed_weight_nbytes = fc1_latent_weight.size();
+      config.weight_scale = fc1_latent_weight_scale[0];
+      config.input_scale = fc1_latent_input_scale[0];
+      prepared_bindings.fc1_latent_scaled_fp8 = ScaledFp8LinearOp::Create(config);
+      if (!expect(
+              prepared_bindings.fc1_latent_scaled_fp8 != nullptr &&
+                  prepared_bindings.fc1_latent_scaled_fp8->valid(),
+              "prepared fc1 scaled-fp8 operator should upload")) {
+        return false;
+      }
+    } else {
+      prepared_bindings.fc1_latent_dense = UploadedLinearOp::Create(fc1_latent_dense_descriptor);
+      if (!expect(
+              prepared_bindings.fc1_latent_dense != nullptr &&
+                  prepared_bindings.fc1_latent_dense->valid(),
+              "prepared fc1 dense operator should upload")) {
+        return false;
+      }
+    }
+    if (metadata->shared_up_family == "scaled_fp8") {
+      ScaledFp8LinearConfig config;
+      config.output_rows = metadata->shared_expert_intermediate_size;
+      config.input_cols = metadata->hidden_size;
+      config.packed_weight_data = shared_up_weight.data();
+      config.packed_weight_nbytes = shared_up_weight.size();
+      config.weight_scale = shared_up_weight_scale[0];
+      config.input_scale = shared_up_input_scale[0];
+      prepared_bindings.shared_up_scaled_fp8 = ScaledFp8LinearOp::Create(config);
+      if (!expect(
+              prepared_bindings.shared_up_scaled_fp8 != nullptr &&
+                  prepared_bindings.shared_up_scaled_fp8->valid(),
+              "prepared shared-up scaled-fp8 operator should upload")) {
+        return false;
+      }
+    } else {
+      prepared_bindings.shared_up_dense = UploadedLinearOp::Create(shared_up_dense_descriptor);
+      if (!expect(
+              prepared_bindings.shared_up_dense != nullptr &&
+                  prepared_bindings.shared_up_dense->valid(),
+              "prepared shared-up dense operator should upload")) {
+        return false;
+      }
+    }
+    if (metadata->shared_down_family == "nvfp4") {
+      prepared_bindings.shared_down_nvfp4 = UploadedLinearOp::Create(shared_down_nvfp4_descriptor);
+      if (!expect(
+              prepared_bindings.shared_down_nvfp4 != nullptr &&
+                  prepared_bindings.shared_down_nvfp4->valid(),
+              "prepared shared-down NVFP4 operator should upload")) {
+        return false;
+      }
+    } else if (metadata->shared_down_family == "scaled_fp8") {
+      ScaledFp8LinearConfig config;
+      config.output_rows = metadata->hidden_size;
+      config.input_cols = metadata->shared_expert_intermediate_size;
+      config.packed_weight_data = shared_down_weight_fp8.data();
+      config.packed_weight_nbytes = shared_down_weight_fp8.size();
+      config.weight_scale = shared_down_weight_scale[0];
+      config.input_scale = shared_down_input_scale[0];
+      prepared_bindings.shared_down_scaled_fp8 = ScaledFp8LinearOp::Create(config);
+      if (!expect(
+              prepared_bindings.shared_down_scaled_fp8 != nullptr &&
+                  prepared_bindings.shared_down_scaled_fp8->valid(),
+              "prepared shared-down scaled-fp8 operator should upload")) {
+        return false;
+      }
+    } else {
+      prepared_bindings.shared_down_dense = UploadedLinearOp::Create(shared_down_dense_descriptor);
+      if (!expect(
+              prepared_bindings.shared_down_dense != nullptr &&
+                  prepared_bindings.shared_down_dense->valid(),
+              "prepared shared-down dense operator should upload")) {
+        return false;
+      }
+    }
+    prepared_bindings.routed_experts.resize(metadata->n_routed_experts);
+    for (auto& prepared : prepared_bindings.routed_experts) {
+      prepared.up_descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
+      prepared.up_descriptor.output_rows = metadata->routed_expert_intermediate_size;
+      prepared.up_descriptor.input_cols = metadata->moe_latent_size;
+      prepared.down_descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
+      prepared.down_descriptor.output_rows = metadata->moe_latent_size;
+      prepared.down_descriptor.input_cols = metadata->routed_expert_intermediate_size;
+    }
+    for (RoutedExpertFixture& expert : routed_experts) {
+      auto up_proj = UploadedLinearOp::Create(expert.up_descriptor);
+      auto down_proj = UploadedLinearOp::Create(expert.down_descriptor);
+      if (!expect(
+              up_proj != nullptr && up_proj->valid() &&
+                  down_proj != nullptr && down_proj->valid(),
+              "prepared routed expert operators should upload")) {
+        return false;
+      }
+      auto& prepared = prepared_bindings.routed_experts[static_cast<std::size_t>(expert.expert_index)];
+      prepared.up_descriptor = expert.up_descriptor;
+      prepared.down_descriptor = expert.down_descriptor;
+      prepared.up_tensor_scale = expert.up_weight_tensor_scale[0];
+      prepared.down_tensor_scale = expert.down_weight_tensor_scale[0];
+      prepared.up_proj = std::move(up_proj);
+      prepared.down_proj = std::move(down_proj);
+    }
+    slice = ExpertLayerSlice::CreatePrepared(layer_config, std::move(prepared_bindings));
+  } else {
+    slice = ExpertLayerSlice::Create(layer_config, bindings);
+  }
   if (!expect(slice != nullptr && slice->valid(), "expert layer slice should be created")) {
     return false;
   }
@@ -647,6 +873,43 @@ bool run_expert_layer_fixture() {
   std::vector<float> output_host(output->numel(), 0.0f);
   if (!expect(output->CopyToHost(output_host.data(), output_host.size()), "final output should download")) {
     return false;
+  }
+
+  const char* request_context_env = std::getenv("NEMOTRON_EXPERT_LAYER_USE_REQUEST_CONTEXT");
+  const bool use_request_context =
+      request_context_env != nullptr && std::string(request_context_env).size() != 0;
+  float request_context_final_diff = 0.0f;
+  float request_context_batch_vs_direct_diff = 0.0f;
+  if (use_request_context) {
+    const auto request_config = make_expert_request_config(*metadata);
+    if (!expect(request_config.has_value(), "expert request config should build")) {
+      return false;
+    }
+    auto request_context = RequestExecutionContext::Create(*request_config);
+    auto request_output = DeviceTensorFp32::Create({metadata->input_rows, metadata->hidden_size});
+    if (!expect(
+            request_context != nullptr && request_context->valid() &&
+                request_output != nullptr && request_output->valid(),
+            "expert request-context tensors should allocate") ||
+        !expect(
+            slice->RunWithRequestContext(
+                *cublas,
+                &heuristic_cache,
+                *request_context,
+                *input,
+                request_output.get(),
+                nullptr),
+            "expert layer slice should run with request context")) {
+      return false;
+    }
+    std::vector<float> request_output_host(request_output->numel(), 0.0f);
+    if (!expect(
+            request_output->CopyToHost(request_output_host.data(), request_output_host.size()),
+            "request-context final output should download")) {
+      return false;
+    }
+    request_context_final_diff = max_abs_diff(request_output_host, expected_final_output);
+    request_context_batch_vs_direct_diff = max_abs_diff(request_output_host, output_host);
   }
 
   auto row_input = DeviceTensorFp32::Create({1, metadata->hidden_size});
@@ -1054,6 +1317,8 @@ bool run_expert_layer_fixture() {
             << " direct_gate_diff=" << direct_gate_diff
             << " direct_fc1_diff=" << direct_fc1_diff
             << " direct_fc2_diff=" << direct_fc2_diff
+            << " request_context_final_diff=" << request_context_final_diff
+            << " request_context_batch_vs_direct_diff=" << request_context_batch_vs_direct_diff
             << " final_diff=" << final_diff
             << " final_rel_l2=" << final_rel_l2
             << "\n";
@@ -1072,6 +1337,12 @@ bool run_expert_layer_fixture() {
       !expect(shared_diff <= 1.0e-3f, "shared output should match oracle") ||
       !expect(mixer_diff <= 1.0e-3f, "mixer output should match oracle") ||
       !expect(batch_vs_sequential_diff <= 1.0e-3f, "batched and row-by-row expert outputs should match oracle") ||
+      !expect(
+          !use_request_context || request_context_final_diff <= 1.0e-3f,
+          "request-context final output should match oracle") ||
+      !expect(
+          !use_request_context || request_context_batch_vs_direct_diff <= 1.0e-3f,
+          "request-context and direct batch outputs should match") ||
       !expect(final_diff <= 1.0e-3f, "final output should match oracle")) {
     return false;
   }

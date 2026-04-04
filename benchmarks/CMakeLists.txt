@@ -1,5 +1,7 @@
 add_subdirectory(gb10_dense_gemm)
 add_subdirectory(decode_bench)
+add_subdirectory(prefill_trace_dump)
+add_subdirectory(expert_layer_trace_dump)
 add_subdirectory(gb10_loader_modes)
 add_subdirectory(gb10_mamba_cache)
 add_subdirectory(gb10_nvfp4_gemm)

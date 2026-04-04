@@ -21,6 +21,8 @@
 
 namespace nemotron {
 
+constexpr std::uint32_t kModelCacheFormatVersion = 5;
+
 enum class ModelCacheEntryKind : std::uint32_t {
   kTensorFp32 = 1,
   kEmbeddingFp32 = 2,
@@ -50,7 +52,7 @@ struct ModelCacheEntry {
 };
 
 struct ModelCacheHeader {
-  std::uint32_t format_version = 3;
+  std::uint32_t format_version = kModelCacheFormatVersion;
   std::string model_id;
   std::string source_revision;
   SingleTokenForwardConfig config;
@@ -91,7 +93,9 @@ class LoadedModelCache {
       const std::string& tensor_name,
       std::size_t output_rows,
       std::size_t input_cols) const;
-  std::unique_ptr<UploadedLinearOp> CreateNvfp4LinearView(const GemmDescriptor& descriptor) const;
+  std::unique_ptr<UploadedLinearOp> CreateNvfp4LinearView(
+      const GemmDescriptor& descriptor,
+      std::optional<float> tensor_scale_override = std::nullopt) const;
   bool ReleaseEntry(const std::string& tensor_name);
   void ReleaseFilePages() const;
 

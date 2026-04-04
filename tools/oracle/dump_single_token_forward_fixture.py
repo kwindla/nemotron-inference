@@ -242,19 +242,39 @@ def dequantize_nvfp4_matrix(
 def load_nvfp4_linear_metadata(model_dir: Path, weight_map: dict[str, str], prefix: str) -> dict[str, object]:
     weight = load_named_tensor(model_dir, weight_map, prefix + ".weight")
     weight_scales = load_named_tensor(model_dir, weight_map, prefix + ".weight_scale")
-    tensor_scale_name = prefix + ".weight_scale_2"
-    if tensor_scale_name not in weight_map:
-        tensor_scale_name = prefix + ".input_scale"
-    weight_scale_2 = float(load_named_tensor(model_dir, weight_map, tensor_scale_name).item())
+    weight_scale_2_name = prefix + ".weight_scale_2"
+    input_scale_name = prefix + ".input_scale"
+    has_weight_scale_2 = weight_scale_2_name in weight_map
+    has_input_scale = input_scale_name in weight_map
+    if not has_weight_scale_2 and not has_input_scale:
+        raise KeyError(
+            f"{prefix} is missing both .weight_scale_2 and .input_scale; "
+            "expected at least one NVFP4 tensor scale input"
+        )
+    weight_scale_2 = (
+        float(load_named_tensor(model_dir, weight_map, weight_scale_2_name).item())
+        if has_weight_scale_2
+        else 1.0
+    )
+    input_scale = (
+        float(load_named_tensor(model_dir, weight_map, input_scale_name).item())
+        if has_input_scale
+        else 1.0
+    )
+    effective_tensor_scale = weight_scale_2 * input_scale
     return {
         "family": "nvfp4",
         "prefix": prefix,
         "weight": weight.contiguous().view(torch.uint8).flatten().cpu(),
         "weight_scales": weight_scales.contiguous().view(torch.uint8).flatten().cpu(),
         "weight_scale_2": weight_scale_2,
+        "input_scale": input_scale,
+        "effective_tensor_scale": effective_tensor_scale,
         "rows": int(weight.shape[0]),
         "cols": int(weight_scales.shape[1] * 16),
-        "tensor_scale_name": tensor_scale_name,
+        "weight_scale_2_name": weight_scale_2_name if has_weight_scale_2 else None,
+        "input_scale_name": input_scale_name if has_input_scale else None,
+        "tensor_scale_contract": "effective_tensor_scale = input_scale * weight_scale_2",
     }
 
 
@@ -322,7 +342,7 @@ def nvfp4_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) 
             host_weight = dequantize_nvfp4_matrix(
                 linear_metadata["weight"],
                 linear_metadata["weight_scales"],
-                float(linear_metadata["weight_scale_2"]),
+                float(linear_metadata["effective_tensor_scale"]),
                 linear_metadata["rows"],
                 linear_metadata["cols"],
             )
@@ -374,10 +394,18 @@ def run_attention_block(
 ) -> torch.Tensor:
     prefix = f"backbone.layers.{layer_index}"
     norm_weight = load_named_tensor(model_dir, weight_map, prefix + ".norm.weight", device=device).to(torch.float32)
-    q_weight = load_named_tensor(model_dir, weight_map, prefix + ".mixer.q_proj.weight", device=device).to(torch.float32)
-    k_weight = load_named_tensor(model_dir, weight_map, prefix + ".mixer.k_proj.weight", device=device).to(torch.float32)
-    v_weight = load_named_tensor(model_dir, weight_map, prefix + ".mixer.v_proj.weight", device=device).to(torch.float32)
-    o_weight = load_named_tensor(model_dir, weight_map, prefix + ".mixer.o_proj.weight", device=device).to(torch.float32)
+    q_proj = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir, weight_map, prefix + ".mixer.q_proj", device=device
+    )
+    k_proj = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir, weight_map, prefix + ".mixer.k_proj", device=device
+    )
+    v_proj = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir, weight_map, prefix + ".mixer.v_proj", device=device
+    )
+    o_proj = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir, weight_map, prefix + ".mixer.o_proj", device=device
+    )
 
     hidden_size = int(config["hidden_size"])
     num_heads = int(config["num_attention_heads"])
@@ -386,9 +414,9 @@ def run_attention_block(
     epsilon = float(config["layer_norm_epsilon"])
 
     norm_output = rms_norm(hidden_states, norm_weight, epsilon)
-    q = F.linear(norm_output, q_weight).to(torch.float32)
-    k = F.linear(norm_output, k_weight).to(torch.float32)
-    v = F.linear(norm_output, v_weight).to(torch.float32)
+    q = run_dense_or_scaled_fp8_linear(norm_output, q_proj).to(torch.float32)
+    k = run_dense_or_scaled_fp8_linear(norm_output, k_proj).to(torch.float32)
+    v = run_dense_or_scaled_fp8_linear(norm_output, v_proj).to(torch.float32)
 
     token_count = hidden_states.shape[0]
     query_states = q.view(1, token_count, num_heads, head_dim).transpose(1, 2).contiguous()
@@ -412,7 +440,7 @@ def run_attention_block(
     attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32)
     attention_output = torch.matmul(attn_weights.to(torch.bfloat16), expanded_value.to(torch.bfloat16))
     attention_output = attention_output.transpose(1, 2).contiguous().view(1, token_count, hidden_size).to(torch.float32)
-    projected_output = F.linear(attention_output, o_weight).to(torch.float32)
+    projected_output = run_dense_or_scaled_fp8_linear(attention_output, o_proj).to(torch.float32)
     return hidden_states.to(torch.float32) + projected_output.view(token_count, hidden_size)
 
 
@@ -576,7 +604,9 @@ def run_expert_block(
     fc1_latent = load_dense_or_scaled_fp8_linear_metadata(
         model_dir, weight_map, mixer_prefix + ".fc1_latent_proj", device=device
     )
-    fc2_latent_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".fc2_latent_proj.weight", device=device).to(torch.float32)
+    fc2_latent = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir, weight_map, mixer_prefix + ".fc2_latent_proj", device=device
+    )
 
     shared_up = load_dense_or_scaled_fp8_linear_metadata(
         model_dir, weight_map, mixer_prefix + ".shared_experts.up_proj", device=device
@@ -621,7 +651,7 @@ def run_expert_block(
                 expert_output * float(selected_weights[token_index, slot].item())
             )
 
-    routed_projected = F.linear(routed_output.to(torch.float32), fc2_latent_weight.to(torch.float32))
+    routed_projected = run_dense_or_scaled_fp8_linear(routed_output.to(torch.float32), fc2_latent).to(torch.float32)
     shared_up_output = run_dense_or_scaled_fp8_linear(norm_output, shared_up).to(torch.float32)
     shared_up_activated = relu2(shared_up_output)
     if shared_down["family"] == "nvfp4":
@@ -767,6 +797,7 @@ def main() -> int:
             "single_token mode runs one token from scratch with zeroed cache/state.",
             "prefix_prefill mode runs a short prompt prefix from scratch and can stop after an early capture layer to keep fixture generation practical.",
             "Attention, Mamba, and MoE blocks mirror the current correctness-first runtime contracts already used by the layer-level oracle fixtures.",
+            "Routed and shared NVFP4 weights use the corrected effective runtime tensor scale contract: input_scale * weight_scale_2.",
             "Captured per-layer outputs are intended for the composed registry-backed forward-path validation.",
             "Captured Mamba layers also include final conv/SSM state snapshots for decode-boundary localization.",
         ],

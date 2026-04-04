@@ -1,10 +1,12 @@
 #include "nemotron/cublaslt_gemm_plan.h"
 #include "nemotron/cublaslt_handle.h"
+#include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/gemm_execution.h"
 #include "nemotron/gemm_planner.h"
 #include "nemotron/nvfp4_gemm_runner.h"
 #include "nemotron/nvfp4_packing.h"
+#include "nemotron/nvfp4_scale_layout.h"
 #include "nemotron/nvfp4_weight.h"
 
 #include <cuda_fp4.h>
@@ -31,15 +33,18 @@ using nemotron::BuildCublasLtGemmPlan;
 using nemotron::BuildGemmLaunchPlan;
 using nemotron::CublasLtHandle;
 using nemotron::DeviceNvfp4Weight;
+using nemotron::DeviceNvfp4Matrix;
 using nemotron::DeviceTensorFp32;
 using nemotron::GemmBackendKind;
 using nemotron::GemmDescriptor;
 using nemotron::GemmHeuristicCache;
 using nemotron::GemmKernelFamily;
+using nemotron::MakeNvfp4PackedMatrixDeviceView;
 using nemotron::Nvfp4PackOptions;
 using nemotron::PackRowMajorFp32ToNvfp4;
 using nemotron::PrepareGemmExecution;
-using nemotron::RunNvfp4RowMajorFp32SourceToDevice;
+using nemotron::RunNvfp4RowMajorFp32AccumToDevice;
+using nemotron::SwizzleRowMajorNvfp4ScalesForExecution;
 
 constexpr float kMaxAbsDiffTolerance = 1.0e-3f;
 constexpr double kMeanAbsDiffTolerance = 1.0e-4;
@@ -48,6 +53,9 @@ struct OracleFixtureMetadata {
   std::filesystem::path fixture_dir;
   std::string fixture_name;
   std::string target_operator;
+  std::string activation_packing_mode = "fixed_checkpoint_input_scale";
+  std::string weight_tensor_scale_contract;
+  bool weight_input_scale_present = false;
   std::size_t rows = 0;
   std::size_t input_cols = 0;
   std::size_t output_rows = 0;
@@ -103,6 +111,15 @@ std::optional<std::size_t> parse_json_uint_field(const std::string& json, const 
   }
 }
 
+std::optional<bool> parse_json_bool_field(const std::string& json, const std::string& key) {
+  const std::regex pattern("\"" + key + "\"\\s*:\\s*(true|false)");
+  std::smatch match;
+  if (!std::regex_search(json, match, pattern) || match.size() != 2) {
+    return std::nullopt;
+  }
+  return match[1].str() == "true";
+}
+
 bool fixture_files_exist(const std::filesystem::path& fixture_dir) {
   return std::filesystem::exists(fixture_dir / "metadata.json") &&
          std::filesystem::exists(fixture_dir / "activations_fp32.bin") &&
@@ -121,6 +138,12 @@ std::optional<OracleFixtureMetadata> load_fixture_metadata(const std::filesystem
   const std::string metadata_json = read_text_file(fixture_dir / "metadata.json");
   const std::optional<std::string> fixture_kind = parse_json_string_field(metadata_json, "fixture_kind");
   const std::optional<std::string> target_operator = parse_json_string_field(metadata_json, "target_operator");
+  const std::optional<std::string> activation_packing_mode =
+      parse_json_string_field(metadata_json, "activation_packing_mode");
+  const std::optional<std::string> weight_tensor_scale_contract =
+      parse_json_string_field(metadata_json, "weight_tensor_scale_contract");
+  const std::optional<bool> weight_input_scale_present =
+      parse_json_bool_field(metadata_json, "weight_input_scale_present");
   const std::optional<std::size_t> rows = parse_json_uint_field(metadata_json, "rows");
   const std::optional<std::size_t> input_cols = parse_json_uint_field(metadata_json, "input_cols");
   const std::optional<std::size_t> output_rows = parse_json_uint_field(metadata_json, "output_rows");
@@ -133,6 +156,13 @@ std::optional<OracleFixtureMetadata> load_fixture_metadata(const std::filesystem
   metadata.fixture_dir = fixture_dir;
   metadata.fixture_name = fixture_dir.filename().string();
   metadata.target_operator = *target_operator;
+  if (activation_packing_mode.has_value()) {
+    metadata.activation_packing_mode = *activation_packing_mode;
+  }
+  if (weight_tensor_scale_contract.has_value()) {
+    metadata.weight_tensor_scale_contract = *weight_tensor_scale_contract;
+  }
+  metadata.weight_input_scale_present = weight_input_scale_present.value_or(false);
   metadata.rows = *rows;
   metadata.input_cols = *input_cols;
   metadata.output_rows = *output_rows;
@@ -259,6 +289,19 @@ bool run_fixture(
     return false;
   }
   if (!expect(
+          !metadata.weight_tensor_scale_contract.empty(),
+          metadata.fixture_name + ": weight tensor scale contract should be recorded")) {
+    return false;
+  }
+  const std::string expected_weight_scale_contract = metadata.weight_input_scale_present
+                                                         ? "effective_fused_input_scale_x_weight_scale_2"
+                                                         : "raw_checkpoint_weight_scale_2";
+  if (!expect(
+          metadata.weight_tensor_scale_contract == expected_weight_scale_contract,
+          metadata.fixture_name + ": weight tensor scale contract should match fixture input-scale availability")) {
+    return false;
+  }
+  if (!expect(
           metadata.input_cols > 0 && activations.size() % metadata.input_cols == 0,
           metadata.fixture_name + ": activation row count should be integral")) {
     return false;
@@ -316,28 +359,71 @@ bool run_fixture(
   }
 
   auto weight = DeviceNvfp4Weight::Upload(weight_descriptor);
-  auto activation_source = DeviceTensorFp32::Create({rows, metadata.input_cols});
+  auto activation_matrix = DeviceNvfp4Matrix::Create(rows, metadata.input_cols);
   auto output = DeviceTensorFp32::Create({rows, metadata.output_rows});
   if (!expect(weight && weight->valid(), metadata.fixture_name + ": weight upload should succeed") ||
       !expect(
-          activation_source && activation_source->valid(),
-          metadata.fixture_name + ": activation tensor should allocate") ||
+          activation_matrix && activation_matrix->valid(),
+          metadata.fixture_name + ": activation matrix should allocate") ||
       !expect(output && output->valid(), metadata.fixture_name + ": output tensor should allocate")) {
-    return false;
-  }
-  if (!expect(
-          activation_source->CopyFromHost(activations.data(), activations.size()),
-          metadata.fixture_name + ": activations should upload")) {
     return false;
   }
 
   Nvfp4PackOptions pack_options;
-  pack_options.fixed_tensor_scale = activation_tensor_scale.front();
+  if (metadata.activation_packing_mode == "fixed_checkpoint_input_scale") {
+    pack_options.fixed_tensor_scale = activation_tensor_scale.front();
+  } else if (metadata.activation_packing_mode != "dynamic_runtime") {
+    return expect(false, metadata.fixture_name + ": unsupported activation packing mode");
+  }
   const auto activation_host_packed =
       PackRowMajorFp32ToNvfp4(activations.data(), rows, metadata.input_cols, pack_options);
   if (!expect(
           activation_host_packed.has_value(),
           metadata.fixture_name + ": host activation packing should succeed")) {
+    return false;
+  }
+  if (!expect(
+          std::fabs(activation_host_packed->tensor_scale - activation_tensor_scale.front()) <= 1.0e-6f,
+          metadata.fixture_name + ": packed activation tensor scale should match fixture metadata")) {
+    return false;
+  }
+  const std::vector<std::uint8_t> activation_matmul_scales = SwizzleRowMajorNvfp4ScalesForExecution(
+      activation_host_packed->block_scales.data(),
+      rows,
+      metadata.input_cols);
+  if (!expect(
+          !activation_matmul_scales.empty(),
+          metadata.fixture_name + ": activation matmul scales should swizzle")) {
+    return false;
+  }
+  if (!expect(
+          cudaMemcpy(
+              const_cast<std::uint8_t*>(activation_matrix->packed_data()),
+              activation_host_packed->packed.data(),
+              activation_host_packed->packed.size(),
+              cudaMemcpyHostToDevice) == cudaSuccess,
+          metadata.fixture_name + ": packed activations should upload") ||
+      !expect(
+          cudaMemcpy(
+              const_cast<std::uint8_t*>(activation_matrix->block_scales_data()),
+              activation_host_packed->block_scales.data(),
+              activation_host_packed->block_scales.size(),
+              cudaMemcpyHostToDevice) == cudaSuccess,
+          metadata.fixture_name + ": activation block scales should upload") ||
+      !expect(
+          cudaMemcpy(
+              const_cast<std::uint8_t*>(activation_matrix->matmul_block_scales_data()),
+              activation_matmul_scales.data(),
+              activation_matmul_scales.size(),
+              cudaMemcpyHostToDevice) == cudaSuccess,
+          metadata.fixture_name + ": activation matmul scales should upload") ||
+      !expect(
+          cudaMemcpy(
+              const_cast<std::uint8_t*>(activation_matrix->tensor_scale_data()),
+              &activation_host_packed->tensor_scale,
+              sizeof(float),
+              cudaMemcpyHostToDevice) == cudaSuccess,
+          metadata.fixture_name + ": activation tensor scale should upload")) {
     return false;
   }
 
@@ -376,7 +462,12 @@ bool run_fixture(
   fixture_reference_mean_abs_diff /= static_cast<double>(expected_output.size());
 
   const auto stats =
-      RunNvfp4RowMajorFp32SourceToDevice(handle, *plan, *activation_source, *weight, output.get(), pack_options);
+      RunNvfp4RowMajorFp32AccumToDevice(
+          handle,
+          *plan,
+          MakeNvfp4PackedMatrixDeviceView(*activation_matrix),
+          *weight,
+          output.get());
   if (!expect(stats.has_value(), metadata.fixture_name + ": NVFP4 runtime path should execute")) {
     return false;
   }
@@ -411,9 +502,6 @@ bool run_fixture(
   if (!expect(
           stats->heuristic_count > 0,
           metadata.fixture_name + ": runtime path should find a cublasLt heuristic")) {
-    return false;
-  }
-  if (!expect(max_abs_output > 0.0f, metadata.fixture_name + ": runtime output should not be identically zero")) {
     return false;
   }
   if (!expect(

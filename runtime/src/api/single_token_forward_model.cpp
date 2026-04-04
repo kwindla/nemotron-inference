@@ -32,6 +32,7 @@
 #include "nemotron/mamba_layer.h"
 #include "nemotron/model_cache.h"
 #include "nemotron/model_schedule.h"
+#include "nemotron/nvfp4_scale_helpers.h"
 #include "nemotron/paged_kv_cache.h"
 #include "nemotron/primitive_ops.h"
 #include "nemotron/runtime_environment.h"
@@ -69,15 +70,6 @@ bool CheckCudaMemoryBudget(const char* caller) {
     std::cerr << caller << ": NEMOTRON_SKIP_MEMORY_CHECK is set, proceeding anyway.\n";
   }
   return true;
-}
-
-std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
-  if (descriptor.tensor_scale_data == nullptr || descriptor.tensor_scale_nbytes != sizeof(float)) {
-    return std::nullopt;
-  }
-  float value = 0.0f;
-  std::memcpy(&value, descriptor.tensor_scale_data, sizeof(float));
-  return value;
 }
 
 std::optional<float> ReadScalarTensorToHostFp32(const KernelTensorDescriptor& descriptor) {
@@ -1072,7 +1064,17 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
         prepared.q_proj = impl->model_cache->CreateDenseLinearView(*bindings->q_proj);
         prepared.k_proj = impl->model_cache->CreateDenseLinearView(*bindings->k_proj);
         prepared.v_proj = impl->model_cache->CreateDenseLinearView(*bindings->v_proj);
-        prepared.o_proj = impl->model_cache->CreateDenseLinearView(*bindings->o_proj);
+        if (bindings->o_proj_kernel_weight != nullptr &&
+            bindings->o_proj_weight_scale != nullptr &&
+            bindings->o_proj_input_scale != nullptr &&
+            bindings->o_proj_kernel_weight->storage_dtype == "fp8_e4m3fn") {
+          prepared.o_proj_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->o_proj->tensor_name,
+              bindings->o_proj->output_rows,
+              bindings->o_proj->input_cols);
+        } else {
+          prepared.o_proj = impl->model_cache->CreateDenseLinearView(*bindings->o_proj);
+        }
         const auto slice_begin = std::chrono::steady_clock::now();
         AttentionLayerConfig attention_config;
         attention_config.layer_index = plan_entry.layer_index;
@@ -1175,7 +1177,17 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
         prepared.gate_score_correction_bias_device =
             impl->model_cache->CreateTensorView(bindings->gate_score_correction_bias->tensor_name);
         prepared.gate_weight = impl->model_cache->CreateDenseLinearView(*bindings->gate_weight);
-        prepared.fc2_latent = impl->model_cache->CreateDenseLinearView(*bindings->fc2_latent_weight);
+        if (bindings->fc2_latent_kernel_weight != nullptr &&
+            bindings->fc2_latent_weight_scale != nullptr &&
+            bindings->fc2_latent_input_scale != nullptr) {
+          prepared.fc2_latent_scaled_fp8 = impl->model_cache->CreateScaledFp8LinearView(
+              bindings->fc2_latent_gemm_weight->tensor_name,
+              bindings->fc2_latent_gemm_weight->output_rows,
+              bindings->fc2_latent_gemm_weight->input_cols);
+        } else {
+          prepared.fc2_latent_dense =
+              impl->model_cache->CreateDenseLinearView(*bindings->fc2_latent_gemm_weight);
+        }
         if (bindings->fc1_latent_kernel_weight != nullptr &&
             bindings->fc1_latent_weight_scale != nullptr &&
             bindings->fc1_latent_input_scale != nullptr) {
@@ -1212,17 +1224,29 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::CreateFromCach
         prepared.routed_experts.resize(bindings->routed_experts.size());
         for (std::size_t expert_index = 0; expert_index < bindings->routed_experts.size(); ++expert_index) {
           const ExpertWeightPair& pair = bindings->routed_experts[expert_index];
+          const auto up_input_scale = ReadOptionalScalarTensorToHostFp32(pair.up_input_scale);
+          const auto down_input_scale = ReadOptionalScalarTensorToHostFp32(pair.down_input_scale);
           prepared.routed_experts[expert_index].up_descriptor = *pair.up_proj;
           prepared.routed_experts[expert_index].down_descriptor = *pair.down_proj;
-          prepared.routed_experts[expert_index].up_tensor_scale = ReadTensorScaleHost(*pair.up_proj);
-          prepared.routed_experts[expert_index].down_tensor_scale = ReadTensorScaleHost(*pair.down_proj);
-          prepared.routed_experts[expert_index].up_input_scale =
-              ReadOptionalScalarTensorToHostFp32(pair.up_input_scale);
-          prepared.routed_experts[expert_index].down_input_scale =
-              ReadOptionalScalarTensorToHostFp32(pair.down_input_scale);
+          prepared.routed_experts[expert_index].up_tensor_scale =
+              ResolveRoutedNvfp4RuntimeTensorScale(*pair.up_proj, up_input_scale);
+          prepared.routed_experts[expert_index].down_tensor_scale =
+              ResolveRoutedNvfp4RuntimeTensorScale(*pair.down_proj, down_input_scale);
+          prepared.routed_experts[expert_index].up_input_scale = up_input_scale;
+          prepared.routed_experts[expert_index].down_input_scale = down_input_scale;
+          if ((pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+               !prepared.routed_experts[expert_index].up_tensor_scale.has_value()) ||
+              (pair.down_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled &&
+               !prepared.routed_experts[expert_index].down_tensor_scale.has_value())) {
+            return nullptr;
+          }
           if (pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-            auto up_proj = impl->model_cache->CreateNvfp4LinearView(*pair.up_proj);
-            auto down_proj = impl->model_cache->CreateNvfp4LinearView(*pair.down_proj);
+            auto up_proj = impl->model_cache->CreateNvfp4LinearView(
+                *pair.up_proj,
+                prepared.routed_experts[expert_index].up_tensor_scale);
+            auto down_proj = impl->model_cache->CreateNvfp4LinearView(
+                *pair.down_proj,
+                prepared.routed_experts[expert_index].down_tensor_scale);
             if ((up_proj == nullptr) != (down_proj == nullptr)) {
               return nullptr;
             }

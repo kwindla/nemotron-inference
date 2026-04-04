@@ -69,10 +69,12 @@ bool FlashInferPrepareShuffledBlockMajorWeight(
 
 std::optional<FlashInferPreparedNvfp4WeightHost> PrepareFlashInferNvfp4WeightHost(
     const GemmDescriptor& descriptor,
+    std::optional<float> tensor_scale_override = std::nullopt,
     std::size_t epilogue_tile_m = 128);
 
 std::optional<NemotronFlashInferNvfp4WeightView> BuildFlashInferRawNvfp4WeightView(
-    const GemmDescriptor& descriptor);
+    const GemmDescriptor& descriptor,
+    std::optional<float> tensor_scale_override = std::nullopt);
 
 NemotronFlashInferNvfp4WeightView BuildFlashInferPreparedNvfp4WeightView(
     const FlashInferPreparedNvfp4WeightHost& prepared);

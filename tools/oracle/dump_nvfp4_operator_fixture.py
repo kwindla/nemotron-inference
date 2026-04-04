@@ -36,8 +36,13 @@ FP4_DECODE_TABLE = [
     -6.0,
 ]
 FP4_MAX_FINITE = 6.0
+FP8_E4M3_MAX_FINITE = 448.0
 MIN_SCALE = 1.0 / 1024.0
 CONTAINER_IMAGE = "nemotron-local/dgx-spark-vllm:0.17.1-b31e9326a-fi065"
+ACTIVATION_PACKING_DYNAMIC_RUNTIME = "dynamic_runtime"
+ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE = "fixed_checkpoint_input_scale"
+RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_checkpoint_weight_scale_2"
+EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_fused_input_scale_x_weight_scale_2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,9 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompts", required=True)
     parser.add_argument("--prompt-name", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--manifest-path", default=None)
     parser.add_argument("--rows", type=int, default=16)
     parser.add_argument("--layer-index", type=int, default=1)
     parser.add_argument("--expert-index", type=int, default=0)
+    parser.add_argument(
+        "--activation-packing-mode",
+        choices=[
+            ACTIVATION_PACKING_DYNAMIC_RUNTIME,
+            ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE,
+        ],
+        default=ACTIVATION_PACKING_DYNAMIC_RUNTIME,
+    )
     parser.add_argument(
         "--operator-kind",
         choices=["up_proj", "down_proj", "shared_down_proj"],
@@ -135,6 +149,13 @@ def build_weight_map(index_path: Path) -> dict[str, str]:
     return payload["weight_map"]
 
 
+def load_manifest_tensor_names(manifest_path: Path | None) -> set[str] | None:
+    if manifest_path is None:
+        return None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return {tensor["name"] for tensor in payload.get("tensors", [])}
+
+
 def load_named_tensor(model_dir: Path, weight_map: dict[str, str], name: str) -> torch.Tensor:
     shard = weight_map[name]
     with safe_open(str(model_dir / shard), framework="pt", device="cpu") as handle:
@@ -149,6 +170,12 @@ def clamp_scale(value: float) -> float:
     if not math.isfinite(value) or value < MIN_SCALE:
         return MIN_SCALE
     return value
+
+
+def require_positive_finite(value: float, label: str) -> float:
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{label} must be finite and > 0, got {value!r}")
+    return float(value)
 
 
 def quantize_input_fp8(x: torch.Tensor, input_scale: float) -> torch.Tensor:
@@ -222,6 +249,38 @@ def pack_fp32_to_nvfp4_fixed(values: torch.Tensor, tensor_scale: float) -> dict[
     }
 
 
+def pack_fp32_to_nvfp4_dynamic(values: torch.Tensor) -> dict[str, Any]:
+    values_f32 = values.to(torch.float32)
+    global_max_abs = float(values_f32.abs().max().item())
+    if global_max_abs > FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE:
+        tensor_scale = clamp_scale(global_max_abs / (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE))
+    else:
+        tensor_scale = 1.0
+    return pack_fp32_to_nvfp4_fixed(values_f32, tensor_scale)
+
+
+def pack_fp32_to_nvfp4(
+    values: torch.Tensor,
+    packing_mode: str,
+    checkpoint_input_scale: float | None = None,
+) -> dict[str, Any]:
+    if packing_mode == ACTIVATION_PACKING_DYNAMIC_RUNTIME:
+        return pack_fp32_to_nvfp4_dynamic(values)
+    if packing_mode == ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE:
+        if checkpoint_input_scale is None:
+            raise ValueError("fixed checkpoint input_scale packing requires a checkpoint input_scale")
+        return pack_fp32_to_nvfp4_fixed(values, checkpoint_input_scale)
+    raise ValueError(f"unsupported activation packing mode {packing_mode!r}")
+
+
+def activation_tensor_scale_contract(packing_mode: str) -> str:
+    if packing_mode == ACTIVATION_PACKING_DYNAMIC_RUNTIME:
+        return "runtime_packed_dynamic"
+    if packing_mode == ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE:
+        return "checkpoint_fixed_input_scale"
+    raise ValueError(f"unsupported activation packing mode {packing_mode!r}")
+
+
 def dequantize_nvfp4_matrix(
     packed: bytes,
     block_scales: bytes,
@@ -248,16 +307,75 @@ def dequantize_nvfp4_matrix(
     return output
 
 
-def load_nvfp4_linear_metadata(model_dir: Path, weight_map: dict[str, str], prefix: str) -> dict[str, Any]:
+def load_nvfp4_linear_metadata(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    prefix: str,
+    manifest_tensor_names: set[str] | None = None,
+) -> dict[str, Any]:
     weight = load_named_tensor(model_dir, weight_map, prefix + ".weight")
     weight_scales = load_named_tensor(model_dir, weight_map, prefix + ".weight_scale")
+    weight_scale_2_name = prefix + ".weight_scale_2"
+    if weight_scale_2_name not in weight_map:
+        raise KeyError(f"NVFP4 linear is missing {weight_scale_2_name}")
+    input_scale_name = prefix + ".input_scale"
+    input_scale = None
+    if input_scale_name in weight_map:
+        input_scale = require_positive_finite(
+            float(load_named_tensor(model_dir, weight_map, input_scale_name).item()),
+            f"{input_scale_name}",
+        )
+    weight_scale_2 = require_positive_finite(
+        float(load_named_tensor(model_dir, weight_map, weight_scale_2_name).item()),
+        f"{weight_scale_2_name}",
+    )
+    tensor_scale = weight_scale_2
+    tensor_scale_contract = RAW_WEIGHT_TENSOR_SCALE_CONTRACT
+    if input_scale is not None:
+        tensor_scale = require_positive_finite(
+            input_scale * weight_scale_2,
+            f"{prefix} effective tensor_scale",
+        )
+        tensor_scale_contract = EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT
+
+    manifest_weight_name = prefix + ".weight"
+    manifest_weight_present = manifest_tensor_names is None or manifest_weight_name in manifest_tensor_names
+    manifest_input_scale_present = (
+        input_scale_name in manifest_tensor_names if manifest_tensor_names is not None and input_scale is not None else False
+    )
+    if manifest_tensor_names is not None:
+        if not manifest_weight_present:
+            raise KeyError(f"{manifest_weight_name} is missing from manifest")
+        if ".mixer.experts." in prefix and input_scale is not None and not manifest_input_scale_present:
+            raise KeyError(f"{input_scale_name} is missing from manifest")
+
     return {
         "prefix": prefix,
         "weight": weight,
-        "input_scale": float(load_named_tensor(model_dir, weight_map, prefix + ".input_scale").item()),
+        "input_scale_name": input_scale_name if input_scale is not None else None,
+        "input_scale": input_scale,
         "weight_scales": weight_scales,
-        "weight_scale_2": float(load_named_tensor(model_dir, weight_map, prefix + ".weight_scale_2").item()),
+        "weight_scale_2_name": weight_scale_2_name,
+        "weight_scale_2": weight_scale_2,
+        "tensor_scale": tensor_scale,
+        "tensor_scale_contract": tensor_scale_contract,
+        "manifest_weight_present": manifest_weight_present,
+        "manifest_input_scale_present": manifest_input_scale_present,
         "input_cols": int(weight_scales.shape[1] * 16),
+    }
+
+
+def nvfp4_scale_metadata(linear_metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "weight_tensor_name": linear_metadata["prefix"] + ".weight",
+        "weight_scale_2_name": linear_metadata["weight_scale_2_name"],
+        "weight_scale_2": linear_metadata["weight_scale_2"],
+        "input_scale_name": linear_metadata["input_scale_name"],
+        "input_scale": linear_metadata["input_scale"],
+        "fixture_tensor_scale": linear_metadata["tensor_scale"],
+        "tensor_scale_contract": linear_metadata["tensor_scale_contract"],
+        "manifest_weight_present": linear_metadata["manifest_weight_present"],
+        "manifest_input_scale_present": linear_metadata["manifest_input_scale_present"],
     }
 
 
@@ -266,6 +384,7 @@ def main() -> None:
     model_dir = Path(args.model_dir)
     prompts_path = Path(args.prompts)
     output_dir = Path(args.output_dir)
+    manifest_path = Path(args.manifest_path) if args.manifest_path else None
     output_dir.mkdir(parents=True, exist_ok=True)
 
     config_module, modeling_module = load_local_modules(model_dir)
@@ -289,6 +408,7 @@ def main() -> None:
     input_ids = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
 
     weight_map = build_weight_map(model_dir / "model.safetensors.index.json")
+    manifest_tensor_names = load_manifest_tensor_names(manifest_path)
 
     embeddings = torch.nn.Embedding(config.vocab_size, config.hidden_size)
     embeddings.weight.data.copy_(load_named_tensor(model_dir, weight_map, "backbone.embeddings.weight").to(torch.float32))
@@ -329,9 +449,24 @@ def main() -> None:
 
     expert_base_prefix = f"backbone.layers.{args.layer_index}.mixer.experts.{args.expert_index}"
     shared_base_prefix = f"backbone.layers.{args.layer_index}.mixer.shared_experts"
-    up_proj = load_nvfp4_linear_metadata(model_dir, weight_map, expert_base_prefix + ".up_proj")
-    down_proj = load_nvfp4_linear_metadata(model_dir, weight_map, expert_base_prefix + ".down_proj")
-    shared_down_proj = load_nvfp4_linear_metadata(model_dir, weight_map, shared_base_prefix + ".down_proj")
+    up_proj = load_nvfp4_linear_metadata(
+        model_dir,
+        weight_map,
+        expert_base_prefix + ".up_proj",
+        manifest_tensor_names=manifest_tensor_names,
+    )
+    down_proj = load_nvfp4_linear_metadata(
+        model_dir,
+        weight_map,
+        expert_base_prefix + ".down_proj",
+        manifest_tensor_names=manifest_tensor_names,
+    )
+    shared_down_proj = load_nvfp4_linear_metadata(
+        model_dir,
+        weight_map,
+        shared_base_prefix + ".down_proj",
+        manifest_tensor_names=manifest_tensor_names,
+    )
     shared_up_proj = ScaledFp8Linear(
         load_named_tensor(model_dir, weight_map, shared_base_prefix + ".up_proj.weight"),
         float(load_named_tensor(model_dir, weight_map, shared_base_prefix + ".up_proj.weight_scale").item()),
@@ -357,7 +492,11 @@ def main() -> None:
         activations = source_activations
         activation_path = "latent_states"
     elif args.operator_kind == "down_proj":
-        up_activation_pack = pack_fp32_to_nvfp4_fixed(source_activations, up_proj["input_scale"])
+        up_activation_pack = pack_fp32_to_nvfp4(
+            source_activations,
+            args.activation_packing_mode,
+            up_proj["input_scale"],
+        )
         up_activation_dequant = dequantize_nvfp4_matrix(
             up_activation_pack["packed"],
             up_activation_pack["block_scales"],
@@ -368,7 +507,7 @@ def main() -> None:
         up_weight_dequant = dequantize_nvfp4_matrix(
             up_proj["weight"].contiguous().numpy().tobytes(),
             fp8_raw_bytes(up_proj["weight_scales"]),
-            up_proj["weight_scale_2"],
+            up_proj["tensor_scale"],
             up_proj["weight"].shape[0],
             up_proj["input_cols"],
         )
@@ -382,7 +521,11 @@ def main() -> None:
         target_operator = shared_down_proj
         activation_path = f"{shared_base_prefix}.up_proj -> {config.mlp_hidden_act}"
 
-    activation_pack = pack_fp32_to_nvfp4_fixed(activations, target_operator["input_scale"])
+    activation_pack = pack_fp32_to_nvfp4(
+        activations,
+        args.activation_packing_mode,
+        target_operator["input_scale"],
+    )
     activation_dequant = dequantize_nvfp4_matrix(
         activation_pack["packed"],
         activation_pack["block_scales"],
@@ -396,7 +539,7 @@ def main() -> None:
     weight_dequant = dequantize_nvfp4_matrix(
         weight_packed_bytes,
         weight_block_scale_bytes,
-        target_operator["weight_scale_2"],
+        target_operator["tensor_scale"],
         target_operator["weight"].shape[0],
         target_operator["input_cols"],
     )
@@ -410,34 +553,44 @@ def main() -> None:
     (output_dir / "weight_packed.bin").write_bytes(weight_packed_bytes)
     (output_dir / "weight_block_scales.bin").write_bytes(weight_block_scale_bytes)
     (output_dir / "weight_tensor_scale.bin").write_bytes(
-        torch.tensor([target_operator["weight_scale_2"]], dtype=torch.float32).numpy().tobytes()
+        torch.tensor([target_operator["tensor_scale"]], dtype=torch.float32).numpy().tobytes()
     )
     (output_dir / "expected_output_fp32.bin").write_bytes(
         expected_output.contiguous().numpy().astype("float32").tobytes()
     )
+    metadata = {
+        "fixture_kind": "nvfp4_operator_oracle_v1",
+        "generator": "dump_nvfp4_operator_fixture.py",
+        "container_image": CONTAINER_IMAGE,
+        "model_dir": str(model_dir),
+        "manifest_path": None if manifest_path is None else str(manifest_path),
+        "prompt_name": args.prompt_name,
+        "operator_kind": args.operator_kind,
+        "target_operator": target_operator["prefix"],
+        "activation_path": activation_path,
+        "activation_packing_mode": args.activation_packing_mode,
+        "activation_tensor_scale_contract": activation_tensor_scale_contract(args.activation_packing_mode),
+        "layer0_path": "checkpoint-derived partial CPU reconstruction with stubbed mamba_ssm RMSNorm and dequantized FP8 linears",
+        "rows": row_count,
+        "input_cols": int(activations.shape[1]),
+        "output_rows": int(target_operator["weight"].shape[0]),
+        "token_count": len(token_ids),
+        "tokens": token_ids,
+        "activation_tensor_scale": activation_pack["tensor_scale"],
+        "weight_tensor_scale": target_operator["tensor_scale"],
+        "weight_tensor_scale_contract": target_operator["tensor_scale_contract"],
+        "weight_input_scale_present": target_operator["input_scale"] is not None,
+        "weight_scale_metadata": nvfp4_scale_metadata(target_operator),
+    }
+    if args.operator_kind == "down_proj":
+        metadata["upstream_nvfp4_activation_source"] = {
+            "operator": up_proj["prefix"],
+            "activation_packing_mode": args.activation_packing_mode,
+            "activation_tensor_scale_contract": activation_tensor_scale_contract(args.activation_packing_mode),
+            "weight_scale_metadata": nvfp4_scale_metadata(up_proj),
+        }
     (output_dir / "metadata.json").write_text(
-        json.dumps(
-            {
-                "fixture_kind": "nvfp4_operator_oracle_v1",
-                "generator": "dump_nvfp4_operator_fixture.py",
-                "container_image": CONTAINER_IMAGE,
-                "model_dir": str(model_dir),
-                "prompt_name": args.prompt_name,
-                "operator_kind": args.operator_kind,
-                "target_operator": target_operator["prefix"],
-                "activation_path": activation_path,
-                "layer0_path": "checkpoint-derived partial CPU reconstruction with stubbed mamba_ssm RMSNorm and dequantized FP8 linears",
-                "rows": row_count,
-                "input_cols": int(activations.shape[1]),
-                "output_rows": int(target_operator["weight"].shape[0]),
-                "token_count": len(token_ids),
-                "tokens": token_ids,
-                "activation_tensor_scale": activation_pack["tensor_scale"],
-                "weight_tensor_scale": target_operator["weight_scale_2"],
-            },
-            indent=2,
-            sort_keys=True,
-        )
+        json.dumps(metadata, indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )

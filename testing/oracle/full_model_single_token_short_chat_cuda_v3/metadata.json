@@ -9,6 +9,26 @@
   "runtime_token_ids": [
     10
   ],
+  "prompt_matched_vllm_oracle_first_generated_token_id": 4268,
+  "prompt_matched_vllm_oracle_generated_token_ids": [
+    4268,
+    2534,
+    1317,
+    4848,
+    10693,
+    1278,
+    3403,
+    1429,
+    1078,
+    15187,
+    6918,
+    1082,
+    2918,
+    46103,
+    1034,
+    1321
+  ],
+  "routed_nvfp4_tensor_scale_contract": "effective_tensor_scale = input_scale * weight_scale_2",
   "stop_layer": 87,
   "hidden_size": 4096,
   "vocab_size": 131072,
@@ -202,7 +222,9 @@
   "notes": [
     "single_token mode runs one token from scratch with zeroed cache/state.",
     "prefix_prefill mode runs a short prompt prefix from scratch and can stop after an early capture layer to keep fixture generation practical.",
+    "Prompt-matched vLLM oracle for the full 40-token short_chat prompt now begins with token 4268 and continues with the recorded 16-token sequence above.",
     "Attention, Mamba, and MoE blocks mirror the current correctness-first runtime contracts already used by the layer-level oracle fixtures.",
+    "Routed and shared NVFP4 runtime tensor scales use the corrected effective contract: input_scale * weight_scale_2.",
     "Captured per-layer outputs are intended for the composed registry-backed forward-path validation.",
     "Captured Mamba layers also include final conv/SSM state snapshots for decode-boundary localization."
   ]
