@@ -4,21 +4,37 @@
 #include <vector>
 
 #include "nemotron/expert_layer.h"
+#include "nemotron/fused_moe_decode.h"
 
 namespace nemotron {
 
-class DeviceNvfp4Weight;
-class MonolithicNvfp4ExpertWeights;
+inline bool MoeBackendHasValidWeightView(const FusedNvfp4WeightView& weight) {
+  return weight.packed_data != nullptr &&
+         weight.block_scales_data != nullptr &&
+         weight.matmul_block_scales_data != nullptr &&
+         weight.tensor_scale_data != nullptr &&
+         weight.output_rows > 0 &&
+         weight.input_cols > 0;
+}
 
 struct MoeBackendPrepareContext {
   const ExpertLayerConfig* config = nullptr;
-  const std::vector<ExpertWeightPair>* routed_weights = nullptr;
-  const GemmDescriptor* shared_up = nullptr;
-  const GemmDescriptor* shared_down = nullptr;
-  const MonolithicNvfp4ExpertWeights* monolithic_up = nullptr;
-  const MonolithicNvfp4ExpertWeights* monolithic_down = nullptr;
-  const DeviceNvfp4Weight* shared_up_device = nullptr;
-  const DeviceNvfp4Weight* shared_down_device = nullptr;
+  FusedNvfp4WeightView shared_up_view;
+  FusedNvfp4WeightView shared_down_view;
+  const std::vector<FusedNvfp4WeightView>* resident_routed_up_views = nullptr;
+  const std::vector<FusedNvfp4WeightView>* resident_routed_down_views = nullptr;
+  const FusedNvfp4WeightView* resident_routed_up_views_device = nullptr;
+  const FusedNvfp4WeightView* resident_routed_down_views_device = nullptr;
+};
+
+struct MoeBackendPreparedWeights {
+  bool prepared = false;
+  FusedNvfp4WeightView shared_up;
+  FusedNvfp4WeightView shared_down;
+  std::vector<FusedNvfp4WeightView> routed_up_views;
+  std::vector<FusedNvfp4WeightView> routed_down_views;
+  const FusedNvfp4WeightView* routed_up_views_device = nullptr;
+  const FusedNvfp4WeightView* routed_down_views_device = nullptr;
 };
 
 class MoeBackend {
@@ -51,6 +67,68 @@ class MoeBackend {
       const float* topk_weights,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace) = 0;
+};
+
+class PreparedResidentMoeBackend : public MoeBackend {
+ public:
+  bool PrepareWeights(const MoeBackendPrepareContext& context) final {
+    prepared_weights_ = MoeBackendPreparedWeights{};
+    if (!PrepareResidentWeights(context, &prepared_weights_)) {
+      return false;
+    }
+    if (!PrepareBackendSpecificWeights(context, &prepared_weights_)) {
+      prepared_weights_ = MoeBackendPreparedWeights{};
+      return false;
+    }
+    prepared_weights_.prepared = true;
+    return true;
+  }
+
+ protected:
+  virtual bool PrepareBackendSpecificWeights(
+      const MoeBackendPrepareContext& context,
+      MoeBackendPreparedWeights* prepared_weights) {
+    (void)context;
+    (void)prepared_weights;
+    return true;
+  }
+
+  const MoeBackendPreparedWeights& prepared_weights() const {
+    return prepared_weights_;
+  }
+
+  static bool PrepareResidentWeights(
+      const MoeBackendPrepareContext& context,
+      MoeBackendPreparedWeights* prepared_weights) {
+    if (prepared_weights == nullptr ||
+        context.config == nullptr ||
+        !MoeBackendHasValidWeightView(context.shared_up_view) ||
+        !MoeBackendHasValidWeightView(context.shared_down_view) ||
+        context.resident_routed_up_views == nullptr ||
+        context.resident_routed_down_views == nullptr ||
+        context.resident_routed_up_views->size() != context.config->n_routed_experts ||
+        context.resident_routed_down_views->size() != context.config->n_routed_experts) {
+      return false;
+    }
+
+    for (std::size_t expert_index = 0; expert_index < context.config->n_routed_experts; ++expert_index) {
+      if (!MoeBackendHasValidWeightView((*context.resident_routed_up_views)[expert_index]) ||
+          !MoeBackendHasValidWeightView((*context.resident_routed_down_views)[expert_index])) {
+        return false;
+      }
+    }
+
+    prepared_weights->shared_up = context.shared_up_view;
+    prepared_weights->shared_down = context.shared_down_view;
+    prepared_weights->routed_up_views = *context.resident_routed_up_views;
+    prepared_weights->routed_down_views = *context.resident_routed_down_views;
+    prepared_weights->routed_up_views_device = context.resident_routed_up_views_device;
+    prepared_weights->routed_down_views_device = context.resident_routed_down_views_device;
+    return true;
+  }
+
+ private:
+  MoeBackendPreparedWeights prepared_weights_;
 };
 
 }  // namespace nemotron

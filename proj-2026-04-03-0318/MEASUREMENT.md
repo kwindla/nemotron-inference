@@ -111,15 +111,15 @@ Decode backend configurations exercised by `bench_full_comparison.sh`:
 
 | Label | Env | Expected backend behavior |
 | --- | --- | --- |
-| `default` | `NEMOTRON_FORWARD_UNIFIED_FUSED=0`, `NEMOTRON_FORWARD_FUSED_MOE_PREFILL=0`, `NEMOTRON_FORWARD_MOE_CUBLASLT=0` | `FusedDecodeBackend` for decode, `BatchedCublasLtBackend` for multi-token prefill |
+| `default` | unset | `UnifiedFusedBackend` for supported resident decode and prefill traffic |
 | `unified_fused` | `NEMOTRON_FORWARD_UNIFIED_FUSED=1`, `NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1` | `UnifiedFusedBackend` for supported decode and prefill traffic |
-| `fallback_disable_override` | `NEMOTRON_FORWARD_UNIFIED_FUSED=0`, `NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1`, `NEMOTRON_FORWARD_MOE_CUBLASLT=0` | Explicit disable must override the legacy opt-in and fall back to the baseline path |
+| `fallback_disable_override` | `NEMOTRON_FORWARD_UNIFIED_FUSED=0`, `NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1` | Explicit disable must override the legacy opt-in and fall back to `DecodeCublasLtBackend` for decode or the host-routing adapter / host fallback for prefill |
 
 Prefill backend configurations exercised by `bench_full_comparison.sh`:
 
 | Label | Env | Covered workloads |
 | --- | --- | --- |
-| `default` | `NEMOTRON_FORWARD_UNIFIED_FUSED=0`, `NEMOTRON_FORWARD_FUSED_MOE_PREFILL=0` | `32`-token cached tail via committed-head and global-root prefix cases |
+| `default` | unset | `32`-token cached tail via committed-head and global-root prefix cases on the unified path when resident |
 | `unified_fused` | `NEMOTRON_FORWARD_UNIFIED_FUSED=1`, `NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1` | same cached-tail cases on the unified path |
 
 Important limitation:

@@ -184,7 +184,7 @@ bool all_finite(const std::vector<float>& values) {
   return true;
 }
 
-bool test_unified_fused_prefill_avoids_host_routing_adapter() {
+bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
   if (!has_cuda_device()) {
     std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
     return true;
@@ -192,8 +192,8 @@ bool test_unified_fused_prefill_avoids_host_routing_adapter() {
 
   ScopedEnvVar scoped_unified("NEMOTRON_FORWARD_UNIFIED_FUSED");
   ScopedEnvVar scoped_prefill("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-  setenv("NEMOTRON_FORWARD_UNIFIED_FUSED", "1", 1);
-  setenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL", "1", 1);
+  unsetenv("NEMOTRON_FORWARD_UNIFIED_FUSED");
+  unsetenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
 
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
@@ -353,8 +353,8 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
   ScopedEnvVar scoped_prefill("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
   ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
   ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
-  setenv("NEMOTRON_FORWARD_UNIFIED_FUSED", "1", 1);
-  setenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL", "1", 1);
+  unsetenv("NEMOTRON_FORWARD_UNIFIED_FUSED");
+  unsetenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
   setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "0", 1);
   setenv("NEMOTRON_EXPERT_MONOLITHIC", "0", 1);
 
@@ -555,7 +555,7 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
 }  // namespace
 
 int main() {
-  return test_unified_fused_prefill_avoids_host_routing_adapter() &&
+  return test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() &&
                  test_nonresident_routed_weights_reject_fastpath_and_use_fallback()
              ? 0
              : 1;

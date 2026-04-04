@@ -5,8 +5,8 @@ usage() {
   cat >&2 <<'EOF'
 Usage: bench_decode_backends.sh [options] [-- extra nano_fused_decode_bench args]
 
-Compares decode backends with nano_fused_decode_bench using token_count == 1
-decode steps after a fixed prompt prefill.
+Compares the current resident decode backends with nano_fused_decode_bench
+using token_count == 1 decode steps after a fixed prompt prefill.
 
 Options:
   --manifest PATH       Manifest path. Defaults to NEMOTRON_FORWARD_MANIFEST or the
@@ -192,29 +192,21 @@ run_case() {
   "${cmd[@]}" 2>&1 | tee "${stdout_path}"
 }
 
-# Force each candidate explicitly instead of relying on ambient defaults.
-# The unified case sets both env spellings so the same command line works across
-# the pre-rename and post-rename trees.
 run_case \
-  scalar_fused_decode \
-  NEMOTRON_FORWARD_UNIFIED_FUSED=0 \
-  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=0 \
-  NEMOTRON_FORWARD_MOE_CUBLASLT=0
+  default
 
 run_case \
   unified_fused \
   NEMOTRON_FORWARD_UNIFIED_FUSED=1 \
-  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1 \
-  NEMOTRON_FORWARD_MOE_CUBLASLT=1
+  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1
 
 run_case \
   decode_cublaslt \
   NEMOTRON_FORWARD_UNIFIED_FUSED=0 \
-  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=0 \
-  NEMOTRON_FORWARD_MOE_CUBLASLT=1
+  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=0
 
 python3 - \
-  "${RUN_DIR}/scalar_fused_decode.json" \
+  "${RUN_DIR}/default.json" \
   "${RUN_DIR}/unified_fused.json" \
   "${RUN_DIR}/decode_cublaslt.json" \
   "${RUN_DIR}/summary.txt" <<'PY'
@@ -243,7 +235,7 @@ for path in input_paths:
         }
     )
 
-baseline = next(row for row in rows if row["label"] == "scalar_fused_decode")
+baseline = next(row for row in rows if row["label"] == "default")
 baseline_ms = baseline["decode_ms"]
 best = min(rows, key=lambda row: row["decode_ms"])
 unified = next(row for row in rows if row["label"] == "unified_fused")
@@ -258,7 +250,7 @@ for row in rows:
         delta_vs_scalar_pct = ((row["decode_ms"] / baseline_ms) - 1.0) * 100.0
     lines.append(
         f"{row['label']}: decode_mean_ms={row['decode_ms']:.6f} "
-        f"delta_vs_scalar_pct={delta_vs_scalar_pct:+.2f} "
+        f"delta_vs_default_pct={delta_vs_scalar_pct:+.2f} "
         f"tokens_per_second={row['tokens_per_second']:.3f} "
         f"prefill_ms={row['prefill_ms']:.6f} "
         f"json={row['json_path']}"
@@ -266,10 +258,15 @@ for row in rows:
 
 lines.append("")
 lines.append(f"winner={best['label']} decode_mean_ms={best['decode_ms']:.6f}")
-if unified["decode_ms"] <= baseline_ms:
-    lines.append("decision=unified_fused_matches_or_beats_scalar_keep_removal_on_table")
+delta_pct = 0.0
+if baseline_ms > 0.0:
+    delta_pct = abs(((unified["decode_ms"] / baseline_ms) - 1.0) * 100.0)
+if delta_pct <= 2.0:
+    lines.append("decision=default_matches_explicit_unified_within_noise")
+elif unified["decode_ms"] <= baseline_ms:
+    lines.append("decision=explicit_unified_beats_default_check_for_ambient_env_drift")
 else:
-    lines.append("decision=scalar_fused_decode_still_wins_keep_scalar_kernel")
+    lines.append("decision=default_beats_explicit_unified_check_for_ambient_env_drift")
 
 summary = "\n".join(lines) + "\n"
 summary_path.write_text(summary, encoding="utf-8")
