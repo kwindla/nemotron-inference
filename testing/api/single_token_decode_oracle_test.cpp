@@ -22,6 +22,10 @@
 #include <unordered_map>
 #include <vector>
 
+// EVIDENCE SURFACE: selected-token trace oracle. This validates single-step
+// decode against a selected-token fixture. It is NOT prompt-matched end-to-end
+// parity.
+
 namespace {
 
 constexpr float kDecodeAbsTol = 3.0e-3f;

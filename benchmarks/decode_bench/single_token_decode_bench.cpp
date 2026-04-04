@@ -26,6 +26,11 @@
 #include <string>
 #include <vector>
 
+// EVIDENCE SURFACE: post-prefill decode throughput benchmark. This measures
+// hot-path decode performance starting from selected_token_id after prefill. It
+// is NOT a parity oracle and should not be used as evidence for prompt-matched
+// correctness.
+
 namespace {
 
 constexpr std::size_t GiB(std::size_t value) {
@@ -748,7 +753,8 @@ int main(int argc, char** argv) {
         << "[--mmap-prefetch] "
         << "[--model-cache /path/to/model.cache] "
         << "[--write-model-cache /path/to/model.cache] "
-        << "[--json-output /path/to/report.json]\n";
+        << "[--json-output /path/to/report.json]\n"
+        << "NOTE: This is a post-prefill throughput measurement, not a parity oracle.\n";
     return 2;
   }
   if (!HasCudaDevice()) {

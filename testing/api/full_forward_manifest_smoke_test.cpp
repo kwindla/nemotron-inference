@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+// EVIDENCE SURFACE: manifest/runtime smoke test. This is NOT a parity oracle.
+
 namespace {
 
 constexpr std::size_t GiB(std::size_t value) {
