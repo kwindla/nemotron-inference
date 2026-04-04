@@ -273,6 +273,14 @@ void ReusableStateArena::Release(const ReusableStateHandle& handle) {
     InsertFreeRegion(impl_->free_regions, it->second.slab_offset, it->second.bytes);
     impl_->current_bytes -= it->second.bytes;
     impl_->allocations.erase(it);
+
+    // When the slab is completely empty, release it back to CUDA so execution
+    // scratch and KV pages can use the VRAM. The slab will be lazily
+    // re-allocated on the next Allocate() call.
+    if (impl_->allocations.empty() && impl_->device_slab != nullptr) {
+      cudaFree(impl_->device_slab);
+      impl_->device_slab = nullptr;
+    }
   }
 }
 
