@@ -33,6 +33,8 @@
 
 namespace {
 
+constexpr const char* kMeasurementType = "post-prefill-throughput";
+
 constexpr std::size_t GiB(std::size_t value) {
   return value * 1024ull * 1024ull * 1024ull;
 }
@@ -851,6 +853,7 @@ int main(int argc, char** argv) {
               << std::flush;
   }
   std::cout << std::fixed << std::setprecision(3)
+            << "measurement_type=" << kMeasurementType << "\n"
             << "environment_build_ms=" << environment_build_ms << "\n"
             << "model_build_ms=" << model_build_ms << "\n"
             << std::flush;
@@ -990,6 +993,7 @@ int main(int argc, char** argv) {
   }
 
   std::cout << std::fixed << std::setprecision(3)
+            << "measurement_type=" << kMeasurementType << "\n"
             << "environment_build_ms=" << environment_build_ms << "\n"
             << "model_build_ms=" << model_build_ms << "\n"
             << "warmup_mean_ms=" << MeanMs(warmup_ms) << "\n"
