@@ -1,5 +1,6 @@
 #include "nemotron/primitive_ops.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace nemotron {
@@ -169,6 +170,28 @@ __global__ void FusedAddRmsNormBf16Kernel(
     normalized_output[row_offset + column] =
         __float2bfloat16_rn(combined * inv_rms * weight[column]);
   }
+}
+
+__global__ void CastTensorFp32ToBf16Kernel(
+    const float* input,
+    __nv_bfloat16* output,
+    std::size_t count) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  output[index] = __float2bfloat16_rn(input[index]);
+}
+
+__global__ void CastTensorBf16ToFp32Kernel(
+    const __nv_bfloat16* input,
+    float* output,
+    std::size_t count) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  output[index] = __bfloat162float(input[index]);
 }
 
 bool HasCompatibleMatrixShape(
@@ -354,6 +377,44 @@ bool FusedAddRmsNormBf16(
       rows,
       hidden_size,
       epsilon);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool CastTensorFp32ToBf16(
+    const DeviceTensorFp32& input,
+    DeviceTensorBf16* output) {
+  if (output == nullptr ||
+      !input.valid() ||
+      !output->valid() ||
+      input.shape() != output->shape()) {
+    return false;
+  }
+
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((input.numel() + block.x - 1) / block.x));
+  CastTensorFp32ToBf16Kernel<<<grid, block>>>(
+      input.data(),
+      output->data(),
+      input.numel());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool CastTensorBf16ToFp32(
+    const DeviceTensorBf16& input,
+    DeviceTensorFp32* output) {
+  if (output == nullptr ||
+      !input.valid() ||
+      !output->valid() ||
+      input.shape() != output->shape()) {
+    return false;
+  }
+
+  const dim3 block(kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((input.numel() + block.x - 1) / block.x));
+  CastTensorBf16ToFp32Kernel<<<grid, block>>>(
+      input.data(),
+      output->data(),
+      input.numel());
   return CheckCuda(cudaGetLastError());
 }
 

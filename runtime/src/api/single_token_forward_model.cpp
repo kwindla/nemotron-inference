@@ -79,6 +79,31 @@ std::unique_ptr<DeviceTensorFp32> CreateDecodeRowView(
   return CreateTokenRangeView(buffer, 0, 1, hidden_size);
 }
 
+std::unique_ptr<DeviceTensorBf16> CreateTokenRangeView(
+    DeviceTensorBf16* buffer,
+    std::size_t token_offset,
+    std::size_t token_count,
+    std::size_t hidden_size) {
+  if (buffer == nullptr ||
+      !buffer->valid() ||
+      buffer->shape().size() != 2 ||
+      token_count == 0 ||
+      token_offset > buffer->shape()[0] ||
+      token_count > (buffer->shape()[0] - token_offset) ||
+      buffer->shape()[1] != hidden_size) {
+    return nullptr;
+  }
+  return DeviceTensorBf16::CreateView(
+      {token_count, hidden_size},
+      buffer->data() + (token_offset * hidden_size));
+}
+
+std::unique_ptr<DeviceTensorBf16> CreateDecodeRowView(
+    DeviceTensorBf16* buffer,
+    std::size_t hidden_size) {
+  return CreateTokenRangeView(buffer, 0, 1, hidden_size);
+}
+
 std::size_t EffectiveMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
   return config.moe_prefill_window_tokens > 0
              ? config.moe_prefill_window_tokens
@@ -133,7 +158,7 @@ std::size_t EffectiveScratchTokens(const RequestExecutionConfig& config, std::si
 
 std::size_t RequestActivationBytes(const RequestExecutionConfig& config, std::size_t max_tokens) {
   const std::size_t scratch_tokens = EffectiveScratchTokens(config, max_tokens);
-  return ((2 * max_tokens) + scratch_tokens) * config.hidden_size * sizeof(float);
+  return ((2 * max_tokens) + scratch_tokens) * config.hidden_size * sizeof(__nv_bfloat16);
 }
 
 std::size_t KvPagesForTokens(const RequestExecutionConfig& config, std::size_t max_tokens) {
@@ -366,6 +391,44 @@ std::vector<float> CopyTensorToHost(const DeviceTensorFp32& tensor) {
   return host;
 }
 
+std::vector<float> CopyTensorToHost(const DeviceTensorBf16& tensor) {
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return {};
+  }
+
+  std::vector<float> host(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    host[i] = __bfloat162float(host_bf16[i]);
+  }
+  return host;
+}
+
+std::vector<float> CopyCombinedTensorToHost(
+    const DeviceTensorBf16& hidden_delta,
+    const DeviceTensorBf16& residual_accum) {
+  if (!hidden_delta.valid() ||
+      !residual_accum.valid() ||
+      hidden_delta.shape() != residual_accum.shape()) {
+    return {};
+  }
+
+  std::vector<__nv_bfloat16> hidden_bf16(hidden_delta.numel());
+  std::vector<__nv_bfloat16> residual_bf16(residual_accum.numel());
+  if (!hidden_delta.CopyToHost(hidden_bf16.data(), hidden_bf16.size()) ||
+      !residual_accum.CopyToHost(residual_bf16.data(), residual_bf16.size())) {
+    return {};
+  }
+
+  std::vector<float> combined(hidden_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < hidden_bf16.size(); ++i) {
+    combined[i] =
+        __bfloat162float(hidden_bf16[i]) +
+        __bfloat162float(residual_bf16[i]);
+  }
+  return combined;
+}
+
 bool AllFinite(const std::vector<float>& values) {
   return std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
 }
@@ -579,7 +642,7 @@ struct SingleTokenForwardModel::Impl {
   std::unique_ptr<CudnnHandle> cudnn;
   std::unique_ptr<GemmHeuristicCache> heuristic_cache;
   PrefixCache* prefix_cache = nullptr;
-  std::unique_ptr<DeviceEmbeddingTableFp32> embedding_table;
+  std::unique_ptr<DeviceEmbeddingTableBf16> embedding_table;
   std::unique_ptr<UploadedLinearOp> lm_head_op;
   std::unique_ptr<DeviceTensorFp32> final_norm_weight;
   std::optional<std::size_t> post_weight_free_vram_bytes;
@@ -683,7 +746,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
   impl->heuristic_cache = std::move(heuristic_cache);
   impl->prefix_cache = &environment.prefix_cache();
   impl->vram_reserve_bytes = vram_reserve_bytes;
-  impl->embedding_table = DeviceEmbeddingTableFp32::Upload(*embedding);
+  impl->embedding_table = DeviceEmbeddingTableBf16::Upload(*embedding);
   impl->lm_head_op = UploadedLinearOp::Create(*lm_head);
   if (!impl->embedding_table || !impl->embedding_table->valid() ||
       !impl->lm_head_op || !impl->lm_head_op->valid()) {
@@ -1268,32 +1331,32 @@ bool SingleTokenForwardModel::RunTokens(
     return false;
   }
 
-  std::unique_ptr<DeviceTensorFp32> hidden_owned;
-  std::unique_ptr<DeviceTensorFp32> residual_owned;
-  std::unique_ptr<DeviceTensorFp32> scratch_owned;
-  std::unique_ptr<DeviceTensorFp32> hidden_view;
-  std::unique_ptr<DeviceTensorFp32> residual_view;
-  std::unique_ptr<DeviceTensorFp32> scratch_view;
-  DeviceTensorFp32* current = nullptr;
-  DeviceTensorFp32* next = nullptr;
-  DeviceTensorFp32* scratch_tensor = nullptr;
+  std::unique_ptr<DeviceTensorBf16> hidden_owned;
+  std::unique_ptr<DeviceTensorBf16> residual_owned;
+  std::unique_ptr<DeviceTensorBf16> scratch_owned;
+  std::unique_ptr<DeviceTensorBf16> hidden_view;
+  std::unique_ptr<DeviceTensorBf16> residual_view;
+  std::unique_ptr<DeviceTensorBf16> scratch_view;
+  DeviceTensorBf16* current = nullptr;
+  DeviceTensorBf16* residual_tensor = nullptr;
+  DeviceTensorBf16* next = nullptr;
   const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
   if (use_decode_scratch) {
     hidden_view = CreateDecodeRowView(request_context.hidden(), impl_->config.hidden_size);
     residual_view = CreateDecodeRowView(request_context.residual(), impl_->config.hidden_size);
     scratch_view = CreateDecodeRowView(request_context.scratch(), impl_->config.hidden_size);
     current = hidden_view.get();
-    next = residual_view.get();
-    scratch_tensor = scratch_view.get();
+    residual_tensor = residual_view.get();
+    next = scratch_view.get();
   } else {
-    hidden_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-    residual_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-    scratch_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    hidden_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    residual_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    scratch_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
     current = hidden_owned.get();
-    next = residual_owned.get();
-    scratch_tensor = scratch_owned.get();
+    residual_tensor = residual_owned.get();
+    next = scratch_owned.get();
   }
-  if (current == nullptr || next == nullptr || scratch_tensor == nullptr) {
+  if (current == nullptr || residual_tensor == nullptr || next == nullptr) {
     std::cerr << "single_token_forward_model: per-run buffers unavailable\n";
     return false;
   }
@@ -1309,7 +1372,8 @@ bool SingleTokenForwardModel::RunTokens(
     return false;
   }
 
-  if (!LookupEmbeddingRowsFp32(*impl_->embedding_table, token_ids, token_count, current).has_value()) {
+  if (!residual_tensor->FillZero() ||
+      !LookupEmbeddingRowsBf16(*impl_->embedding_table, token_ids, token_count, current).has_value()) {
     std::cerr << "single_token_forward_model: embedding lookup failed\n";
     return false;
   }
@@ -1353,6 +1417,7 @@ bool SingleTokenForwardModel::RunTokens(
                 prior_sequence_length,
                 total_sequence_length,
                 *current,
+                residual_tensor,
                 next);
         if (debug && (!created || !valid_slice || !ran)) {
           std::cout << "single_token_forward_model: attention failure"
@@ -1373,6 +1438,7 @@ bool SingleTokenForwardModel::RunTokens(
                 impl_->heuristic_cache.get(),
                 request_context,
                 *current,
+                residual_tensor,
                 next);
         if (debug && (!created || !valid_slice || !ran)) {
           std::cout << "single_token_forward_model: mamba failure"
@@ -1401,17 +1467,24 @@ bool SingleTokenForwardModel::RunTokens(
                   token_offset,
                   chunk_token_count,
                   impl_->config.hidden_size);
+              auto residual_chunk = CreateTokenRangeView(
+                  residual_tensor,
+                  token_offset,
+                  chunk_token_count,
+                  impl_->config.hidden_size);
               auto next_chunk = CreateTokenRangeView(
                   next,
                   token_offset,
                   chunk_token_count,
                   impl_->config.hidden_size);
               ran = current_chunk != nullptr &&
+                    residual_chunk != nullptr &&
                     next_chunk != nullptr &&
                     layer.expert_slice->Run(
                         *impl_->cublas,
                         impl_->heuristic_cache.get(),
                         *current_chunk,
+                        residual_chunk.get(),
                         next_chunk.get(),
                         nullptr);
               if (!ran) {
@@ -1423,6 +1496,7 @@ bool SingleTokenForwardModel::RunTokens(
                 *impl_->cublas,
                 impl_->heuristic_cache.get(),
                 *current,
+                residual_tensor,
                 next,
                 nullptr);
           }
@@ -1453,7 +1527,7 @@ bool SingleTokenForwardModel::RunTokens(
     if (trace != nullptr && capture_set.find(layer.plan.layer_index) != capture_set.end()) {
       CapturedLayerOutput captured;
       captured.layer_index = layer.plan.layer_index;
-      captured.hidden = CopyTensorToHost(*current);
+      captured.hidden = CopyCombinedTensorToHost(*current, *residual_tensor);
       if (captured.hidden.empty()) {
         std::cerr << "single_token_forward_model: failed to capture layer " << layer.plan.layer_index << "\n";
         return false;
@@ -1475,28 +1549,47 @@ bool SingleTokenForwardModel::RunTokens(
     return false;
   }
 
+  const auto materialize_combined_hidden = [&](DeviceTensorBf16* destination) -> bool {
+    auto hidden_fp32 = DeviceTensorFp32::Create(current->shape());
+    auto residual_fp32 = DeviceTensorFp32::Create(residual_tensor->shape());
+    auto combined_fp32 = DeviceTensorFp32::Create(destination->shape());
+    return hidden_fp32 != nullptr &&
+           residual_fp32 != nullptr &&
+           combined_fp32 != nullptr &&
+           CastTensorBf16ToFp32(*current, hidden_fp32.get()) &&
+           CastTensorBf16ToFp32(*residual_tensor, residual_fp32.get()) &&
+           ResidualAddFp32(*hidden_fp32, *residual_fp32, combined_fp32.get()) &&
+           CastTensorFp32ToBf16(*combined_fp32, destination) &&
+           cudaStreamSynchronize(nullptr) == cudaSuccess;
+  };
+
+  DeviceTensorBf16* logits_input = nullptr;
+  if (impl_->final_norm_weight != nullptr) {
+    if (!FusedAddRmsNormBf16(
+            *current,
+            residual_tensor,
+            *impl_->final_norm_weight,
+            impl_->config.layer_norm_epsilon,
+            next)) {
+      std::cerr << "single_token_forward_model: final fused RMSNorm failed\n";
+      return false;
+    }
+    logits_input = next;
+  } else {
+    if (!materialize_combined_hidden(next)) {
+      std::cerr << "single_token_forward_model: final hidden materialization failed\n";
+      return false;
+    }
+    logits_input = next;
+  }
+
   if (trace != nullptr) {
-    trace->final_hidden = CopyTensorToHost(*current);
+    trace->final_hidden =
+        impl_->final_norm_weight != nullptr ? CopyTensorToHost(*residual_tensor) : CopyTensorToHost(*logits_input);
     if (trace->final_hidden.empty()) {
       std::cerr << "single_token_forward_model: failed to capture final hidden state\n";
       return false;
     }
-  }
-
-  const DeviceTensorFp32* logits_input = current;
-  if (impl_->final_norm_weight != nullptr) {
-    if (!RmsNormFp32(
-            *current,
-            *impl_->final_norm_weight,
-            impl_->config.layer_norm_epsilon,
-            scratch_tensor)) {
-      std::cerr << "single_token_forward_model: final RMSNorm failed\n";
-      return false;
-    }
-    logits_input = scratch_tensor;
-  }
-
-  if (trace != nullptr) {
     trace->final_hidden_normed = CopyTensorToHost(*logits_input);
     if (trace->final_hidden_normed.empty()) {
       std::cerr << "single_token_forward_model: failed to capture final normalized hidden state\n";
@@ -1504,11 +1597,30 @@ bool SingleTokenForwardModel::RunTokens(
     }
   }
 
-  if (!impl_->lm_head_op->Run(
-          *impl_->cublas,
-          impl_->heuristic_cache.get(),
-          *logits_input,
-          logits)) {
+  auto logits_bf16 = DeviceTensorBf16::Create({token_count, impl_->config.vocab_size});
+  if (!logits_bf16 || !logits_bf16->valid()) {
+    std::cerr << "single_token_forward_model: BF16 logits scratch allocation failed\n";
+    return false;
+  }
+  const bool lm_head_ok =
+      (impl_->lm_head_op->Run(
+           *impl_->cublas,
+           impl_->heuristic_cache.get(),
+           *logits_input,
+           logits_bf16.get()) &&
+       CastTensorBf16ToFp32(*logits_bf16, logits)) ||
+      ([&]() -> bool {
+        auto logits_input_fp32 = DeviceTensorFp32::Create(logits_input->shape());
+        return logits_input_fp32 != nullptr &&
+               CastTensorBf16ToFp32(*logits_input, logits_input_fp32.get()) &&
+               impl_->lm_head_op->Run(
+                   *impl_->cublas,
+                   impl_->heuristic_cache.get(),
+                   *logits_input_fp32,
+                   logits) &&
+               cudaStreamSynchronize(nullptr) == cudaSuccess;
+      })();
+  if (!lm_head_ok) {
     std::cerr << "single_token_forward_model: lm_head projection failed\n";
     return false;
   }
@@ -1523,7 +1635,7 @@ bool SingleTokenForwardModel::RunTokens(
       return false;
     }
   }
-  return true;
+  return cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 
 }  // namespace nemotron

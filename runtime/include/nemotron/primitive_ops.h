@@ -40,4 +40,12 @@ bool FusedAddRmsNormBf16(
     float epsilon,
     DeviceTensorBf16* normalized_output);
 
+bool CastTensorFp32ToBf16(
+    const DeviceTensorFp32& input,
+    DeviceTensorBf16* output);
+
+bool CastTensorBf16ToFp32(
+    const DeviceTensorBf16& input,
+    DeviceTensorFp32* output);
+
 }  // namespace nemotron

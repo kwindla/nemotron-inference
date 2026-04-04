@@ -94,6 +94,15 @@ class MambaLayerSlice {
       CublasLtHandle& cublas_handle,
       GemmHeuristicCache* heuristic_cache,
       RequestExecutionContext& request_context,
+      const DeviceTensorBf16& input,
+      DeviceTensorBf16* residual,
+      DeviceTensorBf16* output,
+      MambaLayerRunTrace* trace = nullptr) const;
+
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
+      RequestExecutionContext& request_context,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
       MambaLayerRunTrace* trace = nullptr) const;

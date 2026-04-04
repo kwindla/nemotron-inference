@@ -19,6 +19,13 @@ bool HasMambaState(const RequestExecutionContext& request_context) {
          request_context.mamba_state()->valid();
 }
 
+bool HasActivationState(const RequestExecutionContext& request_context) {
+  return request_context.hidden() != nullptr &&
+         request_context.residual() != nullptr &&
+         request_context.hidden()->valid() &&
+         request_context.residual()->valid();
+}
+
 std::size_t LiveKvTensorBytes(const RequestExecutionContext& request_context) {
   if (!HasAttentionState(request_context) || request_context.config().attention_total_pages == 0) {
     return 0;
@@ -43,10 +50,14 @@ std::size_t RequiredKvSnapshotBytes(const RequestExecutionContext& request_conte
 }
 
 std::size_t RequiredMambaSnapshotBytes(const RequestExecutionContext& request_context) {
-  if (!HasMambaState(request_context)) {
+  if (!HasActivationState(request_context)) {
     return 0;
   }
-  return request_context.mamba_conv_state()->bytes() + request_context.mamba_state()->bytes();
+  std::size_t bytes = request_context.hidden()->bytes() + request_context.residual()->bytes();
+  if (HasMambaState(request_context)) {
+    bytes += request_context.mamba_conv_state()->bytes() + request_context.mamba_state()->bytes();
+  }
+  return bytes;
 }
 
 std::optional<ReusableStateDescriptor> SnapshotRequestState(
@@ -70,8 +81,12 @@ std::optional<ReusableStateDescriptor> SnapshotRequestState(
 
   const std::size_t key_bytes = LiveKvTensorBytes(request_context);
   const std::size_t value_bytes = key_bytes;
-  const std::size_t conv_bytes = request_context.mamba_conv_state()->bytes();
-  const std::size_t ssm_bytes = request_context.mamba_state()->bytes();
+  const std::size_t hidden_bytes = request_context.hidden()->bytes();
+  const std::size_t residual_bytes = request_context.residual()->bytes();
+  const std::size_t conv_bytes =
+      HasMambaState(request_context) ? request_context.mamba_conv_state()->bytes() : 0;
+  const std::size_t ssm_bytes =
+      HasMambaState(request_context) ? request_context.mamba_state()->bytes() : 0;
   const bool copied =
       arena.CopyFromDevice(
           descriptor.kv_state,
@@ -86,13 +101,24 @@ std::optional<ReusableStateDescriptor> SnapshotRequestState(
       arena.CopyFromDevice(
           descriptor.mamba_state,
           /*offset_bytes=*/0,
-          request_context.mamba_conv_state()->data(),
-          conv_bytes) &&
+          request_context.hidden()->data(),
+          hidden_bytes) &&
       arena.CopyFromDevice(
           descriptor.mamba_state,
-          /*offset_bytes=*/conv_bytes,
-          request_context.mamba_state()->data(),
-          ssm_bytes);
+          /*offset_bytes=*/hidden_bytes,
+          request_context.residual()->data(),
+          residual_bytes) &&
+      (!HasMambaState(request_context) ||
+       (arena.CopyFromDevice(
+            descriptor.mamba_state,
+            /*offset_bytes=*/hidden_bytes + residual_bytes,
+          request_context.mamba_conv_state()->data(),
+            conv_bytes) &&
+        arena.CopyFromDevice(
+            descriptor.mamba_state,
+            /*offset_bytes=*/hidden_bytes + residual_bytes + conv_bytes,
+            request_context.mamba_state()->data(),
+            ssm_bytes)));
   if (!copied) {
     arena.Release(descriptor);
     return std::nullopt;
@@ -107,8 +133,8 @@ bool RestoreRequestState(
     RequestExecutionContext& request_context) {
   if (!descriptor.valid() ||
       !request_context.valid() ||
+      !HasActivationState(request_context) ||
       !HasAttentionState(request_context) ||
-      !HasMambaState(request_context) ||
       token_count == 0) {
     return false;
   }
@@ -120,10 +146,14 @@ bool RestoreRequestState(
 
   const std::size_t key_bytes = LiveKvTensorBytes(request_context);
   const std::size_t value_bytes = key_bytes;
-  const std::size_t conv_bytes = request_context.mamba_conv_state()->bytes();
-  const std::size_t ssm_bytes = request_context.mamba_state()->bytes();
+  const std::size_t hidden_bytes = request_context.hidden()->bytes();
+  const std::size_t residual_bytes = request_context.residual()->bytes();
+  const std::size_t conv_bytes =
+      HasMambaState(request_context) ? request_context.mamba_conv_state()->bytes() : 0;
+  const std::size_t ssm_bytes =
+      HasMambaState(request_context) ? request_context.mamba_state()->bytes() : 0;
   if (descriptor.kv_state.bytes != key_bytes + value_bytes ||
-      descriptor.mamba_state.bytes != conv_bytes + ssm_bytes) {
+      descriptor.mamba_state.bytes != hidden_bytes + residual_bytes + conv_bytes + ssm_bytes) {
     return false;
   }
 
@@ -140,13 +170,24 @@ bool RestoreRequestState(
          arena.CopyToDevice(
              descriptor.mamba_state,
              /*offset_bytes=*/0,
-             request_context.mamba_conv_state()->data(),
-             conv_bytes) &&
+             request_context.hidden()->data(),
+             hidden_bytes) &&
          arena.CopyToDevice(
              descriptor.mamba_state,
-             /*offset_bytes=*/conv_bytes,
-             request_context.mamba_state()->data(),
-             ssm_bytes);
+             /*offset_bytes=*/hidden_bytes,
+             request_context.residual()->data(),
+             residual_bytes) &&
+         (!HasMambaState(request_context) ||
+          (arena.CopyToDevice(
+               descriptor.mamba_state,
+               /*offset_bytes=*/hidden_bytes + residual_bytes,
+              request_context.mamba_conv_state()->data(),
+               conv_bytes) &&
+           arena.CopyToDevice(
+               descriptor.mamba_state,
+               /*offset_bytes=*/hidden_bytes + residual_bytes + conv_bytes,
+               request_context.mamba_state()->data(),
+               ssm_bytes)));
 }
 
 }  // namespace nemotron

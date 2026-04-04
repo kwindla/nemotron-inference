@@ -39,9 +39,9 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   }
   const std::size_t scratch_tokens = config.scratch_tokens == 0 ? config.max_tokens : config.scratch_tokens;
 
-  auto hidden = DeviceTensorFp32::Create({config.max_tokens, config.hidden_size});
-  auto residual = DeviceTensorFp32::Create({config.max_tokens, config.hidden_size});
-  auto scratch = DeviceTensorFp32::Create({scratch_tokens, config.hidden_size});
+  auto hidden = DeviceTensorBf16::Create({config.max_tokens, config.hidden_size});
+  auto residual = DeviceTensorBf16::Create({config.max_tokens, config.hidden_size});
+  auto scratch = DeviceTensorBf16::Create({scratch_tokens, config.hidden_size});
   if (!hidden || !residual || !scratch) {
     return nullptr;
   }
@@ -111,9 +111,9 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
 
 RequestExecutionContext::RequestExecutionContext(
     RequestExecutionConfig config,
-    std::unique_ptr<DeviceTensorFp32> hidden,
-    std::unique_ptr<DeviceTensorFp32> residual,
-    std::unique_ptr<DeviceTensorFp32> scratch,
+    std::unique_ptr<DeviceTensorBf16> hidden,
+    std::unique_ptr<DeviceTensorBf16> residual,
+    std::unique_ptr<DeviceTensorBf16> scratch,
     std::unique_ptr<DeviceTensorFp32> mamba_conv_state,
     std::unique_ptr<DeviceTensorFp32> mamba_state,
     std::unique_ptr<DeviceTensorBf16> key_cache,
@@ -167,27 +167,27 @@ std::size_t RequestExecutionContext::decode_position() const {
   return decode_position_;
 }
 
-DeviceTensorFp32* RequestExecutionContext::hidden() {
+DeviceTensorBf16* RequestExecutionContext::hidden() {
   return hidden_.get();
 }
 
-const DeviceTensorFp32* RequestExecutionContext::hidden() const {
+const DeviceTensorBf16* RequestExecutionContext::hidden() const {
   return hidden_.get();
 }
 
-DeviceTensorFp32* RequestExecutionContext::residual() {
+DeviceTensorBf16* RequestExecutionContext::residual() {
   return residual_.get();
 }
 
-const DeviceTensorFp32* RequestExecutionContext::residual() const {
+const DeviceTensorBf16* RequestExecutionContext::residual() const {
   return residual_.get();
 }
 
-DeviceTensorFp32* RequestExecutionContext::scratch() {
+DeviceTensorBf16* RequestExecutionContext::scratch() {
   return scratch_.get();
 }
 
-const DeviceTensorFp32* RequestExecutionContext::scratch() const {
+const DeviceTensorBf16* RequestExecutionContext::scratch() const {
   return scratch_.get();
 }
 

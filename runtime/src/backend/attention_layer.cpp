@@ -244,6 +244,19 @@ float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
   return max_diff;
 }
 
+std::vector<float> CopyTensorToHostFp32(const DeviceTensorBf16& tensor) {
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return {};
+  }
+
+  std::vector<float> host_fp32(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    host_fp32[i] = __bfloat162float(host_bf16[i]);
+  }
+  return host_fp32;
+}
+
 std::optional<std::size_t> QueryHeadToKvHead(
     std::size_t query_head,
     std::size_t query_head_count,
@@ -541,11 +554,11 @@ struct AttentionLayerSlice::Impl {
   std::unique_ptr<UploadedLinearOp> k_proj;
   std::unique_ptr<UploadedLinearOp> v_proj;
   std::unique_ptr<UploadedLinearOp> o_proj;
-  std::unique_ptr<DeviceTensorFp32> normed_scratch;
-  std::unique_ptr<DeviceTensorFp32> q_scratch;
-  std::unique_ptr<DeviceTensorFp32> k_scratch;
-  std::unique_ptr<DeviceTensorFp32> v_scratch;
-  std::unique_ptr<DeviceTensorFp32> attn_output_scratch;
+  std::unique_ptr<DeviceTensorBf16> normed_scratch;
+  std::unique_ptr<DeviceTensorBf16> q_scratch;
+  std::unique_ptr<DeviceTensorBf16> k_scratch;
+  std::unique_ptr<DeviceTensorBf16> v_scratch;
+  std::unique_ptr<DeviceTensorBf16> attn_output_scratch;
   std::unique_ptr<DeviceTensorBf16> query_bf16_scratch;
   std::unique_ptr<DeviceTensorBf16> attn_output_bf16_scratch;
   std::array<std::int32_t, 1> query_sequence_lengths_host{0};
@@ -625,11 +638,11 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
   auto k_proj = UploadedLinearOp::Create(*bindings.k_proj);
   auto v_proj = UploadedLinearOp::Create(*bindings.v_proj);
   auto o_proj = UploadedLinearOp::Create(*bindings.o_proj);
-  auto normed_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
-  auto q_scratch = DeviceTensorFp32::Create({1, query_width});
-  auto k_scratch = DeviceTensorFp32::Create({1, kv_width});
-  auto v_scratch = DeviceTensorFp32::Create({1, kv_width});
-  auto attn_output_scratch = DeviceTensorFp32::Create({1, query_width});
+  auto normed_scratch = DeviceTensorBf16::Create({1, config.hidden_size});
+  auto q_scratch = DeviceTensorBf16::Create({1, query_width});
+  auto k_scratch = DeviceTensorBf16::Create({1, kv_width});
+  auto v_scratch = DeviceTensorBf16::Create({1, kv_width});
+  auto attn_output_scratch = DeviceTensorBf16::Create({1, query_width});
   auto query_bf16_scratch =
       DeviceTensorBf16::Create({1, config.query_head_count, 1, config.head_dim});
   auto attn_output_bf16_scratch =
@@ -730,8 +743,9 @@ bool AttentionLayerSlice::Run(
     RequestExecutionContext& request_context,
     std::size_t sequence_start,
     std::size_t total_sequence_length,
-    const DeviceTensorFp32& input,
-    DeviceTensorFp32* output) const {
+    const DeviceTensorBf16& input,
+    DeviceTensorBf16* residual,
+    DeviceTensorBf16* output) const {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   if (!valid() ||
       !cublas_handle.valid() ||
@@ -739,6 +753,9 @@ bool AttentionLayerSlice::Run(
       !input.valid() ||
       input.shape().size() != 2 ||
       input.shape()[1] != impl_->config.hidden_size ||
+      residual == nullptr ||
+      !residual->valid() ||
+      residual->shape() != input.shape() ||
       output == nullptr ||
       !output->valid() ||
       output->shape() != input.shape()) {
@@ -761,20 +778,18 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  std::unique_ptr<DeviceTensorFp32> normed_owned;
-  std::unique_ptr<DeviceTensorFp32> q_owned;
-  std::unique_ptr<DeviceTensorFp32> k_owned;
-  std::unique_ptr<DeviceTensorFp32> v_owned;
-  std::unique_ptr<DeviceTensorFp32> attn_output_owned;
-  std::unique_ptr<DeviceTensorFp32> projected_owned;
+  std::unique_ptr<DeviceTensorBf16> normed_owned;
+  std::unique_ptr<DeviceTensorBf16> q_owned;
+  std::unique_ptr<DeviceTensorBf16> k_owned;
+  std::unique_ptr<DeviceTensorBf16> v_owned;
+  std::unique_ptr<DeviceTensorBf16> attn_output_owned;
   std::unique_ptr<DeviceTensorBf16> query_bf16_owned;
-  std::unique_ptr<DeviceTensorBf16> output_bf16_owned;
-  DeviceTensorFp32* normed = nullptr;
-  DeviceTensorFp32* q = nullptr;
-  DeviceTensorFp32* k = nullptr;
-  DeviceTensorFp32* v = nullptr;
-  DeviceTensorFp32* attn_output_fp32 = nullptr;
-  DeviceTensorFp32* projected = nullptr;
+  std::unique_ptr<DeviceTensorBf16> output_layout_owned;
+  DeviceTensorBf16* normed = nullptr;
+  DeviceTensorBf16* q = nullptr;
+  DeviceTensorBf16* k = nullptr;
+  DeviceTensorBf16* v = nullptr;
+  DeviceTensorBf16* attn_output = nullptr;
   DeviceTensorBf16* query_bf16 = nullptr;
   DeviceTensorBf16* output_bf16 = nullptr;
   const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
@@ -783,37 +798,33 @@ bool AttentionLayerSlice::Run(
     q = impl_->q_scratch.get();
     k = impl_->k_scratch.get();
     v = impl_->v_scratch.get();
-    attn_output_fp32 = impl_->attn_output_scratch.get();
-    projected = output;
+    attn_output = impl_->attn_output_scratch.get();
     query_bf16 = impl_->query_bf16_scratch.get();
     output_bf16 = impl_->attn_output_bf16_scratch.get();
   } else {
-    normed_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-    q_owned = DeviceTensorFp32::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
-    k_owned = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-    v_owned = DeviceTensorFp32::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-    attn_output_owned = DeviceTensorFp32::Create(
+    normed_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    q_owned = DeviceTensorBf16::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
+    k_owned = DeviceTensorBf16::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    v_owned = DeviceTensorBf16::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    attn_output_owned = DeviceTensorBf16::Create(
         {token_count, impl_->config.query_head_count * impl_->config.head_dim});
-    projected_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
     query_bf16_owned =
         DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
-    output_bf16_owned =
+    output_layout_owned =
         DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
     normed = normed_owned.get();
     q = q_owned.get();
     k = k_owned.get();
     v = v_owned.get();
-    attn_output_fp32 = attn_output_owned.get();
-    projected = projected_owned.get();
+    attn_output = attn_output_owned.get();
     query_bf16 = query_bf16_owned.get();
-    output_bf16 = output_bf16_owned.get();
+    output_bf16 = output_layout_owned.get();
   }
   if (!normed ||
       !q ||
       !k ||
       !v ||
-      !attn_output_fp32 ||
-      !projected ||
+      !attn_output ||
       !query_bf16 ||
       !output_bf16 ||
       !output_bf16->FillZero()) {
@@ -823,11 +834,27 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
+  const auto run_linear_bf16 = [&](const UploadedLinearOp& op,
+                                   const DeviceTensorBf16& bf16_input,
+                                   DeviceTensorBf16* bf16_output) -> bool {
+    if (op.Run(cublas_handle, heuristic_cache, bf16_input, bf16_output)) {
+      return true;
+    }
+    auto fp32_input = DeviceTensorFp32::Create(bf16_input.shape());
+    auto fp32_output = DeviceTensorFp32::Create(bf16_output->shape());
+    return fp32_input != nullptr &&
+           fp32_output != nullptr &&
+           CastTensorBf16ToFp32(bf16_input, fp32_input.get()) &&
+           op.Run(cublas_handle, heuristic_cache, *fp32_input, fp32_output.get()) &&
+           CastTensorFp32ToBf16(*fp32_output, bf16_output) &&
+           cudaStreamSynchronize(nullptr) == cudaSuccess;
+  };
+
   const bool norm_ok =
-      RmsNormFp32(input, *impl_->norm_weight, impl_->config.rms_epsilon, normed);
-  const bool q_ok = norm_ok && impl_->q_proj->Run(cublas_handle, heuristic_cache, *normed, q);
-  const bool k_ok = q_ok && impl_->k_proj->Run(cublas_handle, heuristic_cache, *normed, k);
-  const bool v_ok = k_ok && impl_->v_proj->Run(cublas_handle, heuristic_cache, *normed, v);
+      FusedAddRmsNormBf16(input, residual, *impl_->norm_weight, impl_->config.rms_epsilon, normed);
+  const bool q_ok = norm_ok && run_linear_bf16(*impl_->q_proj, *normed, q);
+  const bool k_ok = q_ok && run_linear_bf16(*impl_->k_proj, *normed, k);
+  const bool v_ok = k_ok && run_linear_bf16(*impl_->v_proj, *normed, v);
   if (!norm_ok || !q_ok || !k_ok || !v_ok) {
     if (debug) {
       std::cout << "attention_layer: norm/qkv failed"
@@ -916,7 +943,7 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  if (!ConvertRowMajorFp32ToAttentionQueryBf16(
+  if (!ConvertRowMajorBf16ToAttentionQueryBf16(
           *q,
           token_count,
           impl_->config.query_head_count,
@@ -949,7 +976,7 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  if (!ScatterRowMajorFp32ToPagedCacheBf16(
+  if (!ScatterRowMajorBf16ToPagedCacheBf16(
           *k,
           sequence_start,
           token_count,
@@ -959,7 +986,7 @@ bool AttentionLayerSlice::Run(
           impl_->page_table_k->data(),
           impl_->batch_plan.max_pages_per_sequence,
           request_context.key_cache()) ||
-      !ScatterRowMajorFp32ToPagedCacheBf16(
+      !ScatterRowMajorBf16ToPagedCacheBf16(
           *v,
           sequence_start,
           token_count,
@@ -1095,27 +1122,27 @@ bool AttentionLayerSlice::Run(
     }
   }
 
-  if (!ConvertAttentionOutputBf16ToRowMajorFp32(
+  if (!ConvertAttentionOutputBf16ToRowMajorBf16(
           *output_bf16,
           token_count,
           impl_->config.query_head_count,
           impl_->config.head_dim,
-          attn_output_fp32)) {
+          attn_output)) {
     if (debug) {
-      std::cout << "attention_layer: failed to convert attention output to FP32\n";
+      std::cout << "attention_layer: failed to convert attention output to row-major BF16\n";
     }
     return false;
   }
 
   if (selected_backend != AttentionBackend::kCudnnPaged && DeviceAttentionCompareEnabled()) {
-    std::vector<float> q_host(q->numel(), 0.0f);
+    std::vector<float> q_host = CopyTensorToHostFp32(*q);
     std::vector<__nv_bfloat16> key_cache_host(request_context.key_cache()->numel());
     std::vector<__nv_bfloat16> value_cache_host(request_context.value_cache()->numel());
-    std::vector<float> device_attention_output(attn_output_fp32->numel(), 0.0f);
-    if (q->CopyToHost(q_host.data(), q_host.size()) &&
+    std::vector<float> device_attention_output = CopyTensorToHostFp32(*attn_output);
+    if (!q_host.empty() &&
+        !device_attention_output.empty() &&
         request_context.key_cache()->CopyToHost(key_cache_host.data(), key_cache_host.size()) &&
-        request_context.value_cache()->CopyToHost(value_cache_host.data(), value_cache_host.size()) &&
-        attn_output_fp32->CopyToHost(device_attention_output.data(), device_attention_output.size())) {
+        request_context.value_cache()->CopyToHost(value_cache_host.data(), value_cache_host.size())) {
       const std::vector<__nv_bfloat16> query_host = MatrixToAttentionQueryBf16(
           q_host,
           token_count,
@@ -1157,17 +1184,49 @@ bool AttentionLayerSlice::Run(
     }
   }
 
-  const bool o_ok = impl_->o_proj->Run(cublas_handle, heuristic_cache, *attn_output_fp32, projected);
-  const bool residual_ok = o_ok && ResidualAddFp32(input, *projected, output);
-  if (!o_ok || !residual_ok) {
+  const bool o_ok = run_linear_bf16(*impl_->o_proj, *attn_output, output);
+  if (!o_ok) {
     if (debug) {
-      std::cout << "attention_layer: output projection or residual failed"
-                << " o_ok=" << o_ok
-                << " residual_ok=" << residual_ok << "\n";
+      std::cout << "attention_layer: output projection failed\n";
     }
     return false;
   }
-  return true;
+  return cudaStreamSynchronize(nullptr) == cudaSuccess;
+}
+
+bool AttentionLayerSlice::Run(
+    CublasLtHandle& cublas_handle,
+    const CudnnHandle& cudnn_handle,
+    GemmHeuristicCache* heuristic_cache,
+    RequestExecutionContext& request_context,
+    std::size_t sequence_start,
+    std::size_t total_sequence_length,
+    const DeviceTensorFp32& input,
+    DeviceTensorFp32* output) const {
+  auto input_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto residual_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto delta_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto delta_fp32 = DeviceTensorFp32::Create(input.shape());
+  const bool ok =
+      input_bf16 != nullptr &&
+      residual_bf16 != nullptr &&
+      delta_bf16 != nullptr &&
+      delta_fp32 != nullptr &&
+      CastTensorFp32ToBf16(input, input_bf16.get()) &&
+      residual_bf16->FillZero() &&
+      Run(
+          cublas_handle,
+          cudnn_handle,
+          heuristic_cache,
+          request_context,
+          sequence_start,
+          total_sequence_length,
+          *input_bf16,
+          residual_bf16.get(),
+          delta_bf16.get()) &&
+      CastTensorBf16ToFp32(*delta_bf16, delta_fp32.get()) &&
+      ResidualAddFp32(input, *delta_fp32, output);
+  return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 
 }  // namespace nemotron

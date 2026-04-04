@@ -1,6 +1,7 @@
 #include "nemotron/mamba_layer.h"
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -222,9 +223,11 @@ struct MambaLayerSlice::Impl {
   std::unique_ptr<UploadedLinearOp> out_proj_dense;
   std::unique_ptr<ScaledFp8LinearOp> in_proj_scaled_fp8;
   std::unique_ptr<ScaledFp8LinearOp> out_proj_scaled_fp8;
+  std::unique_ptr<DeviceTensorBf16> normalized_bf16_scratch;
   std::unique_ptr<DeviceTensorFp32> normalized_scratch;
   std::unique_ptr<DeviceTensorFp32> projected_scratch;
   std::unique_ptr<DeviceTensorFp32> scan_output_scratch;
+  std::unique_ptr<DeviceTensorFp32> projected_output_scratch;
 };
 
 std::optional<MambaLayerStateLayout> BuildMambaLayerStateLayout(
@@ -445,10 +448,16 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     return debug_fail("projection shapes do not match config");
   }
 
+  auto normalized_bf16_scratch = DeviceTensorBf16::Create({1, config.hidden_size});
   auto normalized_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
   auto projected_scratch = DeviceTensorFp32::Create({1, in_proj_output_rows});
   auto scan_output_scratch = DeviceTensorFp32::Create({1, config.intermediate_size});
-  if (!normalized_scratch || !projected_scratch || !scan_output_scratch) {
+  auto projected_output_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
+  if (!normalized_bf16_scratch ||
+      !normalized_scratch ||
+      !projected_scratch ||
+      !scan_output_scratch ||
+      !projected_output_scratch) {
     return debug_fail("decode scratch allocation failed");
   }
 
@@ -474,9 +483,11 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
   impl->out_proj_dense = std::move(out_proj_dense);
   impl->in_proj_scaled_fp8 = std::move(in_proj_scaled_fp8);
   impl->out_proj_scaled_fp8 = std::move(out_proj_scaled_fp8);
+  impl->normalized_bf16_scratch = std::move(normalized_bf16_scratch);
   impl->normalized_scratch = std::move(normalized_scratch);
   impl->projected_scratch = std::move(projected_scratch);
   impl->scan_output_scratch = std::move(scan_output_scratch);
+  impl->projected_output_scratch = std::move(projected_output_scratch);
   return std::unique_ptr<MambaLayerSlice>(new MambaLayerSlice(std::move(impl)));
 }
 
@@ -519,12 +530,16 @@ bool MambaLayerSlice::valid() const {
           (impl_->out_proj_family == Impl::ProjectionFamily::kScaledFp8 &&
            impl_->out_proj_scaled_fp8 != nullptr &&
            impl_->out_proj_scaled_fp8->valid())) &&
+         impl_->normalized_bf16_scratch != nullptr &&
+         impl_->normalized_bf16_scratch->valid() &&
          impl_->normalized_scratch != nullptr &&
          impl_->normalized_scratch->valid() &&
          impl_->projected_scratch != nullptr &&
          impl_->projected_scratch->valid() &&
          impl_->scan_output_scratch != nullptr &&
-         impl_->scan_output_scratch->valid();
+         impl_->scan_output_scratch->valid() &&
+         impl_->projected_output_scratch != nullptr &&
+         impl_->projected_output_scratch->valid();
 }
 
 const MambaLayerConfig& MambaLayerSlice::config() const {
@@ -539,8 +554,9 @@ bool MambaLayerSlice::Run(
     CublasLtHandle& cublas_handle,
     GemmHeuristicCache* heuristic_cache,
     RequestExecutionContext& request_context,
-    const DeviceTensorFp32& input,
-    DeviceTensorFp32* output,
+    const DeviceTensorBf16& input,
+    DeviceTensorBf16* residual,
+    DeviceTensorBf16* output,
     MambaLayerRunTrace* trace) const {
   struct StateView {
     float* conv_state = nullptr;
@@ -566,6 +582,9 @@ bool MambaLayerSlice::Run(
       !input.valid() ||
       input.shape().size() != 2 ||
       input.shape()[1] != impl_->config.hidden_size ||
+      residual == nullptr ||
+      !residual->valid() ||
+      residual->shape() != input.shape() ||
       output == nullptr ||
       !output->valid() ||
       output->shape() != input.shape()) {
@@ -601,22 +620,28 @@ bool MambaLayerSlice::Run(
   const std::size_t projection_size =
       impl_->config.intermediate_size + conv_dim + impl_->config.num_heads;
 
+  std::unique_ptr<DeviceTensorBf16> normalized_bf16_owned;
   std::unique_ptr<DeviceTensorFp32> normalized_owned;
   std::unique_ptr<DeviceTensorFp32> projected_owned;
   std::unique_ptr<DeviceTensorFp32> scan_output_owned;
   std::unique_ptr<DeviceTensorFp32> projected_output_owned;
+  DeviceTensorBf16* normalized_bf16 = nullptr;
   DeviceTensorFp32* normalized = nullptr;
   DeviceTensorFp32* projected = nullptr;
   DeviceTensorFp32* scan_output = nullptr;
   DeviceTensorFp32* projected_output = nullptr;
   const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
   if (use_decode_scratch) {
+    normalized_bf16 = impl_->normalized_bf16_scratch.get();
     normalized = impl_->normalized_scratch.get();
     projected = impl_->projected_scratch.get();
     scan_output = impl_->scan_output_scratch.get();
-    projected_output = trace == nullptr ? output : nullptr;
+    projected_output = impl_->projected_output_scratch.get();
   }
-  if (projected_output == nullptr) {
+  if (projected_output == nullptr || normalized_bf16 == nullptr) {
+    if (normalized_bf16 == nullptr) {
+      normalized_bf16_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    }
     if (normalized == nullptr) {
       normalized_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
     }
@@ -630,6 +655,9 @@ bool MambaLayerSlice::Run(
     if (normalized == nullptr) {
       normalized = normalized_owned.get();
     }
+    if (normalized_bf16 == nullptr) {
+      normalized_bf16 = normalized_bf16_owned.get();
+    }
     if (projected == nullptr) {
       projected = projected_owned.get();
     }
@@ -638,7 +666,7 @@ bool MambaLayerSlice::Run(
     }
     projected_output = projected_output_owned.get();
   }
-  if (!normalized || !projected || !scan_output || !projected_output) {
+  if (!normalized_bf16 || !normalized || !projected || !scan_output || !projected_output) {
     return false;
   }
 
@@ -649,7 +677,13 @@ bool MambaLayerSlice::Run(
     trace->projected_output.clear();
   }
 
-  if (!RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.input_rms_epsilon, normalized)) {
+  if (!FusedAddRmsNormBf16(
+          input,
+          residual,
+          *impl_->input_norm_weight,
+          impl_->config.input_rms_epsilon,
+          normalized_bf16) ||
+      !CastTensorBf16ToFp32(*normalized_bf16, normalized)) {
     return false;
   }
 
@@ -677,7 +711,7 @@ bool MambaLayerSlice::Run(
         (impl_->out_proj_family == Impl::ProjectionFamily::kDense &&
          impl_->out_proj_dense->Run(
              cublas_handle, heuristic_cache, *scan_output, projected_output));
-    if (!out_proj_ok || !ResidualAddFp32(input, *projected_output, output)) {
+    if (!out_proj_ok || !CastTensorFp32ToBf16(*projected_output, output)) {
       return false;
     }
     if (trace != nullptr) {
@@ -751,7 +785,8 @@ bool MambaLayerSlice::Run(
       }
     }
 
-    return run_output_projection();
+    return run_output_projection() &&
+           cudaStreamSynchronize(nullptr) == cudaSuccess;
   };
 
 #if !defined(NEMOTRON_PRODUCTION_BUILD)
@@ -982,7 +1017,39 @@ bool MambaLayerSlice::Run(
   if (!RunFusedMambaDecode(fused_params, *projected, scan_output)) {
     return false;
   }
-  return run_output_projection();
+  return run_output_projection() &&
+         cudaStreamSynchronize(nullptr) == cudaSuccess;
+}
+
+bool MambaLayerSlice::Run(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    RequestExecutionContext& request_context,
+    const DeviceTensorFp32& input,
+    DeviceTensorFp32* output,
+    MambaLayerRunTrace* trace) const {
+  auto input_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto residual_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto delta_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto delta_fp32 = DeviceTensorFp32::Create(input.shape());
+  const bool ok =
+      input_bf16 != nullptr &&
+      residual_bf16 != nullptr &&
+      delta_bf16 != nullptr &&
+      delta_fp32 != nullptr &&
+      CastTensorFp32ToBf16(input, input_bf16.get()) &&
+      residual_bf16->FillZero() &&
+      Run(
+          cublas_handle,
+          heuristic_cache,
+          request_context,
+          *input_bf16,
+          residual_bf16.get(),
+          delta_bf16.get(),
+          trace) &&
+      CastTensorBf16ToFp32(*delta_bf16, delta_fp32.get()) &&
+      ResidualAddFp32(input, *delta_fp32, output);
+  return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 
 }  // namespace nemotron

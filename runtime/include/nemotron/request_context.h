@@ -36,12 +36,12 @@ class RequestExecutionContext {
   std::size_t sequence_length() const;
   std::size_t decode_position() const;
 
-  DeviceTensorFp32* hidden();
-  const DeviceTensorFp32* hidden() const;
-  DeviceTensorFp32* residual();
-  const DeviceTensorFp32* residual() const;
-  DeviceTensorFp32* scratch();
-  const DeviceTensorFp32* scratch() const;
+  DeviceTensorBf16* hidden();
+  const DeviceTensorBf16* hidden() const;
+  DeviceTensorBf16* residual();
+  const DeviceTensorBf16* residual() const;
+  DeviceTensorBf16* scratch();
+  const DeviceTensorBf16* scratch() const;
   DeviceTensorFp32* mamba_state();
   const DeviceTensorFp32* mamba_state() const;
   DeviceTensorFp32* mamba_conv_state();
@@ -63,9 +63,9 @@ class RequestExecutionContext {
  private:
   RequestExecutionContext(
       RequestExecutionConfig config,
-      std::unique_ptr<DeviceTensorFp32> hidden,
-      std::unique_ptr<DeviceTensorFp32> residual,
-      std::unique_ptr<DeviceTensorFp32> scratch,
+      std::unique_ptr<DeviceTensorBf16> hidden,
+      std::unique_ptr<DeviceTensorBf16> residual,
+      std::unique_ptr<DeviceTensorBf16> scratch,
       std::unique_ptr<DeviceTensorFp32> mamba_conv_state,
       std::unique_ptr<DeviceTensorFp32> mamba_state,
       std::unique_ptr<DeviceTensorBf16> key_cache,
@@ -73,9 +73,9 @@ class RequestExecutionContext {
       std::optional<PagedKvCacheArena> kv_arena);
 
   RequestExecutionConfig config_;
-  std::unique_ptr<DeviceTensorFp32> hidden_;
-  std::unique_ptr<DeviceTensorFp32> residual_;
-  std::unique_ptr<DeviceTensorFp32> scratch_;
+  std::unique_ptr<DeviceTensorBf16> hidden_;
+  std::unique_ptr<DeviceTensorBf16> residual_;
+  std::unique_ptr<DeviceTensorBf16> scratch_;
   std::unique_ptr<DeviceTensorFp32> mamba_conv_state_;
   std::unique_ptr<DeviceTensorFp32> mamba_state_;
   std::unique_ptr<DeviceTensorBf16> key_cache_;

@@ -15,8 +15,26 @@ bool ConvertRowMajorFp32ToAttentionQueryBf16(
     std::size_t head_dim,
     DeviceTensorBf16* output);
 
+bool ConvertRowMajorBf16ToAttentionQueryBf16(
+    const DeviceTensorBf16& matrix,
+    std::size_t token_count,
+    std::size_t query_head_count,
+    std::size_t head_dim,
+    DeviceTensorBf16* output);
+
 bool ScatterRowMajorFp32ToPagedCacheBf16(
     const DeviceTensorFp32& matrix,
+    std::size_t sequence_start,
+    std::size_t token_count,
+    std::size_t kv_head_count,
+    std::size_t head_dim,
+    std::size_t tokens_per_page,
+    const std::int32_t* page_table_device,
+    std::size_t max_pages_per_sequence,
+    DeviceTensorBf16* cache);
+
+bool ScatterRowMajorBf16ToPagedCacheBf16(
+    const DeviceTensorBf16& matrix,
     std::size_t sequence_start,
     std::size_t token_count,
     std::size_t kv_head_count,
@@ -66,5 +84,12 @@ bool ConvertAttentionOutputBf16ToRowMajorFp32(
     std::size_t query_head_count,
     std::size_t head_dim,
     DeviceTensorFp32* output);
+
+bool ConvertAttentionOutputBf16ToRowMajorBf16(
+    const DeviceTensorBf16& tensor,
+    std::size_t token_count,
+    std::size_t query_head_count,
+    std::size_t head_dim,
+    DeviceTensorBf16* output);
 
 }  // namespace nemotron

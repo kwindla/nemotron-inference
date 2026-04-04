@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 
 #include <cstdlib>
 #include <iostream>
@@ -17,12 +18,14 @@
 #include "nemotron/linear_op_counters.h"
 #include "nemotron/linear_op_trace.h"
 #include "nemotron/linear_reference_kernels.h"
+#include "nemotron/primitive_ops.h"
 
 namespace nemotron {
 
 struct UploadedLinearOp::Impl {
   GemmDescriptor descriptor;
-  std::unique_ptr<DeviceDenseWeightFp32> dense_weight;
+  std::unique_ptr<DeviceDenseWeightFp32> dense_weight_fp32;
+  std::unique_ptr<DeviceDenseWeightBf16> dense_weight_bf16;
   std::unique_ptr<DeviceNvfp4Weight> nvfp4_weight;
   std::unique_ptr<DeviceNvfp4Matrix> activation_pack;
 };
@@ -275,6 +278,42 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
 
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     const GemmDescriptor& descriptor,
+    const DeviceDenseWeightBf16& weight,
+    std::size_t rows,
+    GemmHeuristicCache* heuristic_cache,
+    GemmPlanFailureStep* failure_step = nullptr,
+    CublasLtPlanRejectInfo* reject_info = nullptr) {
+  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
+  if (reject_info != nullptr) {
+    *reject_info = CublasLtPlanRejectInfo{};
+  }
+  const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
+      descriptor,
+      rows,
+      ByteRangeView{
+          reinterpret_cast<const std::uint8_t*>(weight.data()),
+          weight.numel() * sizeof(__nv_bfloat16),
+      },
+      std::nullopt,
+      std::nullopt,
+      failure_step);
+  if (!runtime_launch_plan.has_value()) {
+    return std::nullopt;
+  }
+  const auto execution = PrepareGemmExecution(*runtime_launch_plan, heuristic_cache);
+  if (!execution.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
+    return std::nullopt;
+  }
+  const auto plan = BuildCublasLtGemmPlan(*execution, reject_info);
+  if (!plan.has_value()) {
+    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
+  }
+  return plan;
+}
+
+std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
+    const GemmDescriptor& descriptor,
     const DeviceNvfp4Weight& weight,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache,
@@ -356,8 +395,15 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor&
   impl->descriptor = descriptor;
   switch (descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor:
-      impl->dense_weight = DeviceDenseWeightFp32::Upload(descriptor);
-      if (!impl->dense_weight || !impl->dense_weight->valid()) {
+      if (IsBf16Storage(descriptor.storage_dtype)) {
+        impl->dense_weight_bf16 = DeviceDenseWeightBf16::Upload(descriptor);
+      } else {
+        impl->dense_weight_fp32 = DeviceDenseWeightFp32::Upload(descriptor);
+      }
+      if ((IsBf16Storage(descriptor.storage_dtype) &&
+           (!impl->dense_weight_bf16 || !impl->dense_weight_bf16->valid())) ||
+          (!IsBf16Storage(descriptor.storage_dtype) &&
+           (!impl->dense_weight_fp32 || !impl->dense_weight_fp32->valid()))) {
         if (debug) {
           std::cerr << "linear_op_create: dense upload failed for " << descriptor.tensor_name
                     << " storage=" << descriptor.storage_dtype
@@ -414,7 +460,8 @@ bool UploadedLinearOp::valid() const {
   }
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor:
-      return impl_->dense_weight && impl_->dense_weight->valid();
+      return (impl_->dense_weight_fp32 && impl_->dense_weight_fp32->valid()) ||
+             (impl_->dense_weight_bf16 && impl_->dense_weight_bf16->valid());
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       return impl_->nvfp4_weight &&
              impl_->nvfp4_weight->valid() &&
@@ -452,6 +499,25 @@ bool UploadedLinearOp::Run(
   auto& counters = GetLinearOpCounters();
   const bool trace_enabled = IsLinearOpTraceEnabled();
   bool plan_build_ok = false;
+  if (impl_->descriptor.kernel_family == GemmKernelFamily::kDenseRowMajor &&
+      impl_->dense_weight_fp32 == nullptr &&
+      impl_->dense_weight_bf16 != nullptr &&
+      impl_->dense_weight_bf16->valid()) {
+    auto activations_bf16 = DeviceTensorBf16::Create(activations.shape());
+    auto output_bf16 = DeviceTensorBf16::Create(output->shape());
+    const bool bridge_ok =
+        activations_bf16 != nullptr &&
+        output_bf16 != nullptr &&
+        CastTensorFp32ToBf16(activations, activations_bf16.get()) &&
+        Run(handle, heuristic_cache, *activations_bf16, output_bf16.get()) &&
+        CastTensorBf16ToFp32(*output_bf16, output) &&
+        cudaStreamSynchronize(nullptr) == cudaSuccess;
+    if (!bridge_ok && debug) {
+      std::cerr << "linear_op: FP32 bridge via BF16 dense weight failed for "
+                << impl_->descriptor.tensor_name << "\n";
+    }
+    return bridge_ok;
+  }
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
       if (LinearDeviceFastpathEnabled() && !EnvFlagEnabled(kDenseFastpathDisableEnvVar)) {
@@ -459,7 +525,7 @@ bool UploadedLinearOp::Run(
         CublasLtPlanRejectInfo reject_info;
         const auto plan = BuildRuntimeGemmPlan(
             impl_->descriptor,
-            *impl_->dense_weight,
+            *impl_->dense_weight_fp32,
             rows,
             heuristic_cache,
             &failure_step,
@@ -470,7 +536,7 @@ bool UploadedLinearOp::Run(
           if (const auto stats = RunDenseRowMajorFp32ToDevice(
                   handle,
                   *plan,
-                  *impl_->dense_weight,
+                  *impl_->dense_weight_fp32,
                   activations,
                   output);
               stats.has_value()) {
@@ -610,10 +676,10 @@ bool UploadedLinearOp::Run(
     case GemmKernelFamily::kDenseRowMajor:
       counters.dense_reference_fallback.fetch_add(1, std::memory_order_relaxed);
       device_reference_ok =
-          impl_->dense_weight != nullptr &&
+          impl_->dense_weight_fp32 != nullptr &&
           RunDenseRowMajorHighPrecisionReferenceToDevice(
               activations,
-              *impl_->dense_weight,
+              *impl_->dense_weight_fp32,
               output);
       break;
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
@@ -657,6 +723,95 @@ bool UploadedLinearOp::Run(
               << impl_->descriptor.tensor_name << "\n";
   }
   return true;
+}
+
+bool UploadedLinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output) const {
+  const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
+  if (!valid() ||
+      !handle.valid() ||
+      !activations.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      impl_->descriptor.kernel_family != GemmKernelFamily::kDenseRowMajor ||
+      impl_->dense_weight_bf16 == nullptr ||
+      !impl_->dense_weight_bf16->valid()) {
+    if (debug) {
+      std::cerr << "linear_op: invalid BF16 run state for " << impl_->descriptor.tensor_name << "\n";
+    }
+    return false;
+  }
+
+  const std::size_t rows = activations.shape().at(0);
+  auto& counters = GetLinearOpCounters();
+  const bool trace_enabled = IsLinearOpTraceEnabled();
+  bool plan_build_ok = false;
+
+  if (LinearDeviceFastpathEnabled() && !EnvFlagEnabled(kDenseFastpathDisableEnvVar)) {
+    GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
+    CublasLtPlanRejectInfo reject_info;
+    const auto plan = BuildRuntimeGemmPlan(
+        impl_->descriptor,
+        *impl_->dense_weight_bf16,
+        rows,
+        heuristic_cache,
+        &failure_step,
+        &reject_info);
+    if (plan.has_value()) {
+      plan_build_ok = true;
+      counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
+      if (const auto stats = RunDenseRowMajorBf16ToDevice(
+              handle,
+              *plan,
+              *impl_->dense_weight_bf16,
+              activations,
+              output);
+          stats.has_value()) {
+        counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+        if (trace_enabled) {
+          AppendLinearOpTraceEntry(LinearOpTraceEntry{
+              impl_->descriptor.tensor_name,
+              impl_->descriptor.kernel_family,
+              LinearOpPath::kFastpath,
+              true,
+              true,
+          });
+        }
+        return true;
+      }
+      counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
+      if (debug) {
+        LogGemmExecuteFailure(impl_->descriptor, rows, "runtime");
+      }
+    } else {
+      counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
+      if (debug) {
+        LogGemmPlanBuildFailure(
+            impl_->descriptor,
+            rows,
+            "runtime",
+            failure_step,
+            reject_info);
+      }
+    }
+  } else if (debug) {
+    std::cerr << "linear_op: dense BF16 reference path unavailable for "
+              << impl_->descriptor.tensor_name << "\n";
+  }
+
+  if (trace_enabled) {
+    AppendLinearOpTraceEntry(LinearOpTraceEntry{
+        impl_->descriptor.tensor_name,
+        impl_->descriptor.kernel_family,
+        LinearOpPath::kFastpath,
+        plan_build_ok,
+        false,
+    });
+  }
+  return false;
 }
 
 std::optional<std::vector<float>> ReadVectorWeightToHostFp32(

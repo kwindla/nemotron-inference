@@ -41,6 +41,9 @@ class DeviceTensorFp32 {
 class DeviceTensorBf16 {
  public:
   static std::unique_ptr<DeviceTensorBf16> Create(std::vector<std::size_t> shape);
+  static std::unique_ptr<DeviceTensorBf16> CreateView(
+      std::vector<std::size_t> shape,
+      __nv_bfloat16* data);
 
   DeviceTensorBf16(DeviceTensorBf16&&) noexcept;
   DeviceTensorBf16& operator=(DeviceTensorBf16&&) noexcept;

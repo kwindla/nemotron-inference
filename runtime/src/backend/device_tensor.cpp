@@ -20,6 +20,7 @@ struct DeviceTensorBf16::Impl {
   std::size_t numel = 0;
   std::size_t bytes = 0;
   __nv_bfloat16* data = nullptr;
+  bool owns_data = false;
 };
 
 namespace {
@@ -147,9 +148,27 @@ std::unique_ptr<DeviceTensorBf16> DeviceTensorBf16::Create(std::vector<std::size
   impl->shape = std::move(shape);
   impl->numel = numel;
   impl->bytes = numel * sizeof(__nv_bfloat16);
+  impl->owns_data = true;
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->data), impl->bytes))) {
     return nullptr;
   }
+  return std::unique_ptr<DeviceTensorBf16>(new DeviceTensorBf16(std::move(impl)));
+}
+
+std::unique_ptr<DeviceTensorBf16> DeviceTensorBf16::CreateView(
+    std::vector<std::size_t> shape,
+    __nv_bfloat16* data) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(__nv_bfloat16);
+  impl->data = data;
+  impl->owns_data = false;
   return std::unique_ptr<DeviceTensorBf16>(new DeviceTensorBf16(std::move(impl)));
 }
 
@@ -160,7 +179,7 @@ DeviceTensorBf16::DeviceTensorBf16(DeviceTensorBf16&&) noexcept = default;
 DeviceTensorBf16& DeviceTensorBf16::operator=(DeviceTensorBf16&&) noexcept = default;
 
 DeviceTensorBf16::~DeviceTensorBf16() {
-  if (impl_ && impl_->data != nullptr) {
+  if (impl_ && impl_->owns_data && impl_->data != nullptr) {
     cudaFree(impl_->data);
   }
 }

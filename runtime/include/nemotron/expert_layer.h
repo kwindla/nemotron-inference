@@ -101,6 +101,14 @@ class ExpertLayerSlice {
   bool Run(
       CublasLtHandle& cublas_handle,
       GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& input,
+      DeviceTensorBf16* residual,
+      DeviceTensorBf16* output,
+      ExpertLayerRunTrace* trace = nullptr) const;
+
+  bool Run(
+      CublasLtHandle& cublas_handle,
+      GemmHeuristicCache* heuristic_cache,
       const DeviceTensorFp32& input,
       DeviceTensorFp32* output,
       ExpertLayerRunTrace* trace = nullptr) const;

@@ -58,6 +58,25 @@ __global__ void ConvertRowMajorFp32ToAttentionQueryBf16Kernel(
   }
 }
 
+__global__ void ConvertRowMajorBf16ToAttentionQueryBf16Kernel(
+    const __nv_bfloat16* input,
+    std::size_t token_count,
+    std::size_t query_head_count,
+    std::size_t head_dim,
+    __nv_bfloat16* output) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t total = token_count * query_head_count * head_dim;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = index; i < total; i += stride) {
+    const std::size_t token = i / (query_head_count * head_dim);
+    const std::size_t rem = i % (query_head_count * head_dim);
+    const std::size_t head = rem / head_dim;
+    const std::size_t dim = rem % head_dim;
+    const std::size_t dst = ((head * token_count) + token) * head_dim + dim;
+    output[dst] = input[i];
+  }
+}
+
 __global__ void ConvertAttentionOutputBf16ToRowMajorFp32Kernel(
     const __nv_bfloat16* input,
     std::size_t token_count,
@@ -74,6 +93,25 @@ __global__ void ConvertAttentionOutputBf16ToRowMajorFp32Kernel(
     const std::size_t dim = rem % head_dim;
     const std::size_t src = ((head * token_count) + token) * head_dim + dim;
     output[i] = __bfloat162float(input[src]);
+  }
+}
+
+__global__ void ConvertAttentionOutputBf16ToRowMajorBf16Kernel(
+    const __nv_bfloat16* input,
+    std::size_t token_count,
+    std::size_t query_head_count,
+    std::size_t head_dim,
+    __nv_bfloat16* output) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t total = token_count * query_head_count * head_dim;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = index; i < total; i += stride) {
+    const std::size_t token = i / (query_head_count * head_dim);
+    const std::size_t rem = i % (query_head_count * head_dim);
+    const std::size_t head = rem / head_dim;
+    const std::size_t dim = rem % head_dim;
+    const std::size_t src = ((head * token_count) + token) * head_dim + dim;
+    output[i] = input[src];
   }
 }
 
@@ -110,6 +148,42 @@ __global__ void ScatterRowMajorFp32ToPagedCacheBf16Kernel(
             head_dim +
         dim;
     cache[dst] = __float2bfloat16(matrix[i]);
+  }
+}
+
+__global__ void ScatterRowMajorBf16ToPagedCacheBf16Kernel(
+    const __nv_bfloat16* matrix,
+    std::size_t sequence_start,
+    std::size_t token_count,
+    std::size_t kv_head_count,
+    std::size_t head_dim,
+    std::size_t tokens_per_page,
+    const std::int32_t* page_table,
+    std::size_t max_pages_per_sequence,
+    __nv_bfloat16* cache) {
+  const std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t total = token_count * kv_head_count * head_dim;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = index; i < total; i += stride) {
+    const std::size_t token = i / (kv_head_count * head_dim);
+    const std::size_t rem = i % (kv_head_count * head_dim);
+    const std::size_t head = rem / head_dim;
+    const std::size_t dim = rem % head_dim;
+    const std::size_t absolute_token = sequence_start + token;
+    const std::size_t page_slot = absolute_token / tokens_per_page;
+    const std::size_t page_offset = absolute_token % tokens_per_page;
+    if (page_slot >= max_pages_per_sequence) {
+      continue;
+    }
+    const std::int32_t page_id = page_table[page_slot];
+    if (page_id < 0) {
+      continue;
+    }
+    const std::size_t dst =
+        ((((static_cast<std::size_t>(page_id) * kv_head_count) + head) * tokens_per_page) + page_offset) *
+            head_dim +
+        dim;
+    cache[dst] = matrix[i];
   }
 }
 
@@ -415,6 +489,35 @@ bool ConvertRowMajorFp32ToAttentionQueryBf16(
   return CheckCuda(cudaGetLastError());
 }
 
+bool ConvertRowMajorBf16ToAttentionQueryBf16(
+    const DeviceTensorBf16& matrix,
+    std::size_t token_count,
+    std::size_t query_head_count,
+    std::size_t head_dim,
+    DeviceTensorBf16* output) {
+  if (!matrix.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      matrix.shape().size() != 2 ||
+      matrix.shape()[0] != token_count ||
+      matrix.shape()[1] != query_head_count * head_dim ||
+      output->numel() != token_count * query_head_count * head_dim) {
+    return false;
+  }
+
+  const std::size_t total = token_count * query_head_count * head_dim;
+  const int block_size = 256;
+  const int grid_size =
+      static_cast<int>((total + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
+  ConvertRowMajorBf16ToAttentionQueryBf16Kernel<<<grid_size, block_size>>>(
+      matrix.data(),
+      token_count,
+      query_head_count,
+      head_dim,
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
 bool ScatterRowMajorFp32ToPagedCacheBf16(
     const DeviceTensorFp32& matrix,
     std::size_t sequence_start,
@@ -440,6 +543,43 @@ bool ScatterRowMajorFp32ToPagedCacheBf16(
   const int grid_size =
       static_cast<int>((total + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
   ScatterRowMajorFp32ToPagedCacheBf16Kernel<<<grid_size, block_size>>>(
+      matrix.data(),
+      sequence_start,
+      token_count,
+      kv_head_count,
+      head_dim,
+      tokens_per_page,
+      page_table_device,
+      max_pages_per_sequence,
+      cache->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool ScatterRowMajorBf16ToPagedCacheBf16(
+    const DeviceTensorBf16& matrix,
+    std::size_t sequence_start,
+    std::size_t token_count,
+    std::size_t kv_head_count,
+    std::size_t head_dim,
+    std::size_t tokens_per_page,
+    const std::int32_t* page_table_device,
+    std::size_t max_pages_per_sequence,
+    DeviceTensorBf16* cache) {
+  if (!matrix.valid() ||
+      cache == nullptr ||
+      !cache->valid() ||
+      page_table_device == nullptr ||
+      matrix.shape().size() != 2 ||
+      matrix.shape()[0] != token_count ||
+      matrix.shape()[1] != kv_head_count * head_dim) {
+    return false;
+  }
+
+  const std::size_t total = token_count * kv_head_count * head_dim;
+  const int block_size = 256;
+  const int grid_size =
+      static_cast<int>((total + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
+  ScatterRowMajorBf16ToPagedCacheBf16Kernel<<<grid_size, block_size>>>(
       matrix.data(),
       sequence_start,
       token_count,
@@ -601,6 +741,35 @@ bool ConvertAttentionOutputBf16ToRowMajorFp32(
   const int grid_size =
       static_cast<int>((total + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
   ConvertAttentionOutputBf16ToRowMajorFp32Kernel<<<grid_size, block_size>>>(
+      tensor.data(),
+      token_count,
+      query_head_count,
+      head_dim,
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool ConvertAttentionOutputBf16ToRowMajorBf16(
+    const DeviceTensorBf16& tensor,
+    std::size_t token_count,
+    std::size_t query_head_count,
+    std::size_t head_dim,
+    DeviceTensorBf16* output) {
+  if (!tensor.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      output->shape().size() != 2 ||
+      output->shape()[0] != token_count ||
+      output->shape()[1] != query_head_count * head_dim ||
+      tensor.numel() != token_count * query_head_count * head_dim) {
+    return false;
+  }
+
+  const std::size_t total = token_count * query_head_count * head_dim;
+  const int block_size = 256;
+  const int grid_size =
+      static_cast<int>((total + static_cast<std::size_t>(block_size) - 1u) / static_cast<std::size_t>(block_size));
+  ConvertAttentionOutputBf16ToRowMajorBf16Kernel<<<grid_size, block_size>>>(
       tensor.data(),
       token_count,
       query_head_count,

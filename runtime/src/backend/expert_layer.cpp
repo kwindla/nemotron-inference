@@ -584,6 +584,21 @@ bool CopyToHost(const DeviceTensorFp32& tensor, std::vector<float>* output) {
   return tensor.CopyToHost(output->data(), output->size());
 }
 
+bool CopyToHost(const DeviceTensorBf16& tensor, std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->assign(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
+  }
+  return true;
+}
+
 bool UploadHostVector(const std::vector<float>& input, DeviceTensorFp32* output) {
   return output != nullptr &&
          output->valid() &&
@@ -1041,6 +1056,7 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
+  std::unique_ptr<DeviceTensorBf16> normalized_bf16_scratch;
   std::unique_ptr<DeviceTensorFp32> normalized_scratch;
   std::unique_ptr<DeviceTensorFp32> router_logits_scratch;
   std::unique_ptr<DeviceTensorFp32> output_scratch;
@@ -1817,8 +1833,7 @@ bool ExpertLayerSlice::Impl::RunBatchedHostRoutingAdapterViaCublaslt(
   }
   shared_span.RecordEnd();
   residual_span.RecordStart();
-  if (!ResidualAddFp32(*routed_output, *shared_output, output) ||
-      !ResidualAddFp32(input, *output, output)) {
+  if (!ResidualAddFp32(*routed_output, *shared_output, output)) {
     return false;
   }
   residual_span.RecordEnd();
@@ -2037,8 +2052,7 @@ bool RunMoeDirectDecodeViaCublaslt(
            output,
            false)
            .has_value() ||
-      !ResidualAddFp32(*routed_output, *output, routed_output) ||
-      !ResidualAddFp32(input, *routed_output, output)) {
+      !ResidualAddFp32(*routed_output, *output, output)) {
     return false;
   }
 
@@ -2244,21 +2258,17 @@ class ExpertLayerSlice::Impl::UnifiedFusedBackend final : public PreparedResiden
       auto routed_output = DeviceTensorFp32::CreateView(
           {token_count, impl_->config.hidden_size},
           impl_->fused_prefill_routed_output_scratch->data());
-      std::vector<float> input_host;
       std::vector<float> fused_output_host;
       std::vector<float> fused_routed_host;
       if (!routed_output ||
-          !CopyToHost(input, &input_host) ||
           !CopyToHost(*output, &fused_output_host) ||
           !CopyToHost(*routed_output, &fused_routed_host) ||
-          input_host.size() != fused_output_host.size() ||
           fused_routed_host.size() != fused_output_host.size()) {
         return false;
       }
       std::vector<float> fused_shared_host(fused_output_host.size(), 0.0f);
       for (std::size_t i = 0; i < fused_output_host.size(); ++i) {
-        fused_shared_host[i] =
-            fused_output_host[i] - input_host[i] - fused_routed_host[i];
+        fused_shared_host[i] = fused_output_host[i] - fused_routed_host[i];
       }
       impl_->backend_dispatch_state.fused_debug_output_host =
           std::move(fused_output_host);
@@ -2916,12 +2926,14 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     cumulative_resident_routed_expert_bytes = residency_tracker.resident_routed_expert_bytes;
   }
 
+  auto normalized_bf16_scratch = DeviceTensorBf16::Create({1, config.hidden_size});
   auto normalized_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
   auto router_logits_scratch = DeviceTensorFp32::Create({1, config.n_routed_experts});
   auto output_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
   auto routed_up_scratch = DeviceTensorFp32::Create({1, config.routed_expert_intermediate_size});
   auto shared_up_scratch = DeviceTensorFp32::Create({1, config.shared_expert_intermediate_size});
-  if (!normalized_scratch ||
+  if (!normalized_bf16_scratch ||
+      !normalized_scratch ||
       !router_logits_scratch ||
       !output_scratch ||
       !routed_up_scratch ||
@@ -3030,6 +3042,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->fused_prefill_gather_scratch = std::move(fused_prefill_gather_scratch);
   impl->fused_prefill_expert_up_scratch = std::move(fused_prefill_expert_up_scratch);
   impl->fused_prefill_shared_up_scratch = std::move(fused_prefill_shared_up_scratch);
+  impl->normalized_bf16_scratch = std::move(normalized_bf16_scratch);
   impl->normalized_scratch = std::move(normalized_scratch);
   impl->router_logits_scratch = std::move(router_logits_scratch);
   impl->output_scratch = std::move(output_scratch);
@@ -3195,6 +3208,8 @@ bool ExpertLayerSlice::valid() const {
            impl_->fused_prefill_expert_up_scratch->valid() &&
            impl_->fused_prefill_shared_up_scratch != nullptr &&
            impl_->fused_prefill_shared_up_scratch->valid())) &&
+         impl_->normalized_bf16_scratch != nullptr &&
+         impl_->normalized_bf16_scratch->valid() &&
          impl_->normalized_scratch != nullptr &&
          impl_->normalized_scratch->valid() &&
          impl_->router_logits_scratch != nullptr &&
@@ -3222,8 +3237,9 @@ const ExpertLayerConfig& ExpertLayerSlice::config() const {
 bool ExpertLayerSlice::Run(
     CublasLtHandle& cublas_handle,
     GemmHeuristicCache* heuristic_cache,
-    const DeviceTensorFp32& input,
-    DeviceTensorFp32* output,
+    const DeviceTensorBf16& input,
+    DeviceTensorBf16* residual,
+    DeviceTensorBf16* output,
     ExpertLayerRunTrace* trace) const {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool host_selection_debug =
@@ -3234,12 +3250,18 @@ bool ExpertLayerSlice::Run(
       std::getenv("NEMOTRON_FORWARD_COMPARE_FUSED_MOE") != nullptr &&
       (compare_fused_active_env == nullptr ||
        std::strcmp(compare_fused_active_env, "0") != 0);
+  const auto finish = [](bool ok) {
+    return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
+  };
 
   if (!valid() ||
       !cublas_handle.valid() ||
       !input.valid() ||
       input.shape().size() != 2 ||
       input.shape()[1] != impl_->config.hidden_size ||
+      residual == nullptr ||
+      !residual->valid() ||
+      residual->shape() != input.shape() ||
       output == nullptr ||
       !output->valid() ||
       output->shape() != input.shape()) {
@@ -3257,21 +3279,43 @@ bool ExpertLayerSlice::Run(
     return false;
   }
 
+  std::unique_ptr<DeviceTensorBf16> normalized_bf16_owned;
+  std::unique_ptr<DeviceTensorFp32> input_fp32_owned;
   std::unique_ptr<DeviceTensorFp32> normalized_owned;
   std::unique_ptr<DeviceTensorFp32> router_logits_owned;
+  std::unique_ptr<DeviceTensorFp32> output_fp32_owned;
+  DeviceTensorBf16* normalized_bf16 = nullptr;
+  DeviceTensorFp32* input_fp32 = nullptr;
   DeviceTensorFp32* normalized = nullptr;
   DeviceTensorFp32* router_logits = nullptr;
+  DeviceTensorFp32* output_fp32 = nullptr;
   const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
   if (use_decode_scratch) {
+    normalized_bf16 = impl_->normalized_bf16_scratch.get();
     normalized = impl_->normalized_scratch.get();
     router_logits = impl_->router_logits_scratch.get();
+    output_fp32 = impl_->output_scratch.get();
   } else {
+    normalized_bf16_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    input_fp32_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
     normalized_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
     router_logits_owned = DeviceTensorFp32::Create({token_count, impl_->config.n_routed_experts});
+    output_fp32_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    normalized_bf16 = normalized_bf16_owned.get();
+    input_fp32 = input_fp32_owned.get();
     normalized = normalized_owned.get();
     router_logits = router_logits_owned.get();
+    output_fp32 = output_fp32_owned.get();
   }
-  if (normalized == nullptr || router_logits == nullptr) {
+  if (input_fp32 == nullptr) {
+    input_fp32_owned = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    input_fp32 = input_fp32_owned.get();
+  }
+  if (normalized_bf16 == nullptr ||
+      input_fp32 == nullptr ||
+      normalized == nullptr ||
+      router_logits == nullptr ||
+      output_fp32 == nullptr) {
     if (debug) {
       std::cout << "expert_layer: scratch allocation failed\n";
     }
@@ -3279,7 +3323,14 @@ bool ExpertLayerSlice::Run(
   }
 
   const bool norm_ok =
-      RmsNormFp32(input, *impl_->input_norm_weight, impl_->config.rms_epsilon, normalized);
+      CastTensorBf16ToFp32(input, input_fp32) &&
+      FusedAddRmsNormBf16(
+          input,
+          residual,
+          *impl_->input_norm_weight,
+          impl_->config.rms_epsilon,
+          normalized_bf16) &&
+      CastTensorBf16ToFp32(*normalized_bf16, normalized);
   const bool gate_ok =
       norm_ok &&
       impl_->gate_weight->Run(cublas_handle, heuristic_cache, *normalized, router_logits);
@@ -3319,12 +3370,12 @@ bool ExpertLayerSlice::Run(
                   heuristic_cache,
                   impl_->config,
                   token_count,
-                  input,
+                  *input_fp32,
                   *normalized,
                   *router_logits,
                   topk_ids,
                   topk_weights,
-                  output,
+                  output_fp32,
                   trace)) {
             continue;
           }
@@ -3332,18 +3383,16 @@ bool ExpertLayerSlice::Run(
               impl_->backend_dispatch_state.collected_fused_debug) {
             break;
           }
-          return true;
+          return finish(CastTensorFp32ToBf16(*output_fp32, output));
         }
       } else if (debug) {
         std::cout << "expert_layer: device expert selection failed, falling back\n";
       }
     }
 
-    std::vector<float> input_host;
     std::vector<float> normalized_host;
     std::vector<float> router_logits_host;
-    if (!CopyToHost(input, &input_host) ||
-        !CopyToHost(*normalized, &normalized_host) ||
+    if (!CopyToHost(*normalized, &normalized_host) ||
         !CopyToHost(*router_logits, &router_logits_host)) {
       if (debug) {
         std::cout << "expert_layer: failed to copy direct-moe tensors to host\n";
@@ -3574,16 +3623,23 @@ bool ExpertLayerSlice::Run(
     std::vector<float> final_output(token_count * impl_->config.hidden_size, 0.0f);
     for (std::size_t i = 0; i < final_output.size(); ++i) {
       mixer_output[i] = routed_hidden_output[i] + shared_output[i];
-      final_output[i] = input_host[i] + mixer_output[i];
+      final_output[i] = mixer_output[i];
     }
 
     if (!impl_->backend_dispatch_state.live_fused_output_written) {
-      if (!output->CopyFromHost(final_output.data(), final_output.size())) {
+      if (!output_fp32->CopyFromHost(final_output.data(), final_output.size())) {
         if (debug) {
           std::cout << "expert_layer: direct final output upload failed\n";
         }
         return false;
       }
+    }
+
+    if (!CastTensorFp32ToBf16(*output_fp32, output)) {
+      if (debug) {
+        std::cout << "expert_layer: direct final output cast failed\n";
+      }
+      return false;
     }
 
     if (trace != nullptr) {
@@ -3618,7 +3674,7 @@ bool ExpertLayerSlice::Run(
                 << " host0=" << (final_output.empty() ? 0.0f : final_output.front())
                 << "\n";
     }
-    return true;
+    return finish(true);
   }
 
   auto latent = DeviceTensorFp32::Create({token_count, impl_->config.moe_latent_size});
@@ -3651,13 +3707,11 @@ bool ExpertLayerSlice::Run(
     return false;
   }
 
-  std::vector<float> input_host;
   std::vector<float> normalized_host;
   std::vector<float> router_logits_host;
   std::vector<float> latent_host;
   std::vector<float> shared_up_host;
-  if (!CopyToHost(input, &input_host) ||
-      !CopyToHost(*normalized, &normalized_host) ||
+  if (!CopyToHost(*normalized, &normalized_host) ||
       !CopyToHost(*router_logits, &router_logits_host) ||
       !CopyToHost(*latent, &latent_host) ||
       !CopyToHost(*shared_up, &shared_up_host)) {
@@ -3666,13 +3720,11 @@ bool ExpertLayerSlice::Run(
     }
     return false;
   }
-  if (debug && (HasNonFinite(input_host) ||
-                HasNonFinite(normalized_host) ||
+  if (debug && (HasNonFinite(normalized_host) ||
                 HasNonFinite(router_logits_host) ||
                 HasNonFinite(latent_host) ||
                 HasNonFinite(shared_up_host))) {
     std::cout << "expert_layer: non-finite values detected"
-              << " input=" << HasNonFinite(input_host)
               << " normalized=" << HasNonFinite(normalized_host)
               << " router=" << HasNonFinite(router_logits_host)
               << " latent=" << HasNonFinite(latent_host)
@@ -3891,12 +3943,13 @@ bool ExpertLayerSlice::Run(
   std::vector<float> final_output(token_count * impl_->config.hidden_size, 0.0f);
   for (std::size_t i = 0; i < final_output.size(); ++i) {
     mixer_output[i] = projected_routed_host[i] + shared_output[i];
-    final_output[i] = input_host[i] + mixer_output[i];
+    final_output[i] = mixer_output[i];
   }
 
-  if (!output->CopyFromHost(final_output.data(), final_output.size())) {
+  if (!output_fp32->CopyFromHost(final_output.data(), final_output.size()) ||
+      !CastTensorFp32ToBf16(*output_fp32, output)) {
     if (debug) {
-      std::cout << "expert_layer: final output upload failed\n";
+      std::cout << "expert_layer: final output upload/cast failed\n";
     }
     return false;
   }
@@ -3914,7 +3967,36 @@ bool ExpertLayerSlice::Run(
         mixer_output.begin(),
         mixer_output.begin() + impl_->config.hidden_size);
   }
-  return true;
+  return finish(true);
+}
+
+bool ExpertLayerSlice::Run(
+    CublasLtHandle& cublas_handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& input,
+    DeviceTensorFp32* output,
+    ExpertLayerRunTrace* trace) const {
+  auto input_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto residual_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto delta_bf16 = DeviceTensorBf16::Create(input.shape());
+  auto delta_fp32 = DeviceTensorFp32::Create(input.shape());
+  const bool ok =
+      input_bf16 != nullptr &&
+      residual_bf16 != nullptr &&
+      delta_bf16 != nullptr &&
+      delta_fp32 != nullptr &&
+      CastTensorFp32ToBf16(input, input_bf16.get()) &&
+      residual_bf16->FillZero() &&
+      Run(
+          cublas_handle,
+          heuristic_cache,
+          *input_bf16,
+          residual_bf16.get(),
+          delta_bf16.get(),
+          trace) &&
+      CastTensorBf16ToFp32(*delta_bf16, delta_fp32.get()) &&
+      ResidualAddFp32(input, *delta_fp32, output);
+  return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 
 }  // namespace nemotron
