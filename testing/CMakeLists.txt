@@ -623,6 +623,21 @@ target_compile_definitions(
 nemotron_add_test(expert_layer_oracle_test)
 
 add_executable(
+  expert_layer8_oracle_test
+  backend/expert_layer_oracle_test.cpp
+)
+
+target_link_libraries(expert_layer8_oracle_test PRIVATE nemotron_runtime_backend)
+target_compile_features(expert_layer8_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  expert_layer8_oracle_test
+  PRIVATE
+    NEMOTRON_EXPERT_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/testing/oracle/expert_layer8_decode_block"
+)
+
+nemotron_add_test(expert_layer8_oracle_test)
+
+add_executable(
   mamba_layer_oracle_test
   backend/mamba_layer_oracle_test.cpp
 )
@@ -636,3 +651,18 @@ target_compile_definitions(
 )
 
 nemotron_add_test(mamba_layer_oracle_test)
+
+add_executable(
+  mamba_layer9_oracle_test
+  backend/mamba_layer_oracle_test.cpp
+)
+
+target_link_libraries(mamba_layer9_oracle_test PRIVATE nemotron_runtime_api)
+target_compile_features(mamba_layer9_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  mamba_layer9_oracle_test
+  PRIVATE
+    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/testing/oracle/mamba_layer9_decode_block"
+)
+
+nemotron_add_test(mamba_layer9_oracle_test)
