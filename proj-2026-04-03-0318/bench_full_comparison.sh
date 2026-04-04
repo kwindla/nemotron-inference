@@ -37,10 +37,9 @@ Options:
   --help, -h                 Show this message.
 
 Notes:
-  - The current nano_prefix_cache_ttft_bench executable hardcodes 32-token tail cases
-    and does not expose moe_prefill_window_tokens. This harness therefore emits
-    structured "unavailable" JSON records for the internal 64/128 chunk-window rows
-    instead of fabricating numbers.
+  - The prefix-cache TTFT matrix records real 32/64/128-token resumed-tail cases by
+    driving nano_prefix_cache_ttft_bench with matching
+    --tail-token-count/--moe-prefill-window-tokens values.
   - The fallback check uses nano_save_prompt_oracle to verify that
     NEMOTRON_FORWARD_UNIFIED_FUSED=0 overrides the legacy opt-in and preserves the
     baseline output sequence.
@@ -61,6 +60,28 @@ VLLM_WARMUP_ITERS="${VLLM_WARMUP_ITERS:-2}"
 VLLM_ITERS="${VLLM_ITERS:-5}"
 VLLM_DECODE_PREFIX_TOKENS="${VLLM_DECODE_PREFIX_TOKENS:-256}"
 LABEL=""
+
+resolve_path() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+print(pathlib.Path(sys.argv[1]).resolve())
+PY
+}
+
+resolve_repo_relative_path() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib
+import sys
+
+repo_root = pathlib.Path(sys.argv[1]).resolve()
+candidate = pathlib.Path(sys.argv[2])
+if not candidate.is_absolute():
+    candidate = repo_root / candidate
+print(candidate.resolve())
+PY
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -185,9 +206,35 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-DECODE_BINARY="${REPO_ROOT}/${BENCH_BUILD_DIR}/benchmarks/nano_fused_decode/nano_fused_decode_bench"
-PREFIX_BINARY="${REPO_ROOT}/${BENCH_BUILD_DIR}/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench"
+REPO_ROOT="$(resolve_path "${REPO_ROOT}")"
+SCRIPT_DIR="$(resolve_path "${SCRIPT_DIR}")"
+ARTIFACT_ROOT="$(resolve_repo_relative_path "${REPO_ROOT}" "${ARTIFACT_ROOT}")"
+MANIFEST_PATH="$(resolve_path "${MANIFEST_PATH}")"
+BENCH_BUILD_DIR_PATH="$(resolve_repo_relative_path "${REPO_ROOT}" "${BENCH_BUILD_DIR}")"
+TEST_BUILD_DIR_PATH=""
+if [[ -n "${TEST_BUILD_DIR}" ]]; then
+  TEST_BUILD_DIR_PATH="$(resolve_repo_relative_path "${REPO_ROOT}" "${TEST_BUILD_DIR}")"
+fi
+
+DECODE_BINARY="${BENCH_BUILD_DIR_PATH}/benchmarks/nano_fused_decode/nano_fused_decode_bench"
+PREFIX_BINARY="${BENCH_BUILD_DIR_PATH}/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench"
 VLLM_WRAPPER="${SCRIPT_DIR}/run_bench_vllm.sh"
+DEFAULT_VLLM_PYTHON_BIN="${REPO_ROOT}/vllm-env-cu128/bin/python"
+VLLM_PYTHON_BIN="${VLLM_PYTHON:-${DEFAULT_VLLM_PYTHON_BIN}}"
+VLLM_SOURCE_TREE="${REPO_ROOT}/third_party/vllm"
+VLLM_SOURCE_TREE="$(resolve_path "${VLLM_SOURCE_TREE}")"
+REPO_GIT_REVISION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)"
+VLLM_GIT_REVISION="$(git -C "${VLLM_SOURCE_TREE}" rev-parse HEAD 2>/dev/null || true)"
+VLLM_GIT_TAG="$(git -C "${VLLM_SOURCE_TREE}" describe --tags --always 2>/dev/null || true)"
+MODEL_ID="$(python3 - "${MANIFEST_PATH}" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(payload["runtime"]["model_id"])
+PY
+)"
 
 if [[ ! -x "${DECODE_BINARY}" ]]; then
   echo "bench_full_comparison.sh: decode benchmark binary not executable: ${DECODE_BINARY}" >&2
@@ -203,23 +250,111 @@ if [[ ! -f "${VLLM_WRAPPER}" ]]; then
 fi
 
 ORACLE_BINARY=""
-if [[ -n "${TEST_BUILD_DIR}" ]] && [[ -x "${REPO_ROOT}/${TEST_BUILD_DIR}/testing/nano_save_prompt_oracle" ]]; then
-  ORACLE_BINARY="${REPO_ROOT}/${TEST_BUILD_DIR}/testing/nano_save_prompt_oracle"
+if [[ -n "${TEST_BUILD_DIR_PATH}" ]] && [[ -x "${TEST_BUILD_DIR_PATH}/testing/nano_save_prompt_oracle" ]]; then
+  ORACLE_BINARY="${TEST_BUILD_DIR_PATH}/testing/nano_save_prompt_oracle"
 fi
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="${ARTIFACT_ROOT}/${TIMESTAMP}${LABEL:+_${LABEL}}"
 mkdir -p "${RUN_DIR}/internal" "${RUN_DIR}/vllm" "${RUN_DIR}/fallback"
 
+collect_runtime_backend_env_json() {
+  python3 - "$@" <<'PY'
+import json
+import os
+import sys
+
+payload = {
+    key: value
+    for key, value in os.environ.items()
+    if key.startswith("NEMOTRON_FORWARD_") and value
+}
+for raw in sys.argv[1:]:
+    if "=" not in raw:
+        continue
+    key, value = raw.split("=", 1)
+    if key.startswith("NEMOTRON_FORWARD_") and value:
+        payload[key] = value
+print(json.dumps(dict(sorted(payload.items())), sort_keys=True))
+PY
+}
+
+VLLM_PYTHONPATH_VALUE="${REPO_ROOT}/third_party/vllm${PYTHONPATH:+:${PYTHONPATH}}"
+VLLM_PYTORCH_CUDA_ALLOC_CONF_VALUE="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+VLLM_USE_FLASHINFER_MOE_FP4_VALUE="${VLLM_USE_FLASHINFER_MOE_FP4:-1}"
+VLLM_FLASHINFER_MOE_BACKEND_VALUE="${VLLM_FLASHINFER_MOE_BACKEND:-throughput}"
+VLLM_ALLOW_INSECURE_SERIALIZATION_VALUE="${VLLM_ALLOW_INSECURE_SERIALIZATION:-1}"
+VLLM_NVFP4_GEMM_BACKEND_VALUE="${VLLM_NVFP4_GEMM_BACKEND:-}"
+VLLM_MOE_PADDING_VALUE="${VLLM_MOE_PADDING:-}"
+VLLM_BACKEND_ENV_JSON="$(python3 - "${VLLM_PYTHONPATH_VALUE}" "${VLLM_PYTORCH_CUDA_ALLOC_CONF_VALUE}" "${VLLM_ALLOW_INSECURE_SERIALIZATION_VALUE}" "${VLLM_FLASHINFER_MOE_BACKEND_VALUE}" "${VLLM_USE_FLASHINFER_MOE_FP4_VALUE}" "${VLLM_NVFP4_GEMM_BACKEND_VALUE}" "${VLLM_MOE_PADDING_VALUE}" <<'PY'
+import json
+import sys
+
+payload = {
+    "PYTHONPATH": sys.argv[1],
+    "PYTORCH_CUDA_ALLOC_CONF": sys.argv[2],
+    "VLLM_ALLOW_INSECURE_SERIALIZATION": sys.argv[3],
+    "VLLM_FLASHINFER_MOE_BACKEND": sys.argv[4],
+    "VLLM_USE_FLASHINFER_MOE_FP4": sys.argv[5],
+}
+if sys.argv[6]:
+    payload["VLLM_NVFP4_GEMM_BACKEND"] = sys.argv[6]
+if sys.argv[7]:
+    payload["VLLM_MOE_PADDING"] = sys.argv[7]
+print(json.dumps(dict(sorted(payload.items())), sort_keys=True))
+PY
+)"
+
+augment_json_artifact() {
+  local artifact_path="$1"
+  local artifact_family="$2"
+  local binary_path="$3"
+  local build_dir="$4"
+  local manifest_path="$5"
+  local model_id="$6"
+  local backend_env_json="$7"
+  python3 - "${artifact_path}" "${artifact_family}" "${binary_path}" "${build_dir}" "${manifest_path}" "${model_id}" "${backend_env_json}" "${REPO_ROOT}" "${VLLM_WRAPPER}" "${VLLM_PYTHON_BIN}" "${VLLM_SOURCE_TREE}" "${VLLM_GIT_REVISION}" "${VLLM_GIT_TAG}" <<'PY'
+import json
+import pathlib
+import sys
+
+artifact_path = pathlib.Path(sys.argv[1])
+payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+backend_env = json.loads(sys.argv[7])
+
+def null_if_empty(value: str):
+    return value if value else None
+
+payload["provenance"] = {
+    "artifact_family": sys.argv[2],
+    "repo_root": sys.argv[8],
+    "binary_path": null_if_empty(sys.argv[3]),
+    "build_dir": null_if_empty(sys.argv[4]),
+    "manifest_path": null_if_empty(sys.argv[5]),
+    "model_id": null_if_empty(sys.argv[6]),
+    "backend_selection_env": backend_env,
+    "external_vllm_reference": {
+        "wrapper_path": sys.argv[9],
+        "python_bin": sys.argv[10],
+        "source_tree": sys.argv[11],
+        "git_revision": null_if_empty(sys.argv[12]),
+        "git_tag": null_if_empty(sys.argv[13]),
+    },
+}
+artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
 {
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "repo_root=${REPO_ROOT}"
-  echo "bench_build_dir=${BENCH_BUILD_DIR}"
-  echo "test_build_dir=${TEST_BUILD_DIR:-missing}"
+  echo "bench_build_dir=${BENCH_BUILD_DIR_PATH}"
+  echo "test_build_dir=${TEST_BUILD_DIR_PATH:-missing}"
   echo "decode_binary=${DECODE_BINARY}"
   echo "prefix_binary=${PREFIX_BINARY}"
   echo "oracle_binary=${ORACLE_BINARY:-missing}"
   echo "manifest=${MANIFEST_PATH}"
+  echo "model_id=${MODEL_ID}"
   echo "artifact_dir=${RUN_DIR}"
   echo "decode_tokens=${DECODE_TOKENS}"
   echo "prefix_warmup=${PREFIX_WARMUP}"
@@ -227,6 +362,10 @@ mkdir -p "${RUN_DIR}/internal" "${RUN_DIR}/vllm" "${RUN_DIR}/fallback"
   echo "vllm_warmup_iters=${VLLM_WARMUP_ITERS}"
   echo "vllm_iters=${VLLM_ITERS}"
   echo "vllm_decode_prefix_tokens=${VLLM_DECODE_PREFIX_TOKENS}"
+  echo "vllm_python=${VLLM_PYTHON_BIN}"
+  echo "vllm_source_tree=${VLLM_SOURCE_TREE}"
+  echo "vllm_git_revision=${VLLM_GIT_REVISION}"
+  echo "vllm_git_tag=${VLLM_GIT_TAG}"
   echo "uname=$(uname -a)"
   echo
   echo "[nvcc]"
@@ -241,41 +380,10 @@ mkdir -p "${RUN_DIR}/internal" "${RUN_DIR}/vllm" "${RUN_DIR}/fallback"
   echo
   echo "[env]"
   env | grep -E '^(NEMOTRON_|VLLM_|CUDA_VISIBLE_DEVICES=|LD_LIBRARY_PATH=|PYTHONPATH=)' | sort || true
+  echo
+  echo "[vllm-backend-env-json]"
+  echo "${VLLM_BACKEND_ENV_JSON}"
 } > "${RUN_DIR}/environment.txt"
-
-write_unavailable_json() {
-  local output_path="$1"
-  local config_name="$2"
-  local workload="$3"
-  local requested_window="$4"
-  python3 - "${output_path}" "${config_name}" "${workload}" "${requested_window}" <<'PY'
-import json
-import pathlib
-import sys
-
-output_path = pathlib.Path(sys.argv[1])
-config_name = sys.argv[2]
-workload = sys.argv[3]
-requested_window = int(sys.argv[4])
-
-payload = {
-    "status": "unavailable",
-    "config_name": config_name,
-    "workload": workload,
-    "requested_moe_prefill_window_tokens": requested_window,
-    "reason": (
-        "The current nano_prefix_cache_ttft_bench executable hardcodes 32-token tail "
-        "cases and does not expose moe_prefill_window_tokens."
-    ),
-    "required_surface": (
-        "A benchmark executable or wrapper that can drive the existing runtime with "
-        "SingleTokenForwardConfig.moe_prefill_window_tokens=%d using the existing "
-        "unified backend implementation." % requested_window
-    ),
-}
-output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-PY
-}
 
 parse_prefix_stdout_to_json() {
   local stdout_path="$1"
@@ -293,7 +401,10 @@ config_name = sys.argv[3]
 
 header_pattern = re.compile(
     r"^nano_prefix_cache_ttft_bench: manifest=(?P<manifest>\S+) "
-    r"warmup_iterations=(?P<warmup>\d+) measured_iterations=(?P<iters>\d+)$"
+    r"model_id=(?P<model_id>\S+) "
+    r"warmup_iterations=(?P<warmup>\d+) measured_iterations=(?P<iters>\d+) "
+    r"tail_token_count=(?P<tail>\d+) "
+    r"moe_prefill_window_tokens=(?P<window>\d+)$"
 )
 case_pattern = re.compile(
     r"^Case: (?P<name>\S+) \(total_prompt_tokens=(?P<total>\d+)\)$"
@@ -318,8 +429,11 @@ for raw_line in stdout_path.read_text(encoding="utf-8").splitlines():
     header_match = header_pattern.match(line)
     if header_match:
         payload["manifest_path"] = header_match.group("manifest")
+        payload["model_id"] = header_match.group("model_id")
         payload["warmup_iterations"] = int(header_match.group("warmup"))
         payload["measured_iterations"] = int(header_match.group("iters"))
+        payload["tail_token_count"] = int(header_match.group("tail"))
+        payload["moe_prefill_window_tokens"] = int(header_match.group("window"))
         continue
 
     case_match = case_pattern.match(line)
@@ -365,16 +479,23 @@ run_decode_case() {
   local json_path="${RUN_DIR}/internal/${label}.decode.json"
   local stdout_path="${RUN_DIR}/internal/${label}.decode.stdout.txt"
   local env_path="${RUN_DIR}/internal/${label}.decode.env.txt"
+  local runtime_env_json
+  runtime_env_json="$(collect_runtime_backend_env_json "NEMOTRON_FORWARD_MANIFEST=${MANIFEST_PATH}" "${env_overrides[@]}")"
 
   {
     echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "label=${label}"
     echo "binary=${DECODE_BINARY}"
+    echo "build_dir=${BENCH_BUILD_DIR_PATH}"
     echo "manifest=${MANIFEST_PATH}"
+    echo "model_id=${MODEL_ID}"
     echo "decode_tokens=${DECODE_TOKENS}"
     echo
     echo "[env-overrides]"
     printf '%s\n' "${env_overrides[@]}"
+    echo
+    echo "[backend-selection-env-json]"
+    echo "${runtime_env_json}"
   } > "${env_path}"
 
   local -a cmd=(env)
@@ -390,26 +511,45 @@ run_decode_case() {
 
   echo "bench_full_comparison.sh: running decode case ${label}"
   "${cmd[@]}" 2>&1 | tee "${stdout_path}"
+  augment_json_artifact \
+    "${json_path}" \
+    "runtime_decode" \
+    "${DECODE_BINARY}" \
+    "${BENCH_BUILD_DIR_PATH}" \
+    "${MANIFEST_PATH}" \
+    "${MODEL_ID}" \
+    "${runtime_env_json}"
 }
 
 run_prefix_case() {
   local label="$1"
-  shift
+  local tail_token_count="$2"
+  local moe_prefill_window_tokens="$3"
+  shift 3
   local -a env_overrides=("$@")
   local stdout_path="${RUN_DIR}/internal/${label}.prefix.stdout.txt"
   local json_path="${RUN_DIR}/internal/${label}.prefix.json"
   local env_path="${RUN_DIR}/internal/${label}.prefix.env.txt"
+  local runtime_env_json
+  runtime_env_json="$(collect_runtime_backend_env_json "NEMOTRON_FORWARD_MANIFEST=${MANIFEST_PATH}" "${env_overrides[@]}")"
 
   {
     echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "label=${label}"
     echo "binary=${PREFIX_BINARY}"
+    echo "build_dir=${BENCH_BUILD_DIR_PATH}"
     echo "manifest=${MANIFEST_PATH}"
+    echo "model_id=${MODEL_ID}"
     echo "warmup=${PREFIX_WARMUP}"
     echo "iterations=${PREFIX_ITERS}"
+    echo "tail_token_count=${tail_token_count}"
+    echo "moe_prefill_window_tokens=${moe_prefill_window_tokens}"
     echo
     echo "[env-overrides]"
     printf '%s\n' "${env_overrides[@]}"
+    echo
+    echo "[backend-selection-env-json]"
+    echo "${runtime_env_json}"
   } > "${env_path}"
 
   local -a cmd=(env)
@@ -419,11 +559,21 @@ run_prefix_case() {
     "${PREFIX_BINARY}"
     "--warmup" "${PREFIX_WARMUP}"
     "--iterations" "${PREFIX_ITERS}"
+    "--tail-token-count" "${tail_token_count}"
+    "--moe-prefill-window-tokens" "${moe_prefill_window_tokens}"
   )
 
   echo "bench_full_comparison.sh: running prefix case ${label}"
   "${cmd[@]}" 2>&1 | tee "${stdout_path}"
   parse_prefix_stdout_to_json "${stdout_path}" "${json_path}" "${label}"
+  augment_json_artifact \
+    "${json_path}" \
+    "runtime_prefix_ttft" \
+    "${PREFIX_BINARY}" \
+    "${BENCH_BUILD_DIR_PATH}" \
+    "${MANIFEST_PATH}" \
+    "${MODEL_ID}" \
+    "${runtime_env_json}"
 }
 
 run_oracle_case() {
@@ -433,24 +583,44 @@ run_oracle_case() {
   local json_path="${RUN_DIR}/fallback/${label}.oracle.json"
   local stdout_path="${RUN_DIR}/fallback/${label}.oracle.stdout.txt"
   local env_path="${RUN_DIR}/fallback/${label}.oracle.env.txt"
+  local runtime_env_json
+  runtime_env_json="$(collect_runtime_backend_env_json "NEMOTRON_FORWARD_MANIFEST=${MANIFEST_PATH}" "${env_overrides[@]}")"
 
   {
     echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "label=${label}"
     echo "binary=${ORACLE_BINARY}"
+    echo "build_dir=${TEST_BUILD_DIR_PATH:-missing}"
     echo "manifest=${MANIFEST_PATH}"
+    echo "model_id=${MODEL_ID}"
     echo
     echo "[env-overrides]"
     printf '%s\n' "${env_overrides[@]}"
+    echo
+    echo "[backend-selection-env-json]"
+    echo "${runtime_env_json}"
   } > "${env_path}"
 
   local -a cmd=(env)
   cmd+=("NEMOTRON_FORWARD_MANIFEST=${MANIFEST_PATH}")
+  cmd+=("NEMOTRON_REPO_ROOT=${REPO_ROOT}")
+  cmd+=("NEMOTRON_GIT_REVISION=${REPO_GIT_REVISION}")
+  if [[ -n "${TEST_BUILD_DIR_PATH}" ]]; then
+    cmd+=("NEMOTRON_ORACLE_BUILD_DIR=${TEST_BUILD_DIR_PATH}")
+  fi
   cmd+=("${env_overrides[@]}")
   cmd+=("${ORACLE_BINARY}" "--output" "${json_path}")
 
   echo "bench_full_comparison.sh: running fallback oracle case ${label}"
   "${cmd[@]}" 2>&1 | tee "${stdout_path}"
+  augment_json_artifact \
+    "${json_path}" \
+    "runtime_oracle" \
+    "${ORACLE_BINARY}" \
+    "${TEST_BUILD_DIR_PATH:-}" \
+    "${MANIFEST_PATH}" \
+    "${MODEL_ID}" \
+    "${runtime_env_json}"
 }
 
 compare_oracles() {
@@ -531,25 +701,31 @@ run_decode_case \
 
 run_prefix_case \
   default \
+  32 \
+  32 \
   NEMOTRON_FORWARD_UNIFIED_FUSED=0 \
   NEMOTRON_FORWARD_FUSED_MOE_PREFILL=0
 
 run_prefix_case \
   unified_fused \
+  32 \
+  32 \
   NEMOTRON_FORWARD_UNIFIED_FUSED=1 \
   NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1
 
-write_unavailable_json \
-  "${RUN_DIR}/internal/unified_fused_moe_window64.prefix.json" \
-  "unified_fused_moe_window64" \
-  "prefill_chunk64" \
-  "64"
+run_prefix_case \
+  unified_fused_moe_window64 \
+  64 \
+  64 \
+  NEMOTRON_FORWARD_UNIFIED_FUSED=1 \
+  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1
 
-write_unavailable_json \
-  "${RUN_DIR}/internal/unified_fused_moe_window128.prefix.json" \
-  "unified_fused_moe_window128" \
-  "prefill_chunk128" \
-  "128"
+run_prefix_case \
+  unified_fused_moe_window128 \
+  128 \
+  128 \
+  NEMOTRON_FORWARD_UNIFIED_FUSED=1 \
+  NEMOTRON_FORWARD_FUSED_MOE_PREFILL=1
 
 VLLM_JSON_PATH="${RUN_DIR}/vllm/vllm_flashinfer_cutlass.json"
 VLLM_STDOUT_PATH="${RUN_DIR}/vllm/vllm_flashinfer_cutlass.stdout.txt"
@@ -561,6 +737,14 @@ bash "${VLLM_WRAPPER}" \
   --iters "${VLLM_ITERS}" \
   --decode-prefix-tokens "${VLLM_DECODE_PREFIX_TOKENS}" \
   2>&1 | tee "${VLLM_STDOUT_PATH}"
+augment_json_artifact \
+  "${VLLM_JSON_PATH}" \
+  "external_vllm_ttft" \
+  "${VLLM_PYTHON_BIN}" \
+  "" \
+  "" \
+  "${MODEL_ID}" \
+  "${VLLM_BACKEND_ENV_JSON}"
 
 if [[ -n "${ORACLE_BINARY}" ]]; then
   run_oracle_case \
@@ -578,6 +762,14 @@ if [[ -n "${ORACLE_BINARY}" ]]; then
     "${RUN_DIR}/fallback/fallback_disable_override.oracle.json" \
     "${RUN_DIR}/fallback/fallback_disable_check.json" \
     "${RUN_DIR}/fallback/fallback_disable_check.txt"
+  augment_json_artifact \
+    "${RUN_DIR}/fallback/fallback_disable_check.json" \
+    "runtime_fallback_check" \
+    "${ORACLE_BINARY}" \
+    "${TEST_BUILD_DIR_PATH:-}" \
+    "${MANIFEST_PATH}" \
+    "${MODEL_ID}" \
+    "$(collect_runtime_backend_env_json "NEMOTRON_FORWARD_MANIFEST=${MANIFEST_PATH}")"
 fi
 
 python3 - "${RUN_DIR}" <<'PY'
@@ -635,20 +827,13 @@ for config_name, path in decode_case_specs:
 prefix_case_specs = [
     ("default", run_dir / "internal" / "default.prefix.json"),
     ("unified_fused", run_dir / "internal" / "unified_fused.prefix.json"),
-]
-tail_case_names = [
-    "cached_committed_head_prefix256_tail32",
-    "cached_committed_head_prefix1024_tail32",
-    "cached_committed_head_prefix4096_tail32",
-    "cached_global_root_prefix256_tail32",
-    "cached_global_root_prefix1024_tail32",
-    "cached_global_root_prefix4096_tail32",
+    ("unified_fused_moe_window64", run_dir / "internal" / "unified_fused_moe_window64.prefix.json"),
+    ("unified_fused_moe_window128", run_dir / "internal" / "unified_fused_moe_window128.prefix.json"),
 ]
 for config_name, path in prefix_case_specs:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    for case_name in tail_case_names:
-        case_payload = payload["cases"].get(case_name)
-        if case_payload is None:
+    for case_name, case_payload in sorted(payload["cases"].items()):
+        if "_tail" not in case_name:
             continue
         metrics = case_payload["metrics"]
         tail_prefill = metrics.get("tail_prefill_latency")
@@ -680,26 +865,6 @@ for config_name, path in prefix_case_specs:
                 }
             )
 
-for unavailable_name in [
-    "unified_fused_moe_window64.prefix.json",
-    "unified_fused_moe_window128.prefix.json",
-]:
-    path = run_dir / "internal" / unavailable_name
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    rows.append(
-        {
-            "family": "runtime",
-            "config": payload["config_name"],
-            "workload": payload["workload"],
-            "metric": "hot_prefix_ttft_ms",
-            "median": None,
-            "p95": None,
-            "status": payload["status"],
-            "artifact": str(path),
-            "note": payload["reason"],
-        }
-    )
-
 vllm_payload = json.loads((run_dir / "vllm" / "vllm_flashinfer_cutlass.json").read_text(encoding="utf-8"))
 for case in vllm_payload.get("cases", []):
     label = str(case["label"])
@@ -729,7 +894,7 @@ summary_json = {
     "notes": [
         "Decode metrics come from nano_fused_decode_bench steady-state per-step timings.",
         "Cached-tail metrics come from parsed nano_prefix_cache_ttft_bench stdout summaries.",
-        "Internal 64/128 chunk-window rows are marked unavailable because the current benchmark executable does not expose moe_prefill_window_tokens.",
+        "Unified-fused prefix runs explicitly sweep 32/64/128-token tail windows via nano_prefix_cache_ttft_bench CLI controls.",
     ],
 }
 summary_json_path = run_dir / "summary.json"
@@ -773,5 +938,14 @@ summary_txt_path = run_dir / "summary.txt"
 summary_txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print("\n".join(lines))
 PY
+
+augment_json_artifact \
+  "${RUN_DIR}/summary.json" \
+  "full_comparison_summary" \
+  "${SCRIPT_DIR}/bench_full_comparison.sh" \
+  "" \
+  "${MANIFEST_PATH}" \
+  "${MODEL_ID}" \
+  "$(collect_runtime_backend_env_json "NEMOTRON_FORWARD_MANIFEST=${MANIFEST_PATH}")"
 
 echo "bench_full_comparison.sh: artifacts written to ${RUN_DIR}"

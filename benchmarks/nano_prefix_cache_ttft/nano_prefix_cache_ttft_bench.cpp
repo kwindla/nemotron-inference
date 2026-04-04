@@ -27,7 +27,7 @@ namespace {
 constexpr const char* kNanoModelId = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4";
 constexpr std::size_t kDefaultIterations = 5;
 constexpr std::size_t kDefaultWarmupIterations = 1;
-constexpr std::size_t kTailTokenCount = 32;
+constexpr std::size_t kDefaultTailTokenCount = 32;
 constexpr std::size_t kFirstDecodeTokenCount = 1;
 constexpr std::size_t kPrefixLengths[] = {256, 1024, 4096};
 
@@ -81,6 +81,8 @@ bool HasCudaDevice() {
 struct BenchmarkOptions {
   std::size_t warmup_iterations = kDefaultWarmupIterations;
   std::size_t measured_iterations = kDefaultIterations;
+  std::size_t tail_token_count = kDefaultTailTokenCount;
+  std::size_t moe_prefill_window_tokens = 0;
 };
 
 enum class Scenario {
@@ -254,10 +256,17 @@ bool ParseNonNegativeSizeT(const char* text, std::size_t* value_out) {
 
 void PrintUsage(const char* argv0) {
   std::cerr
-      << "Usage: " << argv0 << " [--warmup <count>] [--iterations <count>]\n"
+      << "Usage: " << argv0
+      << " [--warmup <count>] [--iterations <count>] [--tail-token-count <count>]"
+      << " [--moe-prefill-window-tokens <count>]\n"
       << "  Manifest path is read from NEMOTRON_FORWARD_MANIFEST.\n"
       << "  --warmup <count>      Discarded warmup iterations per case. Default: 1\n"
-      << "  --iterations <count>  Measured iterations per case (must be >= 5). Default: 5\n";
+      << "  --iterations <count>  Measured iterations per case (must be >= 5). Default: 5\n"
+      << "  --tail-token-count <count>\n"
+      << "                        Tail token count for resumed-prefix cases. Default: 32\n"
+      << "  --moe-prefill-window-tokens <count>\n"
+      << "                        Explicit SingleTokenForwardConfig.moe_prefill_window_tokens.\n"
+      << "                        Defaults to --tail-token-count when omitted.\n";
 }
 
 bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
@@ -272,6 +281,15 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
       }
     } else if (arg == "--iterations") {
       if (i + 1 >= argc || !ParsePositiveSizeT(argv[++i], &options->measured_iterations)) {
+        return false;
+      }
+    } else if (arg == "--tail-token-count") {
+      if (i + 1 >= argc || !ParsePositiveSizeT(argv[++i], &options->tail_token_count)) {
+        return false;
+      }
+    } else if (arg == "--moe-prefill-window-tokens") {
+      if (i + 1 >= argc ||
+          !ParsePositiveSizeT(argv[++i], &options->moe_prefill_window_tokens)) {
         return false;
       }
     } else if (arg == "--help" || arg == "-h") {
@@ -874,6 +892,9 @@ int main(int argc, char** argv) {
     PrintUsage(argv[0]);
     return 1;
   }
+  if (options.moe_prefill_window_tokens == 0) {
+    options.moe_prefill_window_tokens = options.tail_token_count;
+  }
 
   ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
   ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
@@ -915,7 +936,8 @@ int main(int argc, char** argv) {
   }
 
   const std::size_t max_total_prompt_tokens =
-      kPrefixLengths[(sizeof(kPrefixLengths) / sizeof(kPrefixLengths[0])) - 1] + kTailTokenCount;
+      kPrefixLengths[(sizeof(kPrefixLengths) / sizeof(kPrefixLengths[0])) - 1] +
+      options.tail_token_count;
   auto runtime_options =
       MakeOptions(max_total_prompt_tokens + kFirstDecodeTokenCount);
   auto runtime_environment =
@@ -932,6 +954,7 @@ int main(int argc, char** argv) {
   nemotron::SingleTokenForwardConfig config = *config_opt;
   config.max_tokens =
       std::max(config.max_tokens, max_total_prompt_tokens + kFirstDecodeTokenCount);
+  config.moe_prefill_window_tokens = options.moe_prefill_window_tokens;
   auto model = nemotron::SingleTokenForwardModel::Create(*runtime_environment, config);
   if (model == nullptr || !model->valid()) {
     std::cerr << "nano_prefix_cache_ttft_bench: forward model build failed\n";
@@ -948,16 +971,19 @@ int main(int argc, char** argv) {
     cases.push_back(CaseSpec{Scenario::kCold, prefix_length, 0});
   }
   for (const std::size_t prefix_length : kPrefixLengths) {
-    cases.push_back(CaseSpec{Scenario::kCommittedHead, prefix_length, kTailTokenCount});
+    cases.push_back(CaseSpec{Scenario::kCommittedHead, prefix_length, options.tail_token_count});
   }
   for (const std::size_t prefix_length : kPrefixLengths) {
-    cases.push_back(CaseSpec{Scenario::kGlobalRoot, prefix_length, kTailTokenCount});
+    cases.push_back(CaseSpec{Scenario::kGlobalRoot, prefix_length, options.tail_token_count});
   }
 
   std::cout << std::unitbuf;
   std::cout << "nano_prefix_cache_ttft_bench: manifest=" << manifest_path
+            << " model_id=" << load_result.manifest.runtime.model_id
             << " warmup_iterations=" << options.warmup_iterations
             << " measured_iterations=" << options.measured_iterations
+            << " tail_token_count=" << options.tail_token_count
+            << " moe_prefill_window_tokens=" << options.moe_prefill_window_tokens
             << "\n";
 
   for (const CaseSpec& spec : cases) {
