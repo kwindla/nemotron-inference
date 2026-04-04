@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <string>
@@ -197,6 +198,12 @@ bool IsRoutedExpertTensorName(const std::string& tensor_name) {
 
 bool IsRoutedExpertCacheEntry(const ModelCacheEntry& entry) {
   return IsRoutedExpertTensorName(entry.tensor_name);
+}
+
+bool Nvfp4TensorScalesMatch(float lhs, float rhs) {
+  const float magnitude = std::max(1.0f, std::max(std::fabs(lhs), std::fabs(rhs)));
+  const float tolerance = 8.0f * std::numeric_limits<float>::epsilon() * magnitude;
+  return std::fabs(lhs - rhs) <= tolerance;
 }
 
 std::optional<std::string> BuildInputScaleTensorName(const std::string& weight_tensor_name) {
@@ -1405,10 +1412,29 @@ std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(
     return nullptr;
   }
   if (tensor_scale_override.has_value()) {
+    // The routed-expert prepare path still recomputes fused
+    // input_scale * weight_scale_2 from live descriptors and passes it here as
+    // a compatibility check. Cache aux2 remains authoritative for v6 entries,
+    // so this path validates parity instead of mutating the cached scalar.
     const float value = *tensor_scale_override;
-    if (!std::isfinite(value) ||
-        value <= 0.0f ||
-        cudaMemcpy(Aux2Ptr(entry), &value, sizeof(value), cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (!std::isfinite(value) || value <= 0.0f) {
+      return nullptr;
+    }
+    if (!IsRoutedExpertTensorName(descriptor.tensor_name)) {
+      std::cerr << "model_cache: refusing tensor_scale_override for non-routed NVFP4 entry "
+                << descriptor.tensor_name
+                << "; overrides are restricted to routed-expert compatibility validation.\n";
+      return nullptr;
+    }
+    float cached_value = 0.0f;
+    if (cudaMemcpy(&cached_value, Aux2Ptr(entry), sizeof(cached_value), cudaMemcpyDeviceToHost) != cudaSuccess) {
+      return nullptr;
+    }
+    if (!Nvfp4TensorScalesMatch(value, cached_value)) {
+      std::cerr << "model_cache: refusing tensor_scale_override for " << descriptor.tensor_name
+                << " because cached aux2=" << cached_value
+                << " does not match requested value=" << value
+                << "; NVFP4 cache aux2 is authoritative for cache-backed serving.\n";
       return nullptr;
     }
   }

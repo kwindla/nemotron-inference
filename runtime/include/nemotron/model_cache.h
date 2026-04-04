@@ -102,6 +102,11 @@ class LoadedModelCache {
       const std::string& tensor_name,
       std::size_t output_rows,
       std::size_t input_cols) const;
+  // NVFP4 cache aux2 is the authoritative serving-time tensor scale for
+  // cache-backed views. `tensor_scale_override` is only for routed-expert
+  // compatibility callers that still recompute fused
+  // `input_scale * weight_scale_2` from source descriptors; it must match the
+  // cached aux2 scalar and is not a general replacement hook.
   std::unique_ptr<UploadedLinearOp> CreateNvfp4LinearView(
       const GemmDescriptor& descriptor,
       std::optional<float> tensor_scale_override = std::nullopt) const;
