@@ -1328,7 +1328,16 @@ std::optional<LayerObservation> RunLayerObservation(
     }
     LayerObservation observation;
     observation.layer_index = layer_index;
-    observation.hidden_row = it->hidden;
+    const std::size_t hidden_size = model.config().hidden_size;
+    if (hidden_size != 0 &&
+        it->hidden.size() > hidden_size &&
+        (it->hidden.size() % hidden_size) == 0) {
+      observation.hidden_row.assign(
+          it->hidden.end() - static_cast<std::ptrdiff_t>(hidden_size),
+          it->hidden.end());
+    } else {
+      observation.hidden_row = it->hidden;
+    }
     observation.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
     std::cout << "nano_16_token_correctness_test: " << RouteDetail(route)
               << " layer compare complete layer_index=" << layer_index

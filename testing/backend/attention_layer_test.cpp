@@ -148,9 +148,13 @@ std::vector<float> cpu_attention(
     std::size_t head_dim) {
   std::vector<float> output(token_count * query_head_count * head_dim, 0.0f);
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  if (kv_head_count == 0 || (query_head_count % kv_head_count) != 0) {
+    return {};
+  }
+  const std::size_t queries_per_kv_head = query_head_count / kv_head_count;
   for (std::size_t token = 0; token < token_count; ++token) {
     for (std::size_t head = 0; head < query_head_count; ++head) {
-      const std::size_t kv_head = head % kv_head_count;
+      const std::size_t kv_head = head / queries_per_kv_head;
       std::vector<float> scores(token + 1, 0.0f);
       float max_score = -1e30f;
       for (std::size_t prev = 0; prev <= token; ++prev) {

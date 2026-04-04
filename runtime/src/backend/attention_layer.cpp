@@ -244,6 +244,26 @@ float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
   return max_diff;
 }
 
+std::optional<std::size_t> QueryHeadToKvHead(
+    std::size_t query_head,
+    std::size_t query_head_count,
+    std::size_t kv_head_count) {
+  if (query_head_count == 0 ||
+      kv_head_count == 0 ||
+      (query_head_count % kv_head_count) != 0) {
+    return std::nullopt;
+  }
+  const std::size_t queries_per_kv_head = query_head_count / kv_head_count;
+  if (queries_per_kv_head == 0) {
+    return std::nullopt;
+  }
+  const std::size_t kv_head = query_head / queries_per_kv_head;
+  if (kv_head >= kv_head_count) {
+    return std::nullopt;
+  }
+  return kv_head;
+}
+
 bool ScatterMatrixIntoPagedCache(
     const std::vector<float>& matrix,
     std::size_t sequence_start,
@@ -341,7 +361,13 @@ std::optional<std::vector<__nv_bfloat16>> RunPagedAttentionHost(
     const std::size_t q_start = static_cast<std::size_t>(query_sequence_starts[batch]);
     const std::size_t kv_tokens = static_cast<std::size_t>(batch_plan.sequence_lengths[batch]);
     for (std::size_t head = 0; head < query_head_count; ++head) {
-      const std::size_t kv_head = head % cache_config.kv_head_count;
+      const auto kv_head = QueryHeadToKvHead(
+          head,
+          query_head_count,
+          cache_config.kv_head_count);
+      if (!kv_head.has_value()) {
+        return std::nullopt;
+      }
       for (std::size_t q_token = 0; q_token < q_tokens; ++q_token) {
         const std::size_t visible_kv_tokens =
             causal ? std::min(kv_tokens, q_start + q_token + 1) : kv_tokens;
@@ -369,7 +395,7 @@ std::optional<std::vector<__nv_bfloat16>> RunPagedAttentionHost(
               cache_config.head_dim);
           const std::size_t k_base = Offset4d(
               page_id,
-              kv_head,
+              *kv_head,
               page_offset,
               0,
               cache_config.kv_head_count,
@@ -412,7 +438,7 @@ std::optional<std::vector<__nv_bfloat16>> RunPagedAttentionHost(
           const std::size_t page_id = static_cast<std::size_t>(batch_plan.page_table[page_index]);
           const std::size_t v_base = Offset4d(
               page_id,
-              kv_head,
+              *kv_head,
               page_offset,
               0,
               cache_config.kv_head_count,

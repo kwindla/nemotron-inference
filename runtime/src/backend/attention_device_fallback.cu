@@ -150,6 +150,7 @@ __global__ void PagedAttentionDeviceFallbackKernel(
   const std::size_t kv_tokens = static_cast<std::size_t>(sequence_lengths[batch]);
   const std::size_t visible_kv_tokens =
       causal ? min(kv_tokens, q_start + q_token + 1u) : kv_tokens;
+  const std::size_t queries_per_kv_head = query_head_count / kv_head_count;
   const std::size_t q_base =
       (((batch * query_head_count) + head) * max_query_tokens + q_token) * head_dim;
   if (threadIdx.x != 0) {
@@ -163,7 +164,7 @@ __global__ void PagedAttentionDeviceFallbackKernel(
     return;
   }
 
-  const std::size_t kv_head = head % kv_head_count;
+  const std::size_t kv_head = head / queries_per_kv_head;
   float max_score = -INFINITY;
   for (std::size_t kv_token = 0; kv_token < visible_kv_tokens; ++kv_token) {
     const std::size_t page_slot = kv_token / tokens_per_page;
@@ -482,6 +483,7 @@ bool RunPagedAttentionDeviceFallback(
       cache_config.kv_head_count == 0 ||
       cache_config.head_dim == 0 ||
       max_pages_per_sequence == 0 ||
+      (query_head_count % cache_config.kv_head_count) != 0 ||
       query.numel() != batch_size * query_head_count * max_query_tokens * cache_config.head_dim ||
       output->numel() != query.numel()) {
     return false;

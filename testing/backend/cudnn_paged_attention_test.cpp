@@ -180,12 +180,16 @@ std::vector<float> cpu_paged_attention_reference(
     float attn_scale,
     bool causal) {
   std::vector<float> output(batch_size * query_head_count * max_query_tokens * head_dim, 0.0f);
+  if (kv_head_count == 0 || (query_head_count % kv_head_count) != 0) {
+    return {};
+  }
+  const std::size_t queries_per_kv_head = query_head_count / kv_head_count;
 
   for (std::size_t batch = 0; batch < batch_size; ++batch) {
     const std::size_t q_tokens = static_cast<std::size_t>(seq_len_q[batch]);
     const std::size_t kv_tokens = static_cast<std::size_t>(seq_len_kv[batch]);
     for (std::size_t head = 0; head < query_head_count; ++head) {
-      const std::size_t kv_head = head % kv_head_count;
+      const std::size_t kv_head = head / queries_per_kv_head;
       for (std::size_t q_token = 0; q_token < q_tokens; ++q_token) {
         const std::size_t visible_kv_tokens = causal ? std::min(kv_tokens, q_token + 1) : kv_tokens;
         std::vector<float> scores(visible_kv_tokens, 0.0f);
