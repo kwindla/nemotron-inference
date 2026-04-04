@@ -14,6 +14,7 @@
 #include <limits>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -70,6 +71,39 @@ struct RoutedExpertFixture {
   GemmDescriptor down_descriptor;
   KernelTensorDescriptor up_input_scale_descriptor;
   KernelTensorDescriptor down_input_scale_descriptor;
+};
+
+class ScopedStreamRedirect {
+ public:
+  ScopedStreamRedirect(std::ostream& stream, std::streambuf* new_buffer)
+      : stream_(stream), old_buffer_(stream.rdbuf(new_buffer)) {}
+
+  ~ScopedStreamRedirect() { stream_.rdbuf(old_buffer_); }
+
+  ScopedStreamRedirect(const ScopedStreamRedirect&) = delete;
+  ScopedStreamRedirect& operator=(const ScopedStreamRedirect&) = delete;
+
+ private:
+  std::ostream& stream_;
+  std::streambuf* old_buffer_ = nullptr;
+};
+
+struct RuntimeScaleContractObservation {
+  bool up_prepack_seen = false;
+  bool up_packed_seen = false;
+  bool down_prepack_seen = false;
+  bool down_packed_seen = false;
+  std::int32_t expert_index = -1;
+  float up_input_scale = 0.0f;
+  float up_tensor_scale = 0.0f;
+  float latent_tensor_scale = 0.0f;
+  float runtime_expected_latent_tensor_scale = 0.0f;
+  bool runtime_latent_match = false;
+  float down_input_scale = 0.0f;
+  float down_tensor_scale = 0.0f;
+  float down_act_tensor_scale = 0.0f;
+  float runtime_expected_down_act_tensor_scale = 0.0f;
+  bool runtime_down_match = false;
 };
 
 bool expect(bool condition, const std::string& message) {
@@ -210,6 +244,146 @@ std::optional<float> parse_routed_expert_input_scale(
   }
   const std::string tail = json.substr(proj_pos, 2048);
   return parse_json_float_field(tail, "input_scale");
+}
+
+bool scale_contract_matches(float actual, float expected) {
+  if (!std::isfinite(actual) || !std::isfinite(expected)) {
+    return false;
+  }
+  const float tolerance =
+      std::max(1.0e-6f, 1.0e-6f * std::max(std::fabs(actual), std::fabs(expected)));
+  return std::fabs(actual - expected) <= tolerance;
+}
+
+bool parse_runtime_scale_contract_log(
+    const std::string& log,
+    std::size_t top_k,
+    std::vector<RuntimeScaleContractObservation>* observations) {
+  if (observations == nullptr) {
+    return false;
+  }
+  observations->assign(top_k, RuntimeScaleContractObservation{});
+
+  const std::regex up_prepack_pattern(
+      R"(scale_contract_up_prepack token=([0-9]+) slot=([0-9]+) expert=(-?[0-9]+) up_input_scale=([-+0-9.eE]+) up_tensor_scale=([-+0-9.eE]+))");
+  const std::regex up_packed_pattern(
+      R"(scale_contract_up_packed token=([0-9]+) slot=([0-9]+) expert=(-?[0-9]+) latent_tensor_scale=([-+0-9.eE]+) expected_latent_tensor_scale=([-+0-9.eE]+) match=(yes|no) fused_alpha=([-+0-9.eE]+))");
+  const std::regex down_prepack_pattern(
+      R"(scale_contract_down_prepack token=([0-9]+) slot=([0-9]+) expert=(-?[0-9]+) down_input_scale=([-+0-9.eE]+) down_tensor_scale=([-+0-9.eE]+))");
+  const std::regex down_packed_pattern(
+      R"(scale_contract_down_packed token=([0-9]+) slot=([0-9]+) expert=(-?[0-9]+) down_act_tensor_scale=([-+0-9.eE]+) expected_down_act_tensor_scale=([-+0-9.eE]+) match=(yes|no) fused_alpha=([-+0-9.eE]+))");
+
+  auto parse_slot =
+      [top_k](const std::smatch& match) -> std::optional<std::size_t> {
+    try {
+      const std::size_t slot = static_cast<std::size_t>(std::stoull(match[2].str()));
+      if (slot >= top_k) {
+        return std::nullopt;
+      }
+      return slot;
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+  auto parse_expert = [](const std::smatch& match) -> std::optional<std::int32_t> {
+    try {
+      return static_cast<std::int32_t>(std::stoi(match[3].str()));
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+  auto parse_float_group =
+      [](const std::smatch& match, std::size_t group_index) -> std::optional<float> {
+    try {
+      return std::stof(match[group_index].str());
+    } catch (...) {
+      return std::nullopt;
+    }
+  };
+
+  std::istringstream input(log);
+  std::string line;
+  while (std::getline(input, line)) {
+    std::smatch match;
+    if (std::regex_search(line, match, up_prepack_pattern)) {
+      const auto slot = parse_slot(match);
+      const auto expert_index = parse_expert(match);
+      const auto up_input_scale = parse_float_group(match, 4);
+      const auto up_tensor_scale = parse_float_group(match, 5);
+      if (!slot.has_value() ||
+          !expert_index.has_value() ||
+          !up_input_scale.has_value() ||
+          !up_tensor_scale.has_value()) {
+        return false;
+      }
+      auto& observation = (*observations)[*slot];
+      observation.up_prepack_seen = true;
+      observation.expert_index = *expert_index;
+      observation.up_input_scale = *up_input_scale;
+      observation.up_tensor_scale = *up_tensor_scale;
+      continue;
+    }
+    if (std::regex_search(line, match, up_packed_pattern)) {
+      const auto slot = parse_slot(match);
+      const auto expert_index = parse_expert(match);
+      const auto latent_tensor_scale = parse_float_group(match, 4);
+      const auto runtime_expected_latent_tensor_scale = parse_float_group(match, 5);
+      if (!slot.has_value() ||
+          !expert_index.has_value() ||
+          !latent_tensor_scale.has_value() ||
+          !runtime_expected_latent_tensor_scale.has_value()) {
+        return false;
+      }
+      auto& observation = (*observations)[*slot];
+      observation.up_packed_seen = true;
+      observation.expert_index = *expert_index;
+      observation.latent_tensor_scale = *latent_tensor_scale;
+      observation.runtime_expected_latent_tensor_scale =
+          *runtime_expected_latent_tensor_scale;
+      observation.runtime_latent_match = match[6].str() == "yes";
+      continue;
+    }
+    if (std::regex_search(line, match, down_prepack_pattern)) {
+      const auto slot = parse_slot(match);
+      const auto expert_index = parse_expert(match);
+      const auto down_input_scale = parse_float_group(match, 4);
+      const auto down_tensor_scale = parse_float_group(match, 5);
+      if (!slot.has_value() ||
+          !expert_index.has_value() ||
+          !down_input_scale.has_value() ||
+          !down_tensor_scale.has_value()) {
+        return false;
+      }
+      auto& observation = (*observations)[*slot];
+      observation.down_prepack_seen = true;
+      observation.expert_index = *expert_index;
+      observation.down_input_scale = *down_input_scale;
+      observation.down_tensor_scale = *down_tensor_scale;
+      continue;
+    }
+    if (std::regex_search(line, match, down_packed_pattern)) {
+      const auto slot = parse_slot(match);
+      const auto expert_index = parse_expert(match);
+      const auto down_act_tensor_scale = parse_float_group(match, 4);
+      const auto runtime_expected_down_act_tensor_scale = parse_float_group(match, 5);
+      if (!slot.has_value() ||
+          !expert_index.has_value() ||
+          !down_act_tensor_scale.has_value() ||
+          !runtime_expected_down_act_tensor_scale.has_value()) {
+        return false;
+      }
+      auto& observation = (*observations)[*slot];
+      observation.down_packed_seen = true;
+      observation.expert_index = *expert_index;
+      observation.down_act_tensor_scale = *down_act_tensor_scale;
+      observation.runtime_expected_down_act_tensor_scale =
+          *runtime_expected_down_act_tensor_scale;
+      observation.runtime_down_match = match[6].str() == "yes";
+      continue;
+    }
+  }
+
+  return true;
 }
 
 std::optional<FixtureMetadata> load_metadata(const std::filesystem::path& root) {
@@ -848,6 +1022,16 @@ bool run_expert_layer3_fastpath_microharness() {
       bound_expert.down_input_scale = &expert.down_input_scale_descriptor;
     }
   }
+  const auto find_routed_expert_fixture =
+      [&](std::int32_t expert_index) -> const RoutedExpertFixture* {
+    const auto it = std::find_if(
+        routed_experts.begin(),
+        routed_experts.end(),
+        [expert_index](const RoutedExpertFixture& expert) {
+          return expert.expert_index == expert_index;
+        });
+    return it == routed_experts.end() ? nullptr : &(*it);
+  };
 
   ExpertLayerConfig layer_config;
   layer_config.layer_index = metadata->layer_index;
@@ -887,8 +1071,15 @@ bool run_expert_layer3_fastpath_microharness() {
   }
 
   GemmHeuristicCache heuristic_cache;
+  bool batch_run_ok = false;
+  {
+    std::ostringstream suppressed_debug_log;
+    ScopedStreamRedirect redirect(std::cerr, suppressed_debug_log.rdbuf());
+    batch_run_ok =
+        slice->Run(*cublas, &heuristic_cache, *batch_input, batch_output.get(), nullptr);
+  }
   if (!expect(
-          slice->Run(*cublas, &heuristic_cache, *batch_input, batch_output.get(), nullptr),
+          batch_run_ok,
           "batched fastpath expert layer run should succeed")) {
     return false;
   }
@@ -916,9 +1107,18 @@ bool run_expert_layer3_fastpath_microharness() {
         row_input_host.data());
     if (!expect(
             row_input->CopyFromHost(row_input_host.data(), row_input_host.size()),
-            "row input hidden should upload") ||
-        !expect(
-            slice->Run(*cublas, &heuristic_cache, *row_input, row_output.get(), nullptr),
+            "row input hidden should upload")) {
+      return false;
+    }
+    bool sequential_run_ok = false;
+    {
+      std::ostringstream suppressed_debug_log;
+      ScopedStreamRedirect redirect(std::cerr, suppressed_debug_log.rdbuf());
+      sequential_run_ok =
+          slice->Run(*cublas, &heuristic_cache, *row_input, row_output.get(), nullptr);
+    }
+    if (!expect(
+            sequential_run_ok,
             "sequential fastpath expert layer run should succeed") ||
         !expect(
             row_output->CopyToHost(row_output_host.data(), row_output_host.size()),
@@ -943,17 +1143,28 @@ bool run_expert_layer3_fastpath_microharness() {
   }
 
   std::copy_n(input_hidden.data(), metadata->hidden_size, row_input_host.data());
+  bool request_run_ok = false;
+  std::ostringstream request_debug_capture;
+  std::string request_debug_log;
   if (!expect(
           row_input->CopyFromHost(row_input_host.data(), row_input_host.size()),
-          "row0 request-context input hidden should upload") ||
-      !expect(
-          slice->RunWithRequestContext(
-              *cublas,
-              &heuristic_cache,
-              *row_request_context,
-              *row_input,
-              row_output.get(),
-              nullptr),
+          "row0 request-context input hidden should upload")) {
+    return false;
+  }
+  {
+    ScopedStreamRedirect redirect(std::cerr, request_debug_capture.rdbuf());
+    request_run_ok = slice->RunWithRequestContext(
+        *cublas,
+        &heuristic_cache,
+        *row_request_context,
+        *row_input,
+        row_output.get(),
+        nullptr);
+  }
+  request_debug_log = request_debug_capture.str();
+  std::cerr << request_debug_log;
+  if (!expect(
+          request_run_ok,
           "row0 request-context fastpath expert layer run should succeed")) {
     return false;
   }
@@ -1049,6 +1260,138 @@ bool run_expert_layer3_fastpath_microharness() {
     std::cerr << (*row0_selected_indices_host)[slot];
   }
   std::cerr << "]\n";
+
+  std::vector<RuntimeScaleContractObservation> runtime_scale_observations;
+  if (!expect(
+          parse_runtime_scale_contract_log(
+              request_debug_log,
+              metadata->top_k,
+              &runtime_scale_observations),
+          "request-context scale contract debug log should parse")) {
+    return false;
+  }
+  std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
+  bool scale_contract_ok = true;
+  const auto record_scale_expect =
+      [&](bool condition, const std::string& message) {
+        if (!expect(condition, message)) {
+          scale_contract_ok = false;
+        }
+      };
+  for (std::size_t slot = 0; slot < metadata->top_k; ++slot) {
+    const std::int32_t expert_index = (*row0_selected_indices_host)[slot];
+    const auto expected_up_input_scale =
+        parse_routed_expert_input_scale(
+            metadata_json,
+            static_cast<std::size_t>(expert_index),
+            "up_proj");
+    const auto expected_down_input_scale =
+        parse_routed_expert_input_scale(
+            metadata_json,
+            static_cast<std::size_t>(expert_index),
+            "down_proj");
+    const RoutedExpertFixture* expert_fixture = find_routed_expert_fixture(expert_index);
+    if (!expect(
+            expected_up_input_scale.has_value() &&
+                expected_down_input_scale.has_value(),
+            "selected expert should expose fixture input scales") ||
+        !expect(
+            expert_fixture != nullptr,
+            "selected expert fixture should be available")) {
+      return false;
+    }
+    const float expected_latent_tensor_scale = 1.0f / *expected_up_input_scale;
+    const float expected_down_act_tensor_scale = 1.0f / *expected_down_input_scale;
+    const RuntimeScaleContractObservation& runtime_observation =
+        runtime_scale_observations[slot];
+    const bool up_input_scale_match =
+        runtime_observation.up_prepack_seen &&
+        scale_contract_matches(
+            runtime_observation.up_input_scale,
+            *expected_up_input_scale);
+    const bool latent_tensor_scale_match =
+        runtime_observation.up_packed_seen &&
+        scale_contract_matches(
+            runtime_observation.latent_tensor_scale,
+            expected_latent_tensor_scale);
+    const bool down_input_scale_match =
+        runtime_observation.down_prepack_seen &&
+        scale_contract_matches(
+            runtime_observation.down_input_scale,
+            *expected_down_input_scale);
+    const bool down_act_tensor_scale_match =
+        runtime_observation.down_packed_seen &&
+        scale_contract_matches(
+            runtime_observation.down_act_tensor_scale,
+            expected_down_act_tensor_scale);
+    std::cerr << "scale_contract_expected: row=00 slot=" << two_digit_stem(slot)
+              << " expert=" << expert_index
+              << " expected_up_input_scale=" << *expected_up_input_scale
+              << " expected_latent_tensor_scale=" << expected_latent_tensor_scale
+              << " expected_up_tensor_scale=" << expert_fixture->up_weight_tensor_scale.front()
+              << " expected_down_input_scale=" << *expected_down_input_scale
+              << " expected_down_act_tensor_scale="
+              << expected_down_act_tensor_scale
+              << " expected_down_tensor_scale="
+              << expert_fixture->down_weight_tensor_scale.front()
+              << "\n";
+    std::cerr << "scale_contract_check: row=00 slot=" << two_digit_stem(slot)
+              << " expert=" << expert_index
+              << " up_input_scale_match=" << (up_input_scale_match ? "yes" : "no")
+              << " latent_tensor_scale_match="
+              << (latent_tensor_scale_match ? "yes" : "no")
+              << " down_input_scale_match=" << (down_input_scale_match ? "yes" : "no")
+              << " down_act_tensor_scale_match="
+              << (down_act_tensor_scale_match ? "yes" : "no")
+              << "\n";
+    record_scale_expect(
+        runtime_observation.up_prepack_seen,
+        "runtime should emit routed up prepack scale dump for each slot");
+    record_scale_expect(
+        runtime_observation.up_packed_seen,
+        "runtime should emit routed up packed scale dump for each slot");
+    record_scale_expect(
+        runtime_observation.down_prepack_seen,
+        "runtime should emit routed down prepack scale dump for each slot");
+    record_scale_expect(
+        runtime_observation.down_packed_seen,
+        "runtime should emit routed down packed scale dump for each slot");
+    record_scale_expect(
+        runtime_observation.expert_index == expert_index,
+        "runtime scale dump expert index should match selected expert");
+    record_scale_expect(
+        runtime_observation.runtime_latent_match,
+        "runtime routed up scale contract match flag should be yes");
+    record_scale_expect(
+        runtime_observation.runtime_down_match,
+        "runtime routed down scale contract match flag should be yes");
+    record_scale_expect(
+        scale_contract_matches(
+            runtime_observation.runtime_expected_latent_tensor_scale,
+            expected_latent_tensor_scale),
+        "runtime expected routed up tensor scale should equal fixture inverse input scale");
+    record_scale_expect(
+        scale_contract_matches(
+            runtime_observation.runtime_expected_down_act_tensor_scale,
+            expected_down_act_tensor_scale),
+        "runtime expected routed down tensor scale should equal fixture inverse input scale");
+    record_scale_expect(
+        up_input_scale_match,
+        "gathered routed up input scale should match fixture checkpoint value");
+    record_scale_expect(
+        latent_tensor_scale_match,
+        "latent tensor scale should equal inverse routed up input scale");
+    record_scale_expect(
+        down_input_scale_match,
+        "gathered routed down input scale should match fixture checkpoint value");
+    record_scale_expect(
+        down_act_tensor_scale_match,
+        "down activation tensor scale should equal inverse routed down input scale");
+  }
+  if (!scale_contract_ok) {
+    return false;
+  }
+  std::cerr << std::fixed << std::setprecision(9);
 
   print_diff_report(
       "row00_fc1_latent_vs_oracle_expected",

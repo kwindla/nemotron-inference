@@ -4383,6 +4383,20 @@ bool RunExpertLayerImpl(
     if (!ensure_selection_metadata_host()) {
       return grouped_fatal("failed to download selected expert metadata for grouped validation");
     }
+    std::vector<std::int32_t> selected_experts_for_token(batch_count, -1);
+    auto scale_contract_matches =
+        [](float actual, float expected) -> bool {
+      if (!std::isfinite(actual) || !std::isfinite(expected)) {
+        return false;
+      }
+      const float tolerance =
+          std::max(1.0e-6f, 1.0e-6f * std::max(std::abs(actual), std::abs(expected)));
+      return std::abs(actual - expected) <= tolerance;
+    };
+    std::vector<float> debug_selected_up_input_scales_host;
+    std::vector<float> debug_selected_up_tensor_scales_host;
+    std::vector<float> debug_selected_down_input_scales_host;
+    std::vector<float> debug_selected_down_tensor_scales_host;
     for (std::size_t selection_index = 0; selection_index < batch_count; ++selection_index) {
       const std::size_t metadata_index = token_index * expected_top_k + selection_index;
       if (metadata_index >= selected_indices_host.size()) {
@@ -4402,6 +4416,7 @@ bool RunExpertLayerImpl(
             " routed_experts=" + std::to_string(routed_expert_count));
       }
       const std::size_t expert_index = static_cast<std::size_t>(selected_expert);
+      selected_experts_for_token[selection_index] = selected_expert;
       const auto& entry = impl.routed_experts[expert_index];
       if (!validate_scale(expert_index, "up_input_scale", entry.up_input_scale) ||
           !validate_scale(expert_index, "up_tensor_scale", entry.up_tensor_scale) ||
@@ -4467,22 +4482,15 @@ bool RunExpertLayerImpl(
                 << " graph_replay=disabled"
                 << " batch_count=" << batch_count
                 << " token=" << token_index << "\n";
-      std::vector<std::int32_t> indices_host(batch_count, 0);
-      if (cudaMemcpy(
-              indices_host.data(),
-              selected_indices_device,
-              batch_count * sizeof(std::int32_t),
-              cudaMemcpyDeviceToHost) == cudaSuccess) {
-        std::cerr << "expert_layer: layer " << impl.config.layer_index
-                  << " selected_experts=[";
-        for (std::size_t i = 0; i < batch_count; ++i) {
-          if (i > 0) {
-            std::cerr << ",";
-          }
-          std::cerr << indices_host[i];
+      std::cerr << "expert_layer: layer " << impl.config.layer_index
+                << " selected_experts=[";
+      for (std::size_t i = 0; i < batch_count; ++i) {
+        if (i > 0) {
+          std::cerr << ",";
         }
-        std::cerr << "]\n";
+        std::cerr << selected_experts_for_token[i];
       }
+      std::cerr << "]\n";
     }
 
     // FROZEN: direct custom grouped fused kernels only -- graph replay disabled.
@@ -4781,6 +4789,43 @@ bool RunExpertLayerImpl(
             stream)) {
       return grouped_fatal("failed to gather selected routed up input scales");
     }
+    if (debug) {
+      if (!GatherIndexedFloatsInPlace(
+              impl.routed_up_tensor_scale_lookup_device.data(),
+              impl.routed_experts.size(),
+              selected_indices_device,
+              batch_count,
+              impl.scratch_selected_up_tensor_scales,
+              stream)) {
+        return grouped_fatal(
+            "failed to gather selected routed up tensor scales for scale contract debug");
+      }
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        return grouped_fatal(
+            "failed to synchronize stream for routed up scale contract debug");
+      }
+      debug_selected_up_input_scales_host.assign(batch_count, 0.0f);
+      debug_selected_up_tensor_scales_host.assign(batch_count, 0.0f);
+      if (!impl.scratch_selected_up_input_scales.CopyToHost(
+              debug_selected_up_input_scales_host.data(),
+              batch_count) ||
+          !impl.scratch_selected_up_tensor_scales.CopyToHost(
+              debug_selected_up_tensor_scales_host.data(),
+              batch_count)) {
+        return grouped_fatal(
+            "failed to download routed up scales for scale contract debug");
+      }
+      std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
+      for (std::size_t slot = 0; slot < batch_count; ++slot) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " scale_contract_up_prepack token=" << token_index
+                  << " slot=" << slot
+                  << " expert=" << selected_experts_for_token[slot]
+                  << " up_input_scale=" << debug_selected_up_input_scales_host[slot]
+                  << " up_tensor_scale=" << debug_selected_up_tensor_scales_host[slot]
+                  << "\n";
+      }
+    }
 
     bool pack_ok = false;
     if (!measure_stage(
@@ -4818,6 +4863,40 @@ bool RunExpertLayerImpl(
           std::string("latent NVFP4 packing failed: batch_count=") +
           std::to_string(batch_count) +
           " latent=" + std::to_string(impl.config.moe_latent_size));
+    }
+    if (debug) {
+      std::vector<float> latent_tensor_scales_host(batch_count, 0.0f);
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        return grouped_fatal(
+            "failed to synchronize stream after routed latent packing");
+      }
+      if (!impl.scratch_latent_tensor_scales.CopyToHost(
+              latent_tensor_scales_host.data(),
+              batch_count)) {
+        return grouped_fatal(
+            "failed to download routed latent tensor scales for scale contract debug");
+      }
+      std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
+      for (std::size_t slot = 0; slot < batch_count; ++slot) {
+        const float expected_latent_tensor_scale =
+            1.0f / debug_selected_up_input_scales_host[slot];
+        const float fused_alpha =
+            latent_tensor_scales_host[slot] * debug_selected_up_tensor_scales_host[slot];
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " scale_contract_up_packed token=" << token_index
+                  << " slot=" << slot
+                  << " expert=" << selected_experts_for_token[slot]
+                  << " latent_tensor_scale=" << latent_tensor_scales_host[slot]
+                  << " expected_latent_tensor_scale=" << expected_latent_tensor_scale
+                  << " match="
+                  << (scale_contract_matches(
+                          latent_tensor_scales_host[slot],
+                          expected_latent_tensor_scale)
+                          ? "yes"
+                          : "no")
+                  << " fused_alpha=" << fused_alpha
+                  << "\n";
+      }
     }
 
     std::unique_ptr<DeviceTensorFp32> grouped_up;
@@ -4973,6 +5052,43 @@ bool RunExpertLayerImpl(
             stream)) {
       return grouped_fatal("failed to gather selected routed down input scales");
     }
+    if (debug) {
+      if (!GatherIndexedFloatsInPlace(
+              impl.routed_down_tensor_scale_lookup_device.data(),
+              impl.routed_experts.size(),
+              selected_indices_device,
+              batch_count,
+              impl.scratch_selected_down_tensor_scales,
+              stream)) {
+        return grouped_fatal(
+            "failed to gather selected routed down tensor scales for scale contract debug");
+      }
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        return grouped_fatal(
+            "failed to synchronize stream for routed down scale contract debug");
+      }
+      debug_selected_down_input_scales_host.assign(batch_count, 0.0f);
+      debug_selected_down_tensor_scales_host.assign(batch_count, 0.0f);
+      if (!impl.scratch_selected_down_input_scales.CopyToHost(
+              debug_selected_down_input_scales_host.data(),
+              batch_count) ||
+          !impl.scratch_selected_down_tensor_scales.CopyToHost(
+              debug_selected_down_tensor_scales_host.data(),
+              batch_count)) {
+        return grouped_fatal(
+            "failed to download routed down scales for scale contract debug");
+      }
+      std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
+      for (std::size_t slot = 0; slot < batch_count; ++slot) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " scale_contract_down_prepack token=" << token_index
+                  << " slot=" << slot
+                  << " expert=" << selected_experts_for_token[slot]
+                  << " down_input_scale=" << debug_selected_down_input_scales_host[slot]
+                  << " down_tensor_scale=" << debug_selected_down_tensor_scales_host[slot]
+                  << "\n";
+      }
+    }
     if (!measure_stage(
             ExpertSubLayerStage::kRelu2Pack,
             &relu2_pack_ok,
@@ -4996,6 +5112,42 @@ bool RunExpertLayerImpl(
           std::to_string(batch_count) +
           " intermediate=" +
           std::to_string(impl.config.routed_expert_intermediate_size));
+    }
+    if (debug) {
+      std::vector<float> down_act_tensor_scales_host(batch_count, 0.0f);
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        return grouped_fatal(
+            "failed to synchronize stream after routed relu2 NVFP4 packing");
+      }
+      if (!impl.scratch_down_act_tensor_scales.CopyToHost(
+              down_act_tensor_scales_host.data(),
+              batch_count)) {
+        return grouped_fatal(
+            "failed to download routed down activation tensor scales for scale contract debug");
+      }
+      std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
+      for (std::size_t slot = 0; slot < batch_count; ++slot) {
+        const float expected_down_act_tensor_scale =
+            1.0f / debug_selected_down_input_scales_host[slot];
+        const float fused_alpha =
+            down_act_tensor_scales_host[slot] *
+            debug_selected_down_tensor_scales_host[slot];
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " scale_contract_down_packed token=" << token_index
+                  << " slot=" << slot
+                  << " expert=" << selected_experts_for_token[slot]
+                  << " down_act_tensor_scale=" << down_act_tensor_scales_host[slot]
+                  << " expected_down_act_tensor_scale="
+                  << expected_down_act_tensor_scale
+                  << " match="
+                  << (scale_contract_matches(
+                          down_act_tensor_scales_host[slot],
+                          expected_down_act_tensor_scale)
+                          ? "yes"
+                          : "no")
+                  << " fused_alpha=" << fused_alpha
+                  << "\n";
+      }
     }
 
     auto down_output = DeviceTensorFp32::CreateView(
