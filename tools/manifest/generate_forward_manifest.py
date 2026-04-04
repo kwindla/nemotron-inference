@@ -366,15 +366,15 @@ def build_nvfp4_entry(
     tensor_name: str,
     compute_checksums: bool,
 ) -> dict[str, Any]:
+    suffix = layer_suffix(tensor_name)
+    is_routed_expert = is_routed_expert_nvfp4_weight(suffix)
+    is_shared_down = suffix == "mixer.shared_experts.down_proj.weight"
     weight = tensor_record(model_dir, weight_map, shard_headers, tensor_name)
     block_scales_name = tensor_name[:-len(".weight")] + ".weight_scale"
-    # Keep the manifest checkpoint-oriented here. For routed NVFP4 weights this
-    # auxiliary names the raw checkpoint tensor_scale source (prefer
-    # weight_scale_2 when present, otherwise input_scale for the legacy/shared
-    # cases). Runtime/cache code that needs one scalar must treat routed expert
-    # tensor_scale as the effective fused value input_scale * weight_scale_2 to
-    # match vLLM alpha semantics, but that reinterpretation does not happen in
-    # the manifest artifact.
+    # Keep the manifest checkpoint-oriented here. The generic tensor_scale
+    # auxiliary always points at raw checkpoint bytes, not a serving-time fused
+    # scalar. Prefer raw weight_scale_2 when present; the input_scale fallback
+    # exists only for legacy NVFP4 layouts that do not expose weight_scale_2.
     tensor_scale_candidates = [
         tensor_name[:-len(".weight")] + ".weight_scale_2",
         tensor_name[:-len(".weight")] + ".input_scale",
@@ -387,6 +387,26 @@ def build_nvfp4_entry(
         raise KeyError(f"missing tensor-scale auxiliary for NVFP4 tensor {tensor_name}")
     block_scales = tensor_record(model_dir, weight_map, shard_headers, block_scales_name)
     tensor_scale = tensor_record(model_dir, weight_map, shard_headers, tensor_scale_name)
+    tensor_scale_auxiliary = {
+        "name": "tensor_scale",
+        "file": tensor_scale["file"],
+        "offset_bytes": tensor_scale["offset_bytes"],
+        "nbytes": tensor_scale["nbytes"],
+        "source_tensor_name": tensor_scale_name,
+        "provenance": "raw_weight_scale_2" if tensor_scale_name.endswith(".weight_scale_2") else "raw_input_scale",
+        "manifest_semantics": "checkpoint_oriented",
+    }
+    if is_routed_expert:
+        routed_input_scale_name = tensor_name[:-len(".weight")] + ".input_scale"
+        if routed_input_scale_name in weight_map:
+            tensor_scale_auxiliary["separate_manifest_input_scale"] = routed_input_scale_name
+        tensor_scale_auxiliary["runtime_fusion_boundary"] = (
+            "runtime/cache may later fuse standalone input_scale with raw weight_scale_2"
+        )
+    elif is_shared_down:
+        tensor_scale_auxiliary["runtime_fusion_boundary"] = (
+            "tensor_scale remains raw weight_scale_2 with no separate input_scale fusion"
+        )
     logical_cols = block_scales["shape"][1] * 16
     logical_shape = [weight["shape"][0], logical_cols]
     return {
@@ -411,12 +431,7 @@ def build_nvfp4_entry(
                 "offset_bytes": block_scales["offset_bytes"],
                 "nbytes": block_scales["nbytes"],
             },
-            {
-                "name": "tensor_scale",
-                "file": tensor_scale["file"],
-                "offset_bytes": tensor_scale["offset_bytes"],
-                "nbytes": tensor_scale["nbytes"],
-            },
+            tensor_scale_auxiliary,
         ],
         "source_tensor_name": tensor_name,
         "checksum": make_checksum(
@@ -446,10 +461,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 tensor_name.rsplit(".", 1)[0] + ".weight",
             )
             if shared_down_weight["dtype"] == "U8":
-                # Keep the standalone shared down_proj input_scale visible in
-                # the manifest so runtime/cache paths can fuse it with
-                # weight_scale_2. Only the block-scale tensor stays folded into
-                # the NVFP4 weight entry.
+                # Keep shared down_proj input_scale visible as its own
+                # checkpoint tensor. The NVFP4 weight entry still carries raw
+                # weight_scale_2 as the generic tensor_scale auxiliary, so no
+                # input_scale fusion is encoded in the manifest entry itself.
                 continue
 
         record = tensor_record(model_dir, weight_map, shard_headers, tensor_name)
