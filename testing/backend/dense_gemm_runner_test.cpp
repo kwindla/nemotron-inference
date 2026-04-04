@@ -13,6 +13,8 @@
 #include "nemotron/weight_arena.h"
 #include "nemotron/weight_arena_plan.h"
 
+#include <cuda_bf16.h>
+
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -32,7 +34,9 @@ using nemotron::BuildKernelCatalog;
 using nemotron::BuildTensorCatalog;
 using nemotron::BuildWeightArenaPlan;
 using nemotron::CublasLtHandle;
+using nemotron::DeviceDenseWeightBf16;
 using nemotron::DeviceDenseWeightFp32;
+using nemotron::DeviceTensorBf16;
 using nemotron::DeviceTensorFp32;
 using nemotron::GemmCatalog;
 using nemotron::GemmHeuristicCache;
@@ -40,6 +44,7 @@ using nemotron::KernelCatalog;
 using nemotron::LoadVerifiedManifestFromJsonFile;
 using nemotron::ManifestLoadResult;
 using nemotron::PrepareGemmExecution;
+using nemotron::RunDenseRowMajorBf16ToDevice;
 using nemotron::RunDenseRowMajorFp32;
 using nemotron::RunDenseRowMajorFp32ToDevice;
 using nemotron::TensorCatalog;
@@ -112,7 +117,10 @@ void write_file(const std::filesystem::path& path, const std::string& contents) 
 
 std::string make_manifest_json(
     const std::string& dense_file,
-    const std::string& dense_checksum) {
+    const std::string& dense_checksum,
+    const std::string& storage_dtype = "fp32",
+    const std::string& compute_dtype = "fp32",
+    std::size_t nbytes = 24) {
   std::ostringstream oss;
   oss
       << "{\n"
@@ -136,13 +144,13 @@ std::string make_manifest_json(
       << "      \"op_class\": \"dense_linear\",\n"
       << "      \"logical_shape\": [2, 3],\n"
       << "      \"packed_shape\": [2, 3],\n"
-      << "      \"storage_dtype\": \"fp32\",\n"
-      << "      \"compute_dtype\": \"fp32\",\n"
+      << "      \"storage_dtype\": \"" << storage_dtype << "\",\n"
+      << "      \"compute_dtype\": \"" << compute_dtype << "\",\n"
       << "      \"layout_tag\": \"row_major\",\n"
       << "      \"alignment_bytes\": 16,\n"
       << "      \"packed_file\": \"" << dense_file << "\",\n"
       << "      \"offset_bytes\": 0,\n"
-      << "      \"nbytes\": 24,\n"
+      << "      \"nbytes\": " << nbytes << ",\n"
       << "      \"source_tensor_name\": \"mlp.up_proj\",\n"
       << "      \"checksum\": \"fnv1a64:" << dense_checksum << "\"\n"
       << "    }\n"
@@ -211,6 +219,22 @@ bool nearly_equal(const std::vector<float>& lhs, const std::vector<float>& rhs, 
     }
   }
   return true;
+}
+
+std::vector<__nv_bfloat16> to_bf16_vector(const std::vector<float>& values) {
+  std::vector<__nv_bfloat16> converted(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __float2bfloat16(values[i]);
+  }
+  return converted;
+}
+
+std::vector<float> from_bf16_vector(const std::vector<__nv_bfloat16>& values) {
+  std::vector<float> converted(values.size(), 0.0f);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __bfloat162float(values[i]);
+  }
+  return converted;
 }
 
 bool test_dense_gemm_runner_executes_against_cpu_reference() {
@@ -421,13 +445,151 @@ bool test_dense_gemm_runner_rejects_non_fp32_dense_descriptor() {
                 "first real dense GEMM runner should reject non-fp32 dense descriptors");
 }
 
+bool test_dense_gemm_runner_bf16_path_matches_fp32_reference() {
+  const auto handle = CublasLtHandle::Create();
+  if (!handle || !handle->valid()) {
+    std::cout << "dense_gemm_runner_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  TempDir temp_dir;
+  const std::vector<float> weights = {
+      1.15625f, -2.03125f, 3.1875f,
+      -4.28125f, 5.40625f, -6.53125f,
+  };
+  const std::vector<float> activations = {
+      0.9375f, -1.28125f, 2.46875f,
+      -3.5625f, 4.6875f, -5.8125f,
+  };
+  const auto weights_bf16 = to_bf16_vector(weights);
+  const auto activations_bf16 = to_bf16_vector(activations);
+  const std::vector<float> rounded_weights = from_bf16_vector(weights_bf16);
+  const std::vector<float> rounded_activations = from_bf16_vector(activations_bf16);
+
+  const std::string weight_bytes_bf16 = bytes_from_vector(weights_bf16);
+  write_file(temp_dir.path() / "weights" / "dense_bf16.bin", weight_bytes_bf16);
+  write_file(
+      temp_dir.path() / "manifest_bf16.json",
+      make_manifest_json(
+          "weights/dense_bf16.bin",
+          fnv1a64_hex(weight_bytes_bf16),
+          "bf16",
+          "bf16",
+          weight_bytes_bf16.size()));
+
+  const std::string weight_bytes_fp32 = bytes_from_vector(rounded_weights);
+  write_file(temp_dir.path() / "weights" / "dense_fp32.bin", weight_bytes_fp32);
+  write_file(
+      temp_dir.path() / "manifest_fp32.json",
+      make_manifest_json(
+          "weights/dense_fp32.bin",
+          fnv1a64_hex(weight_bytes_fp32),
+          "fp32",
+          "fp32",
+          weight_bytes_fp32.size()));
+
+  const LoadedDenseCatalog loaded_bf16 = load_dense_catalog(temp_dir.path() / "manifest_bf16.json");
+  const LoadedDenseCatalog loaded_fp32 = load_dense_catalog(temp_dir.path() / "manifest_fp32.json");
+  if (!expect(loaded_bf16.gemm_catalog.valid(), "bf16 dense catalog should load for bf16 GEMM test") ||
+      !expect(loaded_fp32.gemm_catalog.valid(), "fp32 dense catalog should load for bf16 GEMM test")) {
+    return false;
+  }
+
+  const auto* dense_bf16 = loaded_bf16.gemm_catalog.FindDescriptor("mlp.up_proj");
+  const auto* dense_fp32 = loaded_fp32.gemm_catalog.FindDescriptor("mlp.up_proj");
+  if (!expect(dense_bf16 != nullptr, "bf16 dense descriptor should exist for bf16 GEMM test") ||
+      !expect(dense_fp32 != nullptr, "fp32 dense descriptor should exist for bf16 GEMM test")) {
+    return false;
+  }
+
+  const auto launch_plan_bf16 = BuildGemmLaunchPlan(*dense_bf16, 2);
+  const auto launch_plan_fp32 = BuildGemmLaunchPlan(*dense_fp32, 2);
+  if (!expect(launch_plan_bf16.has_value(), "bf16 launch plan should build") ||
+      !expect(launch_plan_fp32.has_value(), "fp32 launch plan should build")) {
+    return false;
+  }
+
+  GemmHeuristicCache cache;
+  const auto execution_bf16 = PrepareGemmExecution(*launch_plan_bf16, &cache);
+  const auto execution_fp32 = PrepareGemmExecution(*launch_plan_fp32, &cache);
+  if (!expect(execution_bf16.has_value(), "bf16 execution should prepare") ||
+      !expect(execution_fp32.has_value(), "fp32 execution should prepare")) {
+    return false;
+  }
+
+  const auto plan_bf16 = BuildCublasLtGemmPlan(*execution_bf16);
+  const auto plan_fp32 = BuildCublasLtGemmPlan(*execution_fp32);
+  if (!expect(plan_bf16.has_value(), "bf16 cublasLt plan should build") ||
+      !expect(plan_fp32.has_value(), "fp32 cublasLt plan should build")) {
+    return false;
+  }
+
+  auto device_weight_bf16 = DeviceDenseWeightBf16::Upload(*dense_bf16);
+  auto device_activations_bf16 = DeviceTensorBf16::Create({2, 3});
+  auto device_output_bf16 = DeviceTensorBf16::Create({2, 2});
+  if (!expect(device_weight_bf16 && device_weight_bf16->valid(), "bf16 dense weight upload should succeed") ||
+      !expect(device_activations_bf16 && device_activations_bf16->valid(), "bf16 activation tensor should allocate") ||
+      !expect(device_output_bf16 && device_output_bf16->valid(), "bf16 output tensor should allocate")) {
+    return false;
+  }
+  if (!expect(
+          device_activations_bf16->CopyFromHost(activations_bf16.data(), activations_bf16.size()),
+          "bf16 activations should upload")) {
+    return false;
+  }
+
+  const auto bf16_stats = RunDenseRowMajorBf16ToDevice(
+      *handle,
+      *plan_bf16,
+      *device_weight_bf16,
+      *device_activations_bf16,
+      device_output_bf16.get());
+  if (!expect(bf16_stats.has_value(), "bf16 dense GEMM runner should execute successfully")) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> host_output_bf16(device_output_bf16->numel(), __float2bfloat16(0.0f));
+  if (!expect(
+          device_output_bf16->CopyToHost(host_output_bf16.data(), host_output_bf16.size()),
+          "bf16 dense GEMM output should download")) {
+    return false;
+  }
+
+  const auto fp32_result = RunDenseRowMajorFp32(*handle, *plan_fp32, rounded_activations.data(), 2);
+  if (!expect(fp32_result.has_value(), "fp32 dense GEMM runner should execute for bf16 comparison")) {
+    return false;
+  }
+
+  const std::vector<float> bf16_output_fp32 = from_bf16_vector(host_output_bf16);
+  const std::vector<float> fp32_output_bf16_round_trip = from_bf16_vector(to_bf16_vector(fp32_result->output));
+  const auto reference = from_bf16_vector(to_bf16_vector(cpu_reference(
+      rounded_activations,
+      2,
+      rounded_weights,
+      2,
+      3)));
+  return expect(
+             bf16_stats->rows == 2 && bf16_stats->cols == 2,
+             "bf16 dense GEMM runner should report the correct output shape") &&
+         expect(
+             bf16_stats->heuristic_count > 0,
+             "bf16 dense GEMM runner should find at least one cuBLASLt heuristic") &&
+         expect(
+             nearly_equal(bf16_output_fp32, fp32_output_bf16_round_trip, 2.0e-2f),
+             "bf16 dense GEMM output should match fp32 GEMM after bf16 round-trip") &&
+         expect(
+             nearly_equal(bf16_output_fp32, reference, 2.0e-2f),
+             "bf16 dense GEMM output should match the bf16-rounded CPU reference");
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_dense_gemm_runner_executes_against_cpu_reference() &&
       test_dense_gemm_runner_device_tensor_path_executes_against_cpu_reference() &&
-      test_dense_gemm_runner_rejects_non_fp32_dense_descriptor();
+      test_dense_gemm_runner_rejects_non_fp32_dense_descriptor() &&
+      test_dense_gemm_runner_bf16_path_matches_fp32_reference();
 
   if (!ok) {
     return 1;

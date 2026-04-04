@@ -27,11 +27,14 @@ using nemotron::BuildEmbeddingCatalog;
 using nemotron::BuildKernelCatalog;
 using nemotron::BuildTensorCatalog;
 using nemotron::BuildWeightArenaPlan;
+using nemotron::DeviceEmbeddingTableBf16;
 using nemotron::DeviceEmbeddingTableFp32;
+using nemotron::DeviceTensorBf16;
 using nemotron::DeviceTensorFp32;
 using nemotron::EmbeddingCatalog;
 using nemotron::KernelCatalog;
 using nemotron::LoadVerifiedManifestFromJsonFile;
+using nemotron::LookupEmbeddingRowsBf16;
 using nemotron::LookupEmbeddingRowsFp32;
 using nemotron::ManifestLoadResult;
 using nemotron::TensorCatalog;
@@ -208,6 +211,22 @@ bool nearly_equal(const std::vector<float>& lhs, const std::vector<float>& rhs, 
   return true;
 }
 
+std::vector<__nv_bfloat16> to_bf16_vector(const std::vector<float>& values) {
+  std::vector<__nv_bfloat16> converted(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __float2bfloat16(values[i]);
+  }
+  return converted;
+}
+
+std::vector<float> from_bf16_vector(const std::vector<__nv_bfloat16>& values) {
+  std::vector<float> converted(values.size(), 0.0f);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __bfloat162float(values[i]);
+  }
+  return converted;
+}
+
 bool test_embedding_lookup_matches_cpu_reference() {
   if (!has_cuda_device()) {
     std::cout << "embedding_lookup_test: SKIP (no CUDA device available)\n";
@@ -370,13 +389,120 @@ bool test_embedding_lookup_accepts_bf16_weights() {
                 "bf16 embedding lookup output should match the CPU reference");
 }
 
+bool test_embedding_lookup_bf16_path_matches_fp32_lookup() {
+  if (!has_cuda_device()) {
+    std::cout << "embedding_lookup_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  TempDir temp_dir;
+  const std::vector<float> embedding_weights = {
+      1.125f, -2.03125f, 3.0625f,
+      4.1875f, -5.28125f, 6.34375f,
+      7.40625f, -8.53125f, 9.6875f,
+      10.8125f, -11.9375f, 12.0625f,
+  };
+  const auto embedding_weights_bf16 = to_bf16_vector(embedding_weights);
+  const std::string embedding_bytes_bf16 = bytes_from_vector(embedding_weights_bf16);
+  write_file(temp_dir.path() / "weights" / "embedding_bf16.bin", embedding_bytes_bf16);
+  write_file(
+      temp_dir.path() / "manifest_bf16.json",
+      make_manifest_json(
+          "weights/embedding_bf16.bin",
+          fnv1a64_hex(embedding_bytes_bf16),
+          "bf16",
+          "bf16",
+          embedding_bytes_bf16.size()));
+
+  const std::string embedding_bytes_fp32 = bytes_from_vector(embedding_weights);
+  write_file(temp_dir.path() / "weights" / "embedding_fp32.bin", embedding_bytes_fp32);
+  write_file(
+      temp_dir.path() / "manifest_fp32.json",
+      make_manifest_json(
+          "weights/embedding_fp32.bin",
+          fnv1a64_hex(embedding_bytes_fp32),
+          "fp32",
+          "fp32",
+          embedding_bytes_fp32.size()));
+
+  const LoadedEmbeddingCatalog loaded_bf16 = load_embedding_catalog(temp_dir.path() / "manifest_bf16.json");
+  const LoadedEmbeddingCatalog loaded_fp32 = load_embedding_catalog(temp_dir.path() / "manifest_fp32.json");
+  if (!expect(loaded_bf16.embedding_catalog.valid(), "bf16 embedding catalog should load for bf16 path test") ||
+      !expect(loaded_fp32.embedding_catalog.valid(), "fp32 embedding catalog should load for bf16 path test")) {
+    return false;
+  }
+
+  const auto* descriptor_bf16 = loaded_bf16.embedding_catalog.FindDescriptor("backbone.embeddings.weight");
+  const auto* descriptor_fp32 = loaded_fp32.embedding_catalog.FindDescriptor("backbone.embeddings.weight");
+  if (!expect(descriptor_bf16 != nullptr, "bf16 embedding descriptor should exist for bf16 path test") ||
+      !expect(descriptor_fp32 != nullptr, "fp32 embedding descriptor should exist for bf16 path test")) {
+    return false;
+  }
+
+  auto table_bf16 = DeviceEmbeddingTableBf16::Upload(*descriptor_bf16);
+  auto table_fp32 = DeviceEmbeddingTableFp32::Upload(*descriptor_fp32);
+  if (!expect(static_cast<bool>(table_bf16), "bf16 embedding upload should succeed for bf16 path test") ||
+      !expect(static_cast<bool>(table_fp32), "fp32 embedding upload should succeed for bf16 path test")) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> round_trip_weights(embedding_weights_bf16.size(), __float2bfloat16(0.0f));
+  if (!expect(
+          cudaMemcpy(
+              round_trip_weights.data(),
+              table_bf16->data(),
+              round_trip_weights.size() * sizeof(__nv_bfloat16),
+              cudaMemcpyDeviceToHost) == cudaSuccess,
+          "bf16 embedding table should stay resident as bf16")) {
+    return false;
+  }
+
+  const std::vector<std::int32_t> token_ids = {3, 1, 2};
+  auto output_bf16 = DeviceTensorBf16::Create({token_ids.size(), descriptor_bf16->embedding_dim});
+  auto output_fp32 = DeviceTensorFp32::Create({token_ids.size(), descriptor_fp32->embedding_dim});
+  if (!expect(output_bf16 && output_bf16->valid(), "bf16 embedding output tensor should allocate") ||
+      !expect(output_fp32 && output_fp32->valid(), "fp32 embedding output tensor should allocate")) {
+    return false;
+  }
+
+  const auto bf16_stats = LookupEmbeddingRowsBf16(*table_bf16, token_ids.data(), token_ids.size(), output_bf16.get());
+  const auto fp32_stats = LookupEmbeddingRowsFp32(*table_fp32, token_ids.data(), token_ids.size(), output_fp32.get());
+  if (!expect(bf16_stats.has_value(), "bf16 embedding lookup should succeed") ||
+      !expect(fp32_stats.has_value(), "fp32 embedding lookup should succeed in bf16 path test")) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> host_output_bf16(output_bf16->numel(), __float2bfloat16(0.0f));
+  std::vector<float> host_output_fp32(output_fp32->numel(), 0.0f);
+  if (!expect(output_bf16->CopyToHost(host_output_bf16.data(), host_output_bf16.size()),
+              "bf16 embedding output should download") ||
+      !expect(output_fp32->CopyToHost(host_output_fp32.data(), host_output_fp32.size()),
+              "fp32 embedding output should download")) {
+    return false;
+  }
+
+  const std::vector<float> bf16_output_fp32 = from_bf16_vector(host_output_bf16);
+  const std::vector<float> fp32_output_bf16_round_trip = from_bf16_vector(to_bf16_vector(host_output_fp32));
+  const auto reference = cpu_reference(from_bf16_vector(round_trip_weights), token_ids, descriptor_bf16->embedding_dim);
+  return expect(
+             nearly_equal(from_bf16_vector(round_trip_weights), from_bf16_vector(embedding_weights_bf16), 1.0e-6f),
+             "bf16 embedding upload should preserve the original bf16 bytes") &&
+         expect(
+             nearly_equal(bf16_output_fp32, fp32_output_bf16_round_trip, 1.0e-6f),
+             "bf16 embedding lookup should match fp32 lookup after bf16 round-trip") &&
+         expect(
+             nearly_equal(bf16_output_fp32, reference, 1.0e-6f),
+             "bf16 embedding lookup should match the bf16-rounded reference");
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_embedding_lookup_matches_cpu_reference() &&
       test_embedding_lookup_rejects_out_of_range_token() &&
-      test_embedding_lookup_accepts_bf16_weights();
+      test_embedding_lookup_accepts_bf16_weights() &&
+      test_embedding_lookup_bf16_path_matches_fp32_lookup();
 
   if (!ok) {
     return 1;

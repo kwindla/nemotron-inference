@@ -26,6 +26,7 @@ using nemotron::BuildGemmCatalog;
 using nemotron::BuildKernelCatalog;
 using nemotron::BuildTensorCatalog;
 using nemotron::BuildWeightArenaPlan;
+using nemotron::DeviceDenseWeightBf16;
 using nemotron::DeviceDenseWeightFp32;
 using nemotron::GemmCatalog;
 using nemotron::KernelCatalog;
@@ -188,6 +189,22 @@ bool nearly_equal(const std::vector<float>& lhs, const std::vector<float>& rhs, 
   return true;
 }
 
+std::vector<__nv_bfloat16> to_bf16_vector(const std::vector<float>& values) {
+  std::vector<__nv_bfloat16> converted(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __float2bfloat16(values[i]);
+  }
+  return converted;
+}
+
+std::vector<float> from_bf16_vector(const std::vector<__nv_bfloat16>& values) {
+  std::vector<float> converted(values.size(), 0.0f);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __bfloat162float(values[i]);
+  }
+  return converted;
+}
+
 bool test_dense_weight_upload_round_trips_descriptor_bytes() {
   if (!has_cuda_device()) {
     std::cout << "dense_weight_test: SKIP (no CUDA device available)\n";
@@ -286,10 +303,7 @@ bool test_dense_weight_upload_accepts_bf16_descriptor() {
       1.5f, -2.0f, 3.25f,
       4.5f, -5.75f, 6.0f,
   };
-  std::vector<__nv_bfloat16> source_bf16(source_fp32.size());
-  for (std::size_t i = 0; i < source_fp32.size(); ++i) {
-    source_bf16[i] = __float2bfloat16(source_fp32[i]);
-  }
+  const auto source_bf16 = to_bf16_vector(source_fp32);
 
   nemotron::GemmDescriptor descriptor;
   descriptor.tensor_name = "bf16.up_proj";
@@ -329,13 +343,63 @@ bool test_dense_weight_upload_accepts_bf16_descriptor() {
       "BF16 dense weight upload should convert values to FP32");
 }
 
+bool test_dense_weight_bf16_upload_round_trips_descriptor_bytes() {
+  if (!has_cuda_device()) {
+    std::cout << "dense_weight_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  const std::vector<float> source_fp32 = {
+      1.15625f, -2.3125f, 3.46875f,
+      4.59375f, -5.71875f, 6.84375f,
+  };
+  const auto source_bf16 = to_bf16_vector(source_fp32);
+
+  nemotron::GemmDescriptor descriptor;
+  descriptor.tensor_name = "bf16.up_proj";
+  descriptor.op_class = "dense_linear";
+  descriptor.kernel_family = nemotron::GemmKernelFamily::kDenseRowMajor;
+  descriptor.output_rows = 2;
+  descriptor.input_cols = 3;
+  descriptor.storage_dtype = "bf16";
+  descriptor.compute_dtype = "bf16";
+  descriptor.layout_tag = "row_major";
+  descriptor.alignment_bytes = 16;
+  descriptor.packed_data = reinterpret_cast<const std::uint8_t*>(source_bf16.data());
+  descriptor.packed_nbytes = source_bf16.size() * sizeof(__nv_bfloat16);
+
+  auto uploaded = DeviceDenseWeightBf16::Upload(descriptor);
+  if (!expect(static_cast<bool>(uploaded), "BF16 dense weight upload should keep bf16 storage")) {
+    return false;
+  }
+  if (!expect(uploaded->valid(), "BF16 uploaded dense weight should be valid")) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> round_trip(source_bf16.size(), __float2bfloat16(0.0f));
+  if (!expect(
+          cudaMemcpy(
+              round_trip.data(),
+              uploaded->data(),
+              round_trip.size() * sizeof(__nv_bfloat16),
+              cudaMemcpyDeviceToHost) == cudaSuccess,
+          "BF16 uploaded dense weight should copy back to host")) {
+    return false;
+  }
+
+  return expect(
+      nearly_equal(from_bf16_vector(round_trip), from_bf16_vector(source_bf16), 1.0e-6f),
+      "BF16 dense weight upload should preserve the original bf16 bytes");
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       test_dense_weight_upload_round_trips_descriptor_bytes() &&
       test_dense_weight_upload_rejects_non_fp32_descriptor() &&
-      test_dense_weight_upload_accepts_bf16_descriptor();
+      test_dense_weight_upload_accepts_bf16_descriptor() &&
+      test_dense_weight_bf16_upload_round_trips_descriptor_bytes();
 
   if (!ok) {
     return 1;

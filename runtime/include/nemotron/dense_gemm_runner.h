@@ -33,11 +33,24 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output);
 
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceDenseWeightBf16& weights,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output);
+
 std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
     CublasLtHandle& handle,
     const CublasLtGemmPlan& plan,
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output);
+
+std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorBf16ToDevice(
+    CublasLtHandle& handle,
+    const CublasLtGemmPlan& plan,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output);
 
 std::optional<DenseRowMajorHostResult> RunDenseRowMajorFp32(
     CublasLtHandle& handle,
