@@ -48,6 +48,13 @@ __device__ float ClampScale(float value) {
   return value;
 }
 
+__device__ float NormalizeFixedTensorScaleDevice(float value) {
+  if (!isfinite(value) || value <= 0.0f) {
+    return kMinScale;
+  }
+  return value < kMinScale ? kMinScale : value;
+}
+
 __device__ float LoadSourceValue(const float* source, std::size_t index) {
   return source[index];
 }
@@ -277,6 +284,82 @@ __global__ void FusedPackSingleRowToNvfp4Kernel(
 
     const std::size_t dest = ExecutionScaleOffset(0, block_index, padded_blocks_per_row);
     matmul_scales[dest] = block_scale_fp8;
+  }
+}
+
+template <typename SourceT>
+__global__ void PackLatentPerSelectedExpertToNvfp4Kernel(
+    const SourceT* source_row,
+    std::size_t selected_expert_count,
+    std::size_t cols,
+    const float* selected_expert_input_scales,
+    std::size_t packed_row_bytes,
+    std::size_t blocks_per_row,
+    std::size_t padded_blocks_per_row,
+    std::size_t matmul_bytes_per_row,
+    std::uint8_t* packed,
+    std::uint8_t* block_scales,
+    std::uint8_t* matmul_scales,
+    float* tensor_scales) {
+  const std::size_t expert_row = static_cast<std::size_t>(blockIdx.x);
+  if (expert_row >= selected_expert_count) {
+    return;
+  }
+
+  const std::size_t tid = threadIdx.x;
+  const float raw_input_scale = selected_expert_input_scales[expert_row];
+  const float tensor_scale = NormalizeFixedTensorScaleDevice(
+      (raw_input_scale > 0.0f && isfinite(raw_input_scale)) ? 1.0f / raw_input_scale
+                                                            : kMinScale);
+  std::uint8_t* row_packed = packed + (expert_row * packed_row_bytes);
+  std::uint8_t* row_block_scales = block_scales + (expert_row * blocks_per_row);
+  std::uint8_t* row_matmul_scales = matmul_scales + (expert_row * matmul_bytes_per_row);
+
+  if (tid == 0) {
+    tensor_scales[expert_row] = tensor_scale;
+  }
+
+  for (std::size_t i = tid; i < matmul_bytes_per_row; i += blockDim.x) {
+    row_matmul_scales[i] = 0;
+  }
+  __syncthreads();
+
+  for (std::size_t block_index = tid; block_index < blocks_per_row;
+       block_index += blockDim.x) {
+    const std::size_t input_offset = block_index * kBlockWidth;
+    const std::size_t packed_offset = block_index * (kBlockWidth / 2u);
+
+    float block_max_abs = 0.0f;
+    for (std::size_t i = 0; i < kBlockWidth; ++i) {
+      const float abs_value = fabsf(LoadSourceValue(source_row, input_offset + i));
+      if (abs_value > block_max_abs) {
+        block_max_abs = abs_value;
+      }
+    }
+
+    float block_scale = 1.0f;
+    if (block_max_abs > 0.0f) {
+      block_scale = ClampScale(block_max_abs / (kFp4MaxFinite * tensor_scale));
+    }
+    const std::uint8_t block_scale_fp8 = static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
+    row_block_scales[block_index] = block_scale_fp8;
+
+    const float scale = tensor_scale * block_scale;
+    for (std::size_t i = 0; i < kBlockWidth; i += 2) {
+      const float lhs = LoadSourceValue(source_row, input_offset + i) / scale;
+      const float rhs = LoadSourceValue(source_row, input_offset + i + 1) / scale;
+      const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
+                                       __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
+                                   0x0fu;
+      const std::uint8_t rhs_fp4 = static_cast<std::uint8_t>(
+                                       __nv_cvt_float_to_fp4(rhs, __NV_E2M1, cudaRoundNearest)) &
+                                   0x0fu;
+      row_packed[packed_offset + (i / 2u)] = static_cast<std::uint8_t>(lhs_fp4 | (rhs_fp4 << 4));
+    }
+
+    const std::size_t dest = ExecutionScaleOffset(0, block_index, padded_blocks_per_row);
+    row_matmul_scales[dest] = block_scale_fp8;
   }
 }
 
@@ -867,6 +950,105 @@ bool PackDeviceRowMajorBf16ToNvfp4InPlace(
       layout->padded_blocks_per_row,
       matmul_block_scales_data);
   return CheckCuda(cudaGetLastError());
+}
+
+template <typename DeviceTensorT>
+bool PackLatentPerSelectedExpertToNvfp4InPlaceImpl(
+    const DeviceTensorT& source_row,
+    std::size_t selected_expert_count,
+    const float* selected_expert_input_scales,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream) {
+  (void)global_max_bits_scratch;
+  if (!source_row.valid() ||
+      source_row.shape().size() != 2 ||
+      source_row.shape()[0] != 1 ||
+      selected_expert_count == 0 ||
+      selected_expert_input_scales == nullptr ||
+      packed_data == nullptr ||
+      block_scales_data == nullptr ||
+      matmul_block_scales_data == nullptr ||
+      tensor_scale_data == nullptr) {
+    return false;
+  }
+
+  const std::size_t cols = source_row.shape()[1];
+  if (cols == 0 || cols % kBlockWidth != 0) {
+    return false;
+  }
+
+  const auto layout = BuildNvfp4ExecutionScaleLayout(1, cols);
+  if (!layout.has_value()) {
+    return false;
+  }
+
+  constexpr std::size_t kThreadsPerBlock = 256;
+  PackLatentPerSelectedExpertToNvfp4Kernel<<<
+      static_cast<unsigned int>(selected_expert_count),
+      kThreadsPerBlock,
+      0,
+      stream>>>(
+      source_row.data(),
+      selected_expert_count,
+      cols,
+      selected_expert_input_scales,
+      PackedBytes(1, cols),
+      cols / kBlockWidth,
+      layout->padded_blocks_per_row,
+      MatmulScaleBytes(1, cols),
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool PackLatentPerSelectedExpertToNvfp4InPlace(
+    const DeviceTensorFp32& source_row,
+    std::size_t selected_expert_count,
+    const float* selected_expert_input_scales,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream) {
+  return PackLatentPerSelectedExpertToNvfp4InPlaceImpl(
+      source_row,
+      selected_expert_count,
+      selected_expert_input_scales,
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data,
+      global_max_bits_scratch,
+      stream);
+}
+
+bool PackLatentPerSelectedExpertToNvfp4InPlace(
+    const DeviceTensorBf16& source_row,
+    std::size_t selected_expert_count,
+    const float* selected_expert_input_scales,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream) {
+  return PackLatentPerSelectedExpertToNvfp4InPlaceImpl(
+      source_row,
+      selected_expert_count,
+      selected_expert_input_scales,
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data,
+      global_max_bits_scratch,
+      stream);
 }
 
 }  // namespace nemotron

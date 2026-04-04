@@ -3944,18 +3944,6 @@ bool RunExpertLayerImpl(
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
-    // DIAGNOSIS (Step 6): The fused up-proj numeric error (max_abs_diff=0.013)
-    // traces to PackLatentPerSelectedExpertToNvfp4Kernel in
-    // device_nvfp4_matrix.cu:311, which uses input_scale directly as
-    // tensor_scale instead of 1 / input_scale. When input_scale < kMinScale
-    // (1/1024), it is clamped to kMinScale, losing the checkpoint-driven
-    // quantization range. The same pattern affects
-    // ScaleRelu2PackRowsToNvfp4InPlace for the down path.
-    // Down-path nuance: expert_ops.cu:593-595 forwards down_input_scale
-    // directly into tensor_scales[row] without the kMinScale clamp used by the
-    // up-path packing kernel.
-    // Fix target: the caller should pass 1 / input_scale to the packing
-    // kernel, or the kernel should invert internally.
     const auto grouped_fatal =
         [&](const std::string& reason) -> GroupedRoutedResult {
       std::cerr << "expert_layer: layer " << impl.config.layer_index
@@ -4917,6 +4905,7 @@ bool RunExpertLayerImpl(
                           expected_latent_tensor_scale)
                           ? "yes"
                           : "no")
+                  << " fused_alpha=" << fused_alpha
                   << " direct_kernel_tensor_scale=" << direct_kernel_tensor_scale
                   << " direct_kernel_match="
                   << (scale_contract_matches(
@@ -4924,7 +4913,6 @@ bool RunExpertLayerImpl(
                           direct_kernel_tensor_scale)
                           ? "yes"
                           : "no")
-                  << " fused_alpha=" << fused_alpha
                   << "\n";
       }
     }
@@ -5177,6 +5165,7 @@ bool RunExpertLayerImpl(
                           expected_down_act_tensor_scale)
                           ? "yes"
                           : "no")
+                  << " fused_alpha=" << fused_alpha
                   << " direct_kernel_tensor_scale=" << direct_kernel_tensor_scale
                   << " direct_kernel_match="
                   << (scale_contract_matches(
@@ -5184,7 +5173,6 @@ bool RunExpertLayerImpl(
                           direct_kernel_tensor_scale)
                           ? "yes"
                           : "no")
-                  << " fused_alpha=" << fused_alpha
                   << "\n";
       }
     }
