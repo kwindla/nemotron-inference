@@ -26,13 +26,77 @@ namespace nemotron {
 // while shared-down entries continue to store raw weight_scale_2.
 constexpr std::uint32_t kModelCacheFormatVersion = 6;
 
+// Each entry kind defines both its on-disk section layout (`payload`, `aux0`,
+// `aux1`, `aux2`) and the serving-time scalar metadata that cache-backed view
+// factories consume.
 enum class ModelCacheEntryKind : std::uint32_t {
+  // Generic FP32 tensor entry.
+  // payload: contiguous FP32 values for `shape`; `CreateTensorView()` exposes
+  //     them as one flat device view.
+  // aux0/aux1/aux2: unused and must be empty.
+  // Serving-time scalar contract: none. Cache-backed serving consumes only the
+  // payload; `input_scale` and `weight_scale` are ignored.
   kTensorFp32 = 1,
+
+  // FP32 embedding-table entry.
+  // payload: row-major `[vocab_size, embedding_dim]` FP32 table.
+  // aux0/aux1/aux2: unused and must be empty.
+  // Serving-time scalar contract: none. Cache-backed serving consumes only the
+  // payload; `input_scale` and `weight_scale` are ignored.
   kEmbeddingFp32 = 2,
+
+  // Dense row-major FP32 GEMM weight entry.
+  // payload: row-major `[output_rows, input_cols]` FP32 weight matrix.
+  // aux0/aux1/aux2: unused and must be empty.
+  // Serving-time scalar contract: none. `CreateDenseLinearView()` serves the
+  // payload directly as the runtime weight; scalar metadata is ignored.
   kDenseWeightFp32 = 3,
+
+  // Legacy scaled-FP8 compatibility entry.
+  // payload: dequantized row-major `[output_rows, input_cols]` FP32 weight
+  //     matrix.
+  // aux0/aux1/aux2: unused and must be empty.
+  // Serving-time scalar contract: `input_scale` and `weight_scale` remain the
+  // authoritative activation/weight scalars for cache-backed FP8 serving. The
+  // payload is a compatibility surface that `CreateScaledFp8LinearView()` can
+  // use to re-materialize native packed FP8 and fallback dequantized execution.
   kScaledFp8WeightFp32 = 4,
+
+  // NVFP4 aligned weight entry.
+  // payload: aligned packed NVFP4 weight bytes for
+  //     `[output_rows, input_cols]`.
+  // aux0: raw checkpoint block scales in the source row-major layout.
+  // aux1: execution-layout block scales swizzled for serving-time matmul;
+  //     `CreateNvfp4LinearView()` exposes this buffer as
+  //     `descriptor.block_scales_data`.
+  // aux2: one FP32 serving-time tensor-scale scalar exposed as
+  //     `descriptor.tensor_scale_data`.
+  // Serving-time scalar contract: cache-backed NVFP4 serving treats aux2 as
+  // authoritative and consumes payload + aux1 + aux2 as the runtime surface.
+  // aux0 is retained as the raw block-scale side buffer, not as the matmul
+  // block-scale surface.
+  // NVFP4 sub-contracts:
+  //   routed expert NVFP4: aux2 = effective_tensor_scale =
+  //       input_scale * weight_scale_2
+  //   shared-down NVFP4: aux2 = raw weight_scale_2 (current live
+  //       cache/runtime contract; higher-level semantics remain potentially
+  //       ambiguous because there is no separate input-scale fusion here)
   kNvfp4Aligned = 5,
+
+  // Native scaled-FP8 entry.
+  // payload: packed FP8 E4M3 weight bytes for `[output_rows, input_cols]`.
+  // aux0/aux1/aux2: unused and must be empty.
+  // Serving-time scalar contract: `input_scale` and `weight_scale` are the
+  // authoritative activation/weight scalars consumed by cache-backed FP8
+  // serving. The runtime can use the payload plus those scalars for both
+  // native packed FP8 execution and fallback dequantized execution.
   kScaledFp8WeightNative = 6,
+
+  // Dense row-major BF16 GEMM weight entry.
+  // payload: row-major `[output_rows, input_cols]` BF16 weight matrix bytes.
+  // aux0/aux1/aux2: unused and must be empty.
+  // Serving-time scalar contract: none. `CreateDenseLinearView()` serves the
+  // payload directly as the runtime weight; scalar metadata is ignored.
   kDenseWeightBf16 = 7,
 };
 
@@ -42,20 +106,17 @@ struct ModelCacheEntry {
   std::vector<std::size_t> shape;
   std::size_t output_rows = 0;
   std::size_t input_cols = 0;
+  // Section meanings are kind-specific; see `ModelCacheEntryKind` above.
   std::size_t payload_offset = 0;
   std::size_t payload_nbytes = 0;
-  // kNvfp4Aligned on-disk layout:
-  // aux0 = raw checkpoint block scales
-  // aux1 = execution-layout block scales
-  // aux2 = serving-time tensor scale scalar
-  //   routed experts: input_scale * weight_scale_2
-  //   shared-down experts: raw weight_scale_2
   std::size_t aux0_offset = 0;
   std::size_t aux0_nbytes = 0;
   std::size_t aux1_offset = 0;
   std::size_t aux1_nbytes = 0;
   std::size_t aux2_offset = 0;
   std::size_t aux2_nbytes = 0;
+  // Only scaled-FP8 entry kinds currently consume these scalar metadata
+  // fields at serving time. Other entry kinds leave them unused/ignored.
   float input_scale = 0.0f;
   float weight_scale = 0.0f;
 };
