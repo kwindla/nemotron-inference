@@ -533,6 +533,21 @@ target_compile_features(nano_global_root_prefix_cache_test PRIVATE cxx_std_17)
 nemotron_add_test(nano_global_root_prefix_cache_test)
 
 add_executable(
+  multi_turn_prefix_reuse_test
+  api/multi_turn_prefix_reuse_test.cpp
+)
+
+target_link_libraries(multi_turn_prefix_reuse_test PRIVATE nemotron_runtime_api)
+target_compile_features(multi_turn_prefix_reuse_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  multi_turn_prefix_reuse_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+nemotron_add_test(multi_turn_prefix_reuse_test)
+
+add_executable(
   nano_loader_budget_test
   api/nano_loader_budget_test.cpp
 )
