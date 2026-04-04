@@ -23,6 +23,7 @@
 #include "nemotron/kernel_catalog.h"
 #include "nemotron/mamba_layer.h"
 #include "nemotron/model_schedule.h"
+#include "nemotron/nvfp4_scale_helpers.h"
 #include "nemotron/nvfp4_scale_layout.h"
 
 namespace nemotron {
@@ -221,17 +222,34 @@ std::optional<float> ReadTensorScaleHost(const GemmDescriptor& descriptor) {
   return value;
 }
 
+std::optional<float> ReadRoutedNvfp4InputScale(
+    const GemmDescriptor& descriptor,
+    const KernelCatalog& kernel_catalog) {
+  const auto input_scale_name = BuildInputScaleTensorName(descriptor.tensor_name);
+  if (!input_scale_name.has_value()) {
+    return std::nullopt;
+  }
+  const KernelTensorDescriptor* input_scale = kernel_catalog.FindTensor(*input_scale_name);
+  if (input_scale == nullptr) {
+    return std::nullopt;
+  }
+  return ReadScalarFp32(*input_scale);
+}
+
 std::optional<float> ReadNvfp4CacheTensorScale(
     const GemmDescriptor& descriptor,
     const KernelCatalog& kernel_catalog) {
-  // The routed runtime uses the same NVFP4 weight tensor-scale contract as the
-  // generic runtime matmul path, so the cache stores the raw descriptor tensor
-  // scale for routed experts as well.
-  const auto weight_scale_2 = ReadTensorScaleHost(descriptor);
-  if (!weight_scale_2.has_value()) {
-    return std::nullopt;
+  if (!IsRoutedExpertTensorName(descriptor.tensor_name)) {
+    // Shared-down NVFP4 has no separate input_scale tensor, so its on-disk
+    // aux2 scalar keeps the raw weight_scale_2 contract.
+    return ReadTensorScaleHost(descriptor);
   }
-  return weight_scale_2;
+
+  // Routed NVFP4 cache entries persist the serving-time tensor scale consumed
+  // by matmul so cache-backed execution matches the live runtime contract.
+  return ResolveRoutedNvfp4RuntimeTensorScale(
+      descriptor,
+      ReadRoutedNvfp4InputScale(descriptor, kernel_catalog));
 }
 
 bool ShouldPreloadCacheEntry(const ModelCacheEntry& entry) {
@@ -664,15 +682,19 @@ bool AddScaledFp8NativeEntry(
 
 bool AddNvfp4Entry(
     const GemmDescriptor& descriptor,
+    const KernelCatalog& kernel_catalog,
     std::unordered_set<std::string>* seen,
     std::vector<ModelCacheEntry>* entries) {
   if (!seen->insert(descriptor.tensor_name).second) {
     return true;
   }
+  const auto cache_tensor_scale = ReadNvfp4CacheTensorScale(descriptor, kernel_catalog);
   if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
       descriptor.packed_data == nullptr ||
       descriptor.block_scales_data == nullptr ||
-      descriptor.tensor_scale_data == nullptr) {
+      descriptor.tensor_scale_data == nullptr ||
+      descriptor.tensor_scale_nbytes != sizeof(float) ||
+      !cache_tensor_scale.has_value()) {
     return false;
   }
   const std::size_t execution_scale_nbytes =
@@ -689,9 +711,10 @@ bool AddNvfp4Entry(
   entry.payload_nbytes = descriptor.packed_nbytes;
   entry.aux0_nbytes = descriptor.block_scales_nbytes;
   entry.aux1_nbytes = execution_scale_nbytes;
-  // Cache aux2 carries one tensor-scale scalar using the raw descriptor tensor
-  // scale contract for all NVFP4 weights.
-  entry.aux2_nbytes = descriptor.tensor_scale_nbytes;
+  // Cache aux2 always stores one fp32 serving-time tensor scale scalar:
+  // routed experts persist input_scale * weight_scale_2, while shared-down
+  // experts keep raw weight_scale_2.
+  entry.aux2_nbytes = sizeof(float);
   entries->push_back(std::move(entry));
   return true;
 }
@@ -890,7 +913,7 @@ bool WriteDeterministicModelCache(
           return false;
         }
         if (bindings->shared_down_gemm_weight->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-          if (!AddNvfp4Entry(*bindings->shared_down_gemm_weight, &seen, &entries)) {
+          if (!AddNvfp4Entry(*bindings->shared_down_gemm_weight, kernel_catalog, &seen, &entries)) {
             return false;
           }
         } else if (bindings->shared_down_kernel_weight != nullptr &&
@@ -913,8 +936,8 @@ bool WriteDeterministicModelCache(
         }
         for (const ExpertWeightPair& pair : bindings->routed_experts) {
           if (pair.up_proj->kernel_family == GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
-            if (!AddNvfp4Entry(*pair.up_proj, &seen, &entries) ||
-                !AddNvfp4Entry(*pair.down_proj, &seen, &entries)) {
+            if (!AddNvfp4Entry(*pair.up_proj, kernel_catalog, &seen, &entries) ||
+                !AddNvfp4Entry(*pair.down_proj, kernel_catalog, &seen, &entries)) {
               return false;
             }
           } else if (!AddDenseWeightEntry(*pair.up_proj, &seen, &entries) ||
@@ -1018,13 +1041,13 @@ bool WriteDeterministicModelCache(
       }
       case ModelCacheEntryKind::kNvfp4Aligned: {
         const GemmDescriptor* descriptor = gemm_catalog.FindDescriptor(entry.tensor_name);
-        const auto tensor_scale =
+        const auto cache_tensor_scale =
             descriptor == nullptr ? std::nullopt : ReadNvfp4CacheTensorScale(*descriptor, kernel_catalog);
         if (descriptor == nullptr ||
             descriptor->packed_data == nullptr ||
             descriptor->block_scales_data == nullptr ||
             descriptor->tensor_scale_data == nullptr ||
-            !tensor_scale.has_value() ||
+            !cache_tensor_scale.has_value() ||
             entry.aux2_nbytes != sizeof(float) ||
             !WriteByteSpan(output, descriptor->packed_data, descriptor->packed_nbytes, &payload_offset) ||
             !PadOutputToOffset(output, &payload_offset, entry.aux0_offset) ||
@@ -1032,7 +1055,7 @@ bool WriteDeterministicModelCache(
           return false;
         }
         std::vector<std::uint8_t> swizzled(entry.aux1_nbytes, 0u);
-        const float effective_tensor_scale = *tensor_scale;
+        const float effective_tensor_scale = *cache_tensor_scale;
         if (!SwizzleRowMajorNvfp4ScalesForExecutionInto(
                 descriptor->block_scales_data,
                 descriptor->output_rows,

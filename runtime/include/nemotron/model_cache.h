@@ -21,7 +21,10 @@
 
 namespace nemotron {
 
-constexpr std::uint32_t kModelCacheFormatVersion = 5;
+// v6 changes the on-disk NVFP4 aux2 scalar contract for routed experts:
+// routed entries now store effective_tensor_scale = input_scale * weight_scale_2,
+// while shared-down entries continue to store raw weight_scale_2.
+constexpr std::uint32_t kModelCacheFormatVersion = 6;
 
 enum class ModelCacheEntryKind : std::uint32_t {
   kTensorFp32 = 1,
@@ -41,6 +44,12 @@ struct ModelCacheEntry {
   std::size_t input_cols = 0;
   std::size_t payload_offset = 0;
   std::size_t payload_nbytes = 0;
+  // kNvfp4Aligned on-disk layout:
+  // aux0 = raw checkpoint block scales
+  // aux1 = execution-layout block scales
+  // aux2 = serving-time tensor scale scalar
+  //   routed experts: input_scale * weight_scale_2
+  //   shared-down experts: raw weight_scale_2
   std::size_t aux0_offset = 0;
   std::size_t aux0_nbytes = 0;
   std::size_t aux1_offset = 0;
