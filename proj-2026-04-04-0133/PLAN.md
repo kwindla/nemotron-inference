@@ -59,7 +59,7 @@ Design analysis: `proj-2026-04-03-1816/PLAN.md` and its 9 sub-plans.
   Key files: `proj-2026-04-03-0318/verify_correctness.sh`, `proj-2026-04-03-2113/compare_vllm_runtime_oracle.py`
   Analysis: `proj-2026-04-04-0133/bf16_pipeline_analysis.md`
 
-- [ ] **7g. Resolve the multi-token BF16 execution contract**
+- [x] **7g. Resolve the multi-token BF16 execution contract**
   The current BF16 production surface is correct but not fully settled: `attention_layer.cpp`, `expert_layer.cpp`, and `mamba_layer.cpp` all handle `token_count > 1` by slicing the input into single-token views and recursively running the one-token path. Treat this as an explicit alignment item, not an incidental implementation detail. First, make the layer contract observable: add explicit capability / fallback boundaries and a measurable signal (counter, trace field, or benchmark artifact field) that records when multi-token requests are satisfied by sequential row replay instead of a native multi-token path. Then decide whether that sequential replay is (a) a temporary correctness bridge that must be replaced with true multi-token production paths, or (b) an intentional Nano-on-5090 contract that remains only if measurement and code simplicity justify it. If it is temporary, restore native multi-token execution for the affected layers and remove the recursive bridge from the hot path. If any part remains intentional, document the exact surviving divergence, benchmark the prefill / resumed-prefix cost, and fence the bridge so it is explicit rather than silently becoming the default.
 
   Acceptance criteria:
@@ -302,9 +302,9 @@ NEMOTRON_FORWARD_MANIFEST="${NEMOTRON_FORWARD_MANIFEST}" \
 | 7a | Fused add+RMSNorm kernel (BF16 I/O, FP32 internal) | done | 51bd4b7 | |
 | 7b+c | BF16 embedding lookup + BF16 dense GEMM path | done | a0639da | |
 | 7d | BF16 hidden/residual buffers and layer interfaces | done | 3005496 | + GQA fix f66d740, fused decode gate cdd2c13, fastpath 525e2a8, MoE prefill fix 72f527c, decode scratch fix 3005496 |
-| 7e | Residual-add pattern alignment and bootstrap cleanup | done | PENDING | FP32 compat overloads return delta; bootstrap split into validate/plan/assemble; manifest op_class roles replace name heuristics |
+| 7e | Residual-add pattern alignment and bootstrap cleanup | done | e8b8868 | FP32 compat overloads return delta; bootstrap split into validate/plan/assemble; manifest op_class roles replace name heuristics |
 | 7f | BF16 pipeline verification and vLLM parity | done | — | 2026-04-04 rerun now passes `full_forward_manifest_smoke_test`, `nano_16_token_correctness_test`, the long-prompt `nano_save_prompt_oracle` path, and exact-token vLLM parity for `short_chat` (`runtime_generated_token_ids == vllm_generated_token_ids == [1784, 3330, 17000, 10693]`). |
-| 7g | Resolve the multi-token BF16 execution contract | pending | — | Current attention / expert / Mamba BF16 multi-token requests recurse one token at a time; close or explicitly justify that divergence before broad oracle re-baselining or cache follow-on work. |
+| 7g | Resolve the multi-token BF16 execution contract | done | PENDING | All three row-replay bridges removed; native multi-token paths confirmed via per-layer execution counters in benchmark; Tier 2 verification pending |
 | 8 | Port oracle fixture generation to Nano (against BF16 pipeline) | in progress | — | Nano oracle generators now produce live fixtures for `full_model_single_token_short_chat_cuda_v3`, `prefix_prefill_short_chat_layer7_t4_oracle`, `expert_layer1_decode_block`, and `mamba_layer0_decode_block`; the registered oracle gates now pass under the branch’s intended BF16/NVFP4 functional envelopes, but the broader fixture-coverage expansion in the step text is still pending and should follow steps `7e` and `7g`. |
 | 9 | Revisit cache allocator and page/snapshot ownership | pending | — | Snapshot must handle BF16 hidden states |
 | 10 | Multi-turn prefix reuse regression and final verification sweep | pending | — | |

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 
@@ -58,12 +59,22 @@ struct MambaLayerBindings {
   const KernelTensorDescriptor* out_proj_input_scale = nullptr;
 };
 
+struct MambaLayerExecutionCounters {
+  std::size_t native_multi_token_runs = 0;
+  std::size_t native_multi_token_tokens = 0;
+  std::size_t row_replay_runs = 0;
+  std::size_t row_replay_tokens = 0;
+};
+
 struct MambaLayerRunTrace {
   std::vector<float> norm_output;
   std::vector<float> in_proj_output;
   std::vector<float> scan_output;
   std::vector<float> projected_output;
 };
+
+void ResetMambaLayerExecutionCounters();
+MambaLayerExecutionCounters GetMambaLayerExecutionCounters();
 
 std::optional<MambaLayerBindings> BuildMambaLayerBindings(
     const LayerScheduleEntry& layer,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 
@@ -22,7 +23,16 @@ enum class AttentionBackend {
   kDeviceFallback,
 };
 
+struct AttentionLayerExecutionCounters {
+  std::size_t native_multi_token_runs = 0;
+  std::size_t native_multi_token_tokens = 0;
+  std::size_t row_replay_runs = 0;
+  std::size_t row_replay_tokens = 0;
+};
+
 const char* AttentionBackendName(AttentionBackend backend);
+void ResetAttentionLayerExecutionCounters();
+AttentionLayerExecutionCounters GetAttentionLayerExecutionCounters();
 
 struct AttentionBackendSelectorConfig {
   AttentionKvCacheConfig cache_config;

@@ -117,23 +117,14 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
-std::unique_ptr<DeviceTensorBf16> CreateTokenRangeView(
-    DeviceTensorBf16* buffer,
-    std::size_t token_offset,
-    std::size_t token_count,
-    std::size_t hidden_size) {
-  if (buffer == nullptr ||
-      !buffer->valid() ||
-      buffer->shape().size() != 2 ||
-      token_count == 0 ||
-      token_offset > buffer->shape()[0] ||
-      token_count > (buffer->shape()[0] - token_offset) ||
-      buffer->shape()[1] != hidden_size) {
-    return nullptr;
+thread_local AttentionLayerExecutionCounters g_attention_layer_execution_counters;
+
+void RecordAttentionNativeMultiTokenExecution(std::size_t token_count) {
+  if (token_count <= 1) {
+    return;
   }
-  return DeviceTensorBf16::CreateView(
-      {token_count, hidden_size},
-      buffer->data() + (token_offset * hidden_size));
+  ++g_attention_layer_execution_counters.native_multi_token_runs;
+  g_attention_layer_execution_counters.native_multi_token_tokens += token_count;
 }
 
 bool LegacyAttentionPolicyEnvSet(const char* name) {
@@ -492,6 +483,14 @@ std::optional<std::vector<__nv_bfloat16>> RunPagedAttentionHost(
 
 }  // namespace
 
+void ResetAttentionLayerExecutionCounters() {
+  g_attention_layer_execution_counters = AttentionLayerExecutionCounters{};
+}
+
+AttentionLayerExecutionCounters GetAttentionLayerExecutionCounters() {
+  return g_attention_layer_execution_counters;
+}
+
 const char* AttentionBackendName(AttentionBackend backend) {
   switch (backend) {
     case AttentionBackend::kCudnnPaged:
@@ -798,40 +797,7 @@ bool AttentionLayerSlice::Run(
   }
 
   if (token_count > 1) {
-    for (std::size_t token_offset = 0; token_offset < token_count; ++token_offset) {
-      auto input_row = DeviceTensorBf16::CreateView(
-          {1, impl_->config.hidden_size},
-          const_cast<__nv_bfloat16*>(input.data()) + (token_offset * impl_->config.hidden_size));
-      auto residual_row = CreateTokenRangeView(
-          residual,
-          token_offset,
-          1,
-          impl_->config.hidden_size);
-      auto output_row = CreateTokenRangeView(
-          output,
-          token_offset,
-          1,
-          impl_->config.hidden_size);
-      if (input_row == nullptr || residual_row == nullptr || output_row == nullptr) {
-        return false;
-      }
-
-      const std::size_t token_sequence_start = sequence_start + token_offset;
-      const std::size_t token_total_sequence_length = token_sequence_start + 1;
-      if (!Run(
-              cublas_handle,
-              cudnn_handle,
-              heuristic_cache,
-              request_context,
-              token_sequence_start,
-              token_total_sequence_length,
-              *input_row,
-              residual_row.get(),
-              output_row.get())) {
-        return false;
-      }
-    }
-    return true;
+    RecordAttentionNativeMultiTokenExecution(token_count);
   }
 
   std::unique_ptr<DeviceTensorBf16> normed_owned;

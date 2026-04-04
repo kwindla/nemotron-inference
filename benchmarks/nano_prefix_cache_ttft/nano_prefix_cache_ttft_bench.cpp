@@ -1,6 +1,9 @@
+#include "nemotron/attention_layer.h"
 #include "nemotron/device_argmax.h"
 #include "nemotron/device_tensor.h"
+#include "nemotron/expert_layer.h"
 #include "nemotron/manifest.h"
+#include "nemotron/mamba_layer.h"
 #include "nemotron/prefix_cache.h"
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
@@ -107,6 +110,18 @@ struct IterationMetrics {
   std::optional<double> speedup_factor;
   std::optional<double> prefix_snapshot_size_bytes;
   std::optional<double> matched_prefix_token_count;
+  std::optional<double> attention_native_multi_token_runs;
+  std::optional<double> attention_native_multi_token_tokens;
+  std::optional<double> attention_row_replay_runs;
+  std::optional<double> attention_row_replay_tokens;
+  std::optional<double> expert_native_multi_token_runs;
+  std::optional<double> expert_native_multi_token_tokens;
+  std::optional<double> expert_row_replay_runs;
+  std::optional<double> expert_row_replay_tokens;
+  std::optional<double> mamba_native_multi_token_runs;
+  std::optional<double> mamba_native_multi_token_tokens;
+  std::optional<double> mamba_row_replay_runs;
+  std::optional<double> mamba_row_replay_tokens;
 };
 
 struct MetricSummary {
@@ -125,6 +140,31 @@ struct CaseSummary {
   std::optional<MetricSummary> speedup_factor;
   std::optional<MetricSummary> prefix_snapshot_size_bytes;
   std::optional<MetricSummary> matched_prefix_token_count;
+  std::optional<MetricSummary> attention_native_multi_token_runs;
+  std::optional<MetricSummary> attention_native_multi_token_tokens;
+  std::optional<MetricSummary> attention_row_replay_runs;
+  std::optional<MetricSummary> attention_row_replay_tokens;
+  std::optional<MetricSummary> expert_native_multi_token_runs;
+  std::optional<MetricSummary> expert_native_multi_token_tokens;
+  std::optional<MetricSummary> expert_row_replay_runs;
+  std::optional<MetricSummary> expert_row_replay_tokens;
+  std::optional<MetricSummary> mamba_native_multi_token_runs;
+  std::optional<MetricSummary> mamba_native_multi_token_tokens;
+  std::optional<MetricSummary> mamba_row_replay_runs;
+  std::optional<MetricSummary> mamba_row_replay_tokens;
+};
+
+struct LayerExecutionSnapshot {
+  double native_multi_token_runs = 0.0;
+  double native_multi_token_tokens = 0.0;
+  double row_replay_runs = 0.0;
+  double row_replay_tokens = 0.0;
+};
+
+struct BenchmarkExecutionSnapshot {
+  LayerExecutionSnapshot attention;
+  LayerExecutionSnapshot expert;
+  LayerExecutionSnapshot mamba;
 };
 
 struct ColdPassResult {
@@ -461,6 +501,61 @@ MetricSummary SummarizeMetric(const std::vector<double>& values) {
       Percentile(values, 50.0),
       Percentile(values, 95.0),
   };
+}
+
+void ResetLayerExecutionCounters() {
+  nemotron::ResetAttentionLayerExecutionCounters();
+  nemotron::ResetExpertLayerExecutionCounters();
+  nemotron::ResetMambaLayerExecutionCounters();
+}
+
+BenchmarkExecutionSnapshot CollectLayerExecutionCounters() {
+  const nemotron::AttentionLayerExecutionCounters attention =
+      nemotron::GetAttentionLayerExecutionCounters();
+  const nemotron::ExpertLayerExecutionCounters expert =
+      nemotron::GetExpertLayerExecutionCounters();
+  const nemotron::MambaLayerExecutionCounters mamba =
+      nemotron::GetMambaLayerExecutionCounters();
+  return BenchmarkExecutionSnapshot{
+      LayerExecutionSnapshot{
+          static_cast<double>(attention.native_multi_token_runs),
+          static_cast<double>(attention.native_multi_token_tokens),
+          static_cast<double>(attention.row_replay_runs),
+          static_cast<double>(attention.row_replay_tokens),
+      },
+      LayerExecutionSnapshot{
+          static_cast<double>(expert.native_multi_token_runs),
+          static_cast<double>(expert.native_multi_token_tokens),
+          static_cast<double>(expert.row_replay_runs),
+          static_cast<double>(expert.row_replay_tokens),
+      },
+      LayerExecutionSnapshot{
+          static_cast<double>(mamba.native_multi_token_runs),
+          static_cast<double>(mamba.native_multi_token_tokens),
+          static_cast<double>(mamba.row_replay_runs),
+          static_cast<double>(mamba.row_replay_tokens),
+      },
+  };
+}
+
+void RecordLayerExecutionMetrics(
+    const BenchmarkExecutionSnapshot& counters,
+    IterationMetrics* metrics) {
+  if (metrics == nullptr) {
+    return;
+  }
+  metrics->attention_native_multi_token_runs = counters.attention.native_multi_token_runs;
+  metrics->attention_native_multi_token_tokens = counters.attention.native_multi_token_tokens;
+  metrics->attention_row_replay_runs = counters.attention.row_replay_runs;
+  metrics->attention_row_replay_tokens = counters.attention.row_replay_tokens;
+  metrics->expert_native_multi_token_runs = counters.expert.native_multi_token_runs;
+  metrics->expert_native_multi_token_tokens = counters.expert.native_multi_token_tokens;
+  metrics->expert_row_replay_runs = counters.expert.row_replay_runs;
+  metrics->expert_row_replay_tokens = counters.expert.row_replay_tokens;
+  metrics->mamba_native_multi_token_runs = counters.mamba.native_multi_token_runs;
+  metrics->mamba_native_multi_token_tokens = counters.mamba.native_multi_token_tokens;
+  metrics->mamba_row_replay_runs = counters.mamba.row_replay_runs;
+  metrics->mamba_row_replay_tokens = counters.mamba.row_replay_tokens;
 }
 
 template <typename Accessor>
@@ -833,6 +928,78 @@ CaseSummary SummarizeCase(
   if (!matched_tokens.empty()) {
     summary.matched_prefix_token_count = SummarizeMetric(matched_tokens);
   }
+  const auto attention_native_runs = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.attention_native_multi_token_runs; });
+  if (!attention_native_runs.empty()) {
+    summary.attention_native_multi_token_runs = SummarizeMetric(attention_native_runs);
+  }
+  const auto attention_native_tokens = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.attention_native_multi_token_tokens; });
+  if (!attention_native_tokens.empty()) {
+    summary.attention_native_multi_token_tokens = SummarizeMetric(attention_native_tokens);
+  }
+  const auto attention_row_replay_runs = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.attention_row_replay_runs; });
+  if (!attention_row_replay_runs.empty()) {
+    summary.attention_row_replay_runs = SummarizeMetric(attention_row_replay_runs);
+  }
+  const auto attention_row_replay_tokens = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.attention_row_replay_tokens; });
+  if (!attention_row_replay_tokens.empty()) {
+    summary.attention_row_replay_tokens = SummarizeMetric(attention_row_replay_tokens);
+  }
+  const auto expert_native_runs = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.expert_native_multi_token_runs; });
+  if (!expert_native_runs.empty()) {
+    summary.expert_native_multi_token_runs = SummarizeMetric(expert_native_runs);
+  }
+  const auto expert_native_tokens = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.expert_native_multi_token_tokens; });
+  if (!expert_native_tokens.empty()) {
+    summary.expert_native_multi_token_tokens = SummarizeMetric(expert_native_tokens);
+  }
+  const auto expert_row_replay_runs = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.expert_row_replay_runs; });
+  if (!expert_row_replay_runs.empty()) {
+    summary.expert_row_replay_runs = SummarizeMetric(expert_row_replay_runs);
+  }
+  const auto expert_row_replay_tokens = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.expert_row_replay_tokens; });
+  if (!expert_row_replay_tokens.empty()) {
+    summary.expert_row_replay_tokens = SummarizeMetric(expert_row_replay_tokens);
+  }
+  const auto mamba_native_runs = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.mamba_native_multi_token_runs; });
+  if (!mamba_native_runs.empty()) {
+    summary.mamba_native_multi_token_runs = SummarizeMetric(mamba_native_runs);
+  }
+  const auto mamba_native_tokens = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.mamba_native_multi_token_tokens; });
+  if (!mamba_native_tokens.empty()) {
+    summary.mamba_native_multi_token_tokens = SummarizeMetric(mamba_native_tokens);
+  }
+  const auto mamba_row_replay_runs = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.mamba_row_replay_runs; });
+  if (!mamba_row_replay_runs.empty()) {
+    summary.mamba_row_replay_runs = SummarizeMetric(mamba_row_replay_runs);
+  }
+  const auto mamba_row_replay_tokens = CollectOptionalMetrics(
+      iterations,
+      [](const IterationMetrics& metrics) { return metrics.mamba_row_replay_tokens; });
+  if (!mamba_row_replay_tokens.empty()) {
+    summary.mamba_row_replay_tokens = SummarizeMetric(mamba_row_replay_tokens);
+  }
   return summary;
 }
 
@@ -882,6 +1049,66 @@ void PrintSummary(const CaseSummary& summary) {
   PrintOptionalMetric("speedup factor", summary.speedup_factor, "x");
   PrintOptionalMetric("prefix snapshot size", summary.prefix_snapshot_size_bytes, " bytes", true);
   PrintOptionalMetric("matched prefix token count", summary.matched_prefix_token_count, " tokens", true);
+  PrintOptionalMetric(
+      "attention native multi-token runs",
+      summary.attention_native_multi_token_runs,
+      " runs",
+      true);
+  PrintOptionalMetric(
+      "attention native multi-token tokens",
+      summary.attention_native_multi_token_tokens,
+      " tokens",
+      true);
+  PrintOptionalMetric(
+      "attention row replay runs",
+      summary.attention_row_replay_runs,
+      " runs",
+      true);
+  PrintOptionalMetric(
+      "attention row replay tokens",
+      summary.attention_row_replay_tokens,
+      " tokens",
+      true);
+  PrintOptionalMetric(
+      "expert native multi-token runs",
+      summary.expert_native_multi_token_runs,
+      " runs",
+      true);
+  PrintOptionalMetric(
+      "expert native multi-token tokens",
+      summary.expert_native_multi_token_tokens,
+      " tokens",
+      true);
+  PrintOptionalMetric(
+      "expert row replay runs",
+      summary.expert_row_replay_runs,
+      " runs",
+      true);
+  PrintOptionalMetric(
+      "expert row replay tokens",
+      summary.expert_row_replay_tokens,
+      " tokens",
+      true);
+  PrintOptionalMetric(
+      "mamba native multi-token runs",
+      summary.mamba_native_multi_token_runs,
+      " runs",
+      true);
+  PrintOptionalMetric(
+      "mamba native multi-token tokens",
+      summary.mamba_native_multi_token_tokens,
+      " tokens",
+      true);
+  PrintOptionalMetric(
+      "mamba row replay runs",
+      summary.mamba_row_replay_runs,
+      " runs",
+      true);
+  PrintOptionalMetric(
+      "mamba row replay tokens",
+      summary.mamba_row_replay_tokens,
+      " tokens",
+      true);
 }
 
 }  // namespace
@@ -1003,6 +1230,7 @@ int main(int argc, char** argv) {
       const bool is_warmup = iteration < options.warmup_iterations;
       std::cout << "  iteration " << (iteration + 1) << "/" << total_iterations
                 << (is_warmup ? " warmup" : " measure") << "\n";
+      ResetLayerExecutionCounters();
 
       std::optional<IterationMetrics> metrics;
       if (spec.scenario == Scenario::kCold) {
@@ -1027,6 +1255,7 @@ int main(int argc, char** argv) {
           return 1;
         }
       }
+      RecordLayerExecutionMetrics(CollectLayerExecutionCounters(), &*metrics);
 
       if (!is_warmup) {
         measurements.push_back(*metrics);

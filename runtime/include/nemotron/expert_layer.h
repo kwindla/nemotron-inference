@@ -61,6 +61,13 @@ struct ExpertSelection {
   float weight = 0.0f;
 };
 
+struct ExpertLayerExecutionCounters {
+  std::size_t native_multi_token_runs = 0;
+  std::size_t native_multi_token_tokens = 0;
+  std::size_t row_replay_runs = 0;
+  std::size_t row_replay_tokens = 0;
+};
+
 struct ExpertLayerRunTrace {
   std::vector<float> normalized_input;
   std::vector<float> router_logits;
@@ -75,6 +82,9 @@ struct ExpertLayerRunTrace {
   std::vector<float> shared_output;
   std::vector<float> mixer_output;
 };
+
+void ResetExpertLayerExecutionCounters();
+ExpertLayerExecutionCounters GetExpertLayerExecutionCounters();
 
 std::optional<ExpertLayerBindings> BuildExpertLayerBindings(
     const LayerScheduleEntry& layer,

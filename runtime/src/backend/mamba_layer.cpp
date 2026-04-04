@@ -41,32 +41,14 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
-std::unique_ptr<DeviceTensorBf16> CreateTokenRangeView(
-    DeviceTensorBf16* buffer,
-    std::size_t token_offset,
-    std::size_t token_count,
-    std::size_t hidden_size) {
-  if (buffer == nullptr ||
-      !buffer->valid() ||
-      buffer->shape().size() != 2 ||
-      token_count == 0 ||
-      token_offset > buffer->shape()[0] ||
-      token_count > (buffer->shape()[0] - token_offset) ||
-      buffer->shape()[1] != hidden_size) {
-    return nullptr;
-  }
-  return DeviceTensorBf16::CreateView(
-      {token_count, hidden_size},
-      buffer->data() + (token_offset * hidden_size));
-}
+thread_local MambaLayerExecutionCounters g_mamba_layer_execution_counters;
 
-void AppendTraceValues(
-    const std::vector<float>& source,
-    std::vector<float>* destination) {
-  if (destination == nullptr || source.empty()) {
+void RecordMambaNativeMultiTokenExecution(std::size_t token_count) {
+  if (token_count <= 1) {
     return;
   }
-  destination->insert(destination->end(), source.begin(), source.end());
+  ++g_mamba_layer_execution_counters.native_multi_token_runs;
+  g_mamba_layer_execution_counters.native_multi_token_tokens += token_count;
 }
 
 bool ExperimentalFusedMambaDecodeEnabled() {
@@ -222,6 +204,14 @@ float Softplus(float value) {
 }
 
 }  // namespace
+
+void ResetMambaLayerExecutionCounters() {
+  g_mamba_layer_execution_counters = MambaLayerExecutionCounters{};
+}
+
+MambaLayerExecutionCounters GetMambaLayerExecutionCounters() {
+  return g_mamba_layer_execution_counters;
+}
 
 struct MambaLayerSlice::Impl {
   enum class ProjectionFamily {
@@ -644,52 +634,7 @@ bool MambaLayerSlice::Run(
   }
 
   if (token_count > 1) {
-    if (trace != nullptr) {
-      trace->norm_output.clear();
-      trace->in_proj_output.clear();
-      trace->scan_output.clear();
-      trace->projected_output.clear();
-    }
-
-    for (std::size_t token_offset = 0; token_offset < token_count; ++token_offset) {
-      auto input_row = DeviceTensorBf16::CreateView(
-          {1, impl_->config.hidden_size},
-          const_cast<__nv_bfloat16*>(input.data()) + (token_offset * impl_->config.hidden_size));
-      auto residual_row = CreateTokenRangeView(
-          residual,
-          token_offset,
-          1,
-          impl_->config.hidden_size);
-      auto output_row = CreateTokenRangeView(
-          output,
-          token_offset,
-          1,
-          impl_->config.hidden_size);
-      if (input_row == nullptr || residual_row == nullptr || output_row == nullptr) {
-        return false;
-      }
-
-      MambaLayerRunTrace token_trace;
-      MambaLayerRunTrace* token_trace_ptr = trace != nullptr ? &token_trace : nullptr;
-      if (!Run(
-              cublas_handle,
-              heuristic_cache,
-              request_context,
-              *input_row,
-              residual_row.get(),
-              output_row.get(),
-              token_trace_ptr)) {
-        return false;
-      }
-
-      if (trace != nullptr) {
-        AppendTraceValues(token_trace.norm_output, &trace->norm_output);
-        AppendTraceValues(token_trace.in_proj_output, &trace->in_proj_output);
-        AppendTraceValues(token_trace.scan_output, &trace->scan_output);
-        AppendTraceValues(token_trace.projected_output, &trace->projected_output);
-      }
-    }
-    return true;
+    RecordMambaNativeMultiTokenExecution(token_count);
   }
 
   const std::size_t conv_dim =
