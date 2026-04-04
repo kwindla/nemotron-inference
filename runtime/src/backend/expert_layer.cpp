@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1523,6 +1524,18 @@ bool ConfigureRoutedMoEBackend(
   if (strict_failure_reason != nullptr) {
     strict_failure_reason->clear();
   }
+  if (impl->routed_backend_kind != RoutedMoEBackendKind::kCustomFused) {
+    std::cerr << "expert_layer: layer " << impl->config.layer_index
+              << " frozen routed backend resolved to "
+              << ToString(impl->routed_backend_kind)
+              << ", expected custom_fused\n";
+    if (strict_failure_reason != nullptr) {
+      *strict_failure_reason = "frozen routed backend must resolve to custom_fused";
+    }
+    assert(impl->routed_backend_kind == RoutedMoEBackendKind::kCustomFused);
+    return false;
+  }
+  assert(impl->routed_backend_kind == RoutedMoEBackendKind::kCustomFused);
   // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
   (void)ResolveRequestedRoutedMoEBackend();
   std::cerr << "expert_layer: layer " << impl->config.layer_index
@@ -3931,32 +3944,526 @@ bool RunExpertLayerImpl(
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
-    if (trace != nullptr ||
-        routed_accumulator == nullptr ||
-        !routed_accumulator->valid() ||
-        batch_count == 0 ||
-        !impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
-      if (debug && !impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
-        std::cerr << "expert_layer: layer " << impl.config.layer_index
-                  << " routed fastpath disabled before token execution\n";
+    const auto grouped_fatal =
+        [&](const std::string& reason) -> GroupedRoutedResult {
+      std::cerr << "expert_layer: layer " << impl.config.layer_index
+                << " grouped routed fastpath unsupported: "
+                << reason << "\n";
+      return GroupedRoutedResult::kFatal;
+    };
+    const auto buffer_capacity =
+        [&](const auto& buffer) -> std::size_t {
+      return buffer.valid() ? buffer.count() : 0;
+    };
+    const auto require_buffer_capacity =
+        [&](const char* name, const auto& buffer, std::size_t required_count) -> bool {
+      const std::size_t available_count = buffer_capacity(buffer);
+      if (available_count >= required_count) {
+        return true;
       }
+      std::cerr << "expert_layer: layer " << impl.config.layer_index
+                << " grouped routed fastpath insufficient " << name
+                << " capacity: have=" << available_count
+                << " need=" << required_count << "\n";
+      return false;
+    };
+    const auto validate_scale =
+        [&](std::size_t expert_index,
+            const char* scale_name,
+            const std::optional<float>& scale) -> bool {
+      if (!scale.has_value() || !std::isfinite(*scale) || *scale <= 0.0f) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " expert " << expert_index
+                  << " missing or invalid " << scale_name << "\n";
+        return false;
+      }
+      return true;
+    };
+    const auto validate_projection_descriptor =
+        [&](std::size_t expert_index,
+            const char* projection_name,
+            const GemmDescriptor& descriptor,
+            std::size_t expected_output_rows,
+            std::size_t expected_input_cols) -> bool {
+      if (descriptor.kernel_family != GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " expert " << expert_index
+                  << " " << projection_name
+                  << " kernel family " << ToString(descriptor.kernel_family)
+                  << " is unsupported for grouped routed NVFP4\n";
+        return false;
+      }
+      if (descriptor.storage_dtype != "nvfp4_e2m1" ||
+          descriptor.compute_dtype != "fp32_accum" ||
+          descriptor.layout_tag != "cublaslt_fp4_tn_v1") {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " expert " << expert_index
+                  << " " << projection_name
+                  << " descriptor layout/storage is unsupported: storage="
+                  << descriptor.storage_dtype
+                  << " compute=" << descriptor.compute_dtype
+                  << " layout=" << descriptor.layout_tag << "\n";
+        return false;
+      }
+      if (descriptor.output_rows != expected_output_rows ||
+          descriptor.input_cols != expected_input_cols) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " expert " << expert_index
+                  << " " << projection_name
+                  << " dimension mismatch: got="
+                  << descriptor.output_rows << "x" << descriptor.input_cols
+                  << " expected=" << expected_output_rows
+                  << "x" << expected_input_cols << "\n";
+        return false;
+      }
+      const std::size_t expected_packed_nbytes =
+          PackedFp4Bytes(expected_output_rows, expected_input_cols);
+      const std::size_t expected_block_scale_nbytes =
+          RowMajorNvfp4ScaleBytes(expected_output_rows, expected_input_cols);
+      const std::size_t expected_matmul_scale_nbytes =
+          ExecutionNvfp4ScaleBytes(expected_output_rows, expected_input_cols);
+      if (expected_block_scale_nbytes == 0 ||
+          expected_matmul_scale_nbytes == 0 ||
+          descriptor.packed_data == nullptr ||
+          descriptor.block_scales_data == nullptr ||
+          descriptor.tensor_scale_data == nullptr ||
+          descriptor.packed_nbytes != expected_packed_nbytes ||
+          descriptor.block_scales_nbytes != expected_block_scale_nbytes ||
+          descriptor.tensor_scale_nbytes != sizeof(float)) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " expert " << expert_index
+                  << " " << projection_name
+                  << " NVFP4 descriptor bytes mismatch: packed="
+                  << descriptor.packed_nbytes << " expected_packed="
+                  << expected_packed_nbytes << " block_scales="
+                  << descriptor.block_scales_nbytes
+                  << " expected_block_scales=" << expected_block_scale_nbytes
+                  << " tensor_scale_bytes=" << descriptor.tensor_scale_nbytes
+                  << " expected_tensor_scale_bytes=" << sizeof(float)
+                  << " expected_matmul_scales=" << expected_matmul_scale_nbytes
+                  << "\n";
+        return false;
+      }
+      return true;
+    };
+
+    if (trace != nullptr) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPrereqFallback();
       return GroupedRoutedResult::kFallback;
+    }
+
+    if (impl.routed_backend_kind != RoutedMoEBackendKind::kCustomFused) {
+      return grouped_fatal(
+          std::string("resolved backend=") + ToString(impl.routed_backend_kind) +
+          " expected=custom_fused");
+    }
+    if (!impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
+      return grouped_fatal("grouped_routed_nvfp4_enabled=false on frozen custom fused path");
+    }
+    if (!latent_input_row.valid() ||
+        latent_input_row.numel() != impl.config.moe_latent_size) {
+      return grouped_fatal(
+          std::string("latent input row shape unsupported: numel=") +
+          std::to_string(latent_input_row.numel()) +
+          " expected=" + std::to_string(impl.config.moe_latent_size));
+    }
+    if (routed_accumulator == nullptr ||
+        !routed_accumulator->valid() ||
+        routed_accumulator->numel() != impl.config.moe_latent_size) {
+      return grouped_fatal(
+          std::string("routed accumulator shape unsupported: numel=") +
+          std::to_string(
+              routed_accumulator != nullptr && routed_accumulator->valid()
+                  ? routed_accumulator->numel()
+                  : 0) +
+          " expected=" + std::to_string(impl.config.moe_latent_size));
+    }
+    if (selected_indices_device == nullptr || selected_weights_device == nullptr) {
+      return grouped_fatal("missing selected expert indices or weights");
+    }
+
+    const std::size_t expected_top_k = static_cast<std::size_t>(impl.config.top_k);
+    const std::size_t routed_expert_count = impl.routed_experts.size();
+    if (expected_top_k == 0 ||
+        batch_count == 0 ||
+        batch_count != expected_top_k ||
+        batch_count > routed_expert_count) {
+      return grouped_fatal(
+          std::string("unsupported batch_count/top_k relationship: batch_count=") +
+          std::to_string(batch_count) +
+          " top_k=" + std::to_string(expected_top_k) +
+          " routed_experts=" + std::to_string(routed_expert_count));
+    }
+    if (routed_expert_count != static_cast<std::size_t>(impl.config.n_routed_experts)) {
+      return grouped_fatal(
+          std::string("routed expert table size mismatch: table=") +
+          std::to_string(routed_expert_count) +
+          " config=" + std::to_string(impl.config.n_routed_experts));
+    }
+    if (impl.config.moe_latent_size == 0 ||
+        impl.config.routed_expert_intermediate_size == 0 ||
+        impl.config.moe_latent_size % kNvfp4BlockWidth != 0 ||
+        impl.config.routed_expert_intermediate_size % kNvfp4BlockWidth != 0) {
+      return grouped_fatal(
+          std::string("NVFP4 dimensions must be positive multiples of ") +
+          std::to_string(kNvfp4BlockWidth) +
+          ": latent=" + std::to_string(impl.config.moe_latent_size) +
+          " intermediate=" + std::to_string(impl.config.routed_expert_intermediate_size));
     }
 
     const std::size_t down_act_packed_row_stride =
         Nvfp4AlignedPackedRowBytes(impl.config.routed_expert_intermediate_size);
     const std::size_t latent_packed_row_stride =
         Nvfp4PackedRowBytes(impl.config.moe_latent_size);
+    const std::size_t latent_block_scales_per_row =
+        impl.config.moe_latent_size / kNvfp4BlockWidth;
+    const std::size_t down_act_block_scales_per_row =
+        impl.config.routed_expert_intermediate_size / kNvfp4BlockWidth;
+    const std::size_t latent_matmul_scale_row_bytes =
+        ExecutionNvfp4ScaleBytes(1, impl.config.moe_latent_size);
+    const std::size_t down_act_matmul_scale_row_bytes =
+        ExecutionNvfp4ScaleBytes(1, impl.config.routed_expert_intermediate_size);
+    if (latent_packed_row_stride == 0 ||
+        down_act_packed_row_stride == 0 ||
+        latent_matmul_scale_row_bytes == 0 ||
+        down_act_matmul_scale_row_bytes == 0) {
+      return grouped_fatal(
+          std::string("failed to derive NVFP4 execution layout: latent_packed_row_stride=") +
+          std::to_string(latent_packed_row_stride) +
+          " down_act_packed_row_stride=" + std::to_string(down_act_packed_row_stride) +
+          " latent_matmul_scale_row_bytes=" + std::to_string(latent_matmul_scale_row_bytes) +
+          " down_act_matmul_scale_row_bytes=" + std::to_string(down_act_matmul_scale_row_bytes));
+    }
+    if (down_act_packed_row_stride % kCutlassAlign != 0) {
+      return grouped_fatal(
+          std::string("down-activation packed row stride violates alignment: stride=") +
+          std::to_string(down_act_packed_row_stride) +
+          " required_multiple=" + std::to_string(kCutlassAlign));
+    }
+
+    const std::size_t latent_packed_bytes = batch_count * latent_packed_row_stride;
+    const std::size_t latent_block_scale_bytes = batch_count * latent_block_scales_per_row;
+    const std::size_t latent_matmul_scale_bytes = batch_count * latent_matmul_scale_row_bytes;
+    const std::size_t down_act_packed_bytes = batch_count * down_act_packed_row_stride;
+    const std::size_t down_act_block_scale_bytes = batch_count * down_act_block_scales_per_row;
+    const std::size_t down_act_matmul_scale_bytes =
+        batch_count * down_act_matmul_scale_row_bytes;
+    const std::size_t down_output_count = batch_count * impl.config.moe_latent_size;
     const bool use_strided_contiguous_weights = impl.experts_contiguous;
     // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
     const bool try_cutlass_single_token = false;
 
+    if (!require_buffer_capacity(
+            "routed_up_input_scale_lookup_device",
+            impl.routed_up_input_scale_lookup_device,
+            routed_expert_count) ||
+        !require_buffer_capacity(
+            "routed_up_tensor_scale_lookup_device",
+            impl.routed_up_tensor_scale_lookup_device,
+            routed_expert_count) ||
+        !require_buffer_capacity(
+            "routed_down_input_scale_lookup_device",
+            impl.routed_down_input_scale_lookup_device,
+            routed_expert_count) ||
+        !require_buffer_capacity(
+            "routed_down_tensor_scale_lookup_device",
+            impl.routed_down_tensor_scale_lookup_device,
+            routed_expert_count) ||
+        !require_buffer_capacity(
+            "scratch_selected_up_input_scales",
+            impl.scratch_selected_up_input_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_selected_up_tensor_scales",
+            impl.scratch_selected_up_tensor_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_selected_down_input_scales",
+            impl.scratch_selected_down_input_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_selected_down_tensor_scales",
+            impl.scratch_selected_down_tensor_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_latent_packed_data",
+            impl.scratch_latent_packed_data,
+            latent_packed_bytes) ||
+        !require_buffer_capacity(
+            "scratch_latent_block_scales",
+            impl.scratch_latent_block_scales,
+            latent_block_scale_bytes) ||
+        !require_buffer_capacity(
+            "scratch_latent_matmul_scales",
+            impl.scratch_latent_matmul_scales,
+            latent_matmul_scale_bytes) ||
+        !require_buffer_capacity(
+            "scratch_latent_tensor_scales",
+            impl.scratch_latent_tensor_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_global_max_bits",
+            impl.scratch_global_max_bits,
+            1) ||
+        !require_buffer_capacity(
+            "scratch_down_act_packed",
+            impl.scratch_down_act_packed,
+            down_act_packed_bytes) ||
+        !require_buffer_capacity(
+            "scratch_down_act_block_scales",
+            impl.scratch_down_act_block_scales,
+            down_act_block_scale_bytes) ||
+        !require_buffer_capacity(
+            "scratch_down_act_matmul_scales",
+            impl.scratch_down_act_matmul_scales,
+            down_act_matmul_scale_bytes) ||
+        !require_buffer_capacity(
+            "scratch_down_act_tensor_scales",
+            impl.scratch_down_act_tensor_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_row_scales",
+            impl.scratch_row_scales,
+            batch_count) ||
+        !require_buffer_capacity(
+            "scratch_down_proj_per_expert",
+            impl.scratch_down_proj_per_expert,
+            down_output_count)) {
+      return GroupedRoutedResult::kFatal;
+    }
+    if (use_strided_contiguous_weights) {
+      const std::size_t expected_up_packed_stride_bytes =
+          PackedFp4Bytes(
+              impl.config.routed_expert_intermediate_size,
+              impl.config.moe_latent_size);
+      const std::size_t expected_up_block_scale_stride_bytes =
+          RowMajorNvfp4ScaleBytes(
+              impl.config.routed_expert_intermediate_size,
+              impl.config.moe_latent_size);
+      const std::size_t expected_up_matmul_scale_stride_bytes =
+          ExecutionNvfp4ScaleBytes(
+              impl.config.routed_expert_intermediate_size,
+              impl.config.moe_latent_size);
+      const std::size_t expected_down_packed_stride_bytes =
+          PackedFp4Bytes(
+              impl.config.moe_latent_size,
+              impl.config.routed_expert_intermediate_size);
+      const std::size_t expected_down_block_scale_stride_bytes =
+          RowMajorNvfp4ScaleBytes(
+              impl.config.moe_latent_size,
+              impl.config.routed_expert_intermediate_size);
+      const std::size_t expected_down_matmul_scale_stride_bytes =
+          ExecutionNvfp4ScaleBytes(
+              impl.config.moe_latent_size,
+              impl.config.routed_expert_intermediate_size);
+      if (!impl.all_routed_lookups_ready) {
+        return grouped_fatal("contiguous routed lookup tables are not fully materialized");
+      }
+      if (impl.contiguous_up_packed_stride_bytes != expected_up_packed_stride_bytes ||
+          impl.contiguous_up_block_scale_stride_bytes != expected_up_block_scale_stride_bytes ||
+          impl.contiguous_up_matmul_scale_stride_bytes != expected_up_matmul_scale_stride_bytes ||
+          impl.contiguous_down_packed_stride_bytes != expected_down_packed_stride_bytes ||
+          impl.contiguous_down_block_scale_stride_bytes != expected_down_block_scale_stride_bytes ||
+          impl.contiguous_down_matmul_scale_stride_bytes != expected_down_matmul_scale_stride_bytes) {
+        return grouped_fatal(
+            std::string("contiguous routed weight stride mismatch: up_packed=") +
+            std::to_string(impl.contiguous_up_packed_stride_bytes) +
+            " expected_up_packed=" + std::to_string(expected_up_packed_stride_bytes) +
+            " up_block_scales=" + std::to_string(impl.contiguous_up_block_scale_stride_bytes) +
+            " expected_up_block_scales=" +
+            std::to_string(expected_up_block_scale_stride_bytes) +
+            " up_matmul_scales=" + std::to_string(impl.contiguous_up_matmul_scale_stride_bytes) +
+            " expected_up_matmul_scales=" +
+            std::to_string(expected_up_matmul_scale_stride_bytes) +
+            " down_packed=" + std::to_string(impl.contiguous_down_packed_stride_bytes) +
+            " expected_down_packed=" + std::to_string(expected_down_packed_stride_bytes) +
+            " down_block_scales=" +
+            std::to_string(impl.contiguous_down_block_scale_stride_bytes) +
+            " expected_down_block_scales=" +
+            std::to_string(expected_down_block_scale_stride_bytes) +
+            " down_matmul_scales=" +
+            std::to_string(impl.contiguous_down_matmul_scale_stride_bytes) +
+            " expected_down_matmul_scales=" +
+            std::to_string(expected_down_matmul_scale_stride_bytes));
+      }
+      if (!require_buffer_capacity(
+              "contiguous_up_packed",
+              impl.contiguous_up_packed,
+              routed_expert_count * expected_up_packed_stride_bytes) ||
+          !require_buffer_capacity(
+              "contiguous_up_block_scales",
+              impl.contiguous_up_block_scales,
+              routed_expert_count * expected_up_block_scale_stride_bytes) ||
+          !require_buffer_capacity(
+              "contiguous_up_matmul_scales",
+              impl.contiguous_up_matmul_scales,
+              routed_expert_count * expected_up_matmul_scale_stride_bytes) ||
+          !require_buffer_capacity(
+              "contiguous_up_tensor_scales",
+              impl.contiguous_up_tensor_scales,
+              routed_expert_count) ||
+          !require_buffer_capacity(
+              "contiguous_down_packed",
+              impl.contiguous_down_packed,
+              routed_expert_count * expected_down_packed_stride_bytes) ||
+          !require_buffer_capacity(
+              "contiguous_down_block_scales",
+              impl.contiguous_down_block_scales,
+              routed_expert_count * expected_down_block_scale_stride_bytes) ||
+          !require_buffer_capacity(
+              "contiguous_down_matmul_scales",
+              impl.contiguous_down_matmul_scales,
+              routed_expert_count * expected_down_matmul_scale_stride_bytes) ||
+          !require_buffer_capacity(
+              "contiguous_down_tensor_scales",
+              impl.contiguous_down_tensor_scales,
+              routed_expert_count)) {
+        return GroupedRoutedResult::kFatal;
+      }
+    } else if (!require_buffer_capacity(
+                   "routed_up_packed_lookup_device",
+                   impl.routed_up_packed_lookup_device,
+                   routed_expert_count) ||
+               !require_buffer_capacity(
+                   "routed_up_raw_scale_lookup_device",
+                   impl.routed_up_raw_scale_lookup_device,
+                   routed_expert_count) ||
+               !require_buffer_capacity(
+                   "routed_up_matmul_scale_lookup_device",
+                   impl.routed_up_matmul_scale_lookup_device,
+                   routed_expert_count) ||
+               !require_buffer_capacity(
+                   "routed_down_packed_lookup_device",
+                   impl.routed_down_packed_lookup_device,
+                   routed_expert_count) ||
+               !require_buffer_capacity(
+                   "routed_down_raw_scale_lookup_device",
+                   impl.routed_down_raw_scale_lookup_device,
+                   routed_expert_count) ||
+               !require_buffer_capacity(
+                   "routed_down_matmul_scale_lookup_device",
+                   impl.routed_down_matmul_scale_lookup_device,
+                   routed_expert_count) ||
+               !require_buffer_capacity(
+                   "scratch_up_packed_ptrs",
+                   impl.scratch_up_packed_ptrs,
+                   batch_count) ||
+               !require_buffer_capacity(
+                   "scratch_up_raw_scale_ptrs",
+                   impl.scratch_up_raw_scale_ptrs,
+                   batch_count) ||
+               !require_buffer_capacity(
+                   "scratch_up_matmul_scale_ptrs",
+                   impl.scratch_up_matmul_scale_ptrs,
+                   batch_count) ||
+               !require_buffer_capacity(
+                   "scratch_down_packed_ptrs",
+                   impl.scratch_down_packed_ptrs,
+                   batch_count) ||
+               !require_buffer_capacity(
+                   "scratch_down_raw_scale_ptrs",
+                   impl.scratch_down_raw_scale_ptrs,
+                   batch_count) ||
+               !require_buffer_capacity(
+                   "scratch_down_matmul_scale_ptrs",
+                   impl.scratch_down_matmul_scale_ptrs,
+                   batch_count) ||
+               !require_buffer_capacity(
+                   "scratch_missing_count",
+                   impl.scratch_missing_count,
+                   1) ||
+               !require_buffer_capacity(
+                   "scratch_missing_indices",
+                   impl.scratch_missing_indices,
+                   batch_count)) {
+      return GroupedRoutedResult::kFatal;
+    }
+
+    if (!ensure_selection_metadata_host()) {
+      return grouped_fatal("failed to download selected expert metadata for grouped validation");
+    }
+    for (std::size_t selection_index = 0; selection_index < batch_count; ++selection_index) {
+      const std::size_t metadata_index = token_index * expected_top_k + selection_index;
+      if (metadata_index >= selected_indices_host.size()) {
+        return grouped_fatal(
+            std::string("selection metadata index out of range: token=") +
+            std::to_string(token_index) +
+            " selection=" + std::to_string(selection_index) +
+            " metadata_index=" + std::to_string(metadata_index) +
+            " host_size=" + std::to_string(selected_indices_host.size()));
+      }
+      const std::int32_t selected_expert = selected_indices_host[metadata_index];
+      if (selected_expert < 0 ||
+          static_cast<std::size_t>(selected_expert) >= routed_expert_count) {
+        return grouped_fatal(
+            std::string("selected expert index out of range: expert=") +
+            std::to_string(selected_expert) +
+            " routed_experts=" + std::to_string(routed_expert_count));
+      }
+      const std::size_t expert_index = static_cast<std::size_t>(selected_expert);
+      const auto& entry = impl.routed_experts[expert_index];
+      if (!validate_scale(expert_index, "up_input_scale", entry.up_input_scale) ||
+          !validate_scale(expert_index, "up_tensor_scale", entry.up_tensor_scale) ||
+          !validate_scale(expert_index, "down_input_scale", entry.down_input_scale) ||
+          !validate_scale(expert_index, "down_tensor_scale", entry.down_tensor_scale) ||
+          !validate_projection_descriptor(
+              expert_index,
+              "up_proj",
+              entry.up_descriptor,
+              impl.config.routed_expert_intermediate_size,
+              impl.config.moe_latent_size) ||
+          !validate_projection_descriptor(
+              expert_index,
+              "down_proj",
+              entry.down_descriptor,
+              impl.config.moe_latent_size,
+              impl.config.routed_expert_intermediate_size)) {
+        return GroupedRoutedResult::kFatal;
+      }
+      if (use_strided_contiguous_weights) {
+        if (!entry.grouped_lookup_ready) {
+          return grouped_fatal(
+              std::string("contiguous routed lookup entry not initialized for expert=") +
+              std::to_string(expert_index));
+        }
+        continue;
+      }
+      const auto* materialized_entry = ensure_routed_expert_materialized(expert_index);
+      if (materialized_entry == nullptr ||
+          materialized_entry->up_proj == nullptr ||
+          materialized_entry->down_proj == nullptr ||
+          !materialized_entry->up_proj->valid() ||
+          !materialized_entry->down_proj->valid() ||
+          materialized_entry->up_proj->kernel_family() !=
+              GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
+          materialized_entry->down_proj->kernel_family() !=
+              GemmKernelFamily::kCublasLtNvfp4BlockScaled ||
+          materialized_entry->up_proj->output_rows() !=
+              impl.config.routed_expert_intermediate_size ||
+          materialized_entry->up_proj->input_cols() != impl.config.moe_latent_size ||
+          materialized_entry->down_proj->output_rows() != impl.config.moe_latent_size ||
+          materialized_entry->down_proj->input_cols() !=
+              impl.config.routed_expert_intermediate_size) {
+        return grouped_fatal(
+            std::string("selected routed expert weights are not materialized for grouped NVFP4: expert=") +
+            std::to_string(expert_index));
+      }
+      if (!materialized_entry->grouped_lookup_ready &&
+          !ensure_routed_nvfp4_lookup_ready(expert_index)) {
+        return grouped_fatal(
+            std::string("selected routed expert lookup materialization failed: expert=") +
+            std::to_string(expert_index));
+      }
+      if (!impl.routed_experts[expert_index].grouped_lookup_ready) {
+        return grouped_fatal(
+            std::string("selected routed expert lookup is unavailable after materialization: expert=") +
+            std::to_string(expert_index));
+      }
+    }
+
     // FROZEN: direct custom grouped fused kernels only -- graph replay disabled.
 #if 0
-    const std::size_t latent_matmul_scale_row_bytes =
-        ExecutionNvfp4ScaleBytes(1, impl.config.moe_latent_size);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool outer_stream_capturing =
         stream != nullptr &&
@@ -4195,18 +4702,16 @@ bool RunExpertLayerImpl(
               impl.scratch_selected_down_tensor_scales,
               impl.scratch_missing_count,
               impl.scratch_missing_indices)) {
-        RecordGroupedRoutedExpertFastpathFallback();
-        RecordGroupedRoutedExpertLookupFallback();
-        return GroupedRoutedResult::kFallback;
+        return grouped_fatal(
+            std::string("failed to gather selected routed lookup pointers for batch_count=") +
+            std::to_string(batch_count));
       }
       std::uint32_t missing_lookup_count = 0;
       if (!repair_missing_routed_lookups(
               impl.scratch_missing_count,
               impl.scratch_missing_indices,
               &missing_lookup_count)) {
-        RecordGroupedRoutedExpertFastpathFallback();
-        RecordGroupedRoutedExpertLookupFallback();
-        return GroupedRoutedResult::kFallback;
+        return grouped_fatal("failed to repair selected routed lookup entries");
       }
       if (missing_lookup_count != 0) {
         if ((!maybe_prefetch_routed_lookups(token_index) && routed_prefetch_topn != 0) ||
@@ -4237,14 +4742,9 @@ bool RunExpertLayerImpl(
                 impl.scratch_missing_indices,
                 &missing_lookup_count) ||
             missing_lookup_count != 0) {
-          if (debug) {
-            std::cerr << "expert_layer: layer " << impl.config.layer_index
-                      << " routed fastpath missing " << missing_lookup_count
-                      << " selected lookup entries after lazy materialization\n";
-          }
-          RecordGroupedRoutedExpertFastpathFallback();
-          RecordGroupedRoutedExpertLookupFallback();
-          return GroupedRoutedResult::kFallback;
+          return grouped_fatal(
+              std::string("selected routed lookup entries remain unavailable after lazy materialization: missing=") +
+              std::to_string(missing_lookup_count));
         }
       }
     }
@@ -4256,9 +4756,7 @@ bool RunExpertLayerImpl(
             batch_count,
             impl.scratch_selected_up_input_scales,
             stream)) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertLookupFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal("failed to gather selected routed up input scales");
     }
 
     bool pack_ok = false;
@@ -4290,12 +4788,13 @@ bool RunExpertLayerImpl(
                     stream);
               }
             })) {
-      return GroupedRoutedResult::kFatal;
+      return grouped_fatal("profiling wrapper failed during latent NVFP4 packing");
     }
     if (!pack_ok) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertPackFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal(
+          std::string("latent NVFP4 packing failed: batch_count=") +
+          std::to_string(batch_count) +
+          " latent=" + std::to_string(impl.config.moe_latent_size));
     }
 
     std::unique_ptr<DeviceTensorFp32> grouped_up;
@@ -4314,9 +4813,10 @@ bool RunExpertLayerImpl(
       });
     }
     if (!grouped_up || !grouped_up->valid()) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertPackFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal(
+          std::string("failed to allocate grouped routed up scratch: rows=") +
+          std::to_string(batch_count) +
+          " cols=" + std::to_string(impl.config.routed_expert_intermediate_size));
     }
     bool cutlass_up_ok = false;
     // FROZEN: direct custom grouped fused kernels only -- alternate backends disabled.
@@ -4409,16 +4909,15 @@ bool RunExpertLayerImpl(
                                       latent_packed_row_stride,
                                       stream);
                    })) {
-      return GroupedRoutedResult::kFatal;
+      return grouped_fatal("profiling wrapper failed during routed up fused kernel");
     }
     if (!up_ok) {
-      if (debug) {
-        std::cerr << "expert_layer: layer " << impl.config.layer_index
-                  << " routed fastpath up kernel launch failed\n";
-      }
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertMatmulFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal(
+          std::string("routed up fused kernel launch failed: batch_count=") +
+          std::to_string(batch_count) +
+          " latent=" + std::to_string(impl.config.moe_latent_size) +
+          " intermediate=" +
+          std::to_string(impl.config.routed_expert_intermediate_size));
     }
 
     bool relu2_pack_ok = false;
@@ -4429,9 +4928,7 @@ bool RunExpertLayerImpl(
             batch_count,
             impl.scratch_selected_down_input_scales,
             stream)) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertLookupFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal("failed to gather selected routed down input scales");
     }
     if (!measure_stage(
             ExpertSubLayerStage::kRelu2Pack,
@@ -4448,24 +4945,26 @@ bool RunExpertLayerImpl(
                   stream,
                   impl.scratch_selected_down_input_scales.data());
             })) {
-      return GroupedRoutedResult::kFatal;
+      return grouped_fatal("profiling wrapper failed during routed relu2 NVFP4 packing");
     }
     if (!relu2_pack_ok) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertMergeFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal(
+          std::string("routed relu2 NVFP4 packing failed: batch_count=") +
+          std::to_string(batch_count) +
+          " intermediate=" +
+          std::to_string(impl.config.routed_expert_intermediate_size));
     }
 
-    const std::size_t down_output_count = batch_count * impl.config.moe_latent_size;
     auto down_output = DeviceTensorFp32::CreateView(
         {batch_count, impl.config.moe_latent_size},
         impl.scratch_down_proj_per_expert.data());
     if (!down_output || !down_output->valid() ||
         !impl.scratch_down_proj_per_expert.valid() ||
         impl.scratch_down_proj_per_expert.count() < down_output_count) {
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertMatmulFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal(
+          std::string("routed down output scratch is undersized: have=") +
+          std::to_string(buffer_capacity(impl.scratch_down_proj_per_expert)) +
+          " need=" + std::to_string(down_output_count));
     }
 
     bool cutlass_down_ok = false;
@@ -4602,16 +5101,15 @@ bool RunExpertLayerImpl(
                                       down_act_packed_row_stride,
                                       stream);
                    })) {
-      return GroupedRoutedResult::kFatal;
+      return grouped_fatal("profiling wrapper failed during routed down fused kernel");
     }
     if (!down_ok) {
-      if (debug) {
-        std::cerr << "expert_layer: layer " << impl.config.layer_index
-                  << " routed fastpath down kernel launch failed\n";
-      }
-      RecordGroupedRoutedExpertFastpathFallback();
-      RecordGroupedRoutedExpertMatmulFallback();
-      return GroupedRoutedResult::kFallback;
+      return grouped_fatal(
+          std::string("routed down fused kernel launch failed: batch_count=") +
+          std::to_string(batch_count) +
+          " latent=" + std::to_string(impl.config.moe_latent_size) +
+          " intermediate=" +
+          std::to_string(impl.config.routed_expert_intermediate_size));
     }
 
     if (!cutlass_down_ok) {
@@ -4623,13 +5121,7 @@ bool RunExpertLayerImpl(
               batch_count,
               impl.scratch_selected_down_tensor_scales,
               stream)) {
-        if (debug) {
-          std::cerr << "expert_layer: layer " << impl.config.layer_index
-                    << " routed fastpath down scale gather failed\n";
-        }
-        RecordGroupedRoutedExpertFastpathFallback();
-        RecordGroupedRoutedExpertMergeFallback();
-        return GroupedRoutedResult::kFallback;
+        return grouped_fatal("failed to gather contiguous routed down tensor scales");
       }
 
       bool weighted_merge_ok = false;
@@ -4657,16 +5149,12 @@ bool RunExpertLayerImpl(
                       stream);
                 }
               })) {
-        return GroupedRoutedResult::kFatal;
+        return grouped_fatal("profiling wrapper failed during routed weighted merge");
       }
       if (!weighted_merge_ok) {
-        if (debug) {
-          std::cerr << "expert_layer: layer " << impl.config.layer_index
-                    << " routed fastpath weighted merge failed\n";
-        }
-        RecordGroupedRoutedExpertFastpathFallback();
-        RecordGroupedRoutedExpertMergeFallback();
-        return GroupedRoutedResult::kFallback;
+        return grouped_fatal(
+            std::string("routed weighted merge failed: batch_count=") +
+            std::to_string(batch_count));
       }
     }
 
@@ -4682,6 +5170,13 @@ bool RunExpertLayerImpl(
           const float* selected_weights_device,
     std::size_t batch_count) -> GroupedRoutedResult {
     (void)expert_sublayer_profile_enabled;
+    if (impl.routed_backend_kind != RoutedMoEBackendKind::kCustomFused) {
+      std::cerr << "expert_layer: layer " << impl.config.layer_index
+                << " routed fastpath dispatch resolved backend "
+                << ToString(impl.routed_backend_kind)
+                << ", expected custom_fused\n";
+      return GroupedRoutedResult::kFatal;
+    }
     return try_grouped_routed_single_token(
         token_index,
         latent_input_row,
