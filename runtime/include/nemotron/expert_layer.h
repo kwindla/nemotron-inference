@@ -67,8 +67,8 @@ struct ExpertLayerBindings {
 struct ExpertLayerPreparedExpert {
   GemmDescriptor up_descriptor;
   GemmDescriptor down_descriptor;
-  // Routed NVFP4 runtime paths consume the fused effective tensor scale
-  // resolved as checkpoint-side input_scale * runtime weight_scale_2.
+  // Routed NVFP4 tensor scale is raw weight_scale_2 from checkpoint.
+  // Kernel alpha = dynamic_activation_scale * weight_scale_2.
   std::optional<float> up_tensor_scale;
   std::optional<float> down_tensor_scale;
   std::optional<float> up_input_scale;

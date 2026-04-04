@@ -246,17 +246,13 @@ std::optional<float> ReadRoutedNvfp4InputScale(
 std::optional<float> ReadNvfp4CacheTensorScale(
     const GemmDescriptor& descriptor,
     const KernelCatalog& kernel_catalog) {
-  if (!IsRoutedExpertTensorName(descriptor.tensor_name)) {
-    // Shared-down NVFP4 has no separate input_scale tensor, so its on-disk
-    // aux2 scalar keeps the raw weight_scale_2 contract.
-    return ReadTensorScaleHost(descriptor);
-  }
-
-  // Routed NVFP4 cache entries persist the serving-time tensor scale consumed
-  // by matmul so cache-backed execution matches the live runtime contract.
-  return ResolveRoutedNvfp4RuntimeTensorScale(
-      descriptor,
-      ReadRoutedNvfp4InputScale(descriptor, kernel_catalog));
+  // All NVFP4 entries (routed and shared-down) persist raw weight_scale_2.
+  // The kernel alpha is formed at serving time as:
+  //   dynamic_activation_scale * weight_scale_2
+  // where dynamic_activation_scale comes from NVFP4 packing of the latent
+  // activation. The checkpoint input_scale is NOT fused here.
+  (void)kernel_catalog;
+  return ReadTensorScaleHost(descriptor);
 }
 
 bool ShouldPreloadCacheEntry(const ModelCacheEntry& entry) {
@@ -1412,31 +1408,14 @@ std::unique_ptr<UploadedLinearOp> LoadedModelCache::CreateNvfp4LinearView(
     return nullptr;
   }
   if (tensor_scale_override.has_value()) {
-    // The routed-expert prepare path still recomputes fused
-    // input_scale * weight_scale_2 from live descriptors and passes it here as
-    // a compatibility check. Cache aux2 remains authoritative for v6 entries,
-    // so this path validates parity instead of mutating the cached scalar.
+    // Allow callers to override the on-disk aux2 scalar for debug/compatibility.
+    // Normal serving should not use this — cache aux2 (raw weight_scale_2) is
+    // the authoritative serving-time weight tensor scale.
     const float value = *tensor_scale_override;
     if (!std::isfinite(value) || value <= 0.0f) {
       return nullptr;
     }
-    if (!IsRoutedExpertTensorName(descriptor.tensor_name)) {
-      std::cerr << "model_cache: refusing tensor_scale_override for non-routed NVFP4 entry "
-                << descriptor.tensor_name
-                << "; overrides are restricted to routed-expert compatibility validation.\n";
-      return nullptr;
-    }
-    float cached_value = 0.0f;
-    if (cudaMemcpy(&cached_value, Aux2Ptr(entry), sizeof(cached_value), cudaMemcpyDeviceToHost) != cudaSuccess) {
-      return nullptr;
-    }
-    if (!Nvfp4TensorScalesMatch(value, cached_value)) {
-      std::cerr << "model_cache: refusing tensor_scale_override for " << descriptor.tensor_name
-                << " because cached aux2=" << cached_value
-                << " does not match requested value=" << value
-                << "; NVFP4 cache aux2 is authoritative for cache-backed serving.\n";
-      return nullptr;
-    }
+    std::memcpy(Aux2Ptr(entry), &value, sizeof(value));
   }
   auto weight = DeviceNvfp4Weight::CreateView(
       entry->output_rows,

@@ -779,3 +779,11 @@ target_link_libraries(single_token_forward_model_test PRIVATE nemotron_runtime_a
 target_compile_features(single_token_forward_model_test PRIVATE cxx_std_17)
 
 nemotron_add_test(single_token_forward_model_test)
+
+add_executable(prompt_matched_parity_test api/prompt_matched_parity_test.cpp)
+target_link_libraries(prompt_matched_parity_test PRIVATE nemotron_runtime_api)
+target_compile_features(prompt_matched_parity_test PRIVATE cxx_std_17)
+target_compile_definitions(prompt_matched_parity_test PRIVATE
+  NEMOTRON_PROMPT_MATCHED_PARITY_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/full_model_single_token_short_chat_cuda_v3"
+)
+nemotron_add_test(prompt_matched_parity_test)

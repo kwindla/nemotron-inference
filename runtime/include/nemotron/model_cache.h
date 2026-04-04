@@ -21,10 +21,10 @@
 
 namespace nemotron {
 
-// v6 changes the on-disk NVFP4 aux2 scalar contract for routed experts:
-// routed entries now store effective_tensor_scale = input_scale * weight_scale_2,
-// while shared-down entries continue to store raw weight_scale_2.
-constexpr std::uint32_t kModelCacheFormatVersion = 6;
+// v5 cache format: NVFP4 aux2 stores raw weight_scale_2 for all entries
+// (both routed and shared-down). The runtime kernel alpha is computed as
+// dynamic_activation_scale * weight_scale_2 at serving time.
+constexpr std::uint32_t kModelCacheFormatVersion = 5;
 
 // Each entry kind defines both its on-disk section layout (`payload`, `aux0`,
 // `aux1`, `aux2`) and the serving-time scalar metadata that cache-backed view
@@ -76,11 +76,14 @@ enum class ModelCacheEntryKind : std::uint32_t {
   // aux0 is retained as the raw block-scale side buffer, not as the matmul
   // block-scale surface.
   // NVFP4 sub-contracts:
-  //   routed expert NVFP4: aux2 = effective_tensor_scale =
-  //       input_scale * weight_scale_2
-  //   shared-down NVFP4: aux2 = raw weight_scale_2 (current live
-  //       cache/runtime contract; higher-level semantics remain potentially
-  //       ambiguous because there is no separate input-scale fusion here)
+  //   routed expert NVFP4: aux2 = raw weight_scale_2 from checkpoint.
+  //       The kernel alpha is formed at serving time as:
+  //       dynamic_activation_scale * weight_scale_2
+  //       where dynamic_activation_scale comes from NVFP4 packing of the
+  //       latent activation. Checkpoint input_scale is NOT fused here;
+  //       vLLM uses it during activation quantization (a_gscale = 1/input_scale)
+  //       which this runtime handles differently (purely dynamic).
+  //   shared-down NVFP4: aux2 = raw weight_scale_2 (same contract)
   kNvfp4Aligned = 5,
 
   // Native scaled-FP8 entry.

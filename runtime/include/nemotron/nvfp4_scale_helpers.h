@@ -25,11 +25,16 @@ inline std::optional<float> ResolveRoutedNvfp4RuntimeTensorScale(
     return std::nullopt;
   }
 
-  const float effective_tensor_scale = (*input_scale) * weight_scale_2;
-  if (!std::isfinite(effective_tensor_scale) || effective_tensor_scale <= 0.0f) {
+  // The kernel alpha path consumes: activation_dynamic_scale * weight_scale_2
+  // where activation_dynamic_scale comes from NVFP4 packing of the latent
+  // activation (scratch_latent_tensor_scale). The checkpoint input_scale is
+  // NOT fused into this value — it is a separate quantity used elsewhere.
+  // See vLLM reference: g1_alphas = a13_scale * w13_scale_2
+  (void)input_scale;
+  if (!std::isfinite(weight_scale_2) || weight_scale_2 <= 0.0f) {
     return std::nullopt;
   }
-  return effective_tensor_scale;
+  return weight_scale_2;
 }
 
 }  // namespace nemotron
