@@ -5,8 +5,17 @@ elseif(EXISTS "/usr/local/cuda-13.2/compat")
   set(NEMOTRON_TEST_ENVIRONMENT "LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 function(nemotron_add_test name)
   add_test(NAME ${name} COMMAND ${name})
+  if(NEMOTRON_TEST_ENVIRONMENT)
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${NEMOTRON_TEST_ENVIRONMENT}")
+  endif()
+endfunction()
+
+function(nemotron_add_python_test name script)
+  add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/${script})
   if(NEMOTRON_TEST_ENVIRONMENT)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${NEMOTRON_TEST_ENVIRONMENT}")
   endif()
@@ -81,6 +90,11 @@ target_link_libraries(manifest_io_test PRIVATE nemotron_runtime_loader nemotron_
 target_compile_features(manifest_io_test PRIVATE cxx_std_17)
 
 nemotron_add_test(manifest_io_test)
+
+nemotron_add_python_test(
+  forward_manifest_current_checkpoint_regression_test
+  manifest/forward_manifest_current_checkpoint_regression_test.py
+)
 
 add_executable(
   model_schedule_test
