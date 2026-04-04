@@ -533,6 +533,13 @@ std::optional<PreparedNvfp4MatmulCall> PrepareNvfp4MatmulCall(
     return std::nullopt;
   }
 
+  // Cached resources include a mutable op descriptor and reusable device alpha
+  // buffer. Wait for prior launches that may still be consuming them before we
+  // retarget scale pointers or rewrite alpha for the next matmul.
+  if (!CheckCuda(cudaStreamSynchronize(nullptr))) {
+    return std::nullopt;
+  }
+
   if (!check_cublas(
           cublasLtMatmulDescSetAttribute(
               resources->op_desc,
@@ -698,7 +705,8 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     const float* activation_tensor_scale_device,
     const Nvfp4PackedMatrixDeviceView& weights,
     const float* weight_tensor_scale_device,
-    DeviceTensorFp32* output) {
+    DeviceTensorFp32* output,
+    bool allow_tensor_scale_host_fallback) {
   const auto prepared = PrepareNvfp4MatmulCall(handle, plan, activations, weights, output);
   if (!prepared.has_value()) {
     return std::nullopt;
@@ -719,6 +727,10 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
         prepared->resources->device_alpha,
         prepared->resources->device_beta,
         CUBLASLT_POINTER_MODE_DEVICE);
+  }
+
+  if (!allow_tensor_scale_host_fallback) {
+    return std::nullopt;
   }
 
   const auto activation_tensor_scale_host =
@@ -779,7 +791,8 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options) {
+    const Nvfp4PackOptions& pack_options,
+    bool allow_tensor_scale_host_fallback) {
   if (!weights.valid()) {
     return std::nullopt;
   }
@@ -787,14 +800,25 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
   if (!packed || !packed->valid()) {
     return std::nullopt;
   }
-  return RunNvfp4RowMajorFp32AccumToDevice(
+  const auto stats = RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       MakeNvfp4PackedMatrixDeviceView(*packed),
       packed->device_tensor_scale_ptr(),
       weights,
       weights.tensor_scale_data,
-      output);
+      output,
+      allow_tensor_scale_host_fallback);
+  if (!stats.has_value()) {
+    return std::nullopt;
+  }
+
+  // The packed activation buffer is owned by this helper. Keep it alive until
+  // the queued matmul completes so cuBLASLt does not read freed device memory.
+  if (!CheckCuda(cudaStreamSynchronize(nullptr))) {
+    return std::nullopt;
+  }
+  return stats;
 }
 
 std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
@@ -803,14 +827,16 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options) {
+    const Nvfp4PackOptions& pack_options,
+    bool allow_tensor_scale_host_fallback) {
   return RunNvfp4RowMajorFp32SourceToDevice(
       handle,
       plan,
       activations,
       MakeNvfp4PackedMatrixDeviceView(weights),
       output,
-      pack_options);
+      pack_options,
+      allow_tensor_scale_host_fallback);
 }
 
 }  // namespace nemotron

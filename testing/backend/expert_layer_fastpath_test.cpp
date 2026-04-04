@@ -315,12 +315,8 @@ bool test_unified_fused_prefill_avoids_host_routing_adapter() {
 
   auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
   auto batch_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  auto single_input = DeviceTensorFp32::Create({1, kHiddenSize});
-  auto single_output = DeviceTensorFp32::Create({1, kHiddenSize});
   if (!expect(batch_input != nullptr && batch_output != nullptr,
               "batched tensors should allocate") ||
-      !expect(single_input != nullptr && single_output != nullptr,
-              "single-token tensors should allocate") ||
       !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
               "batched input should upload")) {
     return false;
@@ -344,12 +340,185 @@ bool test_unified_fused_prefill_avoids_host_routing_adapter() {
           "unified fused batch run should not copy canonical routing tensors to host")) {
     return false;
   }
+  return true;
+}
+
+bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
+  if (!has_cuda_device()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  ScopedEnvVar scoped_unified("NEMOTRON_FORWARD_UNIFIED_FUSED");
+  ScopedEnvVar scoped_prefill("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
+  ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
+  ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
+  setenv("NEMOTRON_FORWARD_UNIFIED_FUSED", "1", 1);
+  setenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL", "1", 1);
+  setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "0", 1);
+  setenv("NEMOTRON_EXPERT_MONOLITHIC", "0", 1);
+
+  const auto cublas = CublasLtHandle::Create();
+  if (!cublas || !cublas->valid()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  constexpr std::size_t kHiddenSize = 64;
+  constexpr std::size_t kIntermediateSize = 64;
+  constexpr std::size_t kRoutedExperts = 8;
+  constexpr std::size_t kTopK = 2;
+  constexpr std::size_t kTokenCount = 4;
+
+  const std::string layer_prefix = "backbone.layers.1";
+  const std::string mixer_prefix = layer_prefix + ".mixer";
+
+  std::vector<float> input_norm_weight(kHiddenSize, 1.0f);
+  std::vector<float> gate_bias = {0.02f, -0.04f, 0.03f, 0.00f, -0.01f, 0.05f, -0.02f, 0.01f};
+  std::vector<float> gate_weight = make_patterned_values(kRoutedExperts, kHiddenSize, 5, 0.0125f);
+  std::vector<float> shared_up_values = make_patterned_values(kIntermediateSize, kHiddenSize, 19, 0.02f);
+  std::vector<float> shared_down_values = make_patterned_values(kHiddenSize, kIntermediateSize, 31, 0.02f);
+
+  const auto input_norm_descriptor =
+      make_fp32_descriptor(layer_prefix + ".norm.weight", input_norm_weight, {kHiddenSize});
+  const auto gate_bias_descriptor =
+      make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
+  const auto gate_weight_descriptor =
+      make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
+  const auto shared_up_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.up_proj.weight",
+          shared_up_values,
+          kIntermediateSize,
+          kHiddenSize);
+  const auto shared_down_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.down_proj.weight",
+          shared_down_values,
+          kHiddenSize,
+          kIntermediateSize);
+  if (!expect(shared_up_descriptor.has_value(), "shared up NVFP4 descriptor should build") ||
+      !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
+    return false;
+  }
+
+  std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
+  std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
+  ExpertLayerBindings bindings;
+  bindings.input_norm_weight = &input_norm_descriptor;
+  bindings.gate_weight = &gate_weight_descriptor;
+  bindings.gate_score_correction_bias = &gate_bias_descriptor;
+  bindings.shared_up_gemm_weight = &shared_up_descriptor->descriptor;
+  bindings.shared_down_gemm_weight = &shared_down_descriptor->descriptor;
+  bindings.routed_experts.resize(kRoutedExperts);
+  for (std::size_t expert_index = 0; expert_index < kRoutedExperts; ++expert_index) {
+    const std::string expert_prefix =
+        mixer_prefix + ".experts." + std::to_string(expert_index);
+    const auto up_values = make_patterned_values(
+        kIntermediateSize,
+        kHiddenSize,
+        53 + static_cast<int>(expert_index * 2),
+        0.0175f);
+    const auto down_values = make_patterned_values(
+        kHiddenSize,
+        kIntermediateSize,
+        89 + static_cast<int>(expert_index * 3),
+        0.0175f);
+    const auto up_descriptor =
+        make_owned_nvfp4_descriptor(
+            expert_prefix + ".up_proj.weight",
+            up_values,
+            kIntermediateSize,
+            kHiddenSize);
+    const auto down_descriptor =
+        make_owned_nvfp4_descriptor(
+            expert_prefix + ".down_proj.weight",
+            down_values,
+            kHiddenSize,
+            kIntermediateSize);
+    if (!expect(up_descriptor.has_value(), "routed up NVFP4 descriptor should build") ||
+        !expect(down_descriptor.has_value(), "routed down NVFP4 descriptor should build")) {
+      return false;
+    }
+    routed_up_descriptors[expert_index] = std::move(*up_descriptor);
+    routed_down_descriptors[expert_index] = std::move(*down_descriptor);
+    bindings.routed_experts[expert_index].up_proj =
+        &routed_up_descriptors[expert_index].descriptor;
+    bindings.routed_experts[expert_index].down_proj =
+        &routed_down_descriptors[expert_index].descriptor;
+  }
+
+  ExpertLayerConfig config;
+  config.layer_index = 1;
+  config.hidden_size = kHiddenSize;
+  config.moe_latent_size = 0;
+  config.routed_expert_intermediate_size = kIntermediateSize;
+  config.shared_expert_intermediate_size = kIntermediateSize;
+  config.n_routed_experts = kRoutedExperts;
+  config.top_k = kTopK;
+  config.max_token_count = kTokenCount;
+  config.n_group = 1;
+  config.topk_group = 1;
+  config.rms_epsilon = 1.0e-5f;
+  config.routed_scaling_factor = 5.0f;
+  config.norm_topk_prob = true;
+
+  auto slice = ExpertLayerSlice::Create(config, bindings);
+  if (!expect(slice != nullptr && slice->valid(), "nonresident expert layer slice should create")) {
+    return false;
+  }
+
+  std::vector<float> input_values(kTokenCount * kHiddenSize, 0.0f);
+  for (std::size_t token = 0; token < kTokenCount; ++token) {
+    for (std::size_t dim = 0; dim < kHiddenSize; ++dim) {
+      input_values[token * kHiddenSize + dim] =
+          (static_cast<float>(((token + 1) * 11 + (dim * 5)) % 41) - 20.0f) * 0.03125f;
+    }
+  }
+
+  auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto batch_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto single_input = DeviceTensorFp32::Create({1, kHiddenSize});
+  auto single_output = DeviceTensorFp32::Create({1, kHiddenSize});
+  if (!expect(batch_input != nullptr && batch_output != nullptr,
+              "batched tensors should allocate") ||
+      !expect(single_input != nullptr && single_output != nullptr,
+              "single-token tensors should allocate") ||
+      !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
+              "batched input should upload")) {
+    return false;
+  }
+
+  GemmHeuristicCache heuristic_cache;
+  ResetExpertStagingCounters();
+  if (!expect(
+          slice->Run(*cublas, &heuristic_cache, *batch_input, batch_output.get(), nullptr),
+          "nonresident batch run should succeed through fallback") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "fallback batch run should synchronize")) {
+    return false;
+  }
+
+  const auto& counters = GetExpertStagingCounters();
+  if (!expect(
+          counters.total_staging_calls.load(std::memory_order_relaxed) == 0,
+          "nonresident routed weights should not silently restage fast-path experts") ||
+      !expect(
+          counters.total_experts_staged.load(std::memory_order_relaxed) == 0,
+          "nonresident routed weights should not stage routed experts") ||
+      !expect(
+          counters.total_bytes_uploaded.load(std::memory_order_relaxed) == 0,
+          "nonresident routed weights should not upload routed expert bytes at run time") ||
+      !expect(
+          counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
+          "nonresident fallback should not route through the batched host adapter fast path")) {
+    return false;
+  }
 
   std::vector<float> batch_output_host(kTokenCount * kHiddenSize, 0.0f);
   if (!expect(
           batch_output->CopyToHost(batch_output_host.data(), batch_output_host.size()),
-          "batched output should download") ||
-      !expect(all_finite(batch_output_host), "batched output should stay finite")) {
+          "fallback batch output should download") ||
+      !expect(all_finite(batch_output_host), "fallback batch output should stay finite")) {
     return false;
   }
 
@@ -363,13 +532,13 @@ bool test_unified_fused_prefill_avoids_host_routing_adapter() {
         single_input_host.data());
     if (!expect(
             single_input->CopyFromHost(single_input_host.data(), single_input_host.size()),
-            "single-token input should upload") ||
+            "fallback single-token input should upload") ||
         !expect(
             slice->Run(*cublas, &heuristic_cache, *single_input, single_output.get(), nullptr),
-            "single-token run should succeed") ||
+            "fallback single-token run should succeed") ||
         !expect(
             single_output->CopyToHost(single_output_host.data(), single_output_host.size()),
-            "single-token output should download")) {
+            "fallback single-token output should download")) {
       return false;
     }
     std::copy(
@@ -380,11 +549,14 @@ bool test_unified_fused_prefill_avoids_host_routing_adapter() {
 
   return expect(
       max_abs_diff(batch_output_host, sequential_output_host) <= 5.0e-2f,
-      "unified fused batch output should stay aligned with repeated single-token execution");
+      "fallback batch output should stay aligned with repeated single-token execution");
 }
 
 }  // namespace
 
 int main() {
-  return test_unified_fused_prefill_avoids_host_routing_adapter() ? 0 : 1;
+  return test_unified_fused_prefill_avoids_host_routing_adapter() &&
+                 test_nonresident_routed_weights_reject_fastpath_and_use_fallback()
+             ? 0
+             : 1;
 }

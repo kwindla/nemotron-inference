@@ -5,6 +5,8 @@ elseif(EXISTS "/usr/local/cuda-13.2/compat")
   set(NEMOTRON_TEST_ENVIRONMENT "LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 function(nemotron_add_test name)
   add_test(NAME ${name} COMMAND ${name})
   if(NEMOTRON_TEST_ENVIRONMENT)
@@ -498,6 +500,26 @@ target_link_libraries(nvfp4_gemm_runner_test PRIVATE nemotron_runtime_backend)
 target_compile_features(nvfp4_gemm_runner_test PRIVATE cxx_std_17)
 
 nemotron_add_test(nvfp4_gemm_runner_test)
+
+add_executable(
+  nvfp4_vllm_golden_test
+  backend/nvfp4_vllm_golden_test.cpp
+)
+
+target_link_libraries(nvfp4_vllm_golden_test PRIVATE nemotron_runtime_backend)
+target_compile_features(nvfp4_vllm_golden_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  nvfp4_vllm_golden_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+nemotron_add_test(nvfp4_vllm_golden_test)
+
+add_test(
+  NAME nvfp4_manifest_generation_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/backend/nvfp4_manifest_generation_test.py
+)
 
 add_executable(
   nvfp4_oracle_fixture_test
