@@ -31,15 +31,24 @@ namespace {
 
 constexpr const char* kLinearDeviceFastpathEnvVar =
     "NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH";
+constexpr const char* kDenseFastpathDisableEnvVar =
+    "NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH";
+constexpr const char* kNvfp4FastpathDisableEnvVar =
+    "NEMOTRON_FORWARD_LINEAR_DISABLE_NVFP4_FASTPATH";
 constexpr const char* kNvfp4ActivationTensorScaleEnvVar =
     "NEMOTRON_FORWARD_NVFP4_ACTIVATION_TENSOR_SCALE";
 
 bool LinearDeviceFastpathEnabled() {
   const char* value = std::getenv(kLinearDeviceFastpathEnvVar);
   if (value == nullptr) {
-    return false;
+    return true;
   }
   return std::strcmp(value, "0") != 0;
+}
+
+bool EnvFlagEnabled(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
 std::optional<float> ParsePositiveFloatEnv(const char* env_var) {
@@ -94,14 +103,22 @@ void LogGemmPlanBuildFailure(
     std::size_t rows,
     const char* plan_source,
     GemmPlanFailureStep failure_step,
+    std::optional<CublasLtPlanRejectInfo> reject_info = std::nullopt,
     std::optional<Nvfp4ScaleLayout> activation_scale_layout = std::nullopt) {
   std::cerr << "linear_op: plan build failed for " << descriptor.tensor_name
+            << " family=" << ToString(descriptor.kernel_family)
             << " M=" << rows
             << " N=" << descriptor.output_rows
             << " K=" << descriptor.input_cols
             << " step=plan_build"
             << " plan_source=" << plan_source
             << " sub_step=" << GemmPlanFailureStepName(failure_step);
+  if (reject_info.has_value() && reject_info->reason != nullptr) {
+    std::cerr << " reason=" << reject_info->reason
+              << " packed_alignment_ok=" << reject_info->packed_alignment_ok
+              << " block_scales_alignment_ok=" << reject_info->block_scales_alignment_ok
+              << " tensor_scale_alignment_ok=" << reject_info->tensor_scale_alignment_ok;
+  }
   if (activation_scale_layout.has_value()) {
     std::cerr << " activation_scale_layout=" << ToString(*activation_scale_layout);
   }
@@ -173,8 +190,12 @@ std::optional<CublasLtGemmPlan> BuildDescriptorGemmPlan(
     const GemmDescriptor& descriptor,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache,
-    GemmPlanFailureStep* failure_step = nullptr) {
+    GemmPlanFailureStep* failure_step = nullptr,
+    CublasLtPlanRejectInfo* reject_info = nullptr) {
   SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
+  if (reject_info != nullptr) {
+    *reject_info = CublasLtPlanRejectInfo{};
+  }
   const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
   if (!launch_plan.has_value()) {
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildGemmLaunchPlan);
@@ -185,7 +206,7 @@ std::optional<CublasLtGemmPlan> BuildDescriptorGemmPlan(
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  const auto plan = BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution, reject_info);
   if (!plan.has_value()) {
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
   }
@@ -221,8 +242,12 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     const DeviceDenseWeightFp32& weight,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache,
-    GemmPlanFailureStep* failure_step = nullptr) {
+    GemmPlanFailureStep* failure_step = nullptr,
+    CublasLtPlanRejectInfo* reject_info = nullptr) {
   SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
+  if (reject_info != nullptr) {
+    *reject_info = CublasLtPlanRejectInfo{};
+  }
   const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
       descriptor,
       rows,
@@ -241,7 +266,7 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  const auto plan = BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution, reject_info);
   if (!plan.has_value()) {
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
   }
@@ -253,8 +278,12 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     const DeviceNvfp4Weight& weight,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache,
-    GemmPlanFailureStep* failure_step = nullptr) {
+    GemmPlanFailureStep* failure_step = nullptr,
+    CublasLtPlanRejectInfo* reject_info = nullptr) {
   SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
+  if (reject_info != nullptr) {
+    *reject_info = CublasLtPlanRejectInfo{};
+  }
   const auto runtime_launch_plan = BuildRuntimeLaunchPlan(
       descriptor,
       rows,
@@ -279,7 +308,7 @@ std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
   }
-  const auto plan = BuildCublasLtGemmPlan(*execution);
+  const auto plan = BuildCublasLtGemmPlan(*execution, reject_info);
   if (!plan.has_value()) {
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
   }
@@ -425,14 +454,16 @@ bool UploadedLinearOp::Run(
   bool plan_build_ok = false;
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
-      if (LinearDeviceFastpathEnabled()) {
+      if (LinearDeviceFastpathEnabled() && !EnvFlagEnabled(kDenseFastpathDisableEnvVar)) {
         GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
+        CublasLtPlanRejectInfo reject_info;
         const auto plan = BuildRuntimeGemmPlan(
             impl_->descriptor,
             *impl_->dense_weight,
             rows,
             heuristic_cache,
-            &failure_step);
+            &failure_step,
+            &reject_info);
         if (plan.has_value()) {
           plan_build_ok = true;
           counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
@@ -466,7 +497,8 @@ bool UploadedLinearOp::Run(
                 impl_->descriptor,
                 rows,
                 "runtime",
-                failure_step);
+                failure_step,
+                reject_info);
           }
         }
       } else if (debug) {
@@ -481,27 +513,33 @@ bool UploadedLinearOp::Run(
             RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows);
         const std::optional<Nvfp4ScaleLayout> activation_scale_layout =
             pack_options.execution_scale_layout;
-        const bool use_runtime_plan = LinearDeviceFastpathEnabled();
+        const bool use_runtime_plan =
+            LinearDeviceFastpathEnabled() &&
+            !EnvFlagEnabled(kNvfp4FastpathDisableEnvVar);
         const char* plan_source = use_runtime_plan ? "runtime" : "descriptor";
         GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
+        CublasLtPlanRejectInfo reject_info;
         auto plan = use_runtime_plan
                         ? BuildRuntimeGemmPlan(
                               impl_->descriptor,
                               *impl_->nvfp4_weight,
                               rows,
                               heuristic_cache,
-                              &failure_step)
+                              &failure_step,
+                              &reject_info)
                         : BuildDescriptorGemmPlan(
                               impl_->descriptor,
                               rows,
                               heuristic_cache,
-                              &failure_step);
+                              &failure_step,
+                              &reject_info);
         if (!plan.has_value() && debug) {
           LogGemmPlanBuildFailure(
               impl_->descriptor,
               rows,
               plan_source,
               failure_step,
+              reject_info,
               activation_scale_layout);
         }
         if (plan.has_value()) {

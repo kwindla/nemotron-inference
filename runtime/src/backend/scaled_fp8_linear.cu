@@ -23,7 +23,7 @@ bool CheckCuda(cudaError_t status) {
 bool LinearDeviceFastpathEnabled() {
   const char* value = std::getenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
   if (value == nullptr) {
-    return false;
+    return true;
   }
   return std::strcmp(value, "0") != 0;
 }

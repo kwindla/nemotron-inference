@@ -50,7 +50,15 @@ struct CublasLtGemmPlan {
   bool tensor_scale_alignment_ok = false;
 };
 
+struct CublasLtPlanRejectInfo {
+  const char* reason = nullptr;
+  bool packed_alignment_ok = false;
+  bool block_scales_alignment_ok = false;
+  bool tensor_scale_alignment_ok = false;
+};
+
 std::optional<CublasLtGemmPlan> BuildCublasLtGemmPlan(
-    const PreparedGemmExecution& execution);
+    const PreparedGemmExecution& execution,
+    CublasLtPlanRejectInfo* reject_info = nullptr);
 
 }  // namespace nemotron

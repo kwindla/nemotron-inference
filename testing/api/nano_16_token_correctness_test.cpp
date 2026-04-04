@@ -231,7 +231,7 @@ void PrintUnexpectedLinearFallbackWarning(
   }
 
   stream << "WARNING: nano_16_token_correctness_test: unexpected linear reference fallbacks "
-         << "while NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH=1\n";
+         << "while the linear device fastpath was enabled\n";
   for (const LinearFallbackObservation& fallback : fallbacks) {
     stream << "WARNING: nano_16_token_correctness_test: operator="
            << fallback.counter_name
@@ -1535,7 +1535,7 @@ bool run_nano_correctness_gate() {
   const bool strict_expert_staging_enabled =
       EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_EXPERT_STAGING", false);
   const bool linear_device_fastpath_enabled =
-      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", false);
+      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", true);
   const bool capture_embedding_trace =
       EnvEnabledOrDefault("NEMOTRON_NANO_16_TRACE_EMBEDDING", false);
   ScopedExpertStagingCounterReport expert_staging_counter_report(

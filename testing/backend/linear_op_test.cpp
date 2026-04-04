@@ -298,15 +298,13 @@ bool test_uploaded_linear_op_matches_reference_for_small_m_nvfp4() {
     return false;
   }
 
-  setenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", "1", 1);
+  unsetenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
   GemmHeuristicCache cache;
   if (!expect(
           op->Run(*handle, &cache, *activations, fastpath_output.get()),
-          "uploaded NVFP4 linear fastpath should execute")) {
-    unsetenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
+          "uploaded NVFP4 linear fastpath should execute by default")) {
     return false;
   }
-  unsetenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
 
   if (!expect(
           RunNvfp4RowMajorReferenceToDevice(

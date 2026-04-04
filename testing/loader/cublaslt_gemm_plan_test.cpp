@@ -29,6 +29,7 @@ using nemotron::BuildKernelCatalog;
 using nemotron::BuildTensorCatalog;
 using nemotron::BuildWeightArenaPlan;
 using nemotron::CublasLtScaleMode;
+using nemotron::CublasLtPlanRejectInfo;
 using nemotron::CublasLtTransform;
 using nemotron::GemmCatalog;
 using nemotron::GemmHeuristicCache;
@@ -273,8 +274,13 @@ bool test_cublaslt_gemm_plan_rejects_misaligned_dense_operand() {
   execution.launch_plan.k = 2;
   execution.launch_plan.packed_bytes = nemotron::ByteRangeView{bytes + 1, 8};
   execution.launch_plan.heuristic_key = "dense|test";
-  return expect(!BuildCublasLtGemmPlan(execution).has_value(),
-                "misaligned packed weights should reject the cublasLt plan");
+  CublasLtPlanRejectInfo reject_info;
+  const auto plan = BuildCublasLtGemmPlan(execution, &reject_info);
+  return expect(!plan.has_value(), "misaligned packed weights should reject the cublasLt plan") &&
+         expect(
+             reject_info.reason != nullptr &&
+                 std::string(reject_info.reason) == "packed_pointer_alignment",
+             "misaligned packed weights should report the packed pointer alignment reject reason");
 }
 
 }  // namespace

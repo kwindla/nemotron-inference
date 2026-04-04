@@ -18,12 +18,25 @@ bool DebugEnabled() {
   return std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
 }
 
+void ResetRejectInfo(CublasLtPlanRejectInfo* reject_info) {
+  if (reject_info != nullptr) {
+    *reject_info = CublasLtPlanRejectInfo{};
+  }
+}
+
 void LogPlanReject(
     const PreparedGemmExecution& execution,
     const char* reason,
+    CublasLtPlanRejectInfo* reject_info = nullptr,
     bool packed_alignment_ok = false,
     bool block_scales_alignment_ok = false,
     bool tensor_scale_alignment_ok = false) {
+  if (reject_info != nullptr) {
+    reject_info->reason = reason;
+    reject_info->packed_alignment_ok = packed_alignment_ok;
+    reject_info->block_scales_alignment_ok = block_scales_alignment_ok;
+    reject_info->tensor_scale_alignment_ok = tensor_scale_alignment_ok;
+  }
   if (!DebugEnabled()) {
     return;
   }
@@ -106,12 +119,14 @@ const char* ToString(CublasLtScaleMode scale_mode) {
 }
 
 std::optional<CublasLtGemmPlan> BuildCublasLtGemmPlan(
-    const PreparedGemmExecution& execution) {
+    const PreparedGemmExecution& execution,
+    CublasLtPlanRejectInfo* reject_info) {
+  ResetRejectInfo(reject_info);
   if (execution.launch_plan.m == 0 ||
       execution.launch_plan.n == 0 ||
       execution.launch_plan.k == 0 ||
       !execution.launch_plan.packed_bytes.valid()) {
-    LogPlanReject(execution, "invalid_launch_plan");
+    LogPlanReject(execution, "invalid_launch_plan", reject_info);
     return std::nullopt;
   }
 
@@ -137,6 +152,7 @@ std::optional<CublasLtGemmPlan> BuildCublasLtGemmPlan(
         LogPlanReject(
             execution,
             "missing_nvfp4_scale_buffers",
+            reject_info,
             plan.packed_alignment_ok,
             false,
             false);
@@ -154,15 +170,33 @@ std::optional<CublasLtGemmPlan> BuildCublasLtGemmPlan(
   }
 
   if (!plan.packed_alignment_ok) {
-    LogPlanReject(execution, "packed_pointer_alignment", false, plan.block_scales_alignment_ok, plan.tensor_scale_alignment_ok);
+    LogPlanReject(
+        execution,
+        "packed_pointer_alignment",
+        reject_info,
+        false,
+        plan.block_scales_alignment_ok,
+        plan.tensor_scale_alignment_ok);
     return std::nullopt;
   }
   if (execution.requires_block_scales && !plan.block_scales_alignment_ok) {
-    LogPlanReject(execution, "block_scale_pointer_alignment", plan.packed_alignment_ok, false, plan.tensor_scale_alignment_ok);
+    LogPlanReject(
+        execution,
+        "block_scale_pointer_alignment",
+        reject_info,
+        plan.packed_alignment_ok,
+        false,
+        plan.tensor_scale_alignment_ok);
     return std::nullopt;
   }
   if (execution.requires_tensor_scale && !plan.tensor_scale_alignment_ok) {
-    LogPlanReject(execution, "tensor_scale_pointer_alignment", plan.packed_alignment_ok, plan.block_scales_alignment_ok, false);
+    LogPlanReject(
+        execution,
+        "tensor_scale_pointer_alignment",
+        reject_info,
+        plan.packed_alignment_ok,
+        plan.block_scales_alignment_ok,
+        false);
     return std::nullopt;
   }
 

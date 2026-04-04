@@ -199,7 +199,7 @@ std::optional<DenseRowMajorDeviceStats> RunDenseRowMajorFp32ToDevice(
   ok &= output->FillZero();
 
   ok &= check_cublas(
-      cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+      cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F_PEDANTIC, CUDA_R_32F),
       "cublasLtMatmulDescCreate");
   const cublasOperation_t trans_a = ToCublasOp(plan.transform_a);
   const cublasOperation_t trans_b = ToCublasOp(plan.transform_b);
