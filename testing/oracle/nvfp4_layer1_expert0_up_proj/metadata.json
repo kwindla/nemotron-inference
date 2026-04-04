@@ -65,11 +65,11 @@
     "input_scale_name": "backbone.layers.1.mixer.experts.0.up_proj.input_scale",
     "manifest_input_scale_present": true,
     "manifest_weight_present": true,
-    "tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2",
+    "tensor_scale_contract": "effective_tensor_scale = input_scale * weight_scale_2",
     "weight_scale_2": 2.134413989551831e-05,
     "weight_scale_2_name": "backbone.layers.1.mixer.experts.0.up_proj.weight_scale_2",
     "weight_tensor_name": "backbone.layers.1.mixer.experts.0.up_proj.weight"
   },
   "weight_tensor_scale": 4.6898744887613475e-08,
-  "weight_tensor_scale_contract": "effective_fused_input_scale_x_weight_scale_2"
+  "weight_tensor_scale_contract": "effective_tensor_scale = input_scale * weight_scale_2"
 }
