@@ -245,6 +245,10 @@ bool run_expert_layer3_prefix_replay() {
           "batched layer3 output should download")) {
     return false;
   }
+  std::vector<float> batch_output_combined(batch_output.size(), 0.0f);
+  for (std::size_t i = 0; i < batch_output.size(); ++i) {
+    batch_output_combined[i] = layer2_input[i] + batch_output[i];
+  }
 
   auto row_input_tensor =
       nemotron::DeviceTensorFp32::Create({1, metadata->hidden_size});
@@ -258,6 +262,7 @@ bool run_expert_layer3_prefix_replay() {
   std::vector<float> sequential_output(layer3_expected.size(), 0.0f);
   std::vector<float> single_row_input(metadata->hidden_size, 0.0f);
   std::vector<float> single_row_output(metadata->hidden_size, 0.0f);
+  std::vector<float> sequential_output_combined(layer3_expected.size(), 0.0f);
   for (std::size_t token = 0; token < metadata->runtime_token_count; ++token) {
     std::copy_n(
         layer2_input.data() + token * metadata->hidden_size,
@@ -287,10 +292,14 @@ bool run_expert_layer3_prefix_replay() {
         single_row_output.begin(),
         single_row_output.end(),
         sequential_output.begin() + token * metadata->hidden_size);
+    for (std::size_t i = 0; i < metadata->hidden_size; ++i) {
+      sequential_output_combined[token * metadata->hidden_size + i] =
+          single_row_input[i] + single_row_output[i];
+    }
   }
 
-  const float batch_vs_expected = max_abs_diff(batch_output, layer3_expected);
-  const float sequential_vs_expected = max_abs_diff(sequential_output, layer3_expected);
+  const float batch_vs_expected = max_abs_diff(batch_output_combined, layer3_expected);
+  const float sequential_vs_expected = max_abs_diff(sequential_output_combined, layer3_expected);
   const float batch_vs_sequential = max_abs_diff(batch_output, sequential_output);
 
   std::cout << "expert_layer3_prefix_replay_test:"

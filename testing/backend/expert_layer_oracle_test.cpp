@@ -683,6 +683,10 @@ bool run_expert_layer_fixture() {
   if (!expect(output->CopyToHost(output_host.data(), output_host.size()), "final output should download")) {
     return false;
   }
+  std::vector<float> output_combined(output_host.size(), 0.0f);
+  for (std::size_t i = 0; i < output_host.size(); ++i) {
+    output_combined[i] = input_hidden[i] + output_host[i];
+  }
 
   auto row_input = DeviceTensorFp32::Create({1, metadata->hidden_size});
   auto row_output = DeviceTensorFp32::Create({1, metadata->hidden_size});
@@ -704,14 +708,14 @@ bool run_expert_layer_fixture() {
   float projected_routed_diff = 0.0f;
   float shared_diff = 0.0f;
   float mixer_diff = 0.0f;
-  float final_diff = max_abs_diff(output_host, expected_final_output);
+  float final_diff = max_abs_diff(output_combined, expected_final_output);
   float batch_vs_sequential_diff = 0.0f;
   float direct_gate_diff = 0.0f;
   float direct_fc1_diff = 0.0f;
   float direct_fc2_diff = 0.0f;
   float projected_routed_rel_l2 = 0.0f;
   float mixer_rel_l2 = 0.0f;
-  float final_rel_l2 = relative_l2_diff(output_host, expected_final_output);
+  float final_rel_l2 = relative_l2_diff(output_combined, expected_final_output);
   std::vector<float> sequential_output(output_host.size(), 0.0f);
   std::vector<float> row_input_host(metadata->hidden_size, 0.0f);
   std::vector<float> row_output_host(metadata->hidden_size, 0.0f);
@@ -741,6 +745,10 @@ bool run_expert_layer_fixture() {
             row_output->CopyToHost(row_output_host.data(), row_output_host.size()),
             "row final output should download")) {
       return false;
+    }
+    std::vector<float> row_output_combined(row_output_host.size(), 0.0f);
+    for (std::size_t i = 0; i < row_output_host.size(); ++i) {
+      row_output_combined[i] = row_input_host[i] + row_output_host[i];
     }
     if (dump_root_env != nullptr && std::string(dump_root_env).size() != 0 && row == 0) {
       const std::filesystem::path dump_root(dump_root_env);
@@ -962,14 +970,14 @@ bool run_expert_layer_fixture() {
     final_diff = std::max(
         final_diff,
         max_abs_diff(
-            row_output_host,
+            row_output_combined,
             std::vector<float>(
                 expected_final_output.begin() + hidden_offset,
                 expected_final_output.begin() + hidden_offset + metadata->hidden_size)));
     final_rel_l2 = std::max(
         final_rel_l2,
         relative_l2_diff(
-            row_output_host,
+            row_output_combined,
             std::vector<float>(
                 expected_final_output.begin() + hidden_offset,
                 expected_final_output.begin() + hidden_offset + metadata->hidden_size)));

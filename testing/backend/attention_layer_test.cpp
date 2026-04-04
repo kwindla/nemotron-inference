@@ -429,11 +429,12 @@ bool test_attention_layer_slice_matches_cpu_reference() {
   const std::vector<float> k_cpu = cpu_matmul_row_major(normed, std::vector<float>(k_weight.data(), k_weight.data() + k_weight.count()), kTokens, kHidden, kHidden);
   const std::vector<float> v_cpu = cpu_matmul_row_major(normed, std::vector<float>(v_weight.data(), v_weight.data() + v_weight.count()), kTokens, kHidden, kHidden);
   const std::vector<float> attention_cpu = cpu_attention(q_cpu, k_cpu, v_cpu, kTokens, kQueryHeads, kKvHeads, kHeadDim);
-  const std::vector<float> projected_cpu = cpu_matmul_row_major(attention_cpu, std::vector<float>(o_weight.data(), o_weight.data() + o_weight.count()), kTokens, kHidden, kHidden);
-  std::vector<float> expected(projected_cpu.size(), 0.0f);
-  for (std::size_t i = 0; i < expected.size(); ++i) {
-    expected[i] = input_host[i] + projected_cpu[i];
-  }
+  const std::vector<float> expected = cpu_matmul_row_major(
+      attention_cpu,
+      std::vector<float>(o_weight.data(), o_weight.data() + o_weight.count()),
+      kTokens,
+      kHidden,
+      kHidden);
 
   std::vector<float> actual(expected.size(), 0.0f);
   if (!expect(output->CopyToHost(actual.data(), actual.size()), "output download should succeed")) {
@@ -625,8 +626,7 @@ bool test_attention_layer_slice_continues_from_existing_prefix() {
       kHidden);
   std::vector<float> expected_decode(kDecodeTokens * kHidden, 0.0f);
   for (std::size_t i = 0; i < expected_decode.size(); ++i) {
-    expected_decode[i] =
-        decode_host[i] + projected_cpu[(kPrefixTokens * kHidden) + i];
+    expected_decode[i] = projected_cpu[(kPrefixTokens * kHidden) + i];
   }
 
   std::vector<float> actual_decode(expected_decode.size(), 0.0f);

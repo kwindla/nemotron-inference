@@ -1107,13 +1107,11 @@ bool MambaLayerSlice::Run(
     MambaLayerRunTrace* trace) const {
   auto input_bf16 = DeviceTensorBf16::Create(input.shape());
   auto residual_bf16 = DeviceTensorBf16::Create(input.shape());
-  auto delta_bf16 = DeviceTensorBf16::Create(input.shape());
-  auto delta_fp32 = DeviceTensorFp32::Create(input.shape());
+  auto output_bf16 = DeviceTensorBf16::Create(input.shape());
   const bool ok =
       input_bf16 != nullptr &&
       residual_bf16 != nullptr &&
-      delta_bf16 != nullptr &&
-      delta_fp32 != nullptr &&
+      output_bf16 != nullptr &&
       CastTensorFp32ToBf16(input, input_bf16.get()) &&
       residual_bf16->FillZero() &&
       Run(
@@ -1122,10 +1120,9 @@ bool MambaLayerSlice::Run(
           request_context,
           *input_bf16,
           residual_bf16.get(),
-          delta_bf16.get(),
+          output_bf16.get(),
           trace) &&
-      CastTensorBf16ToFp32(*delta_bf16, delta_fp32.get()) &&
-      ResidualAddFp32(input, *delta_fp32, output);
+      CastTensorBf16ToFp32(*output_bf16, output);
   return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 

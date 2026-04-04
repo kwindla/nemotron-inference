@@ -53,11 +53,11 @@ PackedModelManifest make_manifest() {
   manifest.tensors.push_back(make_tensor("backbone.embeddings.weight", "embedding"));
 
   manifest.tensors.push_back(make_tensor("backbone.layers.0.norm.weight", "norm"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.A_log", "mamba_state"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.conv1d.weight", "conv1d"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.dt_bias", "mamba_state"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.in_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.out_proj.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.A_log", "mamba_param"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.conv1d.weight", "mamba_param"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.dt_bias", "mamba_param"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.in_proj.weight", "mamba_linear"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.mixer.out_proj.weight", "mamba_linear"));
 
   manifest.tensors.push_back(make_tensor("backbone.layers.1.norm.weight", "norm"));
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.gate.weight", "router"));
@@ -67,13 +67,13 @@ PackedModelManifest make_manifest() {
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.shared_experts.down_proj", "shared_expert"));
 
   manifest.tensors.push_back(make_tensor("backbone.layers.7.norm.weight", "norm"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.q_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.k_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.v_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.o_proj.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.q_proj.weight", "attention"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.k_proj.weight", "attention"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.v_proj.weight", "attention"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.7.self_attn.o_proj.weight", "attention"));
 
-  manifest.tensors.push_back(make_tensor("backbone.norm_f.weight", "norm"));
-  manifest.tensors.push_back(make_tensor("lm_head.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.norm_f.weight", "final_norm"));
+  manifest.tensors.push_back(make_tensor("lm_head.weight", "logits"));
   return manifest;
 }
 

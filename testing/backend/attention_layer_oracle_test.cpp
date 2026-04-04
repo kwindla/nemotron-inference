@@ -338,6 +338,10 @@ bool run_attention_oracle_fixture() {
   if (!expect(output->CopyToHost(actual_output.data(), actual_output.size()), "final output should download")) {
     return false;
   }
+  std::vector<float> actual_combined(actual_output.size(), 0.0f);
+  for (std::size_t i = 0; i < actual_output.size(); ++i) {
+    actual_combined[i] = input_hidden[i] + actual_output[i];
+  }
 
   std::vector<__nv_bfloat16> key_cache_bf16(request->key_cache()->numel());
   std::vector<__nv_bfloat16> value_cache_bf16(request->value_cache()->numel());
@@ -370,7 +374,7 @@ bool run_attention_oracle_fixture() {
       metadata->tokens_per_page,
       metadata->head_dim);
 
-  const float output_diff = max_abs_diff(actual_output, expected_final_output);
+  const float output_diff = max_abs_diff(actual_combined, expected_final_output);
   const float key_cache_diff = max_abs_diff(actual_key_cache_layer, expected_key_cache);
   const float value_cache_diff = max_abs_diff(actual_value_cache_layer, expected_value_cache);
   if (!expect(output_diff <= 2.5e-2f, "final output should match oracle within tolerance") ||

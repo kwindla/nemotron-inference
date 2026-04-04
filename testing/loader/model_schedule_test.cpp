@@ -50,22 +50,22 @@ PackedModelManifest make_manifest() {
 
   manifest.tensors.push_back(make_tensor("backbone.embeddings.weight", "embedding"));
   manifest.tensors.push_back(make_tensor("backbone.layers.0.input_norm.weight", "norm"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.q_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.k_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.v_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.o_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.1.mamba.in_proj.weight", "dense"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.1.mamba.conv.weight", "conv1d"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.1.mamba.A_log", "mamba_state"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.1.mamba.dt_bias", "mamba_state"));
-  manifest.tensors.push_back(make_tensor("backbone.layers.1.mamba.out_proj.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.q_proj.weight", "attention"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.k_proj.weight", "attention"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.v_proj.weight", "attention"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.o_proj.weight", "attention"));
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.router.weight", "router"));
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.experts.0.up_proj", "routed_expert"));
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.experts.0.down_proj", "routed_expert"));
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.shared_experts.up_proj", "shared_expert"));
   manifest.tensors.push_back(make_tensor("backbone.layers.1.mixer.shared_experts.down_proj", "shared_expert"));
-  manifest.tensors.push_back(make_tensor("backbone.norm_f.weight", "norm"));
-  manifest.tensors.push_back(make_tensor("lm_head.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.2.mamba.in_proj.weight", "mamba_linear"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.2.mamba.conv.weight", "mamba_param"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.2.mamba.A_log", "mamba_param"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.2.mamba.dt_bias", "mamba_param"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.2.mamba.out_proj.weight", "mamba_linear"));
+  manifest.tensors.push_back(make_tensor("backbone.norm_f.weight", "final_norm"));
+  manifest.tensors.push_back(make_tensor("lm_head.weight", "logits"));
   return manifest;
 }
 
@@ -73,6 +73,7 @@ bool test_model_schedule_classifies_layers_and_globals() {
   const nemotron::ModelSchedule schedule = BuildModelSchedule(make_manifest());
   const nemotron::LayerScheduleEntry* layer0 = schedule.FindLayer(0);
   const nemotron::LayerScheduleEntry* layer1 = schedule.FindLayer(1);
+  const nemotron::LayerScheduleEntry* layer2 = schedule.FindLayer(2);
 
   bool saw_embedding = false;
   bool saw_final_norm = false;
@@ -89,32 +90,52 @@ bool test_model_schedule_classifies_layers_and_globals() {
 
   return expect(schedule.valid(), "model schedule should build for a valid manifest") &&
          expect(schedule.issues().empty(), "schedule should not report issues for the test manifest") &&
-         expect(schedule.ordered_layers().size() == 2, "schedule should contain two ordered layers") &&
+         expect(schedule.ordered_layers().size() == 3, "schedule should contain three ordered layers") &&
          expect(schedule.attention_layer_count() == 1, "schedule should count one attention layer") &&
          expect(schedule.mamba_layer_count() == 1, "schedule should count one mamba layer") &&
          expect(schedule.routed_expert_layer_count() == 1, "schedule should count one routed-expert layer") &&
          expect(schedule.shared_expert_layer_count() == 1, "schedule should count one shared-expert layer") &&
          expect(layer0 != nullptr, "layer 0 should be present") &&
          expect(layer1 != nullptr, "layer 1 should be present") &&
+         expect(layer2 != nullptr, "layer 2 should be present") &&
          expect(layer0->has_attention, "layer 0 should be classified as attention") &&
          expect(!layer0->has_mamba, "layer 0 should not be classified as mamba") &&
          expect(layer0->FindBinding("self_attn.q_proj.weight") != nullptr,
                 "layer 0 should expose its local q-projection binding") &&
-         expect(layer1->has_mamba, "layer 1 should be classified as mamba") &&
          expect(layer1->has_router, "layer 1 should be classified as having a router") &&
          expect(layer1->has_routed_experts, "layer 1 should be classified as having routed experts") &&
          expect(layer1->has_shared_experts, "layer 1 should be classified as having shared experts") &&
          expect(layer1->FindBinding("mixer.experts.0.up_proj") != nullptr,
                 "layer 1 should expose routed-expert local bindings") &&
+         expect(layer2->has_mamba, "layer 2 should be classified as mamba") &&
+         expect(!layer2->has_router, "layer 2 should not be classified as having a router") &&
          expect(saw_embedding, "global bindings should include the embedding tensor") &&
          expect(saw_final_norm, "global bindings should include the final norm tensor") &&
          expect(saw_logits, "global bindings should include the logits tensor");
 }
 
+bool test_model_schedule_rejects_layers_without_explicit_manifest_role() {
+  PackedModelManifest manifest = make_manifest();
+  manifest.tensors.erase(manifest.tensors.begin() + 2, manifest.tensors.begin() + 6);
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.q_proj.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.k_proj.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.v_proj.weight", "dense"));
+  manifest.tensors.push_back(make_tensor("backbone.layers.0.self_attn.o_proj.weight", "dense"));
+
+  const nemotron::ModelSchedule schedule = BuildModelSchedule(manifest);
+  const nemotron::LayerScheduleEntry* layer0 = schedule.FindLayer(0);
+  return expect(!schedule.valid(), "schedule should reject a layer without an explicit manifest role") &&
+         expect(layer0 != nullptr, "invalid schedule should still expose the parsed layer") &&
+         expect(layer0->role == nemotron::ModelLayerRole::kUnknown,
+                "implicit dense-only layer should remain unclassified");
+}
+
 }  // namespace
 
 int main() {
-  const bool ok = test_model_schedule_classifies_layers_and_globals();
+  const bool ok =
+      test_model_schedule_classifies_layers_and_globals() &&
+      test_model_schedule_rejects_layers_without_explicit_manifest_role();
   if (!ok) {
     return 1;
   }

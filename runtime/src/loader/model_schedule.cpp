@@ -78,60 +78,76 @@ std::optional<LayerPath> ParseLayerPath(const std::string& tensor_name) {
   return std::nullopt;
 }
 
-bool ContainsAttentionPattern(const std::string& local_name) {
-  return local_name.find("self_attn.") != std::string::npos ||
-         local_name.find("attention.") != std::string::npos ||
-         local_name.find("attn.") != std::string::npos ||
-         local_name.find("q_proj") != std::string::npos ||
-         local_name.find("k_proj") != std::string::npos ||
-         local_name.find("v_proj") != std::string::npos ||
-         local_name.find("o_proj") != std::string::npos;
-}
-
-bool ContainsExpertPattern(const std::string& local_name) {
-  return local_name.find(".experts.") != std::string::npos ||
-         starts_with(local_name, "experts.");
-}
-
-bool ContainsSharedExpertPattern(const std::string& local_name) {
-  return local_name.find("shared_experts.") != std::string::npos;
-}
-
-bool ContainsRouterPattern(const std::string& local_name) {
-  return local_name.find("router") != std::string::npos ||
-         local_name.find("gate") != std::string::npos;
-}
-
-bool ContainsMambaPattern(const std::string& local_name) {
-  if (ContainsAttentionPattern(local_name) ||
-      ContainsExpertPattern(local_name) ||
-      ContainsSharedExpertPattern(local_name)) {
-    return false;
+ModelLayerRole ClassifyLayerRoleFromOpClass(const std::string& op_class) {
+  if (op_class == "attention") {
+    return ModelLayerRole::kAttention;
   }
-
-  return local_name.find("mamba") != std::string::npos ||
-         local_name.find("A_log") != std::string::npos ||
-         local_name.find("dt_bias") != std::string::npos ||
-         local_name.find("conv") != std::string::npos ||
-         local_name.find("ssm") != std::string::npos ||
-         local_name.find("in_proj") != std::string::npos ||
-         local_name.find("out_proj") != std::string::npos;
+  if (op_class == "mamba_linear" ||
+      op_class == "mamba_param" ||
+      op_class == "mamba_state" ||
+      op_class == "conv1d") {
+    return ModelLayerRole::kMamba;
+  }
+  if (op_class == "router" ||
+      op_class == "router_bias" ||
+      op_class == "routed_expert" ||
+      op_class == "routed_expert_up" ||
+      op_class == "routed_expert_down" ||
+      op_class == "shared_expert" ||
+      op_class == "shared_expert_up" ||
+      op_class == "shared_expert_down") {
+    return ModelLayerRole::kExpert;
+  }
+  return ModelLayerRole::kUnknown;
 }
 
-ModelGlobalRole ClassifyGlobalRole(const std::string& tensor_name) {
-  if (tensor_name == "backbone.embeddings.weight" ||
-      tensor_name == "embeddings.weight") {
+bool IsRouterOpClass(const std::string& op_class) {
+  return op_class == "router" || op_class == "router_bias";
+}
+
+bool IsRoutedExpertOpClass(const std::string& op_class) {
+  return op_class == "routed_expert" ||
+         op_class == "routed_expert_up" ||
+         op_class == "routed_expert_down";
+}
+
+bool IsSharedExpertOpClass(const std::string& op_class) {
+  return op_class == "shared_expert" ||
+         op_class == "shared_expert_up" ||
+         op_class == "shared_expert_down";
+}
+
+const char* ModelLayerRoleName(ModelLayerRole role) {
+  switch (role) {
+    case ModelLayerRole::kAttention:
+      return "attention";
+    case ModelLayerRole::kMamba:
+      return "mamba";
+    case ModelLayerRole::kExpert:
+      return "expert";
+    case ModelLayerRole::kUnknown:
+    default:
+      return "unknown";
+  }
+}
+
+ModelGlobalRole ClassifyGlobalRole(const TensorManifestEntry& tensor) {
+  if (tensor.op_class == "embedding" ||
+      tensor.name == "backbone.embeddings.weight" ||
+      tensor.name == "embeddings.weight") {
     return ModelGlobalRole::kEmbedding;
   }
-  if (tensor_name == "backbone.final_norm.weight" ||
-      tensor_name == "final_norm.weight" ||
-      tensor_name == "backbone.norm_f.weight" ||
-      tensor_name == "norm_f.weight") {
+  if (tensor.op_class == "final_norm" ||
+      tensor.name == "backbone.final_norm.weight" ||
+      tensor.name == "final_norm.weight" ||
+      tensor.name == "backbone.norm_f.weight" ||
+      tensor.name == "norm_f.weight") {
     return ModelGlobalRole::kFinalNorm;
   }
-  if (tensor_name == "lm_head.weight" ||
-      tensor_name == "output.weight" ||
-      tensor_name == "logits.weight") {
+  if (tensor.op_class == "logits" ||
+      tensor.name == "lm_head.weight" ||
+      tensor.name == "output.weight" ||
+      tensor.name == "logits.weight") {
     return ModelGlobalRole::kLogits;
   }
   return ModelGlobalRole::kOther;
@@ -207,7 +223,7 @@ ModelSchedule BuildModelSchedule(const PackedModelManifest& manifest) {
       schedule.global_bindings_.push_back(GlobalTensorBinding{
           tensor.name,
           tensor.op_class,
-          ClassifyGlobalRole(tensor.name),
+          ClassifyGlobalRole(tensor),
       });
       continue;
     }
@@ -241,13 +257,29 @@ ModelSchedule BuildModelSchedule(const PackedModelManifest& manifest) {
           "duplicate layer-local tensor binding '" + layer_path->local_name + "'");
     }
 
-    entry.has_attention = entry.has_attention || ContainsAttentionPattern(layer_path->local_name);
+    const ModelLayerRole binding_role = ClassifyLayerRoleFromOpClass(tensor.op_class);
+    if (binding_role != ModelLayerRole::kUnknown) {
+      if (entry.role == ModelLayerRole::kUnknown) {
+        entry.role = binding_role;
+      } else if (entry.role != binding_role) {
+        AddError(
+            &schedule.issues_,
+            tensor.name,
+            "layer mixes explicit manifest roles '" +
+                std::string(ModelLayerRoleName(entry.role)) +
+                "' and '" + std::string(ModelLayerRoleName(binding_role)) + "'");
+      }
+    }
+
+    entry.has_attention =
+        entry.has_attention || binding_role == ModelLayerRole::kAttention;
+    entry.has_mamba =
+        entry.has_mamba || binding_role == ModelLayerRole::kMamba;
+    entry.has_router = entry.has_router || IsRouterOpClass(tensor.op_class);
     entry.has_routed_experts =
-        entry.has_routed_experts || ContainsExpertPattern(layer_path->local_name);
+        entry.has_routed_experts || IsRoutedExpertOpClass(tensor.op_class);
     entry.has_shared_experts =
-        entry.has_shared_experts || ContainsSharedExpertPattern(layer_path->local_name);
-    entry.has_router = entry.has_router || ContainsRouterPattern(layer_path->local_name);
-    entry.has_mamba = entry.has_mamba || ContainsMambaPattern(layer_path->local_name);
+        entry.has_shared_experts || IsSharedExpertOpClass(tensor.op_class);
   }
 
   std::sort(
@@ -260,16 +292,24 @@ ModelSchedule BuildModelSchedule(const PackedModelManifest& manifest) {
   for (std::size_t ordered_index = 0; ordered_index < schedule.ordered_layers_.size(); ++ordered_index) {
     const LayerScheduleEntry& entry = schedule.ordered_layers_[ordered_index];
     schedule.ordered_layer_indices_[entry.layer_index] = ordered_index;
-    if (entry.has_attention) {
+    if (entry.role == ModelLayerRole::kUnknown) {
+      AddError(
+          &schedule.issues_,
+          "layer:" + std::to_string(entry.layer_index),
+          "layer is missing an explicit manifest role op_class");
+      continue;
+    }
+    if (entry.role == ModelLayerRole::kAttention) {
       ++schedule.attention_layer_count_;
     }
-    if (entry.has_mamba) {
+    if (entry.role == ModelLayerRole::kMamba) {
       ++schedule.mamba_layer_count_;
     }
-    if (entry.has_routed_experts || entry.has_router) {
+    if (entry.role == ModelLayerRole::kExpert &&
+        (entry.has_routed_experts || entry.has_router)) {
       ++schedule.routed_expert_layer_count_;
     }
-    if (entry.has_shared_experts) {
+    if (entry.role == ModelLayerRole::kExpert && entry.has_shared_experts) {
       ++schedule.shared_expert_layer_count_;
     }
   }

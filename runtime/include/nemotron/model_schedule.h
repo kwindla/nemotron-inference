@@ -16,6 +16,13 @@ enum class ModelGlobalRole {
   kLogits,
 };
 
+enum class ModelLayerRole {
+  kUnknown,
+  kAttention,
+  kMamba,
+  kExpert,
+};
+
 struct GlobalTensorBinding {
   std::string tensor_name;
   std::string op_class;
@@ -32,6 +39,7 @@ struct LayerScheduleEntry {
   std::size_t layer_index = 0;
   std::vector<LayerTensorBinding> bindings;
   std::unordered_map<std::string, std::vector<std::size_t>> binding_indices_by_local_name;
+  ModelLayerRole role = ModelLayerRole::kUnknown;
   bool has_attention = false;
   bool has_mamba = false;
   bool has_routed_experts = false;

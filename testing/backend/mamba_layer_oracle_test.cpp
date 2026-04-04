@@ -581,13 +581,17 @@ bool run_mamba_layer_fixture() {
           "ssm state should download")) {
     return false;
   }
+  std::vector<float> actual_combined(actual_output.size(), 0.0f);
+  for (std::size_t i = 0; i < actual_output.size(); ++i) {
+    actual_combined[i] = input_hidden[i] + actual_output[i];
+  }
 
-  const float output_diff = max_abs_diff(actual_output, expected_final_output);
+  const float output_diff = max_abs_diff(actual_combined, expected_final_output);
   const float conv_state_diff = max_abs_diff(actual_conv_state, expected_updated_conv_state);
   const float ssm_state_diff = max_abs_diff(actual_ssm_state, expected_next_ssm_state);
   const float norm_output_diff = max_abs_diff(trace.norm_output, expected_norm_output);
   const float in_proj_output_diff = max_abs_diff(trace.in_proj_output, expected_in_proj_output);
-  const float output_rel_l2 = relative_l2_diff(actual_output, expected_final_output);
+  const float output_rel_l2 = relative_l2_diff(actual_combined, expected_final_output);
   const float conv_state_rel_l2 = relative_l2_diff(actual_conv_state, expected_updated_conv_state);
   const float ssm_state_rel_l2 = relative_l2_diff(actual_ssm_state, expected_next_ssm_state);
   const bool nvfp4_projection_fixture = has_in_proj_nvfp4 || has_out_proj_nvfp4;

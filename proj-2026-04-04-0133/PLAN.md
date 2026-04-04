@@ -50,14 +50,41 @@ Design analysis: `proj-2026-04-03-1816/PLAN.md` and its 9 sub-plans.
   Convert `RequestExecutionContext` hidden, residual, and scratch buffers from `DeviceTensorFp32` to `DeviceTensorBf16`. Change layer `Run()` signatures in `attention_layer.h`, `mamba_layer.h`, `expert_layer.h` to accept `DeviceTensorBf16` I/O. Update `SingleTokenForwardModel::RunTokens()` to pass BF16 tensors. Each layer internally: (1) fused add+RMSNorm from 8a at entry, (2) BF16 dense GEMM from 8c for projections, (3) NVFP4 GEMM with BF16→FP32 cast for activation packing, (4) BF16 output. Mamba recurrent state stays FP32 — cast at boundaries. This is the largest change and depends on 8a-8c being done first.
   Key files: `runtime/src/backend/request_context.cpp`, `runtime/include/nemotron/request_context.h`, `runtime/src/backend/attention_layer.cpp`, `runtime/src/backend/mamba_layer.cpp`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/api/single_token_forward_model.cpp`, `runtime/include/nemotron/attention_layer.h`, `runtime/include/nemotron/mamba_layer.h`, `runtime/include/nemotron/expert_layer.h`
 
-- [ ] **7e. Residual-add pattern alignment and bootstrap cleanup**
+- [x] **7e. Residual-add pattern alignment and bootstrap cleanup**
   Remove eager residual add from `attention_layer.cpp:1160`, `mamba_layer.cpp:672`, `expert_layer.cpp:1820`. Each layer returns its output in BF16; the fused add+RMSNorm at the start of the next layer handles add + norm. Split `RuntimeEnvironment::BuildFromManifestFile()` into validation, planning, and assembly phases. Replace heuristic layer-role inference in `ModelSchedule` with explicit manifest roles.
   Key files: `runtime/src/backend/attention_layer.cpp`, `runtime/src/backend/mamba_layer.cpp`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/api/runtime_environment.cpp`, `runtime/src/loader/model_schedule.cpp`
 
 - [ ] **7f. BF16 pipeline verification and vLLM parity**
-  Regenerate oracle and run vLLM parity — target 16/16 token match. Run full ctest (53/53 pass). Run decode benchmark — expect BF16 GEMMs to be faster than FP32 (less memory bandwidth). Run `verify_correctness.sh` — Route A must match Route C. Counters: `dense_reference_fallback=0`, `nvfp4_reference_fallback=0`.
+  Regenerate oracle and run vLLM parity — target 16/16 token match. Run full ctest (currently `57/57` on this branch). Run decode benchmark — expect BF16 GEMMs to be faster than FP32 (less memory bandwidth). Run `verify_correctness.sh` — Route A must match Route C. Counters: `dense_reference_fallback=0`, `nvfp4_reference_fallback=0`.
   Key files: `proj-2026-04-03-0318/verify_correctness.sh`, `proj-2026-04-03-2113/compare_vllm_runtime_oracle.py`
   Analysis: `proj-2026-04-04-0133/bf16_pipeline_analysis.md`
+
+- [ ] **7g. Resolve the multi-token BF16 execution contract**
+  The current BF16 production surface is correct but not fully settled: `attention_layer.cpp`, `expert_layer.cpp`, and `mamba_layer.cpp` all handle `token_count > 1` by slicing the input into single-token views and recursively running the one-token path. Treat this as an explicit alignment item, not an incidental implementation detail. First, make the layer contract observable: add explicit capability / fallback boundaries and a measurable signal (counter, trace field, or benchmark artifact field) that records when multi-token requests are satisfied by sequential row replay instead of a native multi-token path. Then decide whether that sequential replay is (a) a temporary correctness bridge that must be replaced with true multi-token production paths, or (b) an intentional Nano-on-5090 contract that remains only if measurement and code simplicity justify it. If it is temporary, restore native multi-token execution for the affected layers and remove the recursive bridge from the hot path. If any part remains intentional, document the exact surviving divergence, benchmark the prefill / resumed-prefix cost, and fence the bridge so it is explicit rather than silently becoming the default.
+
+  Acceptance criteria:
+  - local correctness, oracle replay, and exact-token vLLM parity remain green
+  - `bench_full_comparison.sh` artifacts are captured before and after the change, with the prefix-cache TTFT matrix kept as the primary comparison record
+  - a focused `nano_prefix_cache_ttft_bench` sweep for `tail_token_count == moe_prefill_window_tokens == 32/64/128` is recorded for the branch
+  - step `7g` cannot close while the production multi-token BF16 path still silently falls back to row replay; any surviving replay path must be explicitly gated, documented, and visible in artifacts
+
+  Required execution order inside `7g`:
+  1. Add observability first so row replay, native multi-token execution, and fallback routing are visible in traces and benchmark artifacts.
+  2. Remove the outer multi-token row-replay bridge in attention and validate the existing native multi-token prefill path against the Tier 1 and `7g` benchmark gates.
+  3. Remove the outer multi-token row-replay bridge in expert while preserving top-level MoE window chunking as a memory policy; keep host-routing and other non-native routes as explicit fallback only.
+  4. Remove the outer multi-token row-replay bridge in Mamba while preserving the explicit inner split between multi-token prefill and single-token fused decode.
+  5. Run the full `7g` verification matrix and only then decide whether any residual replay path is justified enough to remain as an intentional divergence.
+
+  Implementation notes and reference alignment:
+  - **Do `7e` before re-baselining multi-token behavior.** The local vLLM Nemotron-H reference carries `hidden_states` and `residual` separately through every decoder layer and performs fused add+RMSNorm at layer entry, with the final add+norm only after the last layer. That keeps `7e` logically ahead of `7g`, because we should not bless a multi-token contract on top of a residual handoff we already know is still being aligned.
+  - **Attention should remove the outer row-replay bridge, not invent a second prefill architecture.** Below the current `token_count > 1` recursion in `attention_layer.cpp`, the layer already allocates token-count-shaped BF16 buffers, scatters KV for `token_count` tokens, selects an attention backend with `max_query_tokens = token_count`, and runs paged attention over the full token block. The local vLLM reference on RTX 5090 uses the `FLASHINFER` attention backend and explicitly builds separate prefill and decode metadata instead of replaying one token at a time. For this branch, the target is to delete the recursive wrapper and validate the existing native multi-token prefill path against the current backend policy and TTFT gates.
+  - **Expert should also remove the outer row-replay bridge and keep MoE window chunking above a native multi-token layer path.** Below the current `token_count > 1` recursion in `expert_layer.cpp`, the direct-MoE path already computes grouped top-k for the whole token block and can dispatch `token_count > 1` work through `UnifiedFusedBackend` / `RunFusedMoePrefillPath`. The local vLLM reference flattens all prompt tokens into one `(num_tokens, hidden_dim)` tensor, runs grouped top-k token-major, and executes shared+routed experts over that batch; it does not row-replay prompt tokens. Our top-level MoE window chunking in `single_token_forward_model.cpp` can remain as a memory-bounding policy, but each chunk must enter `ExpertLayerSlice::Run()` as real multi-token work, with the host-routing adapter remaining fallback-only and visible in artifacts.
+  - **Mamba is different: remove the outer row-replay bridge, but keep the inner prefill/decode split.** In the local runtime, `MambaLayerSlice::Run()` already contains a real multi-token prefill path (`RunMambaConvPrefill` + `RunMambaSsdPrefill` + gated group norm) and a separate single-token fused decode path. The accidental divergence is the outer `token_count > 1` recursive wrapper, not the existence of a dedicated prefill algorithm. The local vLLM reference follows the same high-level shape: its Mamba metadata builder splits decodes and prefills, and `MambaMixer2` executes dedicated prefill sequence transforms plus a separate decode update path instead of forcing multi-token requests through the decode kernel. So `7g` for Mamba is contract cleanup and explicit measurement, not “make prefill use fused decode.”
+  - **Observability is part of the deliverable, not optional scaffolding.** Add a per-layer or per-request signal that distinguishes native multi-token execution from row replay for attention, expert, and Mamba. The signal must land in benchmark or trace artifacts so `bench_full_comparison.sh` and the focused prefix TTFT sweep can prove whether the bridge is gone, quarantined, or still on the hot path.
+  - **Reference scope for this branch is the actual local RTX 5090 vLLM path, not generic upstream possibilities.** The working reference here is `third_party/vllm` under `docs/vllm_rtx5090.md`, with `FLASHINFER` attention and `FLASHINFER_CUTLASS` NVFP4 MoE on the Nano checkpoint. `7g` should converge toward that batch-oriented prefill/decode execution shape while preserving the intentional exact-prefix cache divergence and our local single-process runtime boundary.
+
+  Do not broaden oracle re-baselining or start cache-allocator work until this contract is closed.
+  Key files: `runtime/src/backend/attention_layer.cpp`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/mamba_layer.cpp`, `runtime/src/api/single_token_forward_model.cpp`, `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`, `proj-2026-04-03-0318/bench_full_comparison.sh`
 
 - [ ] **8. Port oracle fixture generation to Nano and regenerate slice-level golden tests**
   Port `tools/oracle/dump_expert_layer_fixture.py` to handle Nano's non-latent MoE architecture (no `fc1_latent_proj`/`fc2_latent_proj`, NVFP4-packed expert weights instead of scalar FP8). Port `tools/oracle/dump_mamba_layer_fixture.py` to handle Nano's per-channel weight scales (tensor, not scalar) and NVFP4 weight formats. Port `tools/oracle/dump_mamba_update_fixture.py` for Nano dimensions (num_heads=64 not 128). Generate fixtures for representative Nano layers: at least 2 expert layers (e.g., layers 1 and 8), 2 Mamba layers (e.g., layers 0 and 9), and 1 attention layer (e.g., layer 5). Re-register the corresponding tests in `testing/CMakeLists.txt` and verify they pass against the generated fixtures. Fixtures must be generated against the final BF16 pipeline so they encode the correct precision model.
@@ -85,7 +112,7 @@ regressions from known issues.
 
 ### Tier 2: phase boundaries (we run manually after committing)
 
-Run after steps 4, 8f, and 10 — or any time a step touches the hot execution path.
+Run after steps 4, 7f, 7g, 8, and 10 — or any time a step touches the hot execution path.
 
 - `nano_save_prompt_oracle` — generate a fresh oracle, compare against baseline
 - `proj-2026-04-03-0318/verify_correctness.sh` — local correctness gate
@@ -143,7 +170,7 @@ ctest --test-dir build --output-on-failure -R \
 
 ### Tier 2: Phase Boundaries and Hot-Path Changes
 
-Run these after steps 4, 7f, 8, and 10, and after any change that touches the
+Run these after steps 4, 7f, 7g, 8, and 10, and after any change that touches the
 hot execution path.
 
 Local correctness gate:
@@ -208,6 +235,35 @@ proj-2026-04-03-0318/bench_full_comparison.sh \
   --artifact-dir "${ARTIFACT_DIR}/full_comparison"
 ```
 
+Focused prefix-cache TTFT sweep for multi-token BF16 work (`7g`) and cache work
+(`9`):
+
+```bash
+NEMOTRON_FORWARD_MANIFEST="${NEMOTRON_FORWARD_MANIFEST}" \
+./build/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench \
+  --warmup 1 \
+  --iterations 5 \
+  --tail-token-count 32 \
+  --moe-prefill-window-tokens 32 \
+  | tee "${ARTIFACT_DIR}/prefix_ttft_tail32_window32.stdout.txt"
+
+NEMOTRON_FORWARD_MANIFEST="${NEMOTRON_FORWARD_MANIFEST}" \
+./build/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench \
+  --warmup 1 \
+  --iterations 5 \
+  --tail-token-count 64 \
+  --moe-prefill-window-tokens 64 \
+  | tee "${ARTIFACT_DIR}/prefix_ttft_tail64_window64.stdout.txt"
+
+NEMOTRON_FORWARD_MANIFEST="${NEMOTRON_FORWARD_MANIFEST}" \
+./build/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench \
+  --warmup 1 \
+  --iterations 5 \
+  --tail-token-count 128 \
+  --moe-prefill-window-tokens 128 \
+  | tee "${ARTIFACT_DIR}/prefix_ttft_tail128_window128.stdout.txt"
+```
+
 ### Step-by-Step Verification Checklist
 
 - Steps 1-3: run Tier 1 only unless the change touches runtime execution or test
@@ -218,9 +274,16 @@ proj-2026-04-03-0318/bench_full_comparison.sh \
   before the full suite. If any of these steps touch decode, attention, Mamba,
   or MoE execution, also run the direct decode benchmark sanity check.
 - Step 7f: run the complete Tier 2 set.
+- Step 7g: run the complete Tier 2 set. If the change touches multi-token
+  prefill or restored-prefix execution, keep the `bench_full_comparison.sh`
+  artifact as the phase record, not just the decode sanity check, and also run
+  the focused prefix-cache TTFT sweep above for `32/64/128` tail/window pairs.
+  Do not mark `7g` done on correctness alone; the artifact set must make any
+  remaining row-replay path explicit.
 - Step 8: run Tier 1, the targeted oracle/functional ctest regex, runtime oracle
-  generation, and exact-token vLLM parity. If fixture or oracle semantics touch
-  hot-path code, also run `verify_correctness.sh`.
+  generation, and exact-token vLLM parity. Treat broad fixture regeneration as
+  blocked on steps 7e and 7g closing the BF16 execution contract. If fixture or
+  oracle semantics touch hot-path code, also run `verify_correctness.sh`.
 - Step 9: run Tier 1 plus the targeted oracle/functional regex. If cache changes
   affect request execution, also run `verify_correctness.sh` and the direct
   decode benchmark sanity check.
@@ -239,9 +302,10 @@ proj-2026-04-03-0318/bench_full_comparison.sh \
 | 7a | Fused add+RMSNorm kernel (BF16 I/O, FP32 internal) | done | 51bd4b7 | |
 | 7b+c | BF16 embedding lookup + BF16 dense GEMM path | done | a0639da | |
 | 7d | BF16 hidden/residual buffers and layer interfaces | done | 3005496 | + GQA fix f66d740, fused decode gate cdd2c13, fastpath 525e2a8, MoE prefill fix 72f527c, decode scratch fix 3005496 |
-| 7e | Residual-add pattern alignment and bootstrap cleanup | pending | — | |
+| 7e | Residual-add pattern alignment and bootstrap cleanup | done | PENDING | FP32 compat overloads return delta; bootstrap split into validate/plan/assemble; manifest op_class roles replace name heuristics |
 | 7f | BF16 pipeline verification and vLLM parity | done | — | 2026-04-04 rerun now passes `full_forward_manifest_smoke_test`, `nano_16_token_correctness_test`, the long-prompt `nano_save_prompt_oracle` path, and exact-token vLLM parity for `short_chat` (`runtime_generated_token_ids == vllm_generated_token_ids == [1784, 3330, 17000, 10693]`). |
-| 8 | Port oracle fixture generation to Nano (against BF16 pipeline) | in progress | — | Nano oracle generators now produce live fixtures for `full_model_single_token_short_chat_cuda_v3`, `prefix_prefill_short_chat_layer7_t4_oracle`, `expert_layer1_decode_block`, and `mamba_layer0_decode_block`; the registered oracle gates now pass under the branch’s intended BF16/NVFP4 functional envelopes, but the broader fixture-coverage expansion in the step text is still pending. |
+| 7g | Resolve the multi-token BF16 execution contract | pending | — | Current attention / expert / Mamba BF16 multi-token requests recurse one token at a time; close or explicitly justify that divergence before broad oracle re-baselining or cache follow-on work. |
+| 8 | Port oracle fixture generation to Nano (against BF16 pipeline) | in progress | — | Nano oracle generators now produce live fixtures for `full_model_single_token_short_chat_cuda_v3`, `prefix_prefill_short_chat_layer7_t4_oracle`, `expert_layer1_decode_block`, and `mamba_layer0_decode_block`; the registered oracle gates now pass under the branch’s intended BF16/NVFP4 functional envelopes, but the broader fixture-coverage expansion in the step text is still pending and should follow steps `7e` and `7g`. |
 | 9 | Revisit cache allocator and page/snapshot ownership | pending | — | Snapshot must handle BF16 hidden states |
 | 10 | Multi-turn prefix reuse regression and final verification sweep | pending | — | |
 
@@ -264,9 +328,13 @@ The critical path has shifted again:
 5. **The decode performance sanity check remains healthy.**
    The fresh `nano_fused_decode_bench` rerun reported `hot_steady_state_mean_ms=15.597` and `steady_state_generated_tokens_per_second=64.116`, with `dense_reference_fallback=0`, `nvfp4_reference_fallback=0`, `host_routing_adapter_calls=0`, and `host_routing_tensor_copies=0`.
 
+6. **The BF16 execution contract is still open for multi-token requests.**
+   The latest fixes proved correctness, but they also made the current production shape more obvious: attention, expert, and Mamba currently satisfy `token_count > 1` by replaying the one-token path row by row. That may be acceptable as a temporary correctness bridge, but it is still an accidental divergence until we either replace it with true multi-token execution or explicitly keep and justify it with measurements.
+
 ## Immediate Execution Order
 
-1. Close the remaining explicit scope in **8**: add the extra representative Nano fixtures promised in the step text, instead of stopping at the minimum set needed to get the current oracle binaries green.
-2. Resume **7e** and clean up the residual-add / bootstrap contract, since the verification surface is no longer the bottleneck.
-3. Start **9** once the remaining step-8 coverage work is either finished or explicitly descoped; the next architectural work should be cache allocator and snapshot/page ownership, not more ad hoc oracle repair.
-4. Reserve **10** for the final integrated sweep after steps **7e**, **8**, and **9** are all genuinely closed.
+1. Resume **7e** and clean up the residual-add / bootstrap contract while the verification surface is green and the oracle set is still small enough to rebaseline cheaply.
+2. Close **7g** immediately after `7e`: decide whether the current token-by-token BF16 multi-token bridge is temporary or intentional, and either remove it from the hot path or document and benchmark it as an explicit divergence.
+3. Finish the broader fixture expansion in **8** only after **7e** and **7g** stabilize the BF16 execution contract.
+4. Start **9** once step **8** coverage is genuinely complete or explicitly descoped; the next architectural work should be cache allocator and snapshot/page ownership, not more ad hoc oracle repair.
+5. Reserve **10** for the final integrated sweep after steps **7e**, **7g**, **8**, and **9** are all genuinely closed.

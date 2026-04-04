@@ -607,32 +607,28 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
   const std::size_t per_layer_ssm_state = RequiredMambaStateElems(config);
 
   for (const LayerScheduleEntry& layer : layers) {
-    const bool is_attention = layer.has_attention;
-    const bool is_mamba = layer.has_mamba;
-    const bool is_expert = layer.has_router || layer.has_routed_experts || layer.has_shared_experts;
-    const std::size_t family_count =
-        static_cast<std::size_t>(is_attention) +
-        static_cast<std::size_t>(is_mamba) +
-        static_cast<std::size_t>(is_expert);
-    if (family_count != 1) {
-      return std::nullopt;
-    }
-
     ForwardLayerPlanEntry entry;
     entry.layer_index = layer.layer_index;
-    if (is_attention) {
-      entry.kind = ForwardLayerKind::kAttention;
-      ++plan.attention_layer_count;
-    } else if (is_mamba) {
-      entry.kind = ForwardLayerKind::kMamba;
-      entry.mamba_conv_state_offset_elems = mamba_conv_offset;
-      entry.mamba_state_offset_elems = mamba_state_offset;
-      mamba_conv_offset += per_layer_conv_state;
-      mamba_state_offset += per_layer_ssm_state;
-      ++plan.mamba_layer_count;
-    } else {
-      entry.kind = ForwardLayerKind::kExpert;
-      ++plan.expert_layer_count;
+    switch (layer.role) {
+      case ModelLayerRole::kAttention:
+        entry.kind = ForwardLayerKind::kAttention;
+        ++plan.attention_layer_count;
+        break;
+      case ModelLayerRole::kMamba:
+        entry.kind = ForwardLayerKind::kMamba;
+        entry.mamba_conv_state_offset_elems = mamba_conv_offset;
+        entry.mamba_state_offset_elems = mamba_state_offset;
+        mamba_conv_offset += per_layer_conv_state;
+        mamba_state_offset += per_layer_ssm_state;
+        ++plan.mamba_layer_count;
+        break;
+      case ModelLayerRole::kExpert:
+        entry.kind = ForwardLayerKind::kExpert;
+        ++plan.expert_layer_count;
+        break;
+      case ModelLayerRole::kUnknown:
+      default:
+        return std::nullopt;
     }
     plan.layers.push_back(entry);
   }
@@ -1436,6 +1432,9 @@ bool SingleTokenForwardModel::RunTokens(
       capture_layer_indices.begin(),
       capture_layer_indices.end());
 
+  // Decoder layers now follow the deferred residual pattern:
+  // `current` carries the layer delta and `residual_tensor` carries the
+  // accumulated hidden stream updated by fused add+RMSNorm at each layer entry.
   for (const Impl::LayerEntry& layer : impl_->layers) {
     if (debug) {
       std::cout << "single_token_forward_model: running layer "
@@ -1608,6 +1607,8 @@ bool SingleTokenForwardModel::RunTokens(
 
   DeviceTensorBf16* logits_input = nullptr;
   if (impl_->final_norm_weight != nullptr) {
+    // After the last layer, `current` is the final delta and `residual_tensor`
+    // already holds the accumulated hidden state up to the last block boundary.
     if (!FusedAddRmsNormBf16(
             *current,
             residual_tensor,

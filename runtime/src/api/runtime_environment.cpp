@@ -10,10 +10,33 @@
 #include "nemotron/weight_arena.h"
 #include "nemotron/weight_arena_plan.h"
 
+#include <optional>
 #include <utility>
 
 namespace nemotron {
 namespace {
+
+struct ValidatedManifestBootstrap {
+  PackedModelManifest manifest;
+  std::unique_ptr<ArtifactLoader> artifact_loader;
+};
+
+struct PlannedManifestBootstrap {
+  LoaderPlan loader_plan;
+  RuntimeConfig config;
+  std::size_t effective_shared_cache_budget_bytes = 0;
+  std::unique_ptr<ArtifactLoader> artifact_loader;
+  std::unique_ptr<TensorCatalog> tensor_catalog;
+  std::unique_ptr<ModelSchedule> model_schedule;
+  std::unique_ptr<WeightArenaPlan> weight_arena_plan;
+  std::unique_ptr<WeightArena> weight_arena;
+  std::unique_ptr<KernelCatalog> kernel_catalog;
+  std::unique_ptr<GemmCatalog> gemm_catalog;
+  std::unique_ptr<EmbeddingCatalog> embedding_catalog;
+  std::unique_ptr<GemmHeuristicCache> gemm_heuristic_cache;
+  std::unique_ptr<ReusableStateArena> reusable_state_arena;
+  std::unique_ptr<PrefixCache> prefix_cache;
+};
 
 ServiceMemoryTarget ResolveServiceMemoryTarget(const RuntimeBootstrapOptions& options) {
   ServiceMemoryTarget target = options.service_target;
@@ -28,6 +51,126 @@ ServiceMemoryTarget ResolveServiceMemoryTarget(const RuntimeBootstrapOptions& op
     target.prefer_host_memory_snapshot = true;
   }
   return target;
+}
+
+std::optional<ValidatedManifestBootstrap> ValidateManifestBootstrap(
+    const std::filesystem::path& manifest_path,
+    const RuntimeBootstrapOptions& options) {
+  const ManifestLoadResult load_result =
+      options.verify_manifest_files
+          ? LoadVerifiedManifestFromJsonFile(manifest_path)
+          : LoadManifestFromJsonFile(manifest_path);
+  if (!load_result.ok) {
+    return std::nullopt;
+  }
+
+  auto artifact_loader = ArtifactLoader::OpenVerifiedWithMode(
+      load_result.manifest,
+      manifest_path,
+      options.artifact_load_mode);
+  if (!artifact_loader) {
+    return std::nullopt;
+  }
+
+  return ValidatedManifestBootstrap{
+      std::move(load_result.manifest),
+      std::move(artifact_loader),
+  };
+}
+
+std::optional<PlannedManifestBootstrap> PlanManifestBootstrap(
+    ValidatedManifestBootstrap&& validated,
+    const RuntimeBootstrapOptions& options) {
+  auto tensor_catalog = std::make_unique<TensorCatalog>(
+      BuildTensorCatalog(validated.manifest, *validated.artifact_loader));
+  if (!tensor_catalog->valid()) {
+    return std::nullopt;
+  }
+
+  auto model_schedule = std::make_unique<ModelSchedule>(
+      BuildModelSchedule(validated.manifest));
+  if (!model_schedule->valid()) {
+    return std::nullopt;
+  }
+
+  std::unique_ptr<WeightArenaPlan> weight_arena_plan;
+  if (options.materialize_weight_arena) {
+    auto plan = std::make_unique<WeightArenaPlan>(BuildWeightArenaPlan(*tensor_catalog));
+    if (!plan->valid()) {
+      return std::nullopt;
+    }
+    weight_arena_plan = std::move(plan);
+  }
+
+  const ServiceMemoryTarget resolved_target = ResolveServiceMemoryTarget(options);
+  LoaderPlan loader_plan = BuildLoaderPlan(
+      validated.manifest,
+      resolved_target,
+      options.use_fp16_mamba_state,
+      options.reusable_node_metadata_bytes);
+  if (!loader_plan.valid) {
+    return std::nullopt;
+  }
+
+  RuntimeConfig config = LoadRuntimeConfigFromEnv();
+  const std::size_t effective_shared_cache_budget_bytes =
+      config.prefix_cache_enabled ? loader_plan.memory_budget.shared_cache_budget_bytes : 0;
+
+  return PlannedManifestBootstrap{
+      std::move(loader_plan),
+      std::move(config),
+      effective_shared_cache_budget_bytes,
+      std::move(validated.artifact_loader),
+      std::move(tensor_catalog),
+      std::move(model_schedule),
+      std::move(weight_arena_plan),
+  };
+}
+
+std::optional<PlannedManifestBootstrap> AssembleManifestBootstrap(
+    PlannedManifestBootstrap&& plan,
+    const RuntimeBootstrapOptions& options) {
+  KernelCatalog kernel_catalog;
+  if (options.materialize_weight_arena) {
+    if (plan.weight_arena_plan == nullptr || !plan.weight_arena_plan->valid()) {
+      return std::nullopt;
+    }
+    plan.weight_arena = WeightArena::CreateFromPlan(*plan.weight_arena_plan);
+    if (!plan.weight_arena) {
+      return std::nullopt;
+    }
+    kernel_catalog = BuildKernelCatalog(*plan.tensor_catalog, *plan.weight_arena);
+  } else {
+    kernel_catalog = BuildKernelCatalog(*plan.tensor_catalog);
+  }
+  if (!kernel_catalog.valid()) {
+    return std::nullopt;
+  }
+
+  GemmCatalog gemm_catalog = BuildGemmCatalog(kernel_catalog);
+  if (!gemm_catalog.valid()) {
+    return std::nullopt;
+  }
+  EmbeddingCatalog embedding_catalog = BuildEmbeddingCatalog(kernel_catalog);
+  if (!embedding_catalog.valid()) {
+    return std::nullopt;
+  }
+
+  auto reusable_state_arena =
+      std::make_unique<ReusableStateArena>(plan.effective_shared_cache_budget_bytes);
+  auto prefix_cache = std::make_unique<PrefixCache>(
+      plan.effective_shared_cache_budget_bytes,
+      reusable_state_arena.get());
+  auto gemm_heuristic_cache = std::make_unique<GemmHeuristicCache>();
+  ApplyRuntimeConfig(plan.config, prefix_cache.get());
+
+  plan.kernel_catalog = std::make_unique<KernelCatalog>(std::move(kernel_catalog));
+  plan.gemm_catalog = std::make_unique<GemmCatalog>(std::move(gemm_catalog));
+  plan.embedding_catalog = std::make_unique<EmbeddingCatalog>(std::move(embedding_catalog));
+  plan.gemm_heuristic_cache = std::move(gemm_heuristic_cache);
+  plan.reusable_state_arena = std::move(reusable_state_arena);
+  plan.prefix_cache = std::move(prefix_cache);
+  return std::move(plan);
 }
 
 }  // namespace
@@ -80,94 +223,37 @@ std::unique_ptr<RuntimeEnvironment> RuntimeEnvironment::Build(
 std::unique_ptr<RuntimeEnvironment> RuntimeEnvironment::BuildFromManifestFile(
     const std::filesystem::path& manifest_path,
     const RuntimeBootstrapOptions& options) {
-  const ManifestLoadResult load_result =
-      options.verify_manifest_files
-          ? LoadVerifiedManifestFromJsonFile(manifest_path)
-          : LoadManifestFromJsonFile(manifest_path);
-  if (!load_result.ok) {
-    return nullptr;
-  }
-  auto artifact_loader = ArtifactLoader::OpenVerifiedWithMode(
-      load_result.manifest,
-      manifest_path,
-      options.artifact_load_mode);
-  if (!artifact_loader) {
-    return nullptr;
-  }
-  TensorCatalog tensor_catalog = BuildTensorCatalog(load_result.manifest, *artifact_loader);
-  if (!tensor_catalog.valid()) {
-    return nullptr;
-  }
-  std::unique_ptr<WeightArenaPlan> weight_arena_plan;
-  std::unique_ptr<WeightArena> weight_arena;
-  KernelCatalog kernel_catalog;
-  if (options.materialize_weight_arena) {
-    auto plan = std::make_unique<WeightArenaPlan>(BuildWeightArenaPlan(tensor_catalog));
-    if (!plan->valid()) {
-      return nullptr;
-    }
-    auto arena = WeightArena::CreateFromPlan(*plan);
-    if (!arena) {
-      return nullptr;
-    }
-    kernel_catalog = BuildKernelCatalog(tensor_catalog, *arena);
-    weight_arena_plan = std::move(plan);
-    weight_arena = std::move(arena);
-  } else {
-    kernel_catalog = BuildKernelCatalog(tensor_catalog);
-  }
-  if (!kernel_catalog.valid()) {
-    return nullptr;
-  }
-  GemmCatalog gemm_catalog = BuildGemmCatalog(kernel_catalog);
-  if (!gemm_catalog.valid()) {
-    return nullptr;
-  }
-  EmbeddingCatalog embedding_catalog = BuildEmbeddingCatalog(kernel_catalog);
-  if (!embedding_catalog.valid()) {
-    return nullptr;
-  }
-  ModelSchedule model_schedule = BuildModelSchedule(load_result.manifest);
-  if (!model_schedule.valid()) {
+  auto validated = ValidateManifestBootstrap(manifest_path, options);
+  if (!validated.has_value()) {
     return nullptr;
   }
 
-  const ServiceMemoryTarget resolved_target = ResolveServiceMemoryTarget(options);
-  LoaderPlan loader_plan = BuildLoaderPlan(
-      load_result.manifest,
-      resolved_target,
-      options.use_fp16_mamba_state,
-      options.reusable_node_metadata_bytes);
-  if (!loader_plan.valid) {
+  auto planned = PlanManifestBootstrap(std::move(*validated), options);
+  if (!planned.has_value()) {
     return nullptr;
   }
 
-  RuntimeConfig config = LoadRuntimeConfigFromEnv();
-  const std::size_t effective_shared_cache_budget_bytes =
-      config.prefix_cache_enabled ? loader_plan.memory_budget.shared_cache_budget_bytes : 0;
+  auto assembled = AssembleManifestBootstrap(std::move(*planned), options);
+  if (!assembled.has_value()) {
+    return nullptr;
+  }
 
-  auto reusable_state_arena =
-      std::make_unique<ReusableStateArena>(effective_shared_cache_budget_bytes);
-  auto prefix_cache =
-      std::make_unique<PrefixCache>(effective_shared_cache_budget_bytes, reusable_state_arena.get());
-  auto gemm_heuristic_cache = std::make_unique<GemmHeuristicCache>();
-  ApplyRuntimeConfig(config, prefix_cache.get());
-
+  PlannedManifestBootstrap plan = std::move(*assembled);
   return std::unique_ptr<RuntimeEnvironment>(new RuntimeEnvironment(
-      std::move(config),
-      std::move(loader_plan),
-      effective_shared_cache_budget_bytes,
-      std::move(artifact_loader),
-      std::make_unique<TensorCatalog>(std::move(tensor_catalog)),
-      std::make_unique<ModelSchedule>(std::move(model_schedule)),
-      std::move(weight_arena_plan),
-      std::move(weight_arena),
-      std::make_unique<KernelCatalog>(std::move(kernel_catalog)),
-      std::make_unique<GemmCatalog>(std::move(gemm_catalog)),
-      std::make_unique<EmbeddingCatalog>(std::move(embedding_catalog)),
-      std::move(gemm_heuristic_cache),
-      std::move(reusable_state_arena),
-      std::move(prefix_cache)));
+      std::move(plan.config),
+      std::move(plan.loader_plan),
+      plan.effective_shared_cache_budget_bytes,
+      std::move(plan.artifact_loader),
+      std::move(plan.tensor_catalog),
+      std::move(plan.model_schedule),
+      std::move(plan.weight_arena_plan),
+      std::move(plan.weight_arena),
+      std::move(plan.kernel_catalog),
+      std::move(plan.gemm_catalog),
+      std::move(plan.embedding_catalog),
+      std::move(plan.gemm_heuristic_cache),
+      std::move(plan.reusable_state_arena),
+      std::move(plan.prefix_cache)));
 }
 
 RuntimeEnvironment::RuntimeEnvironment(
