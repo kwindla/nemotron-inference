@@ -1060,6 +1060,7 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceTensorFp32> normalized_scratch;
   std::unique_ptr<DeviceTensorFp32> router_logits_scratch;
   std::unique_ptr<DeviceTensorFp32> output_scratch;
+  std::unique_ptr<DeviceTensorFp32> routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> routed_up_scratch;
   std::unique_ptr<DeviceTensorFp32> shared_up_scratch;
   std::unique_ptr<DeviceNvfp4Matrix> normalized_pack;
@@ -2140,7 +2141,7 @@ bool ExpertLayerSlice::Impl::RunDecodeCublasLtBackend(
   MoeDirectDecodeScratch moe_scratch;
   MoeDirectDecodeScratch* moe_scratch_ptr = nullptr;
   if (backend_dispatch_state.use_decode_scratch) {
-    moe_scratch.output_accum = output_scratch.get();
+    moe_scratch.output_accum = routed_output_scratch.get();
     moe_scratch.routed_up = routed_up_scratch.get();
     moe_scratch.shared_up = shared_up_scratch.get();
     moe_scratch_ptr = &moe_scratch;
@@ -2930,12 +2931,14 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   auto normalized_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
   auto router_logits_scratch = DeviceTensorFp32::Create({1, config.n_routed_experts});
   auto output_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
+  auto routed_output_scratch = DeviceTensorFp32::Create({1, config.hidden_size});
   auto routed_up_scratch = DeviceTensorFp32::Create({1, config.routed_expert_intermediate_size});
   auto shared_up_scratch = DeviceTensorFp32::Create({1, config.shared_expert_intermediate_size});
   if (!normalized_bf16_scratch ||
       !normalized_scratch ||
       !router_logits_scratch ||
       !output_scratch ||
+      !routed_output_scratch ||
       !routed_up_scratch ||
       !shared_up_scratch) {
     return debug_fail("decode scratch allocation failed");
@@ -3046,6 +3049,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->normalized_scratch = std::move(normalized_scratch);
   impl->router_logits_scratch = std::move(router_logits_scratch);
   impl->output_scratch = std::move(output_scratch);
+  impl->routed_output_scratch = std::move(routed_output_scratch);
   impl->routed_up_scratch = std::move(routed_up_scratch);
   impl->shared_up_scratch = std::move(shared_up_scratch);
   impl->normalized_pack = std::move(normalized_pack);
@@ -3216,6 +3220,8 @@ bool ExpertLayerSlice::valid() const {
          impl_->router_logits_scratch->valid() &&
          impl_->output_scratch != nullptr &&
          impl_->output_scratch->valid() &&
+         impl_->routed_output_scratch != nullptr &&
+         impl_->routed_output_scratch->valid() &&
          impl_->routed_up_scratch != nullptr &&
          impl_->routed_up_scratch->valid() &&
          impl_->shared_up_scratch != nullptr &&

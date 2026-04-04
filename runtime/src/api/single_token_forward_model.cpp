@@ -54,6 +54,11 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
+bool DecodeLayerNormDebugEnabled() {
+  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_LAYER_NORMS");
+  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
 std::unique_ptr<DeviceTensorFp32> CreateTokenRangeView(
     DeviceTensorFp32* buffer,
     std::size_t token_offset,
@@ -427,6 +432,36 @@ std::vector<float> CopyCombinedTensorToHost(
         __bfloat162float(residual_bf16[i]);
   }
   return combined;
+}
+
+void PrintTensorNorms(
+    const char* label,
+    std::size_t layer_index,
+    const DeviceTensorBf16& hidden_delta,
+    const DeviceTensorBf16& residual_accum) {
+  const std::vector<float> combined = CopyCombinedTensorToHost(hidden_delta, residual_accum);
+  if (combined.empty()) {
+    std::cerr << "single_token_forward_model: " << label
+              << " layer=" << layer_index
+              << " combined_hidden=unavailable\n";
+    return;
+  }
+
+  double sum_sq = 0.0;
+  float max_abs = 0.0f;
+  for (float value : combined) {
+    sum_sq += static_cast<double>(value) * static_cast<double>(value);
+    max_abs = std::max(max_abs, std::fabs(value));
+  }
+
+  std::cerr << "single_token_forward_model: " << label
+            << " layer="
+            << (layer_index == static_cast<std::size_t>(-1)
+                    ? -1
+                    : static_cast<long long>(layer_index))
+            << " l2=" << std::sqrt(sum_sq)
+            << " max_abs=" << max_abs
+            << "\n";
 }
 
 bool AllFinite(const std::vector<float>& values) {
@@ -1255,6 +1290,8 @@ bool SingleTokenForwardModel::RunTokens(
   const bool nonzero_token_count = token_count != 0;
   const bool request_valid = request_context.valid();
   const bool hidden_size_match = request_context.config().hidden_size == impl_->config.hidden_size;
+  const bool decode_layer_norm_debug =
+      token_count == 1 && !reset_request_state && DecodeLayerNormDebugEnabled();
   const std::size_t prior_sequence_length =
       reset_request_state ? 0 : request_context.sequence_length();
   const std::size_t prior_decode_position =
@@ -1380,6 +1417,9 @@ bool SingleTokenForwardModel::RunTokens(
   if (debug) {
     std::cout << "single_token_forward_model: embedding lookup ok for "
               << token_count << " token(s)\n";
+  }
+  if (decode_layer_norm_debug) {
+    PrintTensorNorms("decode_layer_norm", static_cast<std::size_t>(-1), *current, *residual_tensor);
   }
   if (trace != nullptr) {
     trace->embedding_output = CopyTensorToHost(*current);
@@ -1522,6 +1562,9 @@ bool SingleTokenForwardModel::RunTokens(
     if (debug) {
       std::cout << "single_token_forward_model: layer "
                 << layer.plan.layer_index << " ok\n";
+    }
+    if (decode_layer_norm_debug) {
+      PrintTensorNorms("decode_layer_norm", layer.plan.layer_index, *current, *residual_tensor);
     }
 
     if (trace != nullptr && capture_set.find(layer.plan.layer_index) != capture_set.end()) {
