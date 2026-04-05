@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -47,6 +48,11 @@ struct CudaMemInfo {
 bool EnvEnabled(const char* env_var) {
   const char* value = std::getenv(env_var);
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
+bool PrefillTraceEnabled() {
+  static const bool enabled = EnvEnabled("NEMOTRON_FORWARD_PREFILL_TRACE");
+  return enabled;
 }
 
 bool DecodeScratchEnabled() {
@@ -113,6 +119,43 @@ std::size_t EffectiveMoePrefillWindowTokens(const SingleTokenForwardConfig& conf
   return config.moe_prefill_window_tokens > 0
              ? config.moe_prefill_window_tokens
              : config.max_tokens;
+}
+
+const char* ForwardLayerKindName(ForwardLayerKind kind) {
+  switch (kind) {
+    case ForwardLayerKind::kAttention:
+      return "attention";
+    case ForwardLayerKind::kMamba:
+      return "mamba";
+    case ForwardLayerKind::kExpert:
+      return "expert";
+  }
+  return "unknown";
+}
+
+std::size_t WindowCountForTokens(std::size_t token_count, std::size_t window_tokens) {
+  if (token_count == 0 || window_tokens == 0) {
+    return 0;
+  }
+  return 1 + ((token_count - 1) / window_tokens);
+}
+
+void LogPrefillLayerTrace(
+    std::size_t layer_index,
+    ForwardLayerKind kind,
+    std::size_t token_count,
+    std::size_t effective_moe_window_tokens,
+    double wall_time_ms) {
+  std::cerr << "single_token_forward_model: prefill_trace"
+            << " layer=" << layer_index
+            << " kind=" << ForwardLayerKindName(kind)
+            << " token_count=" << token_count
+            << " effective_moe_window_tokens=" << effective_moe_window_tokens;
+  if (kind == ForwardLayerKind::kExpert) {
+    std::cerr << " window_count="
+              << WindowCountForTokens(token_count, effective_moe_window_tokens);
+  }
+  std::cerr << " wall_ms=" << wall_time_ms << "\n";
 }
 
 std::size_t ParseEnvMiB(const char* env_var, std::size_t default_value_mib) {
@@ -1303,6 +1346,8 @@ bool SingleTokenForwardModel::RunTokens(
   const bool logits_shape_ok = logits_valid && logits->shape() == expected_logits_shape;
   const std::size_t effective_moe_window_tokens =
       EffectiveMoePrefillWindowTokens(impl_->config);
+  const bool prefill_trace_enabled =
+      token_count > 1 && PrefillTraceEnabled();
 
   if (!model_valid ||
       !have_tokens ||
@@ -1440,6 +1485,10 @@ bool SingleTokenForwardModel::RunTokens(
                 << layer.plan.layer_index
                 << " kind=" << static_cast<int>(layer.plan.kind) << "\n";
     }
+    std::chrono::steady_clock::time_point layer_start_time;
+    if (prefill_trace_enabled) {
+      layer_start_time = std::chrono::steady_clock::now();
+    }
     bool ok = false;
     switch (layer.plan.kind) {
       case ForwardLayerKind::kAttention: {
@@ -1548,6 +1597,17 @@ bool SingleTokenForwardModel::RunTokens(
         ok = created && valid_slice && ran;
         break;
       }
+    }
+    if (prefill_trace_enabled) {
+      const auto layer_end_time = std::chrono::steady_clock::now();
+      const auto layer_duration_ms =
+          std::chrono::duration<double, std::milli>(layer_end_time - layer_start_time).count();
+      LogPrefillLayerTrace(
+          layer.plan.layer_index,
+          layer.plan.kind,
+          token_count,
+          effective_moe_window_tokens,
+          layer_duration_ms);
     }
     if (!ok) {
       std::cerr << "single_token_forward_model: layer "
