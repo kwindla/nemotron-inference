@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -213,6 +214,17 @@ __global__ __launch_bounds__(128) void ChunkCumsumKernel(
   }
 }
 
+// ChunkStateKernel: computes chunk_delta[p, n] = X^T @ scaled_B
+// Uses WMMA tensor cores to match vLLM/TRT-LLM BF16 precision contract:
+//   scale * B computed in FP32, cast to BF16, then BF16 x BF16 -> FP32 via tensor cores.
+//
+// GEMM: C[P, NTile] = X^T[P, Q] @ scaled_B[Q, NTile]
+//   M=P=64, N=NTile=64, K=Q=128 with WMMA 16x16x16 tiles.
+//   A = X^T: load X[Q, P] row-major as col_major to get transpose.
+//   B = scaled_B[Q, NTile]: load row-major.
+//
+// One CTA per (head, n_tile_block, chunk). 128 threads = 4 warps.
+// 4x4=16 output tiles, 4 tiles per warp.
 template <int Q, int P, int N, int G, int NTile>
 __global__ __launch_bounds__(128) void ChunkStateKernel(
     const __nv_bfloat16* conv_output,
@@ -222,7 +234,15 @@ __global__ __launch_bounds__(128) void ChunkStateKernel(
     const float* dt_chunk,
     const float* dA_cumsum,
     float* state_scratch) {
-  __shared__ float shared_scale[Q];
+  using namespace nvcuda;
+  constexpr int WM = 16, WN = 16, WK = 16;
+  constexpr int TM = P / WM;      // 4 tiles in M (P dimension)
+  constexpr int TN = NTile / WN;  // 4 tiles in N (NTile dimension)
+  constexpr int TK = Q / WK;      // 8 tiles in K (Q dimension)
+
+  __shared__ __nv_bfloat16 s_scaled_b[Q * NTile];  // [Q, NTile] row-major
+  __shared__ __nv_bfloat16 s_x[Q * P];             // [Q, P] row-major
+  __shared__ float s_scale[Q];
 
   const int blocks_per_head = N / NTile;
   const int head = blockIdx.x / blocks_per_head;
@@ -236,30 +256,76 @@ __global__ __launch_bounds__(128) void ChunkStateKernel(
   const std::size_t dt_base = ChunkHeadOffset(chunk, head, Q);
   const float lambda_last = chunk_length > 0 ? dA_cumsum[dt_base + chunk_length - 1] : 0.0f;
 
+  // Compute scale per position
   for (int q = tid; q < Q; q += threads) {
     float scale = 0.0f;
     if (q < chunk_length) {
       scale = expf(lambda_last - dA_cumsum[dt_base + q]) * dt_chunk[dt_base + q];
     }
-    shared_scale[q] = scale;
+    s_scale[q] = scale;
   }
   __syncthreads();
 
-  for (int linear = tid; linear < P * NTile; linear += threads) {
-    const int p = linear / NTile;
-    const int n = n_tile + (linear % NTile);
-    float accum = 0.0f;
-    for (int q = 0; q < chunk_length; ++q) {
+  // Load scaled_B[q, n_local] = bf16(scale[q] * B[q, group, n_tile + n_local])
+  for (int linear = tid; linear < Q * NTile; linear += threads) {
+    const int q = linear / NTile;
+    const int n_local = linear % NTile;
+    __nv_bfloat16 val = __float2bfloat16(0.0f);
+    if (q < chunk_length) {
       const std::size_t token = static_cast<std::size_t>(chunk) * Q + q;
-      const float x = __bfloat162float(conv_output[token * conv_dim + head * P + p]);
-      const float b =
-          __bfloat162float(conv_output[token * conv_dim + intermediate_size + group * N + n]);
-      // Match vLLM: scale * B cast to BF16 before dot with X (BF16 tensor-core contract)
-      const float scaled_b = __bfloat162float(__float2bfloat16(shared_scale[q] * b));
-      accum += scaled_b * x;
+      const float b = __bfloat162float(
+          conv_output[token * conv_dim + intermediate_size + group * N + n_tile + n_local]);
+      val = __float2bfloat16(s_scale[q] * b);
     }
-    state_scratch[(((static_cast<std::size_t>(chunk) * kMambaFixedHeads + head) * P + p) * N) + n] =
-        accum;
+    s_scaled_b[q * NTile + n_local] = val;
+  }
+
+  // Load X[q, p] from conv_output
+  for (int linear = tid; linear < Q * P; linear += threads) {
+    const int q = linear / P;
+    const int p = linear % P;
+    __nv_bfloat16 val = __float2bfloat16(0.0f);
+    if (q < chunk_length) {
+      const std::size_t token = static_cast<std::size_t>(chunk) * Q + q;
+      val = conv_output[token * conv_dim + head * P + p];
+    }
+    s_x[q * P + p] = val;
+  }
+  __syncthreads();
+
+  // WMMA: C[P, NTile] = X^T[P, Q] @ scaled_B[Q, NTile]
+  const int warp_id = tid / 32;
+  const int num_warps = threads / 32;
+
+  for (int tile_idx = warp_id; tile_idx < TM * TN; tile_idx += num_warps) {
+    const int tm = tile_idx / TN;  // P tile index
+    const int tn = tile_idx % TN;  // NTile tile index
+
+    wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    for (int tk = 0; tk < TK; ++tk) {
+      // A = X^T[P, Q]: X is [Q, P] row-major.
+      // Loading col_major from X[Q, P] at offset [tk*WK, tm*WM] with ldm=P
+      // gives X^T fragment [WM=16, WK=16] starting at row tm*WM, col tk*WK.
+      wmma::fragment<wmma::matrix_a, WM, WN, WK, __nv_bfloat16, wmma::col_major> a_frag;
+      wmma::load_matrix_sync(a_frag, &s_x[tk * WK * P + tm * WM], P);
+
+      // B = scaled_B[Q, NTile] row-major at offset [tk*WK, tn*WN] with ldm=NTile.
+      wmma::fragment<wmma::matrix_b, WM, WN, WK, __nv_bfloat16, wmma::row_major> b_frag;
+      wmma::load_matrix_sync(b_frag, &s_scaled_b[tk * WK * NTile + tn * WN], NTile);
+
+      wmma::mma_sync(acc, a_frag, b_frag, acc);
+    }
+
+    // Store: chunk_delta[chunk, head, p, n] with N contiguous.
+    // Output tile covers p in [tm*WM, tm*WM+15], n in [n_tile + tn*WN, n_tile + tn*WN+15].
+    // The full N stride is N (=128), not NTile.
+    const std::size_t out_base =
+        ((static_cast<std::size_t>(chunk) * kMambaFixedHeads + head) * P + tm * WM) * N
+        + (n_tile + tn * WN);
+    wmma::store_matrix_sync(
+        &state_scratch[out_base], acc, N, wmma::mem_row_major);
   }
 }
 
