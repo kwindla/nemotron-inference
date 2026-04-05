@@ -36,6 +36,7 @@ MIN_SCALE = 1.0 / 1024.0
 FP4_DECODE_TABLE_TENSOR = torch.tensor(FP4_DECODE_TABLE, dtype=torch.float32)
 FP4_POSITIVE_VALUES_TENSOR = torch.tensor(FP4_POSITIVE_VALUES, dtype=torch.float32)
 ACTIVATION_PACKING_DYNAMIC_RUNTIME = "dynamic_runtime"
+ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE = "fixed_checkpoint_input_scale"
 RAW_WEIGHT_TENSOR_SCALE_CONTRACT = "raw_weight_scale_2"
 EFFECTIVE_WEIGHT_TENSOR_SCALE_CONTRACT = "effective_tensor_scale = input_scale * weight_scale_2"
 
@@ -184,18 +185,25 @@ def _as_scalar_tensor(value: float | torch.Tensor, device: torch.device) -> torc
     return torch.tensor(float(value), dtype=torch.float32, device=device)
 
 
-def pack_fp32_to_nvfp4_dynamic(values: torch.Tensor) -> dict[str, object]:
+def pack_fp32_to_nvfp4_dynamic(
+    values: torch.Tensor,
+    *,
+    fixed_tensor_scale: float | None = None,
+) -> dict[str, object]:
     if values.dim() != 2 or values.shape[1] % 16 != 0:
         raise ValueError("values must be rank-2 with a column count divisible by 16")
     rows, cols = values.shape
     device = values.device
     blocks = cols // 16
     values_f32 = values.to(torch.float32)
-    global_max_abs = float(values_f32.abs().max().item())
-    if global_max_abs > FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE:
-        tensor_scale = clamp_scale(global_max_abs / (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE))
+    if fixed_tensor_scale is not None:
+        tensor_scale = require_positive_finite(fixed_tensor_scale, "fixed tensor scale")
     else:
-        tensor_scale = 1.0
+        global_max_abs = float(values_f32.abs().max().item())
+        if global_max_abs > FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE:
+            tensor_scale = clamp_scale(global_max_abs / (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE))
+        else:
+            tensor_scale = 1.0
 
     chunks = values_f32.view(rows, blocks, 16)
     block_max = chunks.abs().amax(dim=-1)
@@ -258,6 +266,9 @@ def load_nvfp4_linear_metadata(
     weight_map: dict[str, str],
     prefix: str,
     manifest_tensor_names: set[str] | None = None,
+    *,
+    require_input_scale: bool,
+    fuse_input_scale: bool,
 ) -> dict[str, object]:
     weight = load_named_tensor(model_dir, weight_map, prefix + ".weight")
     weight_scales = load_named_tensor(model_dir, weight_map, prefix + ".weight_scale")
@@ -271,13 +282,17 @@ def load_nvfp4_linear_metadata(
             float(load_named_tensor(model_dir, weight_map, input_scale_name).item()),
             f"{input_scale_name}",
         )
+    elif require_input_scale:
+        raise KeyError(f"{input_scale_name} is missing from checkpoint")
     weight_scale_2 = require_positive_finite(
         float(load_named_tensor(model_dir, weight_map, weight_scale_2_name).item()),
         f"{weight_scale_2_name}",
     )
     tensor_scale = weight_scale_2
     tensor_scale_contract = RAW_WEIGHT_TENSOR_SCALE_CONTRACT
-    if input_scale is not None:
+    if fuse_input_scale:
+        if input_scale is None:
+            raise KeyError(f"{input_scale_name} is missing from checkpoint")
         tensor_scale = require_positive_finite(
             input_scale * weight_scale_2,
             f"{prefix} effective tensor_scale",
@@ -292,7 +307,7 @@ def load_nvfp4_linear_metadata(
     if manifest_tensor_names is not None:
         if not manifest_weight_present:
             raise KeyError(f"{manifest_weight_name} is missing from manifest")
-        if ".mixer.experts." in prefix and input_scale is not None and not manifest_input_scale_present:
+        if require_input_scale and not manifest_input_scale_present:
             raise KeyError(f"{input_scale_name} is missing from manifest")
     return {
         "family": "nvfp4",
@@ -305,6 +320,11 @@ def load_nvfp4_linear_metadata(
         "input_scale": input_scale,
         "tensor_scale": tensor_scale,
         "tensor_scale_contract": tensor_scale_contract,
+        "activation_tensor_scale": (
+            input_scale
+            if input_scale is not None and require_input_scale and not fuse_input_scale
+            else None
+        ),
         "input_cols": int(weight_scales.shape[1] * 16),
         "rows": int(weight.shape[0]),
         "cols": int(weight_scales.shape[1] * 16),
@@ -350,6 +370,8 @@ def load_shared_down_metadata(
             weight_map,
             prefix,
             manifest_tensor_names=manifest_tensor_names,
+            require_input_scale=False,
+            fuse_input_scale=False,
         )
     return load_dense_or_scaled_fp8_linear_metadata(model_dir, weight_map, prefix, device=device)
 
@@ -366,6 +388,14 @@ def nvfp4_scale_metadata(linear_metadata: dict[str, object]) -> dict[str, object
         "manifest_weight_present": linear_metadata["manifest_weight_present"],
         "manifest_input_scale_present": linear_metadata["manifest_input_scale_present"],
     }
+
+
+def activation_packing_mode(linear_metadata: dict[str, object]) -> str:
+    return (
+        ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE
+        if linear_metadata.get("activation_tensor_scale") is not None
+        else ACTIVATION_PACKING_DYNAMIC_RUNTIME
+    )
 
 
 def run_dense_or_scaled_fp8_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) -> torch.Tensor:
@@ -417,7 +447,10 @@ def compute_router_selections(
 
 
 def nvfp4_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) -> torch.Tensor:
-    packed_activation = pack_fp32_to_nvfp4_dynamic(activations.to(torch.float32))
+    packed_activation = pack_fp32_to_nvfp4_dynamic(
+        activations.to(torch.float32),
+        fixed_tensor_scale=linear_metadata.get("activation_tensor_scale"),
+    )
     activation_dequant = dequantize_nvfp4_matrix(
         packed_activation["packed"],
         packed_activation["block_scales"],
@@ -494,7 +527,9 @@ def main() -> int:
     fc1_latent = load_dense_or_scaled_fp8_linear_metadata(
         model_dir, weight_map, mixer_prefix + ".fc1_latent_proj", device=device
     )
-    fc2_latent_weight = load_named_tensor(model_dir, weight_map, mixer_prefix + ".fc2_latent_proj.weight", device=device).to(torch.float32)
+    fc2_latent = load_dense_or_scaled_fp8_linear_metadata(
+        model_dir, weight_map, mixer_prefix + ".fc2_latent_proj", device=device
+    )
 
     shared_up = load_dense_or_scaled_fp8_linear_metadata(
         model_dir, weight_map, mixer_prefix + ".shared_experts.up_proj", device=device
@@ -524,6 +559,7 @@ def main() -> int:
     routed_output = torch.zeros((input_hidden.shape[0], moe_latent_size), dtype=torch.float32, device=device)
     selected_expert_ids_per_row: list[list[int]] = []
     selected_weights_rows: list[torch.Tensor] = []
+    routed_pre_activation_hidden_per_row: list[list[torch.Tensor]] = []
     routed_activated_hidden_per_row: list[list[torch.Tensor]] = []
     routed_expert_outputs_per_row: list[list[torch.Tensor]] = []
     routed_weighted_contributions_per_row: list[list[torch.Tensor]] = []
@@ -532,6 +568,7 @@ def main() -> int:
         selected_expert_ids = [int(value.item()) for value in selected_indices[token_index]]
         selected_expert_ids_per_row.append(selected_expert_ids)
         selected_weights_rows.append(selected_weights[token_index].detach().clone())
+        row_pre_activation_hidden: list[torch.Tensor] = []
         row_activated_hidden: list[torch.Tensor] = []
         row_expert_outputs: list[torch.Tensor] = []
         row_contributions: list[torch.Tensor] = []
@@ -546,16 +583,21 @@ def main() -> int:
                         weight_map,
                         expert_prefix + ".up_proj",
                         manifest_tensor_names=manifest_tensor_names,
+                        require_input_scale=True,
+                        fuse_input_scale=False,
                     ),
                     load_nvfp4_linear_metadata(
                         model_dir,
                         weight_map,
                         expert_prefix + ".down_proj",
                         manifest_tensor_names=manifest_tensor_names,
+                        require_input_scale=True,
+                        fuse_input_scale=False,
                     ),
                 )
             up_proj, down_proj = cached_experts[expert_index]
             expert_hidden = nvfp4_linear(latent_row, up_proj)
+            row_pre_activation_hidden.append(expert_hidden.detach().clone())
             expert_hidden = relu2(expert_hidden)
             expert_output = nvfp4_linear(expert_hidden, down_proj)
             row_activated_hidden.append(expert_hidden.detach().clone())
@@ -564,6 +606,7 @@ def main() -> int:
             row_contributions.append(weighted_contribution.detach().clone())
             routed_row = routed_row + weighted_contribution
         routed_output[token_index : token_index + 1] = routed_row
+        routed_pre_activation_hidden_per_row.append(row_pre_activation_hidden)
         routed_activated_hidden_per_row.append(row_activated_hidden)
         routed_expert_outputs_per_row.append(row_expert_outputs)
         routed_weighted_contributions_per_row.append(row_contributions)
@@ -590,7 +633,7 @@ def main() -> int:
             torch.tensor([down_proj["tensor_scale"]], dtype=torch.float32),
         )
 
-    routed_projected = F.linear(routed_output.to(torch.float32), fc2_latent_weight.to(torch.float32))
+    routed_projected = run_dense_or_scaled_fp8_linear(routed_output.to(torch.float32), fc2_latent).to(torch.float32)
     shared_up_output = run_dense_or_scaled_fp8_linear(norm_output, shared_up).to(torch.float32)
     if shared_down["family"] == "nvfp4":
         shared_output = nvfp4_linear(relu2(shared_up_output), shared_down)
@@ -624,7 +667,18 @@ def main() -> int:
         )
     else:
         write_tensor(output_dir / "fc1_latent_weight_fp32.bin", fc1_latent["weight"].to(torch.float32))
-    write_tensor(output_dir / "fc2_latent_weight_fp32.bin", fc2_latent_weight)
+    if fc2_latent["family"] == "scaled_fp8":
+        write_raw_uint8(output_dir / "fc2_latent_weight_fp8.bin", fc2_latent["weight"].to(torch.float8_e4m3fn))
+        write_tensor(
+            output_dir / "fc2_latent_weight_scale_fp32.bin",
+            torch.tensor([fc2_latent["weight_scale"]], dtype=torch.float32),
+        )
+        write_tensor(
+            output_dir / "fc2_latent_input_scale_fp32.bin",
+            torch.tensor([fc2_latent["input_scale"]], dtype=torch.float32),
+        )
+    else:
+        write_tensor(output_dir / "fc2_latent_weight_fp32.bin", fc2_latent["weight"].to(torch.float32))
     if shared_up["family"] == "scaled_fp8":
         write_raw_uint8(output_dir / "shared_up_weight_fp8.bin", shared_up["weight"].to(torch.float8_e4m3fn))
         write_tensor(
@@ -673,9 +727,14 @@ def main() -> int:
         torch.stack(selected_weights_rows, dim=0).to(torch.float32),
     )
     for token_index, row_contributions in enumerate(routed_weighted_contributions_per_row):
+        row_pre_activation_hidden = routed_pre_activation_hidden_per_row[token_index]
         row_hidden = routed_activated_hidden_per_row[token_index]
         row_outputs = routed_expert_outputs_per_row[token_index]
         for slot, contribution in enumerate(row_contributions):
+            write_tensor(
+                output_dir / f"expected_routed_up_proj_output_row{token_index:02d}_slot{slot:02d}_fp32.bin",
+                row_pre_activation_hidden[slot],
+            )
             write_tensor(
                 output_dir / f"expected_routed_activated_hidden_row{token_index:02d}_slot{slot:02d}_fp32.bin",
                 row_hidden[slot],
@@ -725,10 +784,11 @@ def main() -> int:
         "norm_topk_prob": norm_topk_prob,
         "rms_epsilon": layer_norm_eps,
         "fc1_latent_family": fc1_latent["family"],
+        "fc2_latent_family": fc2_latent["family"],
         "shared_up_family": shared_up["family"],
         "shared_down_family": shared_down["family"],
         "oracle_device": device.type,
-        "routed_nvfp4_activation_packing_mode": ACTIVATION_PACKING_DYNAMIC_RUNTIME,
+        "routed_nvfp4_activation_packing_mode": ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE,
         "routed_nvfp4_weight_tensor_scale_contract": (
             routed_tensor_scale_contracts[0]
             if len(routed_tensor_scale_contracts) == 1
@@ -746,24 +806,24 @@ def main() -> int:
         },
         "nvfp4_contracts": {
             "routed_experts": {
-                "activation_packing_mode": ACTIVATION_PACKING_DYNAMIC_RUNTIME,
+                "activation_packing_mode": ACTIVATION_PACKING_FIXED_CHECKPOINT_INPUT_SCALE,
                 "selected_experts": routed_contracts,
             },
         },
         "notes": [
             "The input hidden state is deterministic unless --input-hidden-bin is provided.",
             "Router, latent projections, shared expert, and selected routed experts all use real checkpoint weights.",
-            "Routed NVFP4 activations are dynamically packed to mirror the runtime path.",
-            "Routed NVFP4 tensor scales stored in this fixture follow the runtime/cache contract: effective_tensor_scale = input_scale * weight_scale_2.",
+            "Routed NVFP4 activations are packed with checkpoint input_scale to mirror the runtime path.",
+            "Routed NVFP4 tensor scales stored in this fixture follow the runtime/cache contract: raw_weight_scale_2, with checkpoint input_scale consumed during activation packing.",
             "expected_final_output_fp32 includes the outer residual add.",
         ],
     }
     if shared_down["family"] == "nvfp4":
-        metadata["shared_down_nvfp4_activation_packing_mode"] = ACTIVATION_PACKING_DYNAMIC_RUNTIME
+        metadata["shared_down_nvfp4_activation_packing_mode"] = activation_packing_mode(shared_down)
         metadata["shared_down_nvfp4_weight_tensor_scale_contract"] = shared_down["tensor_scale_contract"]
         metadata["shared_down_nvfp4_input_scale_present"] = shared_down["input_scale"] is not None
         metadata["nvfp4_contracts"]["shared_down"] = {
-            "activation_packing_mode": ACTIVATION_PACKING_DYNAMIC_RUNTIME,
+            "activation_packing_mode": activation_packing_mode(shared_down),
             **nvfp4_scale_metadata(shared_down),
         }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

@@ -23,7 +23,7 @@ namespace nemotron {
 
 // v5 cache format: NVFP4 aux2 stores raw weight_scale_2 for all entries
 // (both routed and shared-down). The runtime kernel alpha is computed as
-// dynamic_activation_scale * weight_scale_2 at serving time.
+// activation_tensor_scale * weight_scale_2 at serving time.
 constexpr std::uint32_t kModelCacheFormatVersion = 5;
 
 // Each entry kind defines both its on-disk section layout (`payload`, `aux0`,
@@ -77,13 +77,18 @@ enum class ModelCacheEntryKind : std::uint32_t {
   // block-scale surface.
   // NVFP4 sub-contracts:
   //   routed expert NVFP4: aux2 = raw weight_scale_2 from checkpoint.
-  //       The kernel alpha is formed at serving time as:
-  //       dynamic_activation_scale * weight_scale_2
-  //       where dynamic_activation_scale comes from NVFP4 packing of the
-  //       latent activation. Checkpoint input_scale is NOT fused here;
-  //       vLLM uses it during activation quantization (a_gscale = 1/input_scale)
-  //       which this runtime handles differently (purely dynamic).
+  //       The serving-time alpha is formed as:
+  //       activation_tensor_scale * weight_scale_2
+  //       where routed activation packing is the only place checkpoint
+  //       input_scale is consumed.
   //   shared-down NVFP4: aux2 = raw weight_scale_2 (same contract)
+  // TARGET CONTRACT (Steps 2-3): routed aux2 stays raw weight_scale_2.
+  // Checkpoint input_scale moves to routed activation packing only:
+  //   routed-up pack emits activation_tensor_scale = up_input_scale per selected row
+  //   routed-down pack emits activation_tensor_scale = down_input_scale per selected row
+  // Grouped routed scale formation then becomes:
+  //   activation_tensor_scale * aux2
+  // exactly once. aux2 must never pre-fuse input_scale.
   kNvfp4Aligned = 5,
 
   // Native scaled-FP8 entry.
@@ -168,9 +173,9 @@ class LoadedModelCache {
       std::size_t input_cols) const;
   // NVFP4 cache aux2 is the authoritative serving-time tensor scale for
   // cache-backed views. `tensor_scale_override` is only for routed-expert
-  // compatibility callers that still recompute fused
-  // `input_scale * weight_scale_2` from source descriptors; it must match the
-  // cached aux2 scalar and is not a general replacement hook.
+  // compatibility callers that still thread a descriptor-side scalar, but it
+  // must match the cached raw weight_scale_2 scalar and is not a general
+  // replacement hook.
   std::unique_ptr<UploadedLinearOp> CreateNvfp4LinearView(
       const GemmDescriptor& descriptor,
       std::optional<float> tensor_scale_override = std::nullopt) const;

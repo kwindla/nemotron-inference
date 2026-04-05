@@ -25,11 +25,17 @@ inline std::optional<float> ResolveRoutedNvfp4RuntimeTensorScale(
     return std::nullopt;
   }
 
-  // The kernel alpha path consumes: activation_dynamic_scale * weight_scale_2
-  // where activation_dynamic_scale comes from NVFP4 packing of the latent
-  // activation (scratch_latent_tensor_scale). The checkpoint input_scale is
-  // NOT fused into this value — it is a separate quantity used elsewhere.
+  // The kernel alpha path consumes: activation_tensor_scale * weight_scale_2
+  // where activation_tensor_scale comes from NVFP4 activation packing
+  // (for routed-up, one packed activation row per selected expert). The
+  // checkpoint input_scale is NOT fused into this value here.
   // See vLLM reference: g1_alphas = a13_scale * w13_scale_2
+  // TARGET CONTRACT (Steps 2-3): this helper continues to expose raw
+  // weight_scale_2 only. Routed checkpoint input_scale must instead be
+  // consumed during activation packing, so the packer-emitted activation
+  // tensor scale is what participates in:
+  //   activation_tensor_scale * weight_scale_2
+  // input_scale must not be fused into the value returned here.
   (void)input_scale;
   if (!std::isfinite(weight_scale_2) || weight_scale_2 <= 0.0f) {
     return std::nullopt;

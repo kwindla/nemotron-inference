@@ -208,65 +208,85 @@ def main() -> int:
             in_proj_weight.to(torch.float32),
         )
 
+    batch_size = input_hidden.shape[0]
     gate = in_proj_output[:, :intermediate_size]
     hidden_states_B_C = in_proj_output[:, intermediate_size : intermediate_size + conv_dim]
     dt_pre = in_proj_output[:, intermediate_size + conv_dim :]
 
     updated_conv_state = initial_conv_state.clone()
-    updated_conv_state = torch.roll(updated_conv_state, shifts=-1, dims=-1)
-    updated_conv_state[:, :, -1] = hidden_states_B_C
+    next_ssm_state = initial_ssm_state.clone()
+    scan_output_rows: list[torch.Tensor] = []
+    quantized_scan_output_rows: list[torch.Tensor] = []
+    projected_output_rows: list[torch.Tensor] = []
 
-    conv_output = (updated_conv_state * conv_weight[:, 0, :][None, :, :]).sum(dim=-1)
-    conv_output = conv_output + conv_bias[None, :]
-    conv_output = F.silu(conv_output)
-
-    hidden_after_conv = conv_output[:, :intermediate_size]
-    B_grouped = conv_output[:, intermediate_size : intermediate_size + (n_groups * state_size)]
-    C_grouped = conv_output[:, intermediate_size + (n_groups * state_size) :]
-
-    dt = F.softplus(dt_pre[:, :, None] + dt_bias[None, :, None]).expand(-1, -1, head_dim)
-    dt = torch.clamp(dt, min=time_step_min)
     A = -torch.exp(A_log).view(1, num_heads, 1, 1)
     D_expanded = D.view(1, num_heads, 1)
 
-    B = B_grouped.view(1, n_groups, state_size)
-    B = B[:, :, None, :].expand(1, n_groups, num_heads // n_groups, state_size).reshape(1, num_heads, state_size)
-    C = C_grouped.view(1, n_groups, state_size)
-    C = C[:, :, None, :].expand(1, n_groups, num_heads // n_groups, state_size).reshape(1, num_heads, state_size)
-    hidden_ssm = hidden_after_conv.view(1, num_heads, head_dim)
+    for row in range(batch_size):
+        row_hidden_states_B_C = hidden_states_B_C[row : row + 1]
+        row_dt_pre = dt_pre[row : row + 1]
+        row_gate = gate[row : row + 1]
 
-    dA = torch.exp(dt[:, :, :, None] * A)
-    dB = dt[:, :, :, None] * B[:, :, None, :]
-    dBx = dB * hidden_ssm[:, :, :, None]
-    next_ssm_state = initial_ssm_state * dA + dBx
+        updated_conv_state = torch.roll(updated_conv_state, shifts=-1, dims=-1)
+        updated_conv_state[:, :, -1] = row_hidden_states_B_C
 
-    y = torch.matmul(
-        next_ssm_state.view(num_heads, head_dim, state_size),
-        C.view(num_heads, state_size, 1),
-    ).view(1, num_heads, head_dim)
-    y = y + hidden_ssm * D_expanded
-    y_flat = y.view(1, intermediate_size)
+        conv_output = (updated_conv_state * conv_weight[:, 0, :][None, :, :]).sum(dim=-1)
+        conv_output = conv_output + conv_bias[None, :]
+        conv_output = F.silu(conv_output)
 
-    scan_output = grouped_rms_norm_gated(
-        y_flat,
-        gate,
-        mixer_norm_weight,
-        layer_norm_eps,
-        n_groups,
-    )
-    if out_proj_scaled_fp8:
-        quantized_scan_output, projected_output = scaled_fp8_linear(
-            scan_output,
-            out_proj_weight,
-            out_proj_weight_scale,
-            out_proj_input_scale,
+        hidden_after_conv = conv_output[:, :intermediate_size]
+        B_grouped = conv_output[:, intermediate_size : intermediate_size + (n_groups * state_size)]
+        C_grouped = conv_output[:, intermediate_size + (n_groups * state_size) :]
+
+        dt = F.softplus(row_dt_pre[:, :, None] + dt_bias[None, :, None]).expand(-1, -1, head_dim)
+        dt = torch.clamp(dt, min=time_step_min)
+
+        B = B_grouped.view(1, n_groups, state_size)
+        B = B[:, :, None, :].expand(1, n_groups, num_heads // n_groups, state_size).reshape(1, num_heads, state_size)
+        C = C_grouped.view(1, n_groups, state_size)
+        C = C[:, :, None, :].expand(1, n_groups, num_heads // n_groups, state_size).reshape(1, num_heads, state_size)
+        hidden_ssm = hidden_after_conv.view(1, num_heads, head_dim)
+
+        dA = torch.exp(dt[:, :, :, None] * A)
+        dB = dt[:, :, :, None] * B[:, :, None, :]
+        dBx = dB * hidden_ssm[:, :, :, None]
+        next_ssm_state = next_ssm_state * dA + dBx
+
+        y = torch.matmul(
+            next_ssm_state.view(num_heads, head_dim, state_size),
+            C.view(num_heads, state_size, 1),
+        ).view(1, num_heads, head_dim)
+        y = y + hidden_ssm * D_expanded
+        y_flat = y.view(1, intermediate_size)
+
+        scan_output_row = grouped_rms_norm_gated(
+            y_flat,
+            row_gate,
+            mixer_norm_weight,
+            layer_norm_eps,
+            n_groups,
         )
-    else:
-        quantized_scan_output = scan_output.to(torch.float32)
-        projected_output = F.linear(
-            scan_output.to(torch.float32),
-            out_proj_weight.to(torch.float32),
-        )
+        if out_proj_scaled_fp8:
+            quantized_scan_output_row, projected_output_row = scaled_fp8_linear(
+                scan_output_row,
+                out_proj_weight,
+                out_proj_weight_scale,
+                out_proj_input_scale,
+            )
+        else:
+            quantized_scan_output_row = scan_output_row.to(torch.float32)
+            projected_output_row = F.linear(
+                scan_output_row.to(torch.float32),
+                out_proj_weight.to(torch.float32),
+            )
+
+        scan_output_rows.append(scan_output_row)
+        quantized_scan_output_rows.append(quantized_scan_output_row)
+        projected_output_rows.append(projected_output_row)
+
+    scan_output = torch.cat(scan_output_rows, dim=0)
+    quantized_scan_output = torch.cat(quantized_scan_output_rows, dim=0)
+    projected_output = torch.cat(projected_output_rows, dim=0)
     final_output = input_hidden + projected_output
 
     write_tensor(output_dir / "input_hidden_fp32.bin", input_hidden)
@@ -304,6 +324,7 @@ def main() -> int:
     metadata = {
         "fixture_kind": "mamba_layer_decode_oracle_v1",
         "layer_index": args.layer_index,
+        "input_rows": batch_size,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
         "num_heads": num_heads,

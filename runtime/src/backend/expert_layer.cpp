@@ -4886,31 +4886,43 @@ bool RunExpertLayerImpl(
       }
       std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
       for (std::size_t slot = 0; slot < batch_count; ++slot) {
-        const float expected_latent_tensor_scale =
-            1.0f / debug_selected_up_input_scales_host[slot];
-        const float direct_kernel_tensor_scale =
-            normalize_fixed_tensor_scale_for_diagnosis(
-                debug_selected_up_input_scales_host[slot]);
-        const float fused_alpha =
+        const float raw_checkpoint_input_scale = debug_selected_up_input_scales_host[slot];
+        const float normalized_checkpoint_tensor_scale_candidate =
+            normalize_fixed_tensor_scale_for_diagnosis(raw_checkpoint_input_scale);
+        const float candidate_global_scale_inverse =
+            (raw_checkpoint_input_scale > 0.0f && std::isfinite(raw_checkpoint_input_scale))
+                ? normalize_fixed_tensor_scale_for_diagnosis(1.0f / raw_checkpoint_input_scale)
+                : normalize_fixed_tensor_scale_for_diagnosis(0.0f);
+        const float actual_kernel_tensor_scale = latent_tensor_scales_host[slot];
+        const float actual_fused_alpha =
             latent_tensor_scales_host[slot] * debug_selected_up_tensor_scales_host[slot];
+        const float expected_fused_alpha =
+            raw_checkpoint_input_scale * debug_selected_up_tensor_scales_host[slot];
         std::cerr << "expert_layer: layer " << impl.config.layer_index
                   << " scale_contract_up_packed token=" << token_index
                   << " slot=" << slot
                   << " expert=" << selected_experts_for_token[slot]
-                  << " latent_tensor_scale=" << latent_tensor_scales_host[slot]
-                  << " expected_latent_tensor_scale=" << expected_latent_tensor_scale
-                  << " match="
+                  << " actual_kernel_tensor_scale=" << actual_kernel_tensor_scale
+                  << " raw_checkpoint_input_scale=" << raw_checkpoint_input_scale
+                  << " raw_checkpoint_input_scale_match="
                   << (scale_contract_matches(
-                          latent_tensor_scales_host[slot],
-                          expected_latent_tensor_scale)
+                          actual_kernel_tensor_scale,
+                          raw_checkpoint_input_scale)
                           ? "yes"
                           : "no")
-                  << " fused_alpha=" << fused_alpha
-                  << " direct_kernel_tensor_scale=" << direct_kernel_tensor_scale
-                  << " direct_kernel_match="
+                  << " normalized_checkpoint_tensor_scale_candidate="
+                  << normalized_checkpoint_tensor_scale_candidate
+                  << " activation_global_scale_inverse=" << candidate_global_scale_inverse
+                  << " activation_global_scale_inverse_match="
                   << (scale_contract_matches(
-                          latent_tensor_scales_host[slot],
-                          direct_kernel_tensor_scale)
+                          actual_kernel_tensor_scale,
+                          candidate_global_scale_inverse)
+                          ? "yes"
+                          : "no")
+                  << " actual_fused_alpha=" << actual_fused_alpha
+                  << " expected_fused_alpha=" << expected_fused_alpha
+                  << " fused_alpha_match="
+                  << (scale_contract_matches(actual_fused_alpha, expected_fused_alpha)
                           ? "yes"
                           : "no")
                   << "\n";
@@ -5145,32 +5157,44 @@ bool RunExpertLayerImpl(
       }
       std::cerr << std::setprecision(std::numeric_limits<float>::max_digits10);
       for (std::size_t slot = 0; slot < batch_count; ++slot) {
-        const float expected_down_act_tensor_scale =
-            1.0f / debug_selected_down_input_scales_host[slot];
-        const float direct_kernel_tensor_scale =
-            debug_selected_down_input_scales_host[slot];
-        const float fused_alpha =
+        const float raw_checkpoint_input_scale = debug_selected_down_input_scales_host[slot];
+        const float normalized_checkpoint_tensor_scale_candidate =
+            normalize_fixed_tensor_scale_for_diagnosis(raw_checkpoint_input_scale);
+        const float candidate_global_scale_inverse =
+            (raw_checkpoint_input_scale > 0.0f && std::isfinite(raw_checkpoint_input_scale))
+                ? normalize_fixed_tensor_scale_for_diagnosis(1.0f / raw_checkpoint_input_scale)
+                : normalize_fixed_tensor_scale_for_diagnosis(0.0f);
+        const float actual_kernel_tensor_scale = down_act_tensor_scales_host[slot];
+        const float actual_fused_alpha =
             down_act_tensor_scales_host[slot] *
             debug_selected_down_tensor_scales_host[slot];
+        const float expected_fused_alpha =
+            raw_checkpoint_input_scale * debug_selected_down_tensor_scales_host[slot];
         std::cerr << "expert_layer: layer " << impl.config.layer_index
                   << " scale_contract_down_packed token=" << token_index
                   << " slot=" << slot
                   << " expert=" << selected_experts_for_token[slot]
-                  << " down_act_tensor_scale=" << down_act_tensor_scales_host[slot]
-                  << " expected_down_act_tensor_scale="
-                  << expected_down_act_tensor_scale
-                  << " match="
+                  << " actual_kernel_tensor_scale=" << actual_kernel_tensor_scale
+                  << " raw_checkpoint_input_scale=" << raw_checkpoint_input_scale
+                  << " raw_checkpoint_input_scale_match="
                   << (scale_contract_matches(
-                          down_act_tensor_scales_host[slot],
-                          expected_down_act_tensor_scale)
+                          actual_kernel_tensor_scale,
+                          raw_checkpoint_input_scale)
                           ? "yes"
                           : "no")
-                  << " fused_alpha=" << fused_alpha
-                  << " direct_kernel_tensor_scale=" << direct_kernel_tensor_scale
-                  << " direct_kernel_match="
+                  << " normalized_checkpoint_tensor_scale_candidate="
+                  << normalized_checkpoint_tensor_scale_candidate
+                  << " activation_global_scale_inverse=" << candidate_global_scale_inverse
+                  << " activation_global_scale_inverse_match="
                   << (scale_contract_matches(
-                          down_act_tensor_scales_host[slot],
-                          direct_kernel_tensor_scale)
+                          actual_kernel_tensor_scale,
+                          candidate_global_scale_inverse)
+                          ? "yes"
+                          : "no")
+                  << " actual_fused_alpha=" << actual_fused_alpha
+                  << " expected_fused_alpha=" << expected_fused_alpha
+                  << " fused_alpha_match="
+                  << (scale_contract_matches(actual_fused_alpha, expected_fused_alpha)
                           ? "yes"
                           : "no")
                   << "\n";

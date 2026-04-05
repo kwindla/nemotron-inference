@@ -592,7 +592,7 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
     if (tid == 0) {
       const float raw_input_scale = fixed_row_tensor_scales[row];
       tensor_scale = (raw_input_scale > 0.0f && isfinite(raw_input_scale))
-                         ? ClampScale(1.0f / raw_input_scale)
+                         ? raw_input_scale
                          : kMinScale;
       tensor_scales[row] = tensor_scale;
       smem[0] = tensor_scale;

@@ -248,9 +248,9 @@ std::optional<float> ReadNvfp4CacheTensorScale(
     const KernelCatalog& kernel_catalog) {
   // All NVFP4 entries (routed and shared-down) persist raw weight_scale_2.
   // The kernel alpha is formed at serving time as:
-  //   dynamic_activation_scale * weight_scale_2
-  // where dynamic_activation_scale comes from NVFP4 packing of the latent
-  // activation. The checkpoint input_scale is NOT fused here.
+  //   activation_tensor_scale * weight_scale_2
+  // where routed checkpoint input_scale belongs to activation packing, not to
+  // cache aux2 or descriptor tensor-scale resolution.
   (void)kernel_catalog;
   return ReadTensorScaleHost(descriptor);
 }
@@ -715,8 +715,8 @@ bool AddNvfp4Entry(
   entry.aux0_nbytes = descriptor.block_scales_nbytes;
   entry.aux1_nbytes = execution_scale_nbytes;
   // Cache aux2 always stores one fp32 serving-time tensor scale scalar:
-  // routed experts persist input_scale * weight_scale_2, while shared-down
-  // experts keep raw weight_scale_2.
+  // raw weight_scale_2 from the checkpoint. Routed activation packing now
+  // carries checkpoint input_scale separately at serving time.
   entry.aux2_nbytes = sizeof(float);
   entries->push_back(std::move(entry));
   return true;

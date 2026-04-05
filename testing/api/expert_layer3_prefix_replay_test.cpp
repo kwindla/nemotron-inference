@@ -32,6 +32,13 @@ struct FixtureMetadata {
   std::size_t runtime_token_count = 0;
 };
 
+struct DiffSummary {
+  float max_abs_diff = INFINITY;
+  std::size_t index = 0;
+  float actual = 0.0f;
+  float expected = 0.0f;
+};
+
 bool expect(bool condition, const std::string& message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << "\n";
@@ -108,6 +115,40 @@ float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs)
   return max_diff;
 }
 
+DiffSummary summarize_diff(
+    const std::vector<float>& actual,
+    const std::vector<float>& expected) {
+  DiffSummary summary;
+  if (actual.size() != expected.size()) {
+    return summary;
+  }
+  summary.max_abs_diff = 0.0f;
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    const float diff = std::fabs(actual[i] - expected[i]);
+    if (diff > summary.max_abs_diff) {
+      summary.max_abs_diff = diff;
+      summary.index = i;
+      summary.actual = actual[i];
+      summary.expected = expected[i];
+    }
+  }
+  return summary;
+}
+
+void print_diff_summary(
+    const char* label,
+    const DiffSummary& summary,
+    std::size_t hidden_size) {
+  std::cout << "expert_layer3_prefix_replay_test:"
+            << " " << label << "_max_abs_diff=" << summary.max_abs_diff
+            << " " << label << "_index=" << summary.index
+            << " " << label << "_row=" << (hidden_size == 0 ? 0 : summary.index / hidden_size)
+            << " " << label << "_col=" << (hidden_size == 0 ? 0 : summary.index % hidden_size)
+            << " " << label << "_actual=" << summary.actual
+            << " " << label << "_expected=" << summary.expected
+            << "\n";
+}
+
 nemotron::RuntimeBootstrapOptions make_options() {
   nemotron::RuntimeBootstrapOptions options;
   options.service_target.total_memory_bytes = GiB(128);
@@ -147,13 +188,20 @@ bool run_expert_layer3_prefix_replay() {
       read_float_file(fixture_root / "expected_layer_002_output_fp32.bin");
   const std::vector<float> layer3_expected =
       read_float_file(fixture_root / "expected_layer_003_output_fp32.bin");
+  const std::filesystem::path layer3_fixture_root(
+      NEMOTRON_EXPERT_LAYER_PREFIX_INPUT_FIXTURE_ROOT);
+  const std::vector<float> layer3_fixture_expected =
+      read_float_file(layer3_fixture_root / "expected_final_output_fp32.bin");
   if (!expect(
           layer2_input.size() ==
               metadata->runtime_token_count * metadata->hidden_size,
           "layer2 oracle input size should match fixture metadata") ||
       !expect(
           layer3_expected.size() == layer2_input.size(),
-          "layer3 oracle output size should match layer2 input")) {
+          "layer3 oracle output size should match layer2 input") ||
+      !expect(
+          layer3_fixture_expected.size() == layer2_input.size(),
+          "layer3 fixture output size should match layer2 input")) {
     return false;
   }
 
@@ -292,18 +340,51 @@ bool run_expert_layer3_prefix_replay() {
   const float batch_vs_expected = max_abs_diff(batch_output, layer3_expected);
   const float sequential_vs_expected = max_abs_diff(sequential_output, layer3_expected);
   const float batch_vs_sequential = max_abs_diff(batch_output, sequential_output);
+  const float batch_vs_layer3_fixture =
+      max_abs_diff(batch_output, layer3_fixture_expected);
+  const float sequential_vs_layer3_fixture =
+      max_abs_diff(sequential_output, layer3_fixture_expected);
+
+  const DiffSummary batch_vs_prefix_summary =
+      summarize_diff(batch_output, layer3_expected);
+  const DiffSummary sequential_vs_prefix_summary =
+      summarize_diff(sequential_output, layer3_expected);
+  const DiffSummary batch_vs_layer3_fixture_summary =
+      summarize_diff(batch_output, layer3_fixture_expected);
+  const DiffSummary sequential_vs_layer3_fixture_summary =
+      summarize_diff(sequential_output, layer3_fixture_expected);
 
   std::cout << "expert_layer3_prefix_replay_test:"
             << " batch_vs_expected=" << batch_vs_expected
             << " sequential_vs_expected=" << sequential_vs_expected
             << " batch_vs_sequential=" << batch_vs_sequential
+            << " batch_vs_layer3_fixture=" << batch_vs_layer3_fixture
+            << " sequential_vs_layer3_fixture=" << sequential_vs_layer3_fixture
             << "\n";
+  print_diff_summary(
+      "batch_vs_prefix",
+      batch_vs_prefix_summary,
+      metadata->hidden_size);
+  print_diff_summary(
+      "sequential_vs_prefix",
+      sequential_vs_prefix_summary,
+      metadata->hidden_size);
+  print_diff_summary(
+      "batch_vs_layer3_fixture",
+      batch_vs_layer3_fixture_summary,
+      metadata->hidden_size);
+  print_diff_summary(
+      "sequential_vs_layer3_fixture",
+      sequential_vs_layer3_fixture_summary,
+      metadata->hidden_size);
 
   if (debug) {
     std::cerr << "expert_layer3_prefix_replay_test:"
               << " batch_vs_expected=" << batch_vs_expected
               << " sequential_vs_expected=" << sequential_vs_expected
               << " batch_vs_sequential=" << batch_vs_sequential
+              << " batch_vs_layer3_fixture=" << batch_vs_layer3_fixture
+              << " sequential_vs_layer3_fixture=" << sequential_vs_layer3_fixture
               << "\n";
   }
 

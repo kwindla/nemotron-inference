@@ -52,6 +52,7 @@ struct FixtureMetadata {
   float rms_epsilon = 0.0f;
   bool norm_topk_prob = false;
   std::string fc1_latent_family = "scaled_fp8";
+  std::string fc2_latent_family = "dense";
   std::string shared_up_family = "scaled_fp8";
   std::string shared_down_family;
   std::string routed_nvfp4_activation_packing_mode;
@@ -66,11 +67,15 @@ struct RoutedExpertFixture {
   std::vector<std::uint8_t> up_weight_packed;
   std::vector<std::uint8_t> up_weight_block_scales;
   std::vector<float> up_weight_tensor_scale;
+  std::vector<float> up_input_scale;
   std::vector<std::uint8_t> down_weight_packed;
   std::vector<std::uint8_t> down_weight_block_scales;
   std::vector<float> down_weight_tensor_scale;
+  std::vector<float> down_input_scale;
   GemmDescriptor up_descriptor;
   GemmDescriptor down_descriptor;
+  KernelTensorDescriptor up_input_scale_descriptor;
+  KernelTensorDescriptor down_input_scale_descriptor;
 };
 
 bool expect(bool condition, const std::string& message) {
@@ -79,6 +84,15 @@ bool expect(bool condition, const std::string& message) {
     return false;
   }
   return true;
+}
+
+bool is_supported_nvfp4_activation_packing_mode(std::string_view mode) {
+  return mode == "dynamic_runtime" || mode == "fixed_checkpoint_input_scale";
+}
+
+bool is_supported_nvfp4_tensor_scale_contract(std::string_view contract) {
+  return contract == "raw_weight_scale_2" ||
+         contract == "effective_tensor_scale = input_scale * weight_scale_2";
 }
 
 std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path& path) {
@@ -107,6 +121,16 @@ void write_float_file(const std::filesystem::path& path, const std::vector<float
   }
   std::ofstream output(path, std::ios::binary);
   output.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+}
+
+void write_int32_file(const std::filesystem::path& path, const std::vector<std::int32_t>& values) {
+  if (!path.parent_path().empty()) {
+    std::filesystem::create_directories(path.parent_path());
+  }
+  std::ofstream output(path, std::ios::binary);
+  output.write(
+      reinterpret_cast<const char*>(values.data()),
+      static_cast<std::streamsize>(values.size() * sizeof(std::int32_t)));
 }
 
 std::filesystem::path resolve_fixture_root(const char* env_name, const char* default_root) {
@@ -171,6 +195,29 @@ std::optional<std::string> parse_json_string_field(const std::string& json, cons
   return match[1].str();
 }
 
+std::optional<float> parse_routed_expert_input_scale(
+    const std::string& json,
+    std::size_t expert_index,
+    const char* proj_name) {
+  const std::string selected_anchor = "\"selected_experts\"";
+  const std::size_t selected_pos = json.find(selected_anchor);
+  if (selected_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const std::string expert_anchor = "\"" + std::to_string(expert_index) + "\"";
+  const std::size_t expert_pos = json.find(expert_anchor, selected_pos);
+  if (expert_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const std::string proj_anchor = "\"" + std::string(proj_name) + "\"";
+  const std::size_t proj_pos = json.find(proj_anchor, expert_pos);
+  if (proj_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const std::string tail = json.substr(proj_pos, 2048);
+  return parse_json_float_field(tail, "input_scale");
+}
+
 std::optional<FixtureMetadata> load_metadata(const std::filesystem::path& root) {
   const std::string json = read_text_file(root / "metadata.json");
   FixtureMetadata metadata;
@@ -188,6 +235,7 @@ std::optional<FixtureMetadata> load_metadata(const std::filesystem::path& root) 
   const auto rms_epsilon = parse_json_float_field(json, "rms_epsilon");
   const auto norm_topk_prob = parse_json_bool_field(json, "norm_topk_prob");
   const auto fc1_latent_family = parse_json_string_field(json, "fc1_latent_family");
+  const auto fc2_latent_family = parse_json_string_field(json, "fc2_latent_family");
   const auto shared_up_family = parse_json_string_field(json, "shared_up_family");
   const auto shared_down_family = parse_json_string_field(json, "shared_down_family");
   const auto routed_nvfp4_activation_packing_mode =
@@ -221,6 +269,9 @@ std::optional<FixtureMetadata> load_metadata(const std::filesystem::path& root) 
   metadata.norm_topk_prob = *norm_topk_prob;
   if (fc1_latent_family) {
     metadata.fc1_latent_family = *fc1_latent_family;
+  }
+  if (fc2_latent_family) {
+    metadata.fc2_latent_family = *fc2_latent_family;
   }
   if (shared_up_family) {
     metadata.shared_up_family = *shared_up_family;
@@ -391,6 +442,9 @@ std::vector<ExpertSelection> sorted_selections(std::vector<ExpertSelection> sele
 
 bool run_expert_layer_fixture() {
   const char* dump_root_env = std::getenv("NEMOTRON_EXPERT_LAYER_DUMP_ROOT");
+  const char* dump_all_rows_env = std::getenv("NEMOTRON_EXPERT_LAYER_DUMP_ALL_ROWS");
+  const bool dump_all_rows =
+      dump_all_rows_env != nullptr && std::string(dump_all_rows_env).size() != 0;
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   if (debug) {
     std::cerr << "expert_layer_oracle_test: dump_root_env="
@@ -427,6 +481,12 @@ bool run_expert_layer_fixture() {
       read_float_file(fixture_root / "fc1_latent_input_scale_fp32.bin");
   const std::vector<float> fc2_latent_weight =
       read_float_file(fixture_root / "fc2_latent_weight_fp32.bin");
+  const std::vector<std::uint8_t> fc2_latent_weight_fp8 =
+      read_file_bytes(fixture_root / "fc2_latent_weight_fp8.bin");
+  const std::vector<float> fc2_latent_weight_scale =
+      read_float_file(fixture_root / "fc2_latent_weight_scale_fp32.bin");
+  const std::vector<float> fc2_latent_input_scale =
+      read_float_file(fixture_root / "fc2_latent_input_scale_fp32.bin");
   const std::vector<std::uint8_t> shared_up_weight =
       read_file_bytes(fixture_root / "shared_up_weight_fp8.bin");
   const std::vector<float> shared_up_weight_fp32 =
@@ -465,18 +525,23 @@ bool run_expert_layer_fixture() {
       read_int32_file(fixture_root / "expected_selected_expert_indices_u32.bin");
   const std::vector<float> expected_selected_expert_weights =
       read_float_file(fixture_root / "expected_selected_expert_weights_fp32.bin");
+  const std::string metadata_json = read_text_file(fixture_root / "metadata.json");
   const std::string layer_prefix = "backbone.layers." + std::to_string(metadata->layer_index);
   const std::string mixer_prefix = layer_prefix + ".mixer";
+  const bool routed_contract_is_effective =
+      metadata->routed_nvfp4_weight_tensor_scale_contract ==
+      "effective_tensor_scale = input_scale * weight_scale_2";
+  const bool routed_contract_is_raw =
+      metadata->routed_nvfp4_weight_tensor_scale_contract == "raw_weight_scale_2";
 
   if (!expect(input_hidden.size() == metadata->input_rows * metadata->hidden_size, "input hidden size should match metadata") ||
       !expect(norm_weight.size() == metadata->hidden_size, "norm weight size should match metadata") ||
       !expect(
-          metadata->routed_nvfp4_activation_packing_mode == "dynamic_runtime",
-          "routed NVFP4 activation packing mode should be dynamic_runtime") ||
+          is_supported_nvfp4_activation_packing_mode(metadata->routed_nvfp4_activation_packing_mode),
+          "routed NVFP4 activation packing mode should be supported") ||
       !expect(
-          metadata->routed_nvfp4_weight_tensor_scale_contract ==
-              "effective_tensor_scale = input_scale * weight_scale_2",
-          "routed NVFP4 tensor scale contract should be effective fused") ||
+          routed_contract_is_effective || routed_contract_is_raw,
+          "routed NVFP4 tensor scale contract should be supported") ||
       !expect(
           expected_norm_output.empty() ||
               expected_norm_output.size() == metadata->input_rows * metadata->hidden_size,
@@ -491,7 +556,14 @@ bool run_expert_layer_fixture() {
               (metadata->fc1_latent_family == "dense" &&
                fc1_latent_weight_fp32.size() == metadata->moe_latent_size * metadata->hidden_size),
           "fc1 latent weights should match metadata") ||
-      !expect(fc2_latent_weight.size() == metadata->hidden_size * metadata->moe_latent_size, "fc2 latent weight size should match metadata") ||
+      !expect(
+          (metadata->fc2_latent_family == "scaled_fp8" &&
+           fc2_latent_weight_fp8.size() == metadata->hidden_size * metadata->moe_latent_size &&
+           fc2_latent_weight_scale.size() == 1 &&
+           fc2_latent_input_scale.size() == 1) ||
+              (metadata->fc2_latent_family == "dense" &&
+               fc2_latent_weight.size() == metadata->hidden_size * metadata->moe_latent_size),
+          "fc2 latent weights should match metadata") ||
       !expect(
           (metadata->shared_up_family == "scaled_fp8" &&
            shared_up_weight.size() == metadata->shared_expert_intermediate_size * metadata->hidden_size &&
@@ -523,16 +595,14 @@ bool run_expert_layer_fixture() {
     return false;
   }
   if (metadata->shared_down_family == "nvfp4") {
-    const std::string expected_shared_down_contract =
-        metadata->shared_down_nvfp4_input_scale_present
-            ? "effective_tensor_scale = input_scale * weight_scale_2"
-            : "raw_weight_scale_2";
     if (!expect(
-            metadata->shared_down_nvfp4_activation_packing_mode == "dynamic_runtime",
-            "shared down NVFP4 activation packing mode should be dynamic_runtime") ||
+            is_supported_nvfp4_activation_packing_mode(
+                metadata->shared_down_nvfp4_activation_packing_mode),
+            "shared down NVFP4 activation packing mode should be supported") ||
         !expect(
-            metadata->shared_down_nvfp4_weight_tensor_scale_contract == expected_shared_down_contract,
-            "shared down NVFP4 tensor scale contract should match input-scale availability")) {
+            is_supported_nvfp4_tensor_scale_contract(
+                metadata->shared_down_nvfp4_weight_tensor_scale_contract),
+            "shared down NVFP4 tensor scale contract should be supported")) {
       return false;
     }
   }
@@ -553,6 +623,12 @@ bool run_expert_layer_fixture() {
       make_fp32_descriptor(mixer_prefix + ".fc1_latent_proj.input_scale", fc1_latent_input_scale, {1});
   const auto fc2_latent_weight_descriptor =
       make_dense_descriptor(mixer_prefix + ".fc2_latent_proj.weight", fc2_latent_weight, metadata->hidden_size, metadata->moe_latent_size);
+  const auto fc2_latent_fp8_descriptor =
+      make_fp8_descriptor(mixer_prefix + ".fc2_latent_proj.weight", fc2_latent_weight_fp8, {metadata->hidden_size, metadata->moe_latent_size});
+  const auto fc2_latent_weight_scale_descriptor =
+      make_fp32_descriptor(mixer_prefix + ".fc2_latent_proj.weight_scale", fc2_latent_weight_scale, {1});
+  const auto fc2_latent_input_scale_descriptor =
+      make_fp32_descriptor(mixer_prefix + ".fc2_latent_proj.input_scale", fc2_latent_input_scale, {1});
   const auto shared_up_weight_descriptor =
       make_fp8_descriptor(mixer_prefix + ".shared_experts.up_proj.weight", shared_up_weight, {metadata->shared_expert_intermediate_size, metadata->hidden_size});
   const auto shared_up_dense_descriptor =
@@ -603,7 +679,15 @@ bool run_expert_layer_fixture() {
   } else {
     return expect(false, "fc1 latent family should be supported");
   }
-  bindings.fc2_latent_gemm_weight = &fc2_latent_weight_descriptor;
+  if (metadata->fc2_latent_family == "scaled_fp8") {
+    bindings.fc2_latent_kernel_weight = &fc2_latent_fp8_descriptor;
+    bindings.fc2_latent_weight_scale = &fc2_latent_weight_scale_descriptor;
+    bindings.fc2_latent_input_scale = &fc2_latent_input_scale_descriptor;
+  } else if (metadata->fc2_latent_family == "dense") {
+    bindings.fc2_latent_gemm_weight = &fc2_latent_weight_descriptor;
+  } else {
+    return expect(false, "fc2 latent family should be supported");
+  }
   if (metadata->shared_up_family == "scaled_fp8") {
     bindings.shared_up_kernel_weight = &shared_up_weight_descriptor;
     bindings.shared_up_weight_scale = &shared_up_weight_scale_descriptor;
@@ -663,8 +747,27 @@ bool run_expert_layer_fixture() {
     expert.down_weight_packed = read_file_bytes(expert_dir / "down_proj_weight_packed.bin");
     expert.down_weight_block_scales = read_file_bytes(expert_dir / "down_proj_weight_block_scales.bin");
     expert.down_weight_tensor_scale = read_float_file(expert_dir / "down_proj_weight_tensor_scale_fp32.bin");
+    if (routed_contract_is_raw) {
+      const auto up_input_scale =
+          parse_routed_expert_input_scale(metadata_json, expert_index, "up_proj");
+      const auto down_input_scale =
+          parse_routed_expert_input_scale(metadata_json, expert_index, "down_proj");
+      if (!expect(
+              up_input_scale.has_value() && down_input_scale.has_value(),
+              "raw routed NVFP4 fixture should expose per-expert input scales")) {
+        return false;
+      }
+      expert.up_input_scale = {*up_input_scale};
+      expert.down_input_scale = {*down_input_scale};
+    }
     if (!expect(expert.up_weight_tensor_scale.size() == 1, "expert up tensor scale should be scalar") ||
-        !expect(expert.down_weight_tensor_scale.size() == 1, "expert down tensor scale should be scalar")) {
+        !expect(expert.down_weight_tensor_scale.size() == 1, "expert down tensor scale should be scalar") ||
+        !expect(
+            !routed_contract_is_raw || expert.up_input_scale.size() == 1,
+            "raw routed expert up input scale should be scalar") ||
+        !expect(
+            !routed_contract_is_raw || expert.down_input_scale.size() == 1,
+            "raw routed expert down input scale should be scalar")) {
       return false;
     }
     expert.up_descriptor = make_nvfp4_descriptor(
@@ -681,12 +784,28 @@ bool run_expert_layer_fixture() {
         expert.down_weight_tensor_scale,
         metadata->moe_latent_size,
         metadata->routed_expert_intermediate_size);
+    if (routed_contract_is_raw) {
+      expert.up_input_scale_descriptor = make_fp32_descriptor(
+          mixer_prefix + ".experts." + std::to_string(expert_index) + ".up_proj.input_scale",
+          expert.up_input_scale,
+          {1});
+      expert.down_input_scale_descriptor = make_fp32_descriptor(
+          mixer_prefix + ".experts." + std::to_string(expert_index) + ".down_proj.input_scale",
+          expert.down_input_scale,
+          {1});
+    }
     routed_experts.push_back(std::move(expert));
   }
 
   for (RoutedExpertFixture& expert : routed_experts) {
     bindings.routed_experts[static_cast<std::size_t>(expert.expert_index)].up_proj = &expert.up_descriptor;
     bindings.routed_experts[static_cast<std::size_t>(expert.expert_index)].down_proj = &expert.down_descriptor;
+    if (routed_contract_is_raw) {
+      bindings.routed_experts[static_cast<std::size_t>(expert.expert_index)].up_input_scale =
+          &expert.up_input_scale_descriptor;
+      bindings.routed_experts[static_cast<std::size_t>(expert.expert_index)].down_input_scale =
+          &expert.down_input_scale_descriptor;
+    }
   }
 
   ExpertLayerConfig layer_config;
@@ -707,9 +826,7 @@ bool run_expert_layer_fixture() {
   const char* force_create_env = std::getenv("NEMOTRON_EXPERT_LAYER_FORCE_CREATE");
   const bool force_create =
       force_create_env != nullptr && std::string(force_create_env).size() != 0;
-  if (!force_create &&
-      metadata->routed_nvfp4_weight_tensor_scale_contract ==
-      "effective_tensor_scale = input_scale * weight_scale_2") {
+  if (!force_create && routed_contract_is_effective) {
     ExpertLayerPreparedBindings prepared_bindings;
     prepared_bindings.input_norm_weight = DeviceTensorFp32::Create({metadata->hidden_size});
     prepared_bindings.gate_score_correction_bias_device =
@@ -731,14 +848,35 @@ bool run_expert_layer_fixture() {
       return false;
     }
     prepared_bindings.gate_weight = UploadedLinearOp::Create(gate_weight_descriptor);
-    prepared_bindings.fc2_latent_dense = UploadedLinearOp::Create(fc2_latent_weight_descriptor);
     if (!expect(
             prepared_bindings.gate_weight != nullptr &&
-                prepared_bindings.gate_weight->valid() &&
-                prepared_bindings.fc2_latent_dense != nullptr &&
-                prepared_bindings.fc2_latent_dense->valid(),
-            "prepared dense operators should upload")) {
+                prepared_bindings.gate_weight->valid(),
+            "prepared gate operator should upload")) {
       return false;
+    }
+    if (metadata->fc2_latent_family == "scaled_fp8") {
+      ScaledFp8LinearConfig config;
+      config.output_rows = metadata->hidden_size;
+      config.input_cols = metadata->moe_latent_size;
+      config.packed_weight_data = fc2_latent_weight_fp8.data();
+      config.packed_weight_nbytes = fc2_latent_weight_fp8.size();
+      config.weight_scale = fc2_latent_weight_scale[0];
+      config.input_scale = fc2_latent_input_scale[0];
+      prepared_bindings.fc2_latent_scaled_fp8 = ScaledFp8LinearOp::Create(config);
+      if (!expect(
+              prepared_bindings.fc2_latent_scaled_fp8 != nullptr &&
+                  prepared_bindings.fc2_latent_scaled_fp8->valid(),
+              "prepared fc2 scaled-fp8 operator should upload")) {
+        return false;
+      }
+    } else {
+      prepared_bindings.fc2_latent_dense = UploadedLinearOp::Create(fc2_latent_weight_descriptor);
+      if (!expect(
+              prepared_bindings.fc2_latent_dense != nullptr &&
+                  prepared_bindings.fc2_latent_dense->valid(),
+              "prepared fc2 dense operator should upload")) {
+        return false;
+      }
     }
     if (metadata->fc1_latent_family == "scaled_fp8") {
       ScaledFp8LinearConfig config;
@@ -970,31 +1108,54 @@ bool run_expert_layer_fixture() {
             "row final output should download")) {
       return false;
     }
-    if (dump_root_env != nullptr && std::string(dump_root_env).size() != 0 && row == 0) {
+    if (dump_root_env != nullptr &&
+        std::string(dump_root_env).size() != 0 &&
+        (dump_all_rows || row == 0)) {
       const std::filesystem::path dump_root(dump_root_env);
-      write_float_file(dump_root / "trace_latent_output_fp32.bin", trace.latent_output);
-      write_float_file(dump_root / "trace_routed_latent_output_fp32.bin", trace.routed_latent_output);
-      write_float_file(dump_root / "trace_projected_routed_output_fp32.bin", trace.projected_routed_output);
-      write_float_file(dump_root / "trace_shared_output_fp32.bin", trace.shared_output);
-      write_float_file(dump_root / "trace_mixer_output_fp32.bin", trace.mixer_output);
+      const std::string row_stem = std::string(row < 10 ? "0" : "") + std::to_string(row);
+      const std::string row_prefix = dump_all_rows ? ("row" + row_stem + "_") : "";
+      write_float_file(dump_root / (row_prefix + "trace_latent_output_fp32.bin"), trace.latent_output);
+      write_float_file(
+          dump_root / (row_prefix + "trace_routed_latent_output_fp32.bin"),
+          trace.routed_latent_output);
+      write_float_file(
+          dump_root / (row_prefix + "trace_projected_routed_output_fp32.bin"),
+          trace.projected_routed_output);
+      write_float_file(dump_root / (row_prefix + "trace_shared_output_fp32.bin"), trace.shared_output);
+      write_float_file(dump_root / (row_prefix + "trace_mixer_output_fp32.bin"), trace.mixer_output);
+      std::vector<std::int32_t> trace_routed_order_i32;
+      trace_routed_order_i32.reserve(trace.routed_expert_order.size());
+      for (std::size_t expert_index : trace.routed_expert_order) {
+        trace_routed_order_i32.push_back(static_cast<std::int32_t>(expert_index));
+      }
+      write_int32_file(
+          dump_root / (row_prefix + "trace_routed_expert_order_u32.bin"),
+          trace_routed_order_i32);
       for (std::size_t slot = 0; slot < trace.routed_expert_order.size(); ++slot) {
         const std::string slot_stem = std::string(slot < 10 ? "0" : "") + std::to_string(slot);
         write_float_file(
-            dump_root / ("trace_routed_activated_hidden_slot" + slot_stem + "_fp32.bin"),
+            dump_root / (row_prefix + "trace_routed_up_proj_output_slot" + slot_stem + "_fp32.bin"),
+            std::vector<float>(
+                trace.routed_expert_pre_activation_hidden.begin() +
+                    slot * metadata->routed_expert_intermediate_size,
+                trace.routed_expert_pre_activation_hidden.begin() +
+                    (slot + 1) * metadata->routed_expert_intermediate_size));
+        write_float_file(
+            dump_root / (row_prefix + "trace_routed_activated_hidden_slot" + slot_stem + "_fp32.bin"),
             std::vector<float>(
                 trace.routed_expert_activated_hidden.begin() +
                     slot * metadata->routed_expert_intermediate_size,
                 trace.routed_expert_activated_hidden.begin() +
                     (slot + 1) * metadata->routed_expert_intermediate_size));
         write_float_file(
-            dump_root / ("trace_routed_expert_output_slot" + slot_stem + "_fp32.bin"),
+            dump_root / (row_prefix + "trace_routed_expert_output_slot" + slot_stem + "_fp32.bin"),
             std::vector<float>(
                 trace.routed_expert_outputs.begin() +
                     slot * metadata->moe_latent_size,
                 trace.routed_expert_outputs.begin() +
                     (slot + 1) * metadata->moe_latent_size));
         write_float_file(
-            dump_root / ("trace_routed_contribution_slot" + slot_stem + "_fp32.bin"),
+            dump_root / (row_prefix + "trace_routed_contribution_slot" + slot_stem + "_fp32.bin"),
             std::vector<float>(
                 trace.routed_expert_weighted_contributions.begin() +
                     slot * metadata->moe_latent_size,
@@ -1211,7 +1372,8 @@ bool run_expert_layer_fixture() {
     auto exact_fc2_output =
         DeviceTensorFp32::Create({metadata->input_rows, metadata->hidden_size});
     auto direct_gate = UploadedLinearOp::Create(gate_weight_descriptor);
-    auto direct_fc2 = UploadedLinearOp::Create(fc2_latent_weight_descriptor);
+    std::unique_ptr<UploadedLinearOp> direct_fc2_dense;
+    std::unique_ptr<ScaledFp8LinearOp> direct_fc2_fp8;
     std::unique_ptr<UploadedLinearOp> direct_fc1_dense;
     std::unique_ptr<ScaledFp8LinearOp> direct_fc1_fp8;
     if (metadata->fc1_latent_family == "scaled_fp8") {
@@ -1226,6 +1388,18 @@ bool run_expert_layer_fixture() {
     } else {
       direct_fc1_dense = UploadedLinearOp::Create(fc1_latent_dense_descriptor);
     }
+    if (metadata->fc2_latent_family == "scaled_fp8") {
+      ScaledFp8LinearConfig direct_fc2_config;
+      direct_fc2_config.output_rows = metadata->hidden_size;
+      direct_fc2_config.input_cols = metadata->moe_latent_size;
+      direct_fc2_config.packed_weight_data = fc2_latent_weight_fp8.data();
+      direct_fc2_config.packed_weight_nbytes = fc2_latent_weight_fp8.size();
+      direct_fc2_config.weight_scale = fc2_latent_weight_scale[0];
+      direct_fc2_config.input_scale = fc2_latent_input_scale[0];
+      direct_fc2_fp8 = ScaledFp8LinearOp::Create(direct_fc2_config);
+    } else {
+      direct_fc2_dense = UploadedLinearOp::Create(fc2_latent_weight_descriptor);
+    }
     if (!expect(
             exact_norm_input != nullptr &&
                 exact_gate_output != nullptr &&
@@ -1236,8 +1410,8 @@ bool run_expert_layer_fixture() {
                 direct_gate->valid() &&
                 ((direct_fc1_fp8 != nullptr && direct_fc1_fp8->valid()) ||
                  (direct_fc1_dense != nullptr && direct_fc1_dense->valid())) &&
-                direct_fc2 != nullptr &&
-                direct_fc2->valid(),
+                ((direct_fc2_fp8 != nullptr && direct_fc2_fp8->valid()) ||
+                 (direct_fc2_dense != nullptr && direct_fc2_dense->valid())),
             "exact-input component operators should build")) {
       return false;
     }
@@ -1260,7 +1434,9 @@ bool run_expert_layer_fixture() {
                  : direct_fc1_dense->Run(*cublas, &heuristic_cache, *exact_norm_input, exact_fc1_output.get())),
             "exact-input fc1 projection should run") ||
         !expect(
-            direct_fc2->Run(*cublas, &heuristic_cache, *exact_routed_input, exact_fc2_output.get()),
+            (direct_fc2_fp8 != nullptr
+                 ? direct_fc2_fp8->Run(*cublas, &heuristic_cache, *exact_routed_input, exact_fc2_output.get())
+                 : direct_fc2_dense->Run(*cublas, &heuristic_cache, *exact_routed_input, exact_fc2_output.get())),
             "exact-input fc2 projection should run")) {
       return false;
     }

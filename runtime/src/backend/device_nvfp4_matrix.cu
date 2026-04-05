@@ -52,7 +52,7 @@ __device__ float NormalizeFixedTensorScaleDevice(float value) {
   if (!isfinite(value) || value <= 0.0f) {
     return kMinScale;
   }
-  return value < kMinScale ? kMinScale : value;
+  return value;
 }
 
 __device__ float LoadSourceValue(const float* source, std::size_t index) {
@@ -70,9 +70,6 @@ std::optional<float> NormalizeFixedTensorScale(const Nvfp4PackOptions& options) 
   const float value = *options.fixed_tensor_scale;
   if (!std::isfinite(value) || value <= 0.0f) {
     return std::nullopt;
-  }
-  if (value < kMinScale) {
-    return kMinScale;
   }
   return value;
 }
@@ -309,7 +306,7 @@ __global__ void PackLatentPerSelectedExpertToNvfp4Kernel(
   const std::size_t tid = threadIdx.x;
   const float raw_input_scale = selected_expert_input_scales[expert_row];
   const float tensor_scale = NormalizeFixedTensorScaleDevice(
-      (raw_input_scale > 0.0f && isfinite(raw_input_scale)) ? 1.0f / raw_input_scale
+      (raw_input_scale > 0.0f && isfinite(raw_input_scale)) ? raw_input_scale
                                                             : kMinScale);
   std::uint8_t* row_packed = packed + (expert_row * packed_row_bytes);
   std::uint8_t* row_block_scales = block_scales + (expert_row * blocks_per_row);

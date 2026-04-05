@@ -611,6 +611,42 @@ bool test_scaled_fp8_linear_cache_view_matches_mamba_in_proj_fixture() {
       expected_output);
 }
 
+bool test_scaled_fp8_linear_cache_view_matches_batched_layer0_mamba_in_proj_fixture() {
+  const std::filesystem::path fixture_root =
+      "/home/khkramer/src/nemotron-march-2026/proj-2026-04-04-1657/layer0-prefix-oracle.zero";
+  if (!std::filesystem::exists(fixture_root)) {
+    std::cout << "scaled_fp8_linear_test: SKIP batched layer0 mamba fixture (missing oracle fixture)\n";
+    return true;
+  }
+  const auto activations = read_f32_file(fixture_root / "expected_norm_output_fp32.bin");
+  const auto expected_output = read_f32_file(fixture_root / "expected_in_proj_output_fp32.bin");
+  const auto weight_fp8 = read_u8_file(fixture_root / "in_proj_weight_fp8.bin");
+  const auto weight_scale = read_f32_file(fixture_root / "in_proj_weight_scale_fp32.bin");
+  const auto input_scale = read_f32_file(fixture_root / "in_proj_input_scale_fp32.bin");
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kInputCols = 4096;
+  if (!expect(weight_fp8.size() % kInputCols == 0, "batched layer0 mamba in-proj weights should be row-major")) {
+    return false;
+  }
+  const std::size_t output_rows = weight_fp8.size() / kInputCols;
+  if (!expect(activations.size() == kRows * kInputCols, "batched layer0 mamba in-proj activations should match shape") ||
+      !expect(expected_output.size() == kRows * output_rows, "batched layer0 mamba in-proj output should match shape") ||
+      !expect(weight_scale.size() == 1, "batched layer0 mamba in-proj weight scale should load") ||
+      !expect(input_scale.size() == 1, "batched layer0 mamba in-proj input scale should load")) {
+    return false;
+  }
+  return run_scaled_fp8_cache_view_case_and_check_stats(
+      "backbone.layers.0.mixer.in_proj.weight",
+      kRows,
+      kInputCols,
+      output_rows,
+      activations,
+      weight_fp8,
+      weight_scale[0],
+      input_scale[0],
+      expected_output);
+}
+
 bool test_scaled_fp8_linear_cache_view_matches_mamba_out_proj_fixture() {
   const std::filesystem::path fixture_root =
       "/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/oracle/mamba_layer9_runtime_input_block_cuda";
@@ -651,6 +687,7 @@ int main() {
           test_scaled_fp8_linear_matches_oracle_fixture() &&
           test_scaled_fp8_linear_cache_view_matches_expert_oracle_fixture() &&
           test_scaled_fp8_linear_cache_view_matches_mamba_in_proj_fixture() &&
+          test_scaled_fp8_linear_cache_view_matches_batched_layer0_mamba_in_proj_fixture() &&
           test_scaled_fp8_linear_cache_view_matches_mamba_out_proj_fixture())
              ? 0
              : 1;

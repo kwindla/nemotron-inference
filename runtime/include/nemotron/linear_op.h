@@ -54,6 +54,14 @@ class UploadedLinearOp {
   bool Run(
       CublasLtHandle& handle,
       GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorFp32& activations,
+      DeviceTensorFp32* output,
+      const Nvfp4PackOptions& pack_options,
+      cudaStream_t stream = nullptr) const;
+
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
       const DeviceTensorBf16& activations,
       DeviceTensorFp32* output,
       cudaStream_t stream = nullptr) const;
@@ -62,7 +70,23 @@ class UploadedLinearOp {
       CublasLtHandle& handle,
       GemmHeuristicCache* heuristic_cache,
       const DeviceTensorBf16& activations,
+      DeviceTensorFp32* output,
+      const Nvfp4PackOptions& pack_options,
+      cudaStream_t stream = nullptr) const;
+
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& activations,
       DeviceTensorBf16* output,
+      cudaStream_t stream = nullptr) const;
+
+  bool Run(
+      CublasLtHandle& handle,
+      GemmHeuristicCache* heuristic_cache,
+      const DeviceTensorBf16& activations,
+      DeviceTensorBf16* output,
+      const Nvfp4PackOptions& pack_options,
       cudaStream_t stream = nullptr) const;
 
  private:

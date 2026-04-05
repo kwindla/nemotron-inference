@@ -79,4 +79,29 @@ bool PackDeviceRowMajorBf16ToNvfp4InPlace(
     unsigned int* global_max_bits_scratch,
     cudaStream_t stream = nullptr);
 
+// Packs a single latent source row once per selected expert using that
+// expert's checkpoint activation tensor scale. All outputs are laid out as
+// [selected_expert_count, per-row-bytes].
+bool PackLatentPerSelectedExpertToNvfp4InPlace(
+    const DeviceTensorFp32& source_row,
+    std::size_t selected_expert_count,
+    const float* selected_expert_input_scales,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream = nullptr);
+
+bool PackLatentPerSelectedExpertToNvfp4InPlace(
+    const DeviceTensorBf16& source_row,
+    std::size_t selected_expert_count,
+    const float* selected_expert_input_scales,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    unsigned int* global_max_bits_scratch,
+    cudaStream_t stream = nullptr);
+
 }  // namespace nemotron

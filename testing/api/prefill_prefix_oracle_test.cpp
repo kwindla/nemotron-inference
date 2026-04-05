@@ -70,6 +70,17 @@ std::vector<float> read_float_file(const std::filesystem::path& path) {
   return values;
 }
 
+bool write_float_file(const std::filesystem::path& path, const std::vector<float>& values) {
+  std::ofstream output(path, std::ios::binary);
+  if (!output) {
+    return false;
+  }
+  output.write(
+      reinterpret_cast<const char*>(values.data()),
+      static_cast<std::streamsize>(values.size() * sizeof(float)));
+  return output.good();
+}
+
 std::optional<std::size_t> parse_json_uint_field(const std::string& json, const std::string& key) {
   const std::regex pattern("\"" + key + "\"\\s*:\\s*([0-9]+)");
   std::smatch match;
@@ -263,6 +274,31 @@ bool run_prefill_prefix_oracle() {
   std::unordered_map<std::size_t, std::vector<float>> actual_layers;
   for (const auto& captured : trace.captured_layers) {
     actual_layers.emplace(captured.layer_index, captured.hidden);
+  }
+
+  const char* dump_root_env = std::getenv("NEMOTRON_PREFILL_TRACE_DUMP_ROOT");
+  if (dump_root_env != nullptr && std::string(dump_root_env).size() != 0) {
+    const std::filesystem::path dump_root(dump_root_env);
+    std::filesystem::create_directories(dump_root);
+    if (!write_float_file(dump_root / "embedding_output_fp32.bin", trace.embedding_output)) {
+      std::cerr << "prefill_prefix_oracle_test: failed to dump embedding trace\n";
+      return false;
+    }
+    for (const auto& captured : trace.captured_layers) {
+      const std::filesystem::path path =
+          dump_root / ("captured_layer_" + std::to_string(captured.layer_index / 100 % 10) +
+                       std::to_string(captured.layer_index / 10 % 10) +
+                       std::to_string(captured.layer_index % 10) + "_output_fp32.bin");
+      if (!write_float_file(path, captured.hidden)) {
+        std::cerr << "prefill_prefix_oracle_test: failed to dump captured layer "
+                  << captured.layer_index << "\n";
+        return false;
+      }
+    }
+    if (!write_float_file(dump_root / "final_hidden_fp32.bin", trace.final_hidden)) {
+      std::cerr << "prefill_prefix_oracle_test: failed to dump final hidden trace\n";
+      return false;
+    }
   }
 
   for (const std::size_t layer_index : metadata->capture_layers) {

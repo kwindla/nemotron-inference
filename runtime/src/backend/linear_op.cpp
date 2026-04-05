@@ -69,6 +69,12 @@ bool IsBf16DenseDescriptor(const GemmDescriptor& descriptor) {
              descriptor.output_rows * descriptor.input_cols * sizeof(__nv_bfloat16);
 }
 
+bool ShouldForceFp32DenseGateCompute(const GemmDescriptor& descriptor) {
+  return IsBf16DenseDescriptor(descriptor) &&
+         std::string_view(descriptor.tensor_name).find(".mixer.gate.weight") !=
+             std::string_view::npos;
+}
+
 bool ExperimentalDenseDevicePlanSurfaceEnabled() {
   static const bool disabled =
       std::getenv("NEMOTRON_DISABLE_DENSE_DEVICE_PLAN_SURFACE") != nullptr;
@@ -924,7 +930,14 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor&
   impl->descriptor = descriptor;
   switch (descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor:
-      if (IsBf16DenseDescriptor(descriptor)) {
+      if (ShouldForceFp32DenseGateCompute(descriptor)) {
+        impl->descriptor.storage_dtype = "fp32";
+        impl->descriptor.compute_dtype = "fp32";
+        impl->dense_weight = DeviceDenseWeightFp32::Upload(descriptor);
+        if (!impl->dense_weight || !impl->dense_weight->valid()) {
+          return nullptr;
+        }
+      } else if (IsBf16DenseDescriptor(descriptor)) {
         impl->dense_weight_bf16 = UploadDenseWeightToDeviceBf16(descriptor);
         if (!impl->dense_weight_bf16 || !impl->dense_weight_bf16->valid()) {
           return nullptr;
@@ -1028,6 +1041,16 @@ bool UploadedLinearOp::Run(
     const DeviceTensorFp32& activations,
     DeviceTensorFp32* output,
     cudaStream_t stream) const {
+  return Run(handle, heuristic_cache, activations, output, {}, stream);
+}
+
+bool UploadedLinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorFp32& activations,
+    DeviceTensorFp32* output,
+    const Nvfp4PackOptions& pack_options,
+    cudaStream_t stream) const {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool debug = kDebug;
   if (!valid() || !handle.valid() || !activations.valid() || output == nullptr || !output->valid()) {
@@ -1101,7 +1124,7 @@ bool UploadedLinearOp::Run(
                    activations,
                    *impl_->nvfp4_weight,
                    output,
-                   {},
+                   pack_options,
                    stream)
             .has_value();
       }
@@ -1114,6 +1137,16 @@ bool UploadedLinearOp::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& activations,
     DeviceTensorFp32* output,
+    cudaStream_t stream) const {
+  return Run(handle, heuristic_cache, activations, output, {}, stream);
+}
+
+bool UploadedLinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorFp32* output,
+    const Nvfp4PackOptions& pack_options,
     cudaStream_t stream) const {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool debug = kDebug;
@@ -1139,7 +1172,7 @@ bool UploadedLinearOp::Run(
                 stream)) {
           return false;
         }
-        return Run(handle, heuristic_cache, *activations_fp32, output, stream);
+        return Run(handle, heuristic_cache, *activations_fp32, output, pack_options, stream);
       }
       const DenseRuntimeOpFamily dense_family = ClassifyDenseRuntimeOpFamily(impl_->descriptor);
       const auto plan = ResolveDensePlan(
@@ -1214,7 +1247,7 @@ bool UploadedLinearOp::Run(
                  *activations_fp32,
                  *impl_->nvfp4_weight,
                  output,
-                 {},
+                 pack_options,
                  stream)
           .has_value();
     }
@@ -1227,6 +1260,16 @@ bool UploadedLinearOp::Run(
     GemmHeuristicCache* heuristic_cache,
     const DeviceTensorBf16& activations,
     DeviceTensorBf16* output,
+    cudaStream_t stream) const {
+  return Run(handle, heuristic_cache, activations, output, {}, stream);
+}
+
+bool UploadedLinearOp::Run(
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output,
+    const Nvfp4PackOptions& pack_options,
     cudaStream_t stream) const {
   static const bool kDebug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   const bool debug = kDebug;
@@ -1308,7 +1351,7 @@ bool UploadedLinearOp::Run(
       if (output_fp32 == nullptr) {
         return false;
       }
-      if (!Run(handle, heuristic_cache, activations, output_fp32, stream)) {
+      if (!Run(handle, heuristic_cache, activations, output_fp32, pack_options, stream)) {
         return false;
       }
       return ConvertDeviceFp32ToBf16(

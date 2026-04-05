@@ -27,6 +27,7 @@ constexpr std::size_t GiB(std::size_t value) {
 
 struct FixtureMetadata {
   std::size_t layer_index = 0;
+  std::string fc2_latent_family = "dense";
 };
 
 bool expect(bool condition, const std::string& message) {
@@ -76,6 +77,42 @@ std::optional<std::size_t> parse_json_uint_field(
   }
 }
 
+std::optional<float> parse_json_float_field(
+    const std::string& json,
+    const std::string& key) {
+  const std::regex pattern("\"" + key + "\"\\s*:\\s*([-+0-9.eE]+)");
+  std::smatch match;
+  if (!std::regex_search(json, match, pattern) || match.size() != 2) {
+    return std::nullopt;
+  }
+  try {
+    return std::stof(match[1].str());
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<float> parse_routed_expert_input_scale(
+    const std::string& json,
+    std::size_t expert_index,
+    const char* proj_name) {
+  const std::string expert_anchor =
+      "\"experts\":\\s*\\[[\\s\\S]*?\"index\"\\s*:\\s*" + std::to_string(expert_index);
+  const std::regex expert_pattern(expert_anchor);
+  std::smatch expert_match;
+  if (!std::regex_search(json, expert_match, expert_pattern)) {
+    return std::nullopt;
+  }
+  const std::size_t expert_pos = static_cast<std::size_t>(expert_match.position());
+  const std::string proj_anchor = "\"" + std::string(proj_name) + "\"";
+  const std::size_t proj_pos = json.find(proj_anchor, expert_pos);
+  if (proj_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const std::string tail = json.substr(proj_pos, 2048);
+  return parse_json_float_field(tail, "input_scale");
+}
+
 std::optional<FixtureMetadata> load_metadata(
     const std::filesystem::path& root) {
   const std::string json = read_text_file(root / "metadata.json");
@@ -83,8 +120,13 @@ std::optional<FixtureMetadata> load_metadata(
   if (!layer_index) {
     return std::nullopt;
   }
+  const std::regex family_pattern("\"fc2_latent_family\"\\s*:\\s*\"([^\"]+)\"");
+  std::smatch family_match;
   FixtureMetadata metadata;
   metadata.layer_index = *layer_index;
+  if (std::regex_search(json, family_match, family_pattern) && family_match.size() == 2) {
+    metadata.fc2_latent_family = family_match[1].str();
+  }
   return metadata;
 }
 
@@ -261,6 +303,7 @@ bool run_expert_layer3_manifest_binding_compare() {
 
   const std::filesystem::path fixture_root(
       NEMOTRON_EXPERT_LAYER_PREFIX_INPUT_FIXTURE_ROOT);
+  const std::string metadata_json = read_text_file(fixture_root / "metadata.json");
   const auto metadata = load_metadata(fixture_root);
   if (!expect(metadata.has_value(), "fixture metadata should load")) {
     return false;
@@ -340,13 +383,32 @@ bool run_expert_layer3_manifest_binding_compare() {
           *read_kernel_descriptor_fp32(*bindings->fc1_latent_input_scale),
           read_float_file(fixture_root / "fc1_latent_input_scale_fp32.bin"),
           0.0f) ||
-      !compare_float_vectors(
-          "fc2_latent_weight",
-          *read_gemm_descriptor_fp32_scaled(
-              *bindings->fc2_latent_gemm_weight,
-              (*read_kernel_descriptor_fp32(*bindings->fc2_latent_weight_scale))[0]),
-          read_float_file(fixture_root / "fc2_latent_weight_fp32.bin"),
-          0.0f) ||
+      !([&]() {
+          if (metadata->fc2_latent_family == "scaled_fp8") {
+            return compare_exact_bytes(
+                "fc2_latent_weight",
+                bindings->fc2_latent_kernel_weight->packed_data,
+                bindings->fc2_latent_kernel_weight->packed_nbytes,
+                read_file_bytes(fixture_root / "fc2_latent_weight_fp8.bin")) &&
+                   compare_float_vectors(
+                       "fc2_latent_weight_scale",
+                       *read_kernel_descriptor_fp32(*bindings->fc2_latent_weight_scale),
+                       read_float_file(fixture_root / "fc2_latent_weight_scale_fp32.bin"),
+                       0.0f) &&
+                   compare_float_vectors(
+                       "fc2_latent_input_scale",
+                       *read_kernel_descriptor_fp32(*bindings->fc2_latent_input_scale),
+                       read_float_file(fixture_root / "fc2_latent_input_scale_fp32.bin"),
+                       0.0f);
+          }
+          return compare_float_vectors(
+              "fc2_latent_weight",
+              *read_gemm_descriptor_fp32_scaled(
+                  *bindings->fc2_latent_gemm_weight,
+                  (*read_kernel_descriptor_fp32(*bindings->fc2_latent_weight_scale))[0]),
+              read_float_file(fixture_root / "fc2_latent_weight_fp32.bin"),
+              0.0f);
+        }()) ||
       !compare_exact_bytes(
           "shared_up_weight",
           bindings->shared_up_kernel_weight->packed_data,
@@ -438,6 +500,26 @@ bool run_expert_layer3_manifest_binding_compare() {
                 pair.down_proj->tensor_scale_data,
                 pair.down_proj->tensor_scale_nbytes),
             read_float_file(expert_dir / "down_proj_weight_tensor_scale_fp32.bin"),
+            0.0f)) {
+      return false;
+    }
+    const auto expected_up_input_scale =
+        parse_routed_expert_input_scale(metadata_json, static_cast<std::size_t>(expert_id), "up_proj");
+    const auto expected_down_input_scale =
+        parse_routed_expert_input_scale(metadata_json, static_cast<std::size_t>(expert_id), "down_proj");
+    if (!expect(expected_up_input_scale.has_value(), "routed expert up input scale should exist in fixture metadata") ||
+        !expect(expected_down_input_scale.has_value(), "routed expert down input scale should exist in fixture metadata") ||
+        !expect(pair.up_input_scale != nullptr, "routed expert up input scale binding should exist") ||
+        !expect(pair.down_input_scale != nullptr, "routed expert down input scale binding should exist") ||
+        !compare_float_vectors(
+            "expert_" + std::to_string(expert_id) + "_up_input_scale",
+            *read_kernel_descriptor_fp32(*pair.up_input_scale),
+            std::vector<float>{*expected_up_input_scale},
+            0.0f) ||
+        !compare_float_vectors(
+            "expert_" + std::to_string(expert_id) + "_down_input_scale",
+            *read_kernel_descriptor_fp32(*pair.down_input_scale),
+            std::vector<float>{*expected_down_input_scale},
             0.0f)) {
       return false;
     }

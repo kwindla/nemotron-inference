@@ -47,6 +47,10 @@ Run the current C++ tests:
 ctest --test-dir build --output-on-failure
 ```
 
+For lightweight local development, that command is fine. For real manifest-backed or parity validation on DGX Spark / GB10, use the guarded runbook in
+`../proj-2026-04-04-nvfp4-activation-quant-alignment/TEST-RUNBOOK.md`
+instead of blindly launching the whole suite in parallel.
+
 If `/usr/local/cuda/compat` or `/usr/local/cuda-13.2/compat` exists, `ctest` now prepends it automatically for the runtime test binaries. The benchmark wrapper scripts below do the same. Direct binary launches still need an equivalent `LD_LIBRARY_PATH` if the compat stack is required.
 
 Run the first GB10 dense microbenchmark harness:
@@ -131,9 +135,11 @@ Current runtime config support includes:
 DGX Spark operating rule for heavy decode / startup benches:
 
 - run one heavy model-build or decode benchmark at a time
+- run one heavy manifest-backed test at a time as well
 - inspect the decode-bench `memory_snapshots` JSON field before trusting a result
 - on Spark, treat `host_budget_bytes = MemAvailable + SwapFree` as the main safety signal and `cudaMemGetInfo()` as advisory only
 - prefer `NEMOTRON_BENCH_ABORT_ON_LOW_HOST_BUDGET=1` with a warning threshold of at least `20 GiB` for unattended or long-running runs
+- for the current test procedure and expected failures, see `../proj-2026-04-04-nvfp4-activation-quant-alignment/TEST-RUNBOOK.md`
 
 Current startup timing direction on the real manifest-backed build-only path:
 
@@ -309,15 +315,16 @@ Current composed-forward reality:
 - that gate split is now implemented:
   - stop-layer decode sweeps still use strict hidden-state localization
   - the full all-layer decode oracle now gates on functional decode behavior and a final-logit `rel_l2` tripwire
-  - with the real manifest wired in, that all-layer decode oracle now passes
+  - historical note: that oracle passed in an earlier 60-test tree, but the current tree has moved on
 - verification status after this round:
-  - total tests in tree: `60`
-  - the full suite is now green at `60/60` with `NEMOTRON_FORWARD_MANIFEST` set
+  - the old `60/60` statement is stale
+  - the latest guarded CUDA-host run executed `65` registered tests with `59` passes and `6` failures
+  - see `../proj-2026-04-04-nvfp4-activation-quant-alignment/TEST-RUNBOOK.md` for the current procedure and failure list
 
 Latest throughput reality on DGX Spark:
 
 - the packed BF16 / FP8 linear pass plus reduced-sync helper work is now in the runtime default path
-- correctness remains green at `60/60`
+- correctness is not currently green end to end; use the dedicated runbook for the latest pass/fail state
 - current aligned uncached decode measurement:
   - bootstrap `≈ 2.1s`
   - model build `≈ 9.6s`

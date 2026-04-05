@@ -68,7 +68,8 @@ struct ExpertLayerPreparedExpert {
   GemmDescriptor up_descriptor;
   GemmDescriptor down_descriptor;
   // Routed NVFP4 tensor scale is raw weight_scale_2 from checkpoint.
-  // Kernel alpha = dynamic_activation_scale * weight_scale_2.
+  // Kernel alpha = activation_tensor_scale * weight_scale_2, with routed
+  // checkpoint input_scale consumed during activation packing.
   std::optional<float> up_tensor_scale;
   std::optional<float> down_tensor_scale;
   std::optional<float> up_input_scale;
@@ -105,6 +106,7 @@ struct ExpertLayerRunTrace {
   std::vector<float> latent_output;
   std::vector<float> routed_latent_output;
   std::vector<std::size_t> routed_expert_order;
+  std::vector<float> routed_expert_pre_activation_hidden;
   std::vector<float> routed_expert_activated_hidden;
   std::vector<float> routed_expert_outputs;
   std::vector<float> routed_expert_weighted_contributions;

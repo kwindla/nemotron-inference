@@ -53,6 +53,10 @@ bool DenseGemmDebugEnabled() {
 }
 
 bool Fp8FastAccumSupported() {
+  const char* disable_fast_accum = std::getenv("NEMOTRON_DISABLE_FP8_FAST_ACCUM");
+  if (disable_fast_accum != nullptr && !(disable_fast_accum[0] == '0' && disable_fast_accum[1] == '\0')) {
+    return false;
+  }
   static const bool kSupported = []() {
     int device = 0;
     cudaDeviceProp prop{};

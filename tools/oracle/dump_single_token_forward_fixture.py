@@ -183,7 +183,11 @@ def _as_scalar_tensor(value: float | torch.Tensor, device: torch.device) -> torc
     return torch.tensor(float(value), dtype=torch.float32, device=device)
 
 
-def pack_fp32_to_nvfp4_dynamic(values: torch.Tensor) -> dict[str, object]:
+def pack_fp32_to_nvfp4_dynamic(
+    values: torch.Tensor,
+    *,
+    fixed_tensor_scale: float | None = None,
+) -> dict[str, object]:
     rows, cols = values.shape
     assert cols % 16 == 0
     device = values.device
@@ -193,13 +197,21 @@ def pack_fp32_to_nvfp4_dynamic(values: torch.Tensor) -> dict[str, object]:
     min_scale = torch.tensor(MIN_SCALE, dtype=torch.float32, device=device)
     fp4_levels = FP4_LEVELS_TENSOR.to(device=device)
 
-    global_max_abs = values_f32.abs().amax()
-    tensor_scale = torch.where(
-        global_max_abs > (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE),
-        global_max_abs / (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE),
-        one,
-    )
-    tensor_scale = torch.clamp(tensor_scale, min=min_scale)
+    if fixed_tensor_scale is None:
+        global_max_abs = values_f32.abs().amax()
+        tensor_scale = torch.where(
+            global_max_abs > (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE),
+            global_max_abs / (FP4_MAX_FINITE * FP8_E4M3_MAX_FINITE),
+            one,
+        )
+        tensor_scale = torch.clamp(tensor_scale, min=min_scale)
+    else:
+        tensor_scale = torch.tensor(
+            require_positive_finite(fixed_tensor_scale, "fixed tensor scale"),
+            dtype=torch.float32,
+            device=device,
+        )
+        tensor_scale = torch.clamp(tensor_scale, min=min_scale)
 
     block_max = blocks.abs().amax(dim=-1)
     block_scale = torch.where(
@@ -317,6 +329,11 @@ def load_nvfp4_linear_metadata(
         "weight_scale_2_name": weight_scale_2_name,
         "input_scale_name": input_scale_name if input_scale is not None else None,
         "tensor_scale_contract": tensor_scale_contract,
+        "activation_tensor_scale": (
+            input_scale
+            if input_scale is not None and require_input_scale and not fuse_input_scale
+            else None
+        ),
         "manifest_weight_present": manifest_weight_present,
         "manifest_input_scale_present": manifest_input_scale_present,
     }
@@ -377,7 +394,10 @@ def run_dense_or_scaled_fp8_linear(activations: torch.Tensor, linear_metadata: d
 
 
 def nvfp4_linear(activations: torch.Tensor, linear_metadata: dict[str, object]) -> torch.Tensor:
-    packed_activation = pack_fp32_to_nvfp4_dynamic(activations.to(torch.float32))
+    packed_activation = pack_fp32_to_nvfp4_dynamic(
+        activations.to(torch.float32),
+        fixed_tensor_scale=linear_metadata.get("activation_tensor_scale"),
+    )
     dequantized_activation = dequantize_nvfp4_matrix(
         packed_activation["packed"],
         packed_activation["block_scales"],
@@ -705,7 +725,7 @@ def run_expert_block(
                         expert_prefix + ".up_proj",
                         manifest_tensor_names=manifest_tensor_names,
                         require_input_scale=True,
-                        fuse_input_scale=True,
+                        fuse_input_scale=False,
                     ),
                     load_nvfp4_linear_metadata(
                         model_dir,
@@ -713,7 +733,7 @@ def run_expert_block(
                         expert_prefix + ".down_proj",
                         manifest_tensor_names=manifest_tensor_names,
                         require_input_scale=True,
-                        fuse_input_scale=True,
+                        fuse_input_scale=False,
                     ),
                 )
                 expert_linear_cache[expert_prefix] = expert_entry
@@ -887,7 +907,7 @@ def main() -> int:
             "single_token mode runs one token from scratch with zeroed cache/state.",
             "prefix_prefill mode runs a short prompt prefix from scratch and can stop after an early capture layer to keep fixture generation practical.",
             "Attention, Mamba, and MoE blocks mirror the current correctness-first runtime contracts already used by the layer-level oracle fixtures.",
-            "Routed expert NVFP4 tensor scales use effective_tensor_scale = input_scale * weight_scale_2.",
+            "Routed expert NVFP4 tensor scales stay raw_weight_scale_2; checkpoint input_scale is consumed during activation packing.",
             "Shared-down NVFP4 tensor scales remain raw_weight_scale_2.",
             "Captured per-layer outputs are intended for the composed registry-backed forward-path validation.",
             "Captured Mamba layers also include final conv/SSM state snapshots for decode-boundary localization.",
