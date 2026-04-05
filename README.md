@@ -51,6 +51,12 @@ For lightweight local development, that command is fine. For real manifest-backe
 `../proj-2026-04-04-nvfp4-activation-quant-alignment/TEST-RUNBOOK.md`
 instead of blindly launching the whole suite in parallel.
 
+Current vLLM parity baseline note:
+
+- the checked-in oracle path at [tools/oracle/generate_vllm_trace.sh](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/oracle/generate_vllm_trace.sh) is pinned to `nemotron-local/dgx-spark-vllm:0.17.1-b31e9326a-fi065`
+- that pinned image is the active parity oracle today; it is not automatically the latest upstream `vllm` `main`
+- if you want parity against current upstream `main`, update the image pin intentionally and regenerate the vLLM trace artifacts before treating comparisons as authoritative
+
 If `/usr/local/cuda/compat` or `/usr/local/cuda-13.2/compat` exists, `ctest` now prepends it automatically for the runtime test binaries. The benchmark wrapper scripts below do the same. Direct binary launches still need an equivalent `LD_LIBRARY_PATH` if the compat stack is required.
 
 Run the first GB10 dense microbenchmark harness:

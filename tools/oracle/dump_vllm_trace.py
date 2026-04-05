@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import traceback
 import types
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,6 +47,11 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def append_jsonl(path: Path, payload: Any) -> None:
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def write_tensor(path: Path, tensor: torch.Tensor) -> None:
     path.write_bytes(tensor.contiguous().cpu().float().numpy().tobytes())
 
@@ -58,6 +65,26 @@ def extract_hidden_tensor(output: Any) -> torch.Tensor:
         output = output[0]
     if not isinstance(output, torch.Tensor):
         raise TypeError(f"Expected tensor output, got {type(output)!r}")
+    return output
+
+
+def extract_layer_boundary_tensor(output: Any) -> torch.Tensor:
+    if isinstance(output, tuple):
+        if len(output) < 2:
+            raise TypeError(
+                f"Expected decoder-layer tuple output to have at least 2 items, got {len(output)}"
+            )
+        hidden_states = output[0]
+        residual = output[1]
+        if not isinstance(hidden_states, torch.Tensor):
+            raise TypeError(f"Expected hidden_states tensor, got {type(hidden_states)!r}")
+        if residual is None:
+            return hidden_states
+        if not isinstance(residual, torch.Tensor):
+            raise TypeError(f"Expected residual tensor or None, got {type(residual)!r}")
+        return hidden_states + residual
+    if not isinstance(output, torch.Tensor):
+        raise TypeError(f"Expected tensor layer output, got {type(output)!r}")
     return output
 
 
@@ -96,12 +123,42 @@ class TraceCapture:
     step_sources: dict[int, str] = field(default_factory=dict)
     step_logit_shapes: dict[int, list[int]] = field(default_factory=dict)
     step_layer_counts: dict[int, int] = field(default_factory=dict)
+    forward_log_path: Path | None = None
+    forward_call_index: int = 0
 
     def reset_current_stage(self) -> None:
         self.current_embedding = None
         self.current_layers = {}
         self.current_final_hidden = None
         self.current_final_hidden_normed = None
+
+    def record_forward_call(
+        self,
+        *,
+        phase: str,
+        num_tokens: int,
+        stage: str | None,
+        step: int | None,
+        positions_shape: list[int] | None = None,
+        output_type: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self.forward_log_path is None:
+            return
+        self.forward_call_index += 1
+        append_jsonl(
+            self.forward_log_path,
+            {
+                "index": self.forward_call_index,
+                "phase": phase,
+                "num_tokens": num_tokens,
+                "stage": stage,
+                "step": step,
+                "positions_shape": positions_shape,
+                "output_type": output_type,
+                "error": error,
+            },
+        )
 
     def begin_stage(self, stage: str | None, step: int | None) -> None:
         self.active_stage = stage
@@ -133,12 +190,20 @@ class TraceCapture:
             return
         if isinstance(output, tuple):
             normed_tensor = output[0]
-            final_hidden_tensor = output[1]
         else:
             normed_tensor = output
-            final_hidden_tensor = inputs[0]
-        if not isinstance(normed_tensor, torch.Tensor) or not isinstance(final_hidden_tensor, torch.Tensor):
+        if not isinstance(normed_tensor, torch.Tensor):
             raise TypeError("Unexpected final norm hook payload")
+        if not inputs:
+            raise TypeError("Final norm hook did not receive hidden-state inputs")
+        final_hidden_tensor = inputs[0]
+        if not isinstance(final_hidden_tensor, torch.Tensor):
+            raise TypeError("Unexpected final norm hidden-state input payload")
+        if len(inputs) > 1 and inputs[1] is not None:
+            residual_tensor = inputs[1]
+            if not isinstance(residual_tensor, torch.Tensor):
+                raise TypeError("Unexpected final norm residual input payload")
+            final_hidden_tensor = final_hidden_tensor + residual_tensor
         self.current_final_hidden = to_cpu_fp32(final_hidden_tensor)
         self.current_final_hidden_normed = to_cpu_fp32(normed_tensor)
 
@@ -257,7 +322,7 @@ def install_trace_hooks(
 
     def layer_hook(layer_idx: int):
         def _hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
-            trace.capture_layer(layer_idx, extract_hidden_tensor(output))
+            trace.capture_layer(layer_idx, extract_layer_boundary_tensor(output))
 
         return _hook
 
@@ -298,17 +363,44 @@ def install_trace_hooks(
             trace.next_decode_forward_step += 1
 
         trace.begin_stage(stage, step)
-        result = original_inner_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
+        trace.record_forward_call(
+            phase="begin",
+            num_tokens=num_tokens,
+            stage=stage,
+            step=step,
+            positions_shape=list(positions.shape),
         )
+        try:
+            result = original_inner_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
+        except Exception as exc:
+            trace.record_forward_call(
+                phase="exception",
+                num_tokens=num_tokens,
+                stage=stage,
+                step=step,
+                positions_shape=list(positions.shape),
+                error=repr(exc),
+            )
+            trace.finish_stage()
+            raise
         if stage is not None:
             trace.pending_logit_stage = stage
             trace.pending_logit_step = step
         else:
             trace.finish_stage()
+        trace.record_forward_call(
+            phase="end",
+            num_tokens=num_tokens,
+            stage=stage,
+            step=step,
+            positions_shape=list(positions.shape),
+            output_type=type(result).__name__,
+        )
         return result
 
     def wrapped_compute_logits(model_self: Any, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -380,6 +472,8 @@ def main() -> None:
         raise ValueError("--decode-steps must be at least 1")
 
     output_dir = Path(args.output_dir)
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_dir = Path(args.model_dir)
@@ -422,6 +516,7 @@ def main() -> None:
             num_layers=num_layers,
             total_decode_steps=args.decode_steps,
             decode_capture_layers=args.decode_capture_layers,
+            forward_log_path=output_dir / "forward_calls.jsonl",
         )
         cleanup_hooks = install_trace_hooks(runtime_model, trace, len(prompt_token_ids))
 
@@ -480,6 +575,14 @@ def main() -> None:
             "decode_step_count": args.decode_steps,
         }
         write_json(output_dir / "metadata.json", metadata)
+    except Exception as exc:
+        failure = {
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        write_json(output_dir / "failure.json", failure)
+        raise
     finally:
         if cleanup_hooks is not None:
             cleanup_hooks()
