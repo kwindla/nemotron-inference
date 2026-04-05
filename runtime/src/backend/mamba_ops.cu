@@ -314,9 +314,8 @@ __global__ __launch_bounds__(128) void ChunkScanKernel(
     shared_x[linear] = value;
   }
   for (int q = tid; q < Q; q += threads) {
-    const float dA = dA_cumsum[chunk_head_base + q];
-    shared_dA[q] = dA;
-    shared_dt[q] = q < chunk_length ? expf(-dA) * dt_chunk[chunk_head_base + q] : 0.0f;
+    shared_dA[q] = q < chunk_length ? dA_cumsum[chunk_head_base + q] : 0.0f;
+    shared_dt[q] = q < chunk_length ? dt_chunk[chunk_head_base + q] : 0.0f;
   }
   __syncthreads();
 
@@ -343,7 +342,8 @@ __global__ __launch_bounds__(128) void ChunkScanKernel(
     const std::size_t cb_row_base =
         (((static_cast<std::size_t>(chunk) * G + group) * Q + qi) * Q);
     for (int qj = 0; qj <= qi; ++qj) {
-      accum += scale_i * shared_dt[qj] * cb_chunk[cb_row_base + qj] *
+      const float intra_chunk_scale = expf(shared_dA[qi] - shared_dA[qj]) * shared_dt[qj];
+      accum += intra_chunk_scale * cb_chunk[cb_row_base + qj] *
                __bfloat162float(shared_x[qj * P + p]);
     }
 
