@@ -30,7 +30,7 @@ struct MambaLayerConfig {
   std::size_t ssm_state_offset_elems = 0;
   float input_rms_epsilon = 1.0e-5f;
   float mixer_rms_epsilon = 1.0e-5f;
-  float time_step_min = 1.0e-3f;
+  float time_step_min = 0.0f;
 };
 
 struct MambaLayerBindings {

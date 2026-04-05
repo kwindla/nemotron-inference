@@ -28,6 +28,7 @@
 namespace {
 
 using nemotron::CublasLtHandle;
+using nemotron::DeviceTensorBf16;
 using nemotron::DeviceTensorFp32;
 using nemotron::GemmDescriptor;
 using nemotron::GemmKernelFamily;
@@ -94,6 +95,29 @@ std::vector<float> read_float_file(const std::filesystem::path& path) {
   std::vector<float> values(bytes.size() / sizeof(float), 0.0f);
   std::memcpy(values.data(), bytes.data(), bytes.size());
   return values;
+}
+
+std::vector<__nv_bfloat16> to_bf16(const std::vector<float>& values) {
+  std::vector<__nv_bfloat16> converted(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __float2bfloat16(values[i]);
+  }
+  return converted;
+}
+
+bool copy_bf16_tensor_to_host(const DeviceTensorBf16& tensor, std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->resize(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
+  }
+  return true;
 }
 
 std::filesystem::path resolve_fixture_root(const char* env_name, const char* default_root) {
@@ -459,10 +483,11 @@ std::optional<MambaReplayResult> run_mamba_replay(
   request_config.mamba_hidden_size = hidden_size;
   request_config.mamba_projection_size = projection_size;
   request_config.mamba_intermediate_size = layer_config.intermediate_size;
-  request_config.mamba_conv_state_bytes_fp32 = conv_state_elems * sizeof(float);
+  request_config.mamba_conv_state_bytes = conv_state_elems * sizeof(__nv_bfloat16);
   request_config.mamba_state_bytes_fp32 = ssm_state_elems * sizeof(float);
 
   std::vector<float> zero_conv_state(conv_state_elems, 0.0f);
+  const std::vector<__nv_bfloat16> zero_conv_state_bf16 = to_bf16(zero_conv_state);
   std::vector<float> zero_ssm_state(ssm_state_elems, 0.0f);
 
   auto request = RequestExecutionContext::Create(request_config);
@@ -473,8 +498,8 @@ std::optional<MambaReplayResult> run_mamba_replay(
       !output || !output->valid() ||
       !input->CopyFromHost(input_hidden.data(), input_hidden.size()) ||
       !request->mamba_conv_state()->CopyFromHost(
-          zero_conv_state.data(),
-          zero_conv_state.size()) ||
+          zero_conv_state_bf16.data(),
+          zero_conv_state_bf16.size()) ||
       !request->mamba_state()->CopyFromHost(
           zero_ssm_state.data(),
           zero_ssm_state.size())) {
@@ -495,9 +520,7 @@ std::optional<MambaReplayResult> run_mamba_replay(
   result.final_conv_state.resize(conv_state_elems, 0.0f);
   result.final_ssm_state.resize(ssm_state_elems, 0.0f);
   if (!output->CopyToHost(result.residual_output.data(), result.residual_output.size()) ||
-      !request->mamba_conv_state()->CopyToHost(
-          result.final_conv_state.data(),
-          result.final_conv_state.size()) ||
+      !copy_bf16_tensor_to_host(*request->mamba_conv_state(), &result.final_conv_state) ||
       !request->mamba_state()->CopyToHost(
           result.final_ssm_state.data(),
           result.final_ssm_state.size())) {
@@ -515,26 +538,27 @@ std::optional<MambaReplayResult> run_mamba_replay(
   }
 
   auto manual_request = RequestExecutionContext::Create(request_config);
-  auto projected = DeviceTensorFp32::Create({input_rows, projection_size});
-  auto conv_output = DeviceTensorFp32::Create({input_rows, conv_dim});
-  auto y_output = DeviceTensorFp32::Create({input_rows, layer_config.intermediate_size});
-  auto grouped_output = DeviceTensorFp32::Create({input_rows, layer_config.intermediate_size});
+  auto projected = DeviceTensorBf16::Create({input_rows, projection_size});
+  auto conv_output = DeviceTensorBf16::Create({input_rows, conv_dim});
+  auto y_output = DeviceTensorBf16::Create({input_rows, layer_config.intermediate_size});
+  auto grouped_output = DeviceTensorBf16::Create({input_rows, layer_config.intermediate_size});
+  const std::vector<__nv_bfloat16> projected_bf16 = to_bf16(trace.in_proj_output);
   if (!manual_request || !manual_request->valid() ||
       !projected || !projected->valid() ||
       !conv_output || !conv_output->valid() ||
       !y_output || !y_output->valid() ||
       !grouped_output || !grouped_output->valid() ||
       !manual_request->mamba_conv_state()->CopyFromHost(
-          zero_conv_state.data(),
-          zero_conv_state.size()) ||
+          zero_conv_state_bf16.data(),
+          zero_conv_state_bf16.size()) ||
       !manual_request->mamba_state()->CopyFromHost(
           zero_ssm_state.data(),
           zero_ssm_state.size()) ||
-      !projected->CopyFromHost(trace.in_proj_output.data(), trace.in_proj_output.size())) {
+      !projected->CopyFromHost(projected_bf16.data(), projected_bf16.size())) {
     return std::nullopt;
   }
 
-  if (!nemotron::MambaConv1dSiluUpdateFp32(
+  if (!nemotron::MambaConv1dSiluUpdateBf16(
           *projected,
           layer_config.intermediate_size,
           conv_dim,
@@ -544,7 +568,7 @@ std::optional<MambaReplayResult> run_mamba_replay(
           *conv1d_bias,
           manual_request->mamba_conv_state(),
           conv_output.get()) ||
-      !nemotron::MambaSsmUpdateFp32(
+      !nemotron::MambaSsmUpdateBf16(
           *projected,
           *conv_output,
           layer_config.intermediate_size,
@@ -560,7 +584,7 @@ std::optional<MambaReplayResult> run_mamba_replay(
           *dt_bias,
           manual_request->mamba_state(),
           y_output.get()) ||
-      !nemotron::GroupedRmsNormGatedFp32(
+      !nemotron::GroupedRmsNormGatedBf16(
           *y_output,
           *projected,
           *mixer_norm_weight,
@@ -575,12 +599,10 @@ std::optional<MambaReplayResult> run_mamba_replay(
   std::vector<float> manual_grouped_output(grouped_output->numel(), 0.0f);
   std::vector<float> manual_conv_state(conv_state_elems, 0.0f);
   std::vector<float> manual_ssm_state(ssm_state_elems, 0.0f);
-  if (!conv_output->CopyToHost(result.conv_output.data(), result.conv_output.size()) ||
-      !y_output->CopyToHost(result.ssm_output.data(), result.ssm_output.size()) ||
-      !grouped_output->CopyToHost(manual_grouped_output.data(), manual_grouped_output.size()) ||
-      !manual_request->mamba_conv_state()->CopyToHost(
-          manual_conv_state.data(),
-          manual_conv_state.size()) ||
+  if (!copy_bf16_tensor_to_host(*conv_output, &result.conv_output) ||
+      !copy_bf16_tensor_to_host(*y_output, &result.ssm_output) ||
+      !copy_bf16_tensor_to_host(*grouped_output, &manual_grouped_output) ||
+      !copy_bf16_tensor_to_host(*manual_request->mamba_conv_state(), &manual_conv_state) ||
       !manual_request->mamba_state()->CopyToHost(
           manual_ssm_state.data(),
           manual_ssm_state.size())) {
@@ -798,15 +820,14 @@ bool run_mamba_layer_vllm_microrepro() {
           << "dump_root=" << dump_root << "\n";
 
   GemmHeuristicCache heuristic_cache;
-  if (!verify_prefix_oracle_against_replay(
+  const bool prefix_oracle_ok =
+      verify_prefix_oracle_against_replay(
           *cublas,
           &heuristic_cache,
           layer_config,
           *bindings,
           *prefix_oracle,
-          summary)) {
-    return false;
-  }
+          summary);
 
   const auto replay =
       run_mamba_replay(*cublas, &heuristic_cache, layer_config, *bindings, input_hidden);
@@ -846,14 +867,14 @@ bool run_mamba_layer_vllm_microrepro() {
   const std::size_t max_row =
       static_cast<std::size_t>(std::distance(rowwise_final_max_diff.begin(), max_row_iter));
 
-  if (!expect(
+  const bool replay_vs_runtime_ok =
+      expect(
           replay_vs_runtime.max_abs_diff <= 1.0e-6f,
-          "manifest-backed layer-0 replay should match the captured runtime output") ||
-      !expect(
+          "manifest-backed layer-0 replay should match the captured runtime output");
+  const bool out_proj_vs_runtime_ok =
+      expect(
           out_proj_vs_runtime.max_abs_diff <= 1.0e-6f,
-          "manifest-backed out-proj output should match the inferred runtime out-proj output")) {
-    return false;
-  }
+          "manifest-backed out-proj output should match the inferred runtime out-proj output");
 
   const bool residual_add_excluded =
       std::fabs(replay_vs_vllm.max_abs_diff - out_proj_vs_vllm.max_abs_diff) <= 1.0e-6f &&
@@ -872,6 +893,9 @@ bool run_mamba_layer_vllm_microrepro() {
     summary << (row == 0 ? ": " : ", ") << row << "=" << rowwise_final_max_diff[row];
   }
   summary << "\n"
+          << "prefix_oracle.ok=" << (prefix_oracle_ok ? "true" : "false") << "\n"
+          << "runtime_replay.ok=" << (replay_vs_runtime_ok ? "true" : "false") << "\n"
+          << "runtime_out_proj.ok=" << (out_proj_vs_runtime_ok ? "true" : "false") << "\n"
           << "inference.residual_add_excluded="
           << (residual_add_excluded ? "true" : "false") << "\n"
           << "inference.max_row=" << max_row << "\n"
@@ -908,7 +932,7 @@ bool run_mamba_layer_vllm_microrepro() {
   summary_output << summary.str();
   summary_output.close();
   std::cout << summary.str();
-  return true;
+  return prefix_oracle_ok && replay_vs_runtime_ok && out_proj_vs_runtime_ok;
 }
 
 bool run_mamba_layer_fixture() {
@@ -1109,8 +1133,9 @@ bool run_mamba_layer_fixture() {
   request_config.mamba_projection_size =
       metadata->intermediate_size + conv_dim + metadata->num_heads;
   request_config.mamba_intermediate_size = metadata->intermediate_size;
-  request_config.mamba_conv_state_bytes_fp32 = conv_state_elems * sizeof(float);
+  request_config.mamba_conv_state_bytes = conv_state_elems * sizeof(__nv_bfloat16);
   request_config.mamba_state_bytes_fp32 = ssm_state_elems * sizeof(float);
+  const std::vector<__nv_bfloat16> initial_conv_state_bf16 = to_bf16(initial_conv_state);
 
   auto request = RequestExecutionContext::Create(request_config);
   auto input = DeviceTensorFp32::Create({input_rows, metadata->hidden_size});
@@ -1120,7 +1145,9 @@ bool run_mamba_layer_fixture() {
       !expect(output != nullptr && output->valid(), "output tensor should create for mamba oracle") ||
       !expect(input->CopyFromHost(input_hidden.data(), input_hidden.size()), "fixture input should upload") ||
       !expect(
-          request->mamba_conv_state()->CopyFromHost(initial_conv_state.data(), initial_conv_state.size()),
+          request->mamba_conv_state()->CopyFromHost(
+              initial_conv_state_bf16.data(),
+              initial_conv_state_bf16.size()),
           "initial conv state should upload") ||
       !expect(
           request->mamba_state()->CopyFromHost(initial_ssm_state.data(), initial_ssm_state.size()),
@@ -1141,7 +1168,7 @@ bool run_mamba_layer_fixture() {
   std::vector<float> actual_ssm_state(expected_next_ssm_state.size(), 0.0f);
   if (!expect(output->CopyToHost(actual_output.data(), actual_output.size()), "final output should download") ||
       !expect(
-          request->mamba_conv_state()->CopyToHost(actual_conv_state.data(), actual_conv_state.size()),
+          copy_bf16_tensor_to_host(*request->mamba_conv_state(), &actual_conv_state),
           "conv state should download") ||
       !expect(
           request->mamba_state()->CopyToHost(actual_ssm_state.data(), actual_ssm_state.size()),
@@ -1239,7 +1266,9 @@ bool run_mamba_layer_fixture() {
       !expect(batch_output_tensor != nullptr && batch_output_tensor->valid(), "batched output tensor should create for mamba oracle") ||
       !expect(batch_input_tensor->CopyFromHost(batch_input.data(), batch_input.size()), "batched fixture input should upload") ||
       !expect(
-          batch_request->mamba_conv_state()->CopyFromHost(initial_conv_state.data(), initial_conv_state.size()),
+          batch_request->mamba_conv_state()->CopyFromHost(
+              initial_conv_state_bf16.data(),
+              initial_conv_state_bf16.size()),
           "batched initial conv state should upload") ||
       !expect(
           batch_request->mamba_state()->CopyFromHost(initial_ssm_state.data(), initial_ssm_state.size()),
@@ -1260,7 +1289,9 @@ bool run_mamba_layer_fixture() {
       !expect(sequential_input_tensor != nullptr && sequential_input_tensor->valid(), "sequential input tensor should create for mamba oracle") ||
       !expect(sequential_output_tensor != nullptr && sequential_output_tensor->valid(), "sequential output tensor should create for mamba oracle") ||
       !expect(
-          sequential_request->mamba_conv_state()->CopyFromHost(initial_conv_state.data(), initial_conv_state.size()),
+          sequential_request->mamba_conv_state()->CopyFromHost(
+              initial_conv_state_bf16.data(),
+              initial_conv_state_bf16.size()),
           "sequential initial conv state should upload") ||
       !expect(
           sequential_request->mamba_state()->CopyFromHost(initial_ssm_state.data(), initial_ssm_state.size()),
@@ -1309,15 +1340,13 @@ bool run_mamba_layer_fixture() {
           batch_output_tensor->CopyToHost(batch_outputs.data(), batch_outputs.size()),
           "batched mamba output should download") ||
       !expect(
-          batch_request->mamba_conv_state()->CopyToHost(batch_conv_state.data(), batch_conv_state.size()),
+          copy_bf16_tensor_to_host(*batch_request->mamba_conv_state(), &batch_conv_state),
           "batched conv state should download") ||
       !expect(
           batch_request->mamba_state()->CopyToHost(batch_ssm_state.data(), batch_ssm_state.size()),
           "batched ssm state should download") ||
       !expect(
-          sequential_request->mamba_conv_state()->CopyToHost(
-              sequential_conv_state.data(),
-              sequential_conv_state.size()),
+          copy_bf16_tensor_to_host(*sequential_request->mamba_conv_state(), &sequential_conv_state),
           "sequential conv state should download") ||
       !expect(
           sequential_request->mamba_state()->CopyToHost(

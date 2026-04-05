@@ -58,14 +58,14 @@ __device__ __forceinline__ void StoreMambaValue(
   output[index] = __float2bfloat16(value);
 }
 
-template <int kWidth, typename ProjectedT, typename OutputT>
+template <int kWidth, typename ProjectedT, typename ConvStateT, typename OutputT>
 __global__ __launch_bounds__(kDecodeConvThreads) void MambaDecodeCausalConv1dUpdateKernel(
     const ProjectedT* projected,
     std::size_t intermediate_size,
     std::size_t conv_dim,
     const float* conv_weight,
     const float* conv_bias,
-    float* conv_state,
+    ConvStateT* conv_state,
     OutputT* conv_output) {
   const std::size_t channel = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= conv_dim) {
@@ -73,21 +73,21 @@ __global__ __launch_bounds__(kDecodeConvThreads) void MambaDecodeCausalConv1dUpd
   }
 
   const float x_value = LoadMambaValue(projected, intermediate_size + channel);
-  float* state_row = conv_state + channel * kWidth;
+  ConvStateT* state_row = conv_state + channel * kWidth;
   const float* weight_row = conv_weight + channel * kWidth;
 
   float state_values[kWidth];
 #pragma unroll
   for (int tap = 0; tap < kWidth; ++tap) {
-    state_values[tap] = state_row[tap];
+    state_values[tap] = LoadMambaValue(state_row, tap);
   }
 #pragma unroll
   for (int tap = 0; tap + 1 < kWidth; ++tap) {
     state_values[tap] = state_values[tap + 1];
-    state_row[tap] = state_values[tap];
+    StoreMambaValue(state_row, tap, state_values[tap]);
   }
   state_values[kWidth - 1] = x_value;
-  state_row[kWidth - 1] = x_value;
+  StoreMambaValue(state_row, kWidth - 1, x_value);
 
   float accum = conv_bias[channel];
 #pragma unroll
@@ -113,6 +113,7 @@ __global__ __launch_bounds__(kDecodeSsmThreads) void MambaSelectiveStateUpdateDe
     const float* dt_bias,
     float* ssm_state,
     OutputT* gated_output) {
+  (void)time_step_min;
   const std::size_t head = static_cast<std::size_t>(blockIdx.x);
   if (head >= num_heads) {
     return;
@@ -139,7 +140,7 @@ __global__ __launch_bounds__(kDecodeSsmThreads) void MambaSelectiveStateUpdateDe
   if (threadIdx.x == 0) {
     const float dt_base =
         LoadMambaValue(projected, intermediate_size + conv_dim + head) + dt_bias[head];
-    shared_dt = fmaxf(SoftplusDevice(dt_base), time_step_min);
+    shared_dt = SoftplusDevice(dt_base);
     shared_decay = expf(shared_dt * (-expf(a_log[head])));
     shared_d = d[head];
   }
@@ -170,7 +171,7 @@ __global__ __launch_bounds__(kDecodeSsmThreads) void MambaSelectiveStateUpdateDe
   }
 }
 
-template <typename ProjectedT, typename OutputT>
+template <typename ProjectedT, typename ConvStateT, typename OutputT>
 __global__ void MambaConv1dSiluUpdateKernel(
     const ProjectedT* projected,
     std::size_t token_count,
@@ -180,28 +181,28 @@ __global__ void MambaConv1dSiluUpdateKernel(
     std::size_t conv_kernel_size,
     const float* conv_weight,
     const float* conv_bias,
-    float* conv_state,
+    ConvStateT* conv_state,
     OutputT* conv_output) {
   const std::size_t channel = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= conv_dim) {
     return;
   }
 
-  float* state_row = conv_state + channel * conv_kernel_size;
+  ConvStateT* state_row = conv_state + channel * conv_kernel_size;
   const float* weight_row = conv_weight + channel * conv_kernel_size;
   for (std::size_t token = 0; token < token_count; ++token) {
     const float conv_input =
         LoadMambaValue(projected, token * projection_size + intermediate_size + channel);
     if (conv_kernel_size > 1) {
       for (std::size_t tap = 0; tap + 1 < conv_kernel_size; ++tap) {
-        state_row[tap] = state_row[tap + 1];
+        StoreMambaValue(state_row, tap, LoadMambaValue(state_row, tap + 1));
       }
     }
-    state_row[conv_kernel_size - 1] = conv_input;
+    StoreMambaValue(state_row, conv_kernel_size - 1, conv_input);
 
     float accum = conv_bias[channel];
     for (std::size_t tap = 0; tap < conv_kernel_size; ++tap) {
-      accum += state_row[tap] * weight_row[tap];
+      accum += LoadMambaValue(state_row, tap) * weight_row[tap];
     }
     StoreMambaValue(conv_output, token * conv_dim + channel, SiLUDevice(accum));
   }
@@ -225,6 +226,7 @@ __global__ void MambaSsmUpdateKernel(
     const float* dt_bias,
     float* ssm_state,
     OutputT* y_output) {
+  (void)time_step_min;
   const std::size_t hidden_index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (hidden_index >= intermediate_size) {
@@ -243,7 +245,7 @@ __global__ void MambaSsmUpdateKernel(
     const float dt_base =
         LoadMambaValue(projected, token * projection_size + intermediate_size + conv_dim + head) +
         dt_bias[head];
-    const float dt = fmaxf(SoftplusDevice(dt_base), time_step_min);
+    const float dt = SoftplusDevice(dt_base);
     const float decay = expf(dt * a);
     const std::size_t grouped_b_offset =
         token * conv_dim + intermediate_size + group * state_size;
@@ -357,7 +359,7 @@ __global__ void GroupedRmsNormKernel(
   }
 }
 
-template <typename ProjectedT, typename OutputT>
+template <typename ProjectedT, typename ConvStateT, typename OutputT>
 bool LaunchMambaDecodeCausalConv1dUpdate(
     const ProjectedT* projected,
     std::size_t intermediate_size,
@@ -365,7 +367,7 @@ bool LaunchMambaDecodeCausalConv1dUpdate(
     std::size_t conv_kernel_size,
     const float* conv_weight,
     const float* conv_bias,
-    float* conv_state,
+    ConvStateT* conv_state,
     OutputT* conv_output,
     cudaStream_t stream) {
   const int grid_size =
@@ -455,7 +457,7 @@ bool LaunchMambaSelectiveStateUpdateDecode(
   return CheckCuda(cudaGetLastError());
 }
 
-template <typename ProjectedT, typename OutputT>
+template <typename ProjectedT, typename ConvStateT, typename OutputT>
 __global__ void MambaDecodeStepFusedKernel(
     const ProjectedT* projected,
     std::size_t projection_size,
@@ -476,9 +478,10 @@ __global__ void MambaDecodeStepFusedKernel(
     const float* d,
     const float* dt_bias,
     const float* mixer_norm_weight,
-    float* conv_state,
+    ConvStateT* conv_state,
     float* ssm_state,
     OutputT* output) {
+  (void)time_step_min;
   const std::size_t group = static_cast<std::size_t>(blockIdx.x);
   if (group >= n_groups) {
     return;
@@ -488,7 +491,7 @@ __global__ void MambaDecodeStepFusedKernel(
   const std::size_t hidden_begin = group * group_hidden_size;
   const std::size_t b_begin = intermediate_size + group * state_size;
   const std::size_t c_begin = intermediate_size + (n_groups * state_size) + group * state_size;
-  float* conv_state_base = conv_state + conv_state_offset_elems;
+  ConvStateT* conv_state_base = conv_state + conv_state_offset_elems;
   float* ssm_state_base = ssm_state + ssm_state_offset_elems;
 
   extern __shared__ float shared_storage[];
@@ -499,36 +502,36 @@ __global__ void MambaDecodeStepFusedKernel(
 
   for (std::size_t local_state = threadIdx.x; local_state < state_size; local_state += blockDim.x) {
     const std::size_t b_channel = b_begin + local_state;
-    float* b_state_row = conv_state_base + b_channel * conv_kernel_size;
+    ConvStateT* b_state_row = conv_state_base + b_channel * conv_kernel_size;
     const float* b_weight_row = conv_weight + b_channel * conv_kernel_size;
     const float b_input = LoadMambaValue(projected, intermediate_size + b_channel);
     if (conv_kernel_size > 1) {
       for (std::size_t tap = 0; tap + 1 < conv_kernel_size; ++tap) {
-        b_state_row[tap] = b_state_row[tap + 1];
+        StoreMambaValue(b_state_row, tap, LoadMambaValue(b_state_row, tap + 1));
       }
     }
-    b_state_row[conv_kernel_size - 1] = b_input;
+    StoreMambaValue(b_state_row, conv_kernel_size - 1, b_input);
 
     float b_accum = conv_bias[b_channel];
     for (std::size_t tap = 0; tap < conv_kernel_size; ++tap) {
-      b_accum += b_state_row[tap] * b_weight_row[tap];
+      b_accum += LoadMambaValue(b_state_row, tap) * b_weight_row[tap];
     }
     shared_b[local_state] = SiLUDevice(b_accum);
 
     const std::size_t c_channel = c_begin + local_state;
-    float* c_state_row = conv_state_base + c_channel * conv_kernel_size;
+    ConvStateT* c_state_row = conv_state_base + c_channel * conv_kernel_size;
     const float* c_weight_row = conv_weight + c_channel * conv_kernel_size;
     const float c_input = LoadMambaValue(projected, intermediate_size + c_channel);
     if (conv_kernel_size > 1) {
       for (std::size_t tap = 0; tap + 1 < conv_kernel_size; ++tap) {
-        c_state_row[tap] = c_state_row[tap + 1];
+        StoreMambaValue(c_state_row, tap, LoadMambaValue(c_state_row, tap + 1));
       }
     }
-    c_state_row[conv_kernel_size - 1] = c_input;
+    StoreMambaValue(c_state_row, conv_kernel_size - 1, c_input);
 
     float c_accum = conv_bias[c_channel];
     for (std::size_t tap = 0; tap < conv_kernel_size; ++tap) {
-      c_accum += c_state_row[tap] * c_weight_row[tap];
+      c_accum += LoadMambaValue(c_state_row, tap) * c_weight_row[tap];
     }
     shared_c[local_state] = SiLUDevice(c_accum);
   }
@@ -539,19 +542,22 @@ __global__ void MambaDecodeStepFusedKernel(
        local_hidden < group_hidden_size;
        local_hidden += blockDim.x) {
     const std::size_t hidden_index = hidden_begin + local_hidden;
-    float* hidden_conv_state_row = conv_state_base + hidden_index * conv_kernel_size;
+    ConvStateT* hidden_conv_state_row = conv_state_base + hidden_index * conv_kernel_size;
     const float* hidden_weight_row = conv_weight + hidden_index * conv_kernel_size;
     const float hidden_input = LoadMambaValue(projected, intermediate_size + hidden_index);
     if (conv_kernel_size > 1) {
       for (std::size_t tap = 0; tap + 1 < conv_kernel_size; ++tap) {
-        hidden_conv_state_row[tap] = hidden_conv_state_row[tap + 1];
+        StoreMambaValue(
+            hidden_conv_state_row,
+            tap,
+            LoadMambaValue(hidden_conv_state_row, tap + 1));
       }
     }
-    hidden_conv_state_row[conv_kernel_size - 1] = hidden_input;
+    StoreMambaValue(hidden_conv_state_row, conv_kernel_size - 1, hidden_input);
 
     float hidden_accum = conv_bias[hidden_index];
     for (std::size_t tap = 0; tap < conv_kernel_size; ++tap) {
-      hidden_accum += hidden_conv_state_row[tap] * hidden_weight_row[tap];
+      hidden_accum += LoadMambaValue(hidden_conv_state_row, tap) * hidden_weight_row[tap];
     }
     const float hidden_value = SiLUDevice(hidden_accum);
     const std::size_t head = hidden_index / head_dim;
@@ -559,7 +565,7 @@ __global__ void MambaDecodeStepFusedKernel(
     const float d_value = d[head];
     const float dt_base =
         LoadMambaValue(projected, intermediate_size + conv_dim + head) + dt_bias[head];
-    const float dt = fmaxf(SoftplusDevice(dt_base), time_step_min);
+    const float dt = SoftplusDevice(dt_base);
     const float decay = expf(dt * a);
 
     float* state_row = ssm_state_base + hidden_index * state_size;
@@ -608,7 +614,7 @@ bool MambaCausalConv1dUpdateDecodeFp32(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* conv_output,
     cudaStream_t stream) {
   if (!projected.valid() ||
@@ -652,7 +658,7 @@ bool MambaCausalConv1dUpdateDecodeBf16(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorBf16* conv_output,
     cudaStream_t stream) {
   if (!projected.valid() ||
@@ -696,7 +702,7 @@ bool MambaConv1dSiluUpdateFp32(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* conv_output,
     cudaStream_t stream) {
   if (!projected.valid() ||
@@ -743,7 +749,7 @@ bool MambaConv1dSiluUpdateBf16(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorBf16* conv_output,
     cudaStream_t stream) {
   if (!projected.valid() ||
@@ -818,7 +824,6 @@ bool MambaSsmUpdateFp32(
       a_log.numel() != num_heads ||
       d.numel() != num_heads ||
       dt_bias.numel() != num_heads ||
-      time_step_min <= 0.0f ||
       ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
     return false;
   }
@@ -881,7 +886,6 @@ bool MambaSsmUpdateBf16(
       a_log.numel() != num_heads ||
       d.numel() != num_heads ||
       dt_bias.numel() != num_heads ||
-      time_step_min <= 0.0f ||
       ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
     return false;
   }
@@ -949,7 +953,6 @@ bool MambaSelectiveStateUpdateDecodeFp32(
       a_log.numel() != num_heads ||
       d.numel() != num_heads ||
       dt_bias.numel() != num_heads ||
-      time_step_min <= 0.0f ||
       ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
     return false;
   }
@@ -1013,7 +1016,6 @@ bool MambaSelectiveStateUpdateDecodeBf16(
       a_log.numel() != num_heads ||
       d.numel() != num_heads ||
       dt_bias.numel() != num_heads ||
-      time_step_min <= 0.0f ||
       ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
     return false;
   }
@@ -1055,7 +1057,7 @@ bool MambaDecodeStepFusedFp32(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     const DeviceTensorFp32& mixer_norm_weight,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* ssm_state,
     DeviceTensorFp32* output,
     cudaStream_t stream) {
@@ -1093,7 +1095,6 @@ bool MambaDecodeStepFusedFp32(
       intermediate_size % n_groups != 0 ||
       num_heads % n_groups != 0 ||
       conv_kernel_size == 0 ||
-      time_step_min <= 0.0f ||
       mixer_rms_epsilon <= 0.0f ||
       conv_state_offset_elems + (conv_dim * conv_kernel_size) > conv_state->numel() ||
       ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {
@@ -1151,7 +1152,7 @@ bool MambaDecodeStepFusedBf16(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     const DeviceTensorFp32& mixer_norm_weight,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* ssm_state,
     DeviceTensorBf16* output,
     cudaStream_t stream) {
@@ -1189,7 +1190,6 @@ bool MambaDecodeStepFusedBf16(
       intermediate_size % n_groups != 0 ||
       num_heads % n_groups != 0 ||
       conv_kernel_size == 0 ||
-      time_step_min <= 0.0f ||
       mixer_rms_epsilon <= 0.0f ||
       conv_state_offset_elems + (conv_dim * conv_kernel_size) > conv_state->numel() ||
       ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel()) {

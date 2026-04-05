@@ -25,7 +25,7 @@ struct RequestExecutionConfig {
   std::size_t mamba_hidden_size = 0;
   std::size_t mamba_projection_size = 0;
   std::size_t mamba_intermediate_size = 0;
-  std::size_t mamba_conv_state_bytes_fp32 = 0;
+  std::size_t mamba_conv_state_bytes = 0;
   std::size_t mamba_state_bytes_fp32 = 0;
   std::size_t expert_selection_capacity = 0;
   std::size_t expert_intermediate_scratch_numel = 0;
@@ -64,8 +64,8 @@ class RequestExecutionContext {
   const DeviceTensorBf16* scratch_decode_bf16() const;
   DeviceTensorFp32* mamba_state();
   const DeviceTensorFp32* mamba_state() const;
-  DeviceTensorFp32* mamba_conv_state();
-  const DeviceTensorFp32* mamba_conv_state() const;
+  DeviceTensorBf16* mamba_conv_state();
+  const DeviceTensorBf16* mamba_conv_state() const;
   DeviceTensorFp32* mamba_normalized_decode();
   const DeviceTensorFp32* mamba_normalized_decode() const;
   DeviceTensorFp32* mamba_projected_decode();
@@ -165,7 +165,7 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorBf16> hidden_decode_bf16,
       std::unique_ptr<DeviceTensorBf16> residual_decode_bf16,
       std::unique_ptr<DeviceTensorBf16> scratch_decode_bf16,
-      std::unique_ptr<DeviceTensorFp32> mamba_conv_state,
+      std::unique_ptr<DeviceTensorBf16> mamba_conv_state,
       std::unique_ptr<DeviceTensorFp32> mamba_state,
       std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode,
       std::unique_ptr<DeviceTensorFp32> mamba_projected_decode,
@@ -199,7 +199,7 @@ class RequestExecutionContext {
   std::unique_ptr<DeviceTensorBf16> hidden_decode_bf16_;
   std::unique_ptr<DeviceTensorBf16> residual_decode_bf16_;
   std::unique_ptr<DeviceTensorBf16> scratch_decode_bf16_;
-  std::unique_ptr<DeviceTensorFp32> mamba_conv_state_;
+  std::unique_ptr<DeviceTensorBf16> mamba_conv_state_;
   std::unique_ptr<DeviceTensorFp32> mamba_state_;
   std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode_;
   std::unique_ptr<DeviceTensorFp32> mamba_projected_decode_;

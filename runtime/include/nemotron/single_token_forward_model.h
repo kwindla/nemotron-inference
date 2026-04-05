@@ -49,7 +49,7 @@ struct SingleTokenForwardConfig {
   std::size_t expert_topk_group = 1;
 
   float layer_norm_epsilon = 1.0e-5f;
-  float mamba_time_step_min = 1.0e-3f;
+  float mamba_time_step_min = 0.0f;
   float routed_scaling_factor = 1.0f;
   bool norm_topk_prob = true;
 };

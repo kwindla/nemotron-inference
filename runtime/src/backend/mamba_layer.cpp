@@ -405,20 +405,6 @@ std::unique_ptr<DeviceTensorBf16> CreateBf16ViewFromFp32Storage(
   return DeviceTensorBf16::CreateView(shape, reinterpret_cast<__nv_bfloat16*>(storage->data()));
 }
 
-std::unique_ptr<DeviceTensorFp32> CreateFp32SliceView(
-    DeviceTensorFp32* storage,
-    std::size_t offset_elems,
-    std::vector<std::size_t> shape) {
-  if (storage == nullptr || !storage->valid()) {
-    return nullptr;
-  }
-  const std::size_t count = NumelFromShape(shape);
-  if (count == 0 || offset_elems + count > storage->numel()) {
-    return nullptr;
-  }
-  return DeviceTensorFp32::CreateView(std::move(shape), storage->data() + offset_elems);
-}
-
 std::unique_ptr<DeviceTensorBf16> CreateBf16SliceView(
     DeviceTensorBf16* storage,
     std::size_t offset_elems,
@@ -529,7 +515,7 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
       config.intermediate_size % config.n_groups != 0 ||
       config.input_rms_epsilon <= 0.0f ||
       config.mixer_rms_epsilon <= 0.0f ||
-      config.time_step_min <= 0.0f ||
+      config.time_step_min < 0.0f ||
       conv_state_elems == 0 ||
       ssm_state_elems == 0) {
     return nullptr;
@@ -758,7 +744,7 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::CreatePrepared(
       config.intermediate_size % config.n_groups != 0 ||
       config.input_rms_epsilon <= 0.0f ||
       config.mixer_rms_epsilon <= 0.0f ||
-      config.time_step_min <= 0.0f ||
+      config.time_step_min < 0.0f ||
       conv_state_elems == 0 ||
       ssm_state_elems == 0 ||
       !bindings.input_norm_weight || !bindings.input_norm_weight->valid() ||
@@ -906,44 +892,57 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  std::unique_ptr<DeviceTensorFp32> normalized_local;
-  std::unique_ptr<DeviceTensorFp32> projected_local;
-  std::unique_ptr<DeviceTensorFp32> scan_output_local;
+  std::unique_ptr<DeviceTensorFp32> normalized_fp32_local;
+  std::unique_ptr<DeviceTensorBf16> normalized_local;
+  std::unique_ptr<DeviceTensorBf16> projected_local;
+  std::unique_ptr<DeviceTensorBf16> scan_output_local;
   std::unique_ptr<DeviceTensorFp32> projected_output_local;
-  std::unique_ptr<DeviceTensorFp32> conv_output;
-  std::unique_ptr<DeviceTensorFp32> y_output;
+  std::unique_ptr<DeviceTensorBf16> conv_output;
+  std::unique_ptr<DeviceTensorBf16> y_output;
 
-  DeviceTensorFp32* normalized = nullptr;
-  DeviceTensorFp32* projected = nullptr;
-  DeviceTensorFp32* scan_output = nullptr;
+  DeviceTensorFp32* normalized_fp32 = nullptr;
+  DeviceTensorBf16* normalized = nullptr;
+  DeviceTensorBf16* projected = nullptr;
+  DeviceTensorBf16* scan_output = nullptr;
   DeviceTensorFp32* projected_output = nullptr;
-  std::unique_ptr<DeviceTensorFp32> decode_conv_output_view;
-  std::unique_ptr<DeviceTensorFp32> decode_gated_output_view;
+  std::unique_ptr<DeviceTensorBf16> decode_conv_output_view;
+  std::unique_ptr<DeviceTensorBf16> decode_gated_output_view;
 
   if (token_count == 1 &&
       request_context.mamba_normalized_decode() != nullptr &&
       request_context.mamba_projected_decode() != nullptr &&
       request_context.mamba_scan_output_decode() != nullptr &&
       request_context.mamba_projected_output_decode() != nullptr) {
-    normalized = request_context.mamba_normalized_decode();
-    projected = request_context.mamba_projected_decode();
-    scan_output = request_context.mamba_scan_output_decode();
+    normalized_fp32 = request_context.mamba_normalized_decode();
+    normalized_local = DeviceTensorBf16::Create({1, impl_->config.hidden_size});
+    projected_local = CreateBf16ViewFromFp32Storage(
+        request_context.mamba_projected_decode(),
+        {1, projection_size});
+    scan_output_local = CreateBf16ViewFromFp32Storage(
+        request_context.mamba_scan_output_decode(),
+        {1, impl_->config.intermediate_size});
+    normalized = normalized_local.get();
+    projected = projected_local.get();
+    scan_output = scan_output_local.get();
     projected_output = request_context.mamba_projected_output_decode();
   } else {
-    normalized_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
-    projected_local = DeviceTensorFp32::Create({token_count, projection_size});
-    scan_output_local = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
+    normalized_fp32_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    normalized_local = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    projected_local = DeviceTensorBf16::Create({token_count, projection_size});
+    scan_output_local = DeviceTensorBf16::Create({token_count, impl_->config.intermediate_size});
     projected_output_local = DeviceTensorFp32::Create({token_count, impl_->config.hidden_size});
+    normalized_fp32 = normalized_fp32_local.get();
     normalized = normalized_local.get();
     projected = projected_local.get();
     scan_output = scan_output_local.get();
     projected_output = projected_output_local.get();
   }
   if (token_count != 1) {
-    conv_output = DeviceTensorFp32::Create({token_count, conv_dim});
-    y_output = DeviceTensorFp32::Create({token_count, impl_->config.intermediate_size});
+    conv_output = DeviceTensorBf16::Create({token_count, conv_dim});
+    y_output = DeviceTensorBf16::Create({token_count, impl_->config.intermediate_size});
   }
-  if (normalized == nullptr || projected == nullptr || scan_output == nullptr ||
+  if (normalized_fp32 == nullptr || normalized == nullptr || projected == nullptr ||
+      scan_output == nullptr ||
       projected_output == nullptr ||
       (token_count != 1 && (!conv_output || !y_output))) {
     return false;
@@ -962,9 +961,9 @@ bool MambaLayerSlice::Run(
       };
   if (use_optimized_decode) {
     decode_conv_output_view =
-        CreateFp32SliceView(projected, impl_->config.intermediate_size, {1, conv_dim});
+        CreateBf16SliceView(projected, impl_->config.intermediate_size, {1, conv_dim});
     decode_gated_output_view =
-        CreateFp32SliceView(projected, 0, {1, impl_->config.intermediate_size});
+        CreateBf16SliceView(projected, 0, {1, impl_->config.intermediate_size});
     if (!decode_conv_output_view || !decode_gated_output_view) {
       return false;
     }
@@ -983,11 +982,17 @@ bool MambaLayerSlice::Run(
           &norm_ok,
           [&]() {
             return RmsNormFp32(
-                input,
-                *impl_->input_norm_weight,
-                impl_->config.input_rms_epsilon,
-                normalized,
-                stream);
+                       input,
+                       *impl_->input_norm_weight,
+                       impl_->config.input_rms_epsilon,
+                       normalized_fp32,
+                       stream) &&
+                   ConvertDeviceFp32ToBf16(
+                       normalized_fp32->data(),
+                       normalized_fp32->numel(),
+                       normalized->data(),
+                       stream) &&
+                   true;
           })) {
     return false;
   }
@@ -996,8 +1001,8 @@ bool MambaLayerSlice::Run(
   }
 
   if (trace != nullptr) {
-    trace->norm_output.resize(normalized->numel(), 0.0f);
-    if (!normalized->CopyToHost(trace->norm_output.data(), trace->norm_output.size())) {
+    trace->norm_output.resize(normalized_fp32->numel(), 0.0f);
+    if (!normalized_fp32->CopyToHost(trace->norm_output.data(), trace->norm_output.size())) {
       return false;
     }
   }
@@ -1020,11 +1025,8 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  if (trace != nullptr) {
-    trace->in_proj_output.resize(projected->numel(), 0.0f);
-    if (!projected->CopyToHost(trace->in_proj_output.data(), trace->in_proj_output.size())) {
-      return false;
-    }
+  if (trace != nullptr && !CopyTensorToHost(*projected, &trace->in_proj_output)) {
+    return false;
   }
 
   if (token_count == 1) {
@@ -1034,7 +1036,7 @@ bool MambaLayerSlice::Run(
               MambaSubLayerStage::kConv1dSilu,
               &conv1d_ok,
               [&]() {
-                return MambaCausalConv1dUpdateDecodeFp32(
+                return MambaCausalConv1dUpdateDecodeBf16(
                     *projected,
                     impl_->config.intermediate_size,
                     conv_dim,
@@ -1054,7 +1056,7 @@ bool MambaLayerSlice::Run(
               MambaSubLayerStage::kSsmUpdate,
               &ssm_ok,
               [&]() {
-                return MambaSelectiveStateUpdateDecodeFp32(
+                return MambaSelectiveStateUpdateDecodeBf16(
                     *projected,
                     *decode_conv_output_view,
                     impl_->config.intermediate_size,
@@ -1080,7 +1082,7 @@ bool MambaLayerSlice::Run(
               MambaSubLayerStage::kGroupedNormGating,
               &grouped_norm_ok,
               [&]() {
-                return GroupedRmsNormFp32(
+                return GroupedRmsNormBf16(
                     *decode_gated_output_view,
                     *impl_->mixer_norm_weight,
                     impl_->config.n_groups,
@@ -1102,7 +1104,7 @@ bool MambaLayerSlice::Run(
               MambaSubLayerStage::kSsmUpdate,
               &fused_decode_ok,
               [&]() {
-                return MambaDecodeStepFusedFp32(
+                return MambaDecodeStepFusedBf16(
                     *projected,
                     impl_->config.intermediate_size,
                     conv_dim,
@@ -1138,7 +1140,7 @@ bool MambaLayerSlice::Run(
             MambaSubLayerStage::kConv1dSilu,
             &conv1d_ok,
             [&]() {
-              return MambaConv1dSiluUpdateFp32(
+              return MambaConv1dSiluUpdateBf16(
                   *projected,
                   impl_->config.intermediate_size,
                   conv_dim,
@@ -1158,7 +1160,7 @@ bool MambaLayerSlice::Run(
             MambaSubLayerStage::kSsmUpdate,
             &ssm_ok,
             [&]() {
-              return MambaSsmUpdateFp32(
+              return MambaSsmUpdateBf16(
                   *projected,
                   *conv_output,
                   impl_->config.intermediate_size,
@@ -1184,7 +1186,7 @@ bool MambaLayerSlice::Run(
             MambaSubLayerStage::kGroupedNormGating,
             &grouped_norm_ok,
             [&]() {
-              return GroupedRmsNormGatedFp32(
+              return GroupedRmsNormGatedBf16(
                   *y_output,
                   *projected,
                   *impl_->mixer_norm_weight,
@@ -1200,11 +1202,8 @@ bool MambaLayerSlice::Run(
     }
   }
 
-  if (trace != nullptr) {
-    trace->scan_output.resize(scan_output->numel(), 0.0f);
-    if (!scan_output->CopyToHost(trace->scan_output.data(), trace->scan_output.size())) {
-      return false;
-    }
+  if (trace != nullptr && !CopyTensorToHost(*scan_output, &trace->scan_output)) {
+    return false;
   }
 
   bool out_proj_ok = false;

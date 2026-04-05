@@ -16,7 +16,7 @@ bool MambaCausalConv1dUpdateDecodeFp32(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* conv_output,
     cudaStream_t stream = nullptr);
 
@@ -28,7 +28,7 @@ bool MambaCausalConv1dUpdateDecodeBf16(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorBf16* conv_output,
     cudaStream_t stream = nullptr);
 
@@ -40,7 +40,7 @@ bool MambaConv1dSiluUpdateFp32(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* conv_output,
     cudaStream_t stream = nullptr);
 
@@ -52,7 +52,7 @@ bool MambaConv1dSiluUpdateBf16(
     std::size_t conv_state_offset_elems,
     const DeviceTensorFp32& conv_weight,
     const DeviceTensorFp32& conv_bias,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorBf16* conv_output,
     cudaStream_t stream = nullptr);
 
@@ -147,7 +147,7 @@ bool MambaDecodeStepFusedFp32(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     const DeviceTensorFp32& mixer_norm_weight,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* ssm_state,
     DeviceTensorFp32* output,
     cudaStream_t stream = nullptr);
@@ -171,7 +171,7 @@ bool MambaDecodeStepFusedBf16(
     const DeviceTensorFp32& d,
     const DeviceTensorFp32& dt_bias,
     const DeviceTensorFp32& mixer_norm_weight,
-    DeviceTensorFp32* conv_state,
+    DeviceTensorBf16* conv_state,
     DeviceTensorFp32* ssm_state,
     DeviceTensorBf16* output,
     cudaStream_t stream = nullptr);

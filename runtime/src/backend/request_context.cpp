@@ -1,5 +1,6 @@
 #include "nemotron/request_context.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdlib>
@@ -131,7 +132,7 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   }
 
   std::unique_ptr<DeviceTensorFp32> mamba_state;
-  std::unique_ptr<DeviceTensorFp32> mamba_conv_state;
+  std::unique_ptr<DeviceTensorBf16> mamba_conv_state;
   std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode;
   std::unique_ptr<DeviceTensorFp32> mamba_projected_decode;
   std::unique_ptr<DeviceTensorFp32> mamba_scan_output_decode;
@@ -147,12 +148,12 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
   std::unique_ptr<DeviceTensorBf16> attention_output_bf16_decode;
   std::unique_ptr<DeviceTensorFp32> expert_intermediate_scratch;
   std::unique_ptr<DeviceTensorFp32> expert_aux_scratch;
-  if (config.mamba_conv_state_bytes_fp32 != 0) {
-    if (config.mamba_conv_state_bytes_fp32 % sizeof(float) != 0) {
+  if (config.mamba_conv_state_bytes != 0) {
+    if (config.mamba_conv_state_bytes % sizeof(__nv_bfloat16) != 0) {
       return nullptr;
     }
-    const std::size_t state_numel = config.mamba_conv_state_bytes_fp32 / sizeof(float);
-    mamba_conv_state = DeviceTensorFp32::Create({state_numel});
+    const std::size_t state_numel = config.mamba_conv_state_bytes / sizeof(__nv_bfloat16);
+    mamba_conv_state = DeviceTensorBf16::Create({state_numel});
     if (!mamba_conv_state || !mamba_conv_state->FillZero()) {
       return nullptr;
     }
@@ -310,7 +311,7 @@ RequestExecutionContext::RequestExecutionContext(
     std::unique_ptr<DeviceTensorBf16> hidden_decode_bf16,
     std::unique_ptr<DeviceTensorBf16> residual_decode_bf16,
     std::unique_ptr<DeviceTensorBf16> scratch_decode_bf16,
-    std::unique_ptr<DeviceTensorFp32> mamba_conv_state,
+    std::unique_ptr<DeviceTensorBf16> mamba_conv_state,
     std::unique_ptr<DeviceTensorFp32> mamba_state,
     std::unique_ptr<DeviceTensorFp32> mamba_normalized_decode,
     std::unique_ptr<DeviceTensorFp32> mamba_projected_decode,
@@ -389,7 +390,7 @@ bool RequestExecutionContext::valid() const {
   if (config_.mamba_state_bytes_fp32 != 0 && (!mamba_state_ || !mamba_state_->valid())) {
     return false;
   }
-  if (config_.mamba_conv_state_bytes_fp32 != 0 &&
+  if (config_.mamba_conv_state_bytes != 0 &&
       (!mamba_conv_state_ || !mamba_conv_state_->valid())) {
     return false;
   }
@@ -531,11 +532,11 @@ const DeviceTensorFp32* RequestExecutionContext::mamba_state() const {
   return mamba_state_.get();
 }
 
-DeviceTensorFp32* RequestExecutionContext::mamba_conv_state() {
+DeviceTensorBf16* RequestExecutionContext::mamba_conv_state() {
   return mamba_conv_state_.get();
 }
 
-const DeviceTensorFp32* RequestExecutionContext::mamba_conv_state() const {
+const DeviceTensorBf16* RequestExecutionContext::mamba_conv_state() const {
   return mamba_conv_state_.get();
 }
 

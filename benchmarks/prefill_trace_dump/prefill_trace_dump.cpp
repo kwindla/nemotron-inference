@@ -2,6 +2,7 @@
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -37,6 +38,23 @@ struct Options {
 bool HasCudaDevice() {
   int device_count = 0;
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
+
+bool CopyBf16TensorToHost(
+    const nemotron::DeviceTensorBf16& tensor,
+    std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->resize(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
+  }
+  return true;
 }
 
 std::vector<std::uint8_t> ReadFileBytes(const std::filesystem::path& path) {
@@ -150,7 +168,7 @@ void DumpRequestState(
   if (const auto* full_conv = request_context.mamba_conv_state();
       full_conv != nullptr && full_conv->valid()) {
     std::vector<float> host(full_conv->numel(), 0.0f);
-    if (full_conv->CopyToHost(host.data(), host.size())) {
+    if (CopyBf16TensorToHost(*full_conv, &host)) {
       WriteFloatFile(dump_root / "mamba_conv_state_full_fp32.bin", host);
       const std::size_t per_layer = MambaConvStateElemsPerLayer(config);
       for (const auto& layer : plan.layers) {

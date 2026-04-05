@@ -1,6 +1,8 @@
 #include "nemotron/model_schedule.h"
 #include "nemotron/single_token_forward_model.h"
 
+#include <cuda_bf16.h>
+
 #include <iostream>
 #include <string>
 
@@ -153,8 +155,8 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
                 "KV layer count should span the maximum layer index") &&
          expect(plan->request_config.attention_total_pages == 8,
                 "KV page capacity should reserve one page per indexed layer slot when attention is present") &&
-         expect(plan->request_config.mamba_conv_state_bytes_fp32 ==
-                    expected_conv_state_elems * sizeof(float),
+         expect(plan->request_config.mamba_conv_state_bytes ==
+                    expected_conv_state_elems * sizeof(__nv_bfloat16),
                 "conv-state bytes should match the single Mamba layer footprint") &&
          expect(plan->request_config.mamba_state_bytes_fp32 ==
                     expected_ssm_state_elems * sizeof(float),

@@ -1,5 +1,7 @@
 #include "nemotron/request_context.h"
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <iostream>
 #include <vector>
@@ -15,6 +17,31 @@ bool expect(bool condition, const char* message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << "\n";
     return false;
+  }
+  return true;
+}
+
+std::vector<__nv_bfloat16> to_bf16(const std::vector<float>& values) {
+  std::vector<__nv_bfloat16> converted(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    converted[i] = __float2bfloat16(values[i]);
+  }
+  return converted;
+}
+
+bool copy_bf16_tensor_to_host(
+    const nemotron::DeviceTensorBf16& tensor,
+    std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->resize(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
   }
   return true;
 }
@@ -35,7 +62,7 @@ RequestExecutionConfig make_config() {
   config.mamba_hidden_size = 16;
   config.mamba_projection_size = 48;
   config.mamba_intermediate_size = 24;
-  config.mamba_conv_state_bytes_fp32 = 32 * sizeof(float);
+  config.mamba_conv_state_bytes = 32 * sizeof(__nv_bfloat16);
   config.mamba_state_bytes_fp32 = 64 * sizeof(float);
   config.expert_selection_capacity = 24;
   config.expert_intermediate_scratch_numel = 96;
@@ -181,9 +208,12 @@ bool test_request_context_reset_releases_pages_and_clears_positions() {
     return false;
   }
   std::vector<float> state_values(32, 1.0f);
+  const std::vector<__nv_bfloat16> state_values_bf16 = to_bf16(state_values);
   std::vector<float> projected_values(48, 1.0f);
   if (!expect(
-          context->mamba_conv_state()->CopyFromHost(state_values.data(), state_values.size()),
+          context->mamba_conv_state()->CopyFromHost(
+              state_values_bf16.data(),
+              state_values_bf16.size()),
           "mamba conv-state upload should succeed")) {
     return false;
   }
@@ -211,7 +241,7 @@ bool test_request_context_reset_releases_pages_and_clears_positions() {
     return false;
   }
   if (!expect(
-          context->mamba_conv_state()->CopyToHost(state_values.data(), state_values.size()),
+          copy_bf16_tensor_to_host(*context->mamba_conv_state(), &state_values),
           "mamba conv-state download should succeed after reset")) {
     return false;
   }

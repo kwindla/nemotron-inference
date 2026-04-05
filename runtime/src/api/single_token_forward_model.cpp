@@ -350,7 +350,7 @@ SingleTokenForwardConfig KnownNemotron3Super120BA12BConfig() {
   config.expert_topk_group = 1;
 
   config.layer_norm_epsilon = 1.0e-5f;
-  config.mamba_time_step_min = 1.0e-3f;
+  config.mamba_time_step_min = 0.0f;
   config.routed_scaling_factor = 5.0f;
   config.norm_topk_prob = true;
   return config;
@@ -382,7 +382,7 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
       config.expert_n_group == 0 ||
       config.expert_topk_group == 0 ||
       config.layer_norm_epsilon <= 0.0f ||
-      config.mamba_time_step_min <= 0.0f) {
+      config.mamba_time_step_min < 0.0f) {
     return std::nullopt;
   }
 
@@ -439,7 +439,7 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
   plan.request_config.mamba_projection_size =
       config.mamba_intermediate_size + RequiredMambaConvDim(config) + config.mamba_num_heads;
   plan.request_config.mamba_intermediate_size = config.mamba_intermediate_size;
-  plan.request_config.mamba_conv_state_bytes_fp32 = mamba_conv_offset * sizeof(float);
+  plan.request_config.mamba_conv_state_bytes = mamba_conv_offset * sizeof(__nv_bfloat16);
   plan.request_config.mamba_state_bytes_fp32 = mamba_state_offset * sizeof(float);
   plan.request_config.expert_selection_capacity = config.max_tokens * config.experts_per_token;
   plan.request_config.expert_intermediate_scratch_numel =
