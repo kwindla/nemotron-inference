@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current implementation order.
+
 ## Goal
 
 Close all accidental divergences in the NVFP4 expert-weight path and move this branch toward a polished prepared-weight implementation that matches the vLLM reference shape unless there is a concrete reason not to.
@@ -167,4 +172,3 @@ These should remain unless the evidence changes.
 - [ ] Decide whether `MonolithicNvfp4ExpertWeights` should become the single source of truth for resident expert views
 - [ ] Audit `RunNvfp4RowMajorFp32AccumToDevice()` for host fallbacks that should be eliminated from the polished path
 - [ ] Confirm that manifest generation emits kernel-native packed bytes and block-scale bytes, not raw shapes that still need runtime reshaping
-

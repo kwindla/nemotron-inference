@@ -2,6 +2,12 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** This document is now background analysis only.
+The authoritative execution plan is `proj-2026-04-04-0133/PLAN.md`.
+This file does not reflect the current `7e -> 7g -> 8 -> 9 -> 10` sequencing,
+the latest `57/57` verification status, or the current BF16 multi-token and
+local vLLM-on-RTX-5090 alignment findings.
+
 ## Program Judgment
 
 Closing accidental divergences is now the critical priority.

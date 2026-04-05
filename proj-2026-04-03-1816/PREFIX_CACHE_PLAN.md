@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current cache follow-on ordering.
+
 ## Goal
 
 Close accidental divergences in prefix reuse, reusable-state ownership, and page allocation on the Nano / RTX 5090 branch.

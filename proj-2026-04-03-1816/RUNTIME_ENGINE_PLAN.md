@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current execution order.
+
 ## Objective
 
 Close accidental divergences between this Nano-on-RTX-5090 branch and the vLLM reference architecture in the runtime engine and control plane.

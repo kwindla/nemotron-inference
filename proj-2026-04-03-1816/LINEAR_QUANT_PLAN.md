@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current BF16 pipeline closure work.
+
 ## Priority
 
 Closing accidental divergences is the critical priority now. The non-MoE linear and quantization path should converge toward one polished, vLLM-shaped implementation, with fallback/reference behavior kept only when it is still justified by correctness or lack of a native backend.

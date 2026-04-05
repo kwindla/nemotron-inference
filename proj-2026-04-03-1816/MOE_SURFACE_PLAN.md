@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current multi-token BF16 closure order.
+
 ## Priority
 
 Closing accidental divergences is the critical priority now. The MoE surface should converge toward one polished, vLLM-shaped execution path, with legacy paths kept only when they are still justified by correctness, unsupported shapes, or measured performance.

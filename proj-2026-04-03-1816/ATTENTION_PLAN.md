@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current BF16 multi-token or local vLLM-on-RTX-5090 alignment work.
+
 ## Goal
 
 Close all accidental divergences in the attention and paged-KV subsystem, while preserving only the divergences that are intentional for exact-prefix caching on Nano.
@@ -105,4 +110,3 @@ The critical priority now is not new optimization work. The critical priority is
 - Then harden allocator invariants and page-table tests so the cache ABI is visible and stable.
 - Then measure cuDNN, the Nano decode kernel, and the general fallback against the same workloads.
 - Only after those measurements should any backend-specific cleanup or deletion happen.
-

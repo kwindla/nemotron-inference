@@ -2,6 +2,10 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for the current verification runbook,
+phase boundaries, and BF16 multi-token acceptance criteria.
+
 ## Goal
 
 Close accidental verification gaps in the Nano-on-RTX-5090 branch so the runtime stays honest against both its own oracles and the local vLLM baseline.

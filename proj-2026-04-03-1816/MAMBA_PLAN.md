@@ -2,6 +2,11 @@
 
 Project directory: `./proj-2026-04-03-1816`
 
+**Superseded status (2026-04-04):** Background analysis only.
+Follow `proj-2026-04-04-0133/PLAN.md` for active execution sequencing and
+verification requirements. This file is not the authoritative source for the
+current BF16 multi-token and prefix-reuse alignment work.
+
 ## Goal
 
 Close all accidental divergences in the Mamba path so this branch has one polished, production-quality Mamba implementation.
