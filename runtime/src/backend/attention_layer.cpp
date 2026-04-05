@@ -10,15 +10,13 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "nemotron/attention_device_fallback.h"
-#include "nemotron/cudnn_paged_attention.h"
+#include "nemotron/attention_native_kernels.h"
 #include "nemotron/paged_attention_plan.h"
 
 namespace nemotron {
@@ -106,17 +104,6 @@ bool ends_with(const std::string& value, const std::string& suffix) {
          value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-bool DeviceAttentionCompareEnabled() {
-  const char* active = std::getenv("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION_ACTIVE");
-  return std::getenv("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION") != nullptr &&
-         (active == nullptr || std::strcmp(active, "0") != 0);
-}
-
-bool DecodeScratchEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
-  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
-}
-
 thread_local AttentionLayerExecutionCounters g_attention_layer_execution_counters;
 
 void RecordAttentionNativeMultiTokenExecution(std::size_t token_count) {
@@ -125,31 +112,6 @@ void RecordAttentionNativeMultiTokenExecution(std::size_t token_count) {
   }
   ++g_attention_layer_execution_counters.native_multi_token_runs;
   g_attention_layer_execution_counters.native_multi_token_tokens += token_count;
-}
-
-bool LegacyAttentionPolicyEnvSet(const char* name) {
-  return std::getenv(name) != nullptr;
-}
-
-void AcknowledgeLegacyAttentionPolicyEnvOverrides(bool debug) {
-  static const bool production_env_set =
-      LegacyAttentionPolicyEnvSet("NEMOTRON_FORWARD_ATTENTION_PRODUCTION");
-  static const bool scalar_fallback_env_set =
-      LegacyAttentionPolicyEnvSet("NEMOTRON_FORWARD_ATTENTION_SCALAR_FALLBACK");
-
-  if (!debug || (!production_env_set && !scalar_fallback_env_set)) {
-    return;
-  }
-
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    std::cerr
-        << "attention_layer: ignoring legacy production selection env vars "
-        << "(NEMOTRON_FORWARD_ATTENTION_PRODUCTION, "
-        << "NEMOTRON_FORWARD_ATTENTION_SCALAR_FALLBACK); "
-        << "backend selection is now deterministic from the validated config\n";
-  }
 }
 
 int GetCurrentDeviceSmVersion() {
@@ -167,32 +129,54 @@ int GetCurrentDeviceSmVersion() {
   return major * 10 + minor;
 }
 
-bool IsNanoDecodeShape(const AttentionBackendSelectorConfig& config) {
-  return config.batch_size == 1 &&
-         config.query_head_count == 32 &&
-         config.max_query_tokens == 1 &&
-         config.cache_config.dtype == KvCacheDataType::kBf16 &&
-         config.cache_config.kv_head_count == 2 &&
-         config.cache_config.head_dim == 128 &&
-         config.cache_config.tokens_per_page == 16 &&
-         config.causal &&
-         !config.generate_stats;
+bool IsNanoDecodeShape(
+    const AttentionLayerConfig& layer_config,
+    const AttentionKvCacheConfig& cache_config,
+    std::size_t batch_size,
+    std::size_t token_count) {
+  return batch_size == 1 &&
+         layer_config.query_head_count == 32 &&
+         token_count == 1 &&
+         cache_config.dtype == KvCacheDataType::kBf16 &&
+         cache_config.kv_head_count == 2 &&
+         cache_config.head_dim == 128 &&
+         cache_config.tokens_per_page == 16;
 }
 
 constexpr std::size_t kNanoMultiTokenMaxQueryTokens = 1024;
 
-bool IsNanoMultiTokenShape(const AttentionBackendSelectorConfig& config) {
-  return config.batch_size >= 1 &&
-         config.batch_size <= 4 &&
-         config.query_head_count == 32 &&
-         config.max_query_tokens >= 2 &&
-         config.max_query_tokens <= kNanoMultiTokenMaxQueryTokens &&
-         config.cache_config.dtype == KvCacheDataType::kBf16 &&
-         config.cache_config.kv_head_count == 2 &&
-         config.cache_config.head_dim == 128 &&
-         config.cache_config.tokens_per_page == 16 &&
-         config.causal &&
-         !config.generate_stats;
+bool IsNanoMultiTokenShape(
+    const AttentionLayerConfig& layer_config,
+    const AttentionKvCacheConfig& cache_config,
+    std::size_t batch_size,
+    std::size_t token_count) {
+  return batch_size >= 1 &&
+         batch_size <= 4 &&
+         layer_config.query_head_count == 32 &&
+         token_count >= 2 &&
+         token_count <= kNanoMultiTokenMaxQueryTokens &&
+         cache_config.dtype == KvCacheDataType::kBf16 &&
+         cache_config.kv_head_count == 2 &&
+         cache_config.head_dim == 128 &&
+         cache_config.tokens_per_page == 16;
+}
+
+bool SupportsNativeAttention(
+    const AttentionLayerConfig& layer_config,
+    const AttentionKvCacheConfig& cache_config,
+    std::size_t batch_size,
+    std::size_t token_count,
+    int device_sm) {
+  if (token_count == 1) {
+    return device_sm >= 100 &&
+           IsNanoDecodeShape(layer_config, cache_config, batch_size, token_count);
+  }
+  return device_sm >= 120 &&
+         IsNanoMultiTokenShape(layer_config, cache_config, batch_size, token_count);
+}
+
+const char* NativeAttentionKernelName(std::size_t token_count) {
+  return token_count == 1 ? "nano_decode" : "nano_multi_token";
 }
 
 const KernelTensorDescriptor* FindKernelBinding(
@@ -223,280 +207,6 @@ const GemmDescriptor* FindGemmBinding(
   return nullptr;
 }
 
-std::vector<__nv_bfloat16> MatrixToAttentionQueryBf16(
-    const std::vector<float>& matrix,
-    std::size_t token_count,
-    std::size_t query_head_count,
-    std::size_t head_dim) {
-  std::vector<__nv_bfloat16> output(token_count * query_head_count * head_dim);
-  for (std::size_t token = 0; token < token_count; ++token) {
-    for (std::size_t head = 0; head < query_head_count; ++head) {
-      for (std::size_t dim = 0; dim < head_dim; ++dim) {
-        const std::size_t src = token * (query_head_count * head_dim) + head * head_dim + dim;
-        const std::size_t dst = ((head * token_count) + token) * head_dim + dim;
-        output[dst] = __float2bfloat16(matrix[src]);
-      }
-    }
-  }
-  return output;
-}
-
-std::vector<float> AttentionOutputBf16ToMatrix(
-    const std::vector<__nv_bfloat16>& tensor,
-    std::size_t token_count,
-    std::size_t query_head_count,
-    std::size_t head_dim) {
-  std::vector<float> output(token_count * query_head_count * head_dim, 0.0f);
-  for (std::size_t token = 0; token < token_count; ++token) {
-    for (std::size_t head = 0; head < query_head_count; ++head) {
-      for (std::size_t dim = 0; dim < head_dim; ++dim) {
-        const std::size_t dst = token * (query_head_count * head_dim) + head * head_dim + dim;
-        const std::size_t src = ((head * token_count) + token) * head_dim + dim;
-        output[dst] = __bfloat162float(tensor[src]);
-      }
-    }
-  }
-  return output;
-}
-
-float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
-  if (lhs.size() != rhs.size()) {
-    return std::numeric_limits<float>::infinity();
-  }
-  float max_diff = 0.0f;
-  for (std::size_t i = 0; i < lhs.size(); ++i) {
-    max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
-  }
-  return max_diff;
-}
-
-std::vector<float> CopyTensorToHostFp32(const DeviceTensorBf16& tensor) {
-  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
-  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
-    return {};
-  }
-
-  std::vector<float> host_fp32(host_bf16.size(), 0.0f);
-  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
-    host_fp32[i] = __bfloat162float(host_bf16[i]);
-  }
-  return host_fp32;
-}
-
-std::optional<std::size_t> QueryHeadToKvHead(
-    std::size_t query_head,
-    std::size_t query_head_count,
-    std::size_t kv_head_count) {
-  if (query_head_count == 0 ||
-      kv_head_count == 0 ||
-      (query_head_count % kv_head_count) != 0) {
-    return std::nullopt;
-  }
-  const std::size_t queries_per_kv_head = query_head_count / kv_head_count;
-  if (queries_per_kv_head == 0) {
-    return std::nullopt;
-  }
-  const std::size_t kv_head = query_head / queries_per_kv_head;
-  if (kv_head >= kv_head_count) {
-    return std::nullopt;
-  }
-  return kv_head;
-}
-
-bool ScatterMatrixIntoPagedCache(
-    const std::vector<float>& matrix,
-    std::size_t sequence_start,
-    std::size_t token_count,
-    std::size_t kv_head_count,
-    std::size_t head_dim,
-    std::size_t tokens_per_page,
-    const std::vector<KvPageHandle>& pages,
-    std::vector<__nv_bfloat16>* cache_values) {
-  if (cache_values == nullptr) {
-    return false;
-  }
-  for (std::size_t token = 0; token < token_count; ++token) {
-    const std::size_t absolute_token = sequence_start + token;
-    const std::size_t page_slot = absolute_token / tokens_per_page;
-    const std::size_t page_offset = absolute_token % tokens_per_page;
-    if (page_slot >= pages.size()) {
-      return false;
-    }
-    const std::size_t page_id = pages[page_slot].page_id;
-    for (std::size_t head = 0; head < kv_head_count; ++head) {
-      for (std::size_t dim = 0; dim < head_dim; ++dim) {
-        const std::size_t src = token * (kv_head_count * head_dim) + head * head_dim + dim;
-        const std::size_t dst =
-            (((page_id * kv_head_count) + head) * tokens_per_page + page_offset) * head_dim + dim;
-        (*cache_values)[dst] = __float2bfloat16(matrix[src]);
-      }
-    }
-  }
-  return true;
-}
-
-std::size_t Offset4d(
-    std::size_t i0,
-    std::size_t i1,
-    std::size_t i2,
-    std::size_t i3,
-    std::size_t d1,
-    std::size_t d2,
-    std::size_t d3) {
-  return ((i0 * d1 + i1) * d2 + i2) * d3 + i3;
-}
-
-std::optional<std::vector<__nv_bfloat16>> RunPagedAttentionHost(
-    const std::vector<__nv_bfloat16>& query,
-    const std::vector<__nv_bfloat16>& key_cache,
-    const std::vector<__nv_bfloat16>& value_cache,
-    const PagedAttentionBatchPlan& batch_plan,
-    std::size_t query_head_count,
-    const std::vector<std::int32_t>& query_sequence_lengths,
-    const std::vector<std::int32_t>& query_sequence_starts,
-    std::size_t max_query_tokens,
-    float attn_scale,
-    bool causal) {
-  if (!batch_plan.valid() ||
-      batch_plan.batch_size == 0 ||
-      query_head_count == 0 ||
-      max_query_tokens == 0 ||
-      batch_plan.page_table.empty() ||
-      query_sequence_lengths.size() != batch_plan.batch_size ||
-      query_sequence_starts.size() != batch_plan.batch_size) {
-    return std::nullopt;
-  }
-
-  const AttentionKvCacheConfig& cache_config = batch_plan.cache_config;
-  const std::size_t expected_query_count =
-      batch_plan.batch_size * query_head_count * max_query_tokens * cache_config.head_dim;
-  if (query.size() != expected_query_count) {
-    return std::nullopt;
-  }
-
-  std::size_t max_page_id = 0;
-  bool found_page = false;
-  for (std::int32_t page_id : batch_plan.page_table) {
-    if (page_id < 0) {
-      continue;
-    }
-    max_page_id = std::max(max_page_id, static_cast<std::size_t>(page_id));
-    found_page = true;
-  }
-  if (!found_page) {
-    return std::nullopt;
-  }
-
-  const std::size_t required_cache_count =
-      (max_page_id + 1) * cache_config.kv_head_count * cache_config.tokens_per_page *
-      cache_config.head_dim;
-  if (key_cache.size() < required_cache_count || value_cache.size() < required_cache_count) {
-    return std::nullopt;
-  }
-
-  std::vector<__nv_bfloat16> output(expected_query_count, __float2bfloat16(0.0f));
-  for (std::size_t batch = 0; batch < batch_plan.batch_size; ++batch) {
-    const std::size_t q_tokens = static_cast<std::size_t>(query_sequence_lengths[batch]);
-    const std::size_t q_start = static_cast<std::size_t>(query_sequence_starts[batch]);
-    const std::size_t kv_tokens = static_cast<std::size_t>(batch_plan.sequence_lengths[batch]);
-    for (std::size_t head = 0; head < query_head_count; ++head) {
-      const auto kv_head = QueryHeadToKvHead(
-          head,
-          query_head_count,
-          cache_config.kv_head_count);
-      if (!kv_head.has_value()) {
-        return std::nullopt;
-      }
-      for (std::size_t q_token = 0; q_token < q_tokens; ++q_token) {
-        const std::size_t visible_kv_tokens =
-            causal ? std::min(kv_tokens, q_start + q_token + 1) : kv_tokens;
-        if (visible_kv_tokens == 0) {
-          continue;
-        }
-
-        std::vector<float> scores(visible_kv_tokens, 0.0f);
-        float max_score = -std::numeric_limits<float>::infinity();
-        for (std::size_t kv_token = 0; kv_token < visible_kv_tokens; ++kv_token) {
-          const std::size_t page_slot = kv_token / cache_config.tokens_per_page;
-          const std::size_t page_offset = kv_token % cache_config.tokens_per_page;
-          const std::size_t page_index = batch * batch_plan.max_pages_per_sequence + page_slot;
-          if (page_index >= batch_plan.page_table.size() || batch_plan.page_table[page_index] < 0) {
-            return std::nullopt;
-          }
-          const std::size_t page_id = static_cast<std::size_t>(batch_plan.page_table[page_index]);
-          const std::size_t q_base = Offset4d(
-              batch,
-              head,
-              q_token,
-              0,
-              query_head_count,
-              max_query_tokens,
-              cache_config.head_dim);
-          const std::size_t k_base = Offset4d(
-              page_id,
-              *kv_head,
-              page_offset,
-              0,
-              cache_config.kv_head_count,
-              cache_config.tokens_per_page,
-              cache_config.head_dim);
-
-          float score = 0.0f;
-          for (std::size_t dim = 0; dim < cache_config.head_dim; ++dim) {
-            score += __bfloat162float(query[q_base + dim]) *
-                     __bfloat162float(key_cache[k_base + dim]);
-          }
-          score *= attn_scale;
-          scores[kv_token] = score;
-          max_score = std::max(max_score, score);
-        }
-
-        float denom = 0.0f;
-        for (float& score : scores) {
-          score = std::exp(score - max_score);
-          denom += score;
-        }
-        if (!(denom > 0.0f)) {
-          return std::nullopt;
-        }
-
-        const std::size_t out_base = Offset4d(
-            batch,
-            head,
-            q_token,
-            0,
-            query_head_count,
-            max_query_tokens,
-            cache_config.head_dim);
-        std::vector<float> accumulated(cache_config.head_dim, 0.0f);
-        for (std::size_t kv_token = 0; kv_token < visible_kv_tokens; ++kv_token) {
-          const float weight = scores[kv_token] / denom;
-          const std::size_t page_slot = kv_token / cache_config.tokens_per_page;
-          const std::size_t page_offset = kv_token % cache_config.tokens_per_page;
-          const std::size_t page_index = batch * batch_plan.max_pages_per_sequence + page_slot;
-          const std::size_t page_id = static_cast<std::size_t>(batch_plan.page_table[page_index]);
-          const std::size_t v_base = Offset4d(
-              page_id,
-              *kv_head,
-              page_offset,
-              0,
-              cache_config.kv_head_count,
-              cache_config.tokens_per_page,
-              cache_config.head_dim);
-          for (std::size_t dim = 0; dim < cache_config.head_dim; ++dim) {
-            accumulated[dim] += weight * __bfloat162float(value_cache[v_base + dim]);
-          }
-        }
-        for (std::size_t dim = 0; dim < cache_config.head_dim; ++dim) {
-          output[out_base + dim] = __float2bfloat16(accumulated[dim]);
-        }
-      }
-    }
-  }
-
-  return output;
-}
-
 }  // namespace
 
 void ResetAttentionLayerExecutionCounters() {
@@ -507,90 +217,8 @@ AttentionLayerExecutionCounters GetAttentionLayerExecutionCounters() {
   return g_attention_layer_execution_counters;
 }
 
-const char* AttentionBackendName(AttentionBackend backend) {
-  switch (backend) {
-    case AttentionBackend::kCudnnPaged:
-      return "cudnn_paged";
-    case AttentionBackend::kNanoDecode:
-      return "nano_decode";
-    case AttentionBackend::kNanoMultiToken:
-      return "nano_multi_token";
-    case AttentionBackend::kDeviceFallback:
-      return "device_fallback";
-    case AttentionBackend::kUnavailable:
-      break;
-  }
-  return "unavailable";
-}
-
-bool AttentionBackendSelectorConfig::valid() const {
-  if (!BuildAttentionKvPageGeometry(cache_config).has_value() ||
-      batch_size == 0 ||
-      query_head_count == 0 ||
-      max_query_tokens == 0 ||
-      max_kv_tokens == 0 ||
-      container_page_count == 0 ||
-      page_table_entries == 0) {
-    return false;
-  }
-
-  const std::size_t required_pages = RequiredPagesForTokens(cache_config, max_kv_tokens);
-  return required_pages > 0 &&
-         page_table_entries >= required_pages &&
-         container_page_count >= required_pages;
-}
-
-bool AttentionBackendPolicy::Supports(
-    AttentionBackend backend,
-    const AttentionBackendSelectorConfig& config,
-    std::size_t token_count,
-    int device_sm) const {
-  if (!config.valid() ||
-      token_count == 0 ||
-      token_count > config.max_query_tokens ||
-      config.cache_config.dtype != KvCacheDataType::kBf16) {
-    return false;
-  }
-
-  switch (backend) {
-    case AttentionBackend::kNanoDecode:
-      return token_count == 1 && device_sm >= 100 && IsNanoDecodeShape(config);
-    case AttentionBackend::kNanoMultiToken:
-      return token_count >= 2 &&
-             token_count <= kNanoMultiTokenMaxQueryTokens &&
-             device_sm >= 120 &&
-             IsNanoMultiTokenShape(config);
-    case AttentionBackend::kCudnnPaged:
-      return config.cudnn_available && config.cudnn_version >= 90500;
-    case AttentionBackend::kDeviceFallback:
-      return !config.generate_stats;
-    case AttentionBackend::kUnavailable:
-      break;
-  }
-  return false;
-}
-
-AttentionBackend AttentionBackendPolicy::Select(
-    const AttentionBackendSelectorConfig& config,
-    std::size_t token_count) const {
-  const int device_sm = GetCurrentDeviceSmVersion();
-  constexpr std::array<AttentionBackend, 4> kPriorityOrder = {
-      AttentionBackend::kNanoDecode,
-      AttentionBackend::kNanoMultiToken,
-      AttentionBackend::kCudnnPaged,
-      AttentionBackend::kDeviceFallback,
-  };
-  for (const AttentionBackend backend : kPriorityOrder) {
-    if (Supports(backend, config, token_count, device_sm)) {
-      return backend;
-    }
-  }
-  return AttentionBackend::kUnavailable;
-}
-
 struct AttentionLayerSlice::Impl {
   AttentionLayerConfig config;
-  AttentionBackendPolicy backend_policy;
   std::unique_ptr<DeviceTensorFp32> norm_weight;
   std::unique_ptr<UploadedLinearOp> q_proj;
   std::unique_ptr<UploadedLinearOp> k_proj;
@@ -640,7 +268,6 @@ std::unique_ptr<AttentionLayerSlice> AttentionLayerSlice::Create(
     const AttentionLayerConfig& config,
     const AttentionLayerBindings& bindings) {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
-  AcknowledgeLegacyAttentionPolicyEnvOverrides(debug);
   const auto debug_fail = [&](const char* message) -> std::unique_ptr<AttentionLayerSlice> {
     if (debug) {
       std::cerr << "attention_layer: create failed for layer "
@@ -788,6 +415,7 @@ bool AttentionLayerSlice::Run(
     const DeviceTensorBf16& input,
     DeviceTensorBf16* residual,
     DeviceTensorBf16* output) const {
+  (void)cudnn_handle;
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   if (!valid() ||
       !cublas_handle.valid() ||
@@ -881,7 +509,7 @@ bool AttentionLayerSlice::Run(
   DeviceTensorBf16* attn_output = nullptr;
   DeviceTensorBf16* query_bf16 = nullptr;
   DeviceTensorBf16* output_bf16 = nullptr;
-  const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
+  const bool use_decode_scratch = token_count == 1;
   if (use_decode_scratch) {
     normed = impl_->normed_scratch.get();
     q = impl_->q_scratch.get();
@@ -1091,141 +719,64 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
-  AttentionBackendSelectorConfig backend_selector_config;
-  backend_selector_config.cache_config = request_context.config().attention_kv_cache;
-  backend_selector_config.batch_size = impl_->batch_plan.batch_size;
-  backend_selector_config.query_head_count = impl_->config.query_head_count;
-  backend_selector_config.max_query_tokens = token_count;
-  backend_selector_config.max_kv_tokens = total_sequence_length;
-  backend_selector_config.container_page_count = request_context.config().attention_total_pages;
-  backend_selector_config.page_table_entries = impl_->batch_plan.max_pages_per_sequence;
-  backend_selector_config.cudnn_version = cudnn_handle.version();
-  backend_selector_config.cudnn_available = cudnn_handle.valid();
-  backend_selector_config.causal = true;
-  backend_selector_config.generate_stats = false;
-  if (!backend_selector_config.valid()) {
+  const int device_sm = GetCurrentDeviceSmVersion();
+  if (!SupportsNativeAttention(
+          impl_->config,
+          request_context.config().attention_kv_cache,
+          impl_->batch_plan.batch_size,
+          token_count,
+          device_sm)) {
     if (debug) {
-      std::cout << "attention_layer: invalid attention backend selector config\n";
+      std::cout << "attention_layer: unsupported native attention shape"
+                << " token_count=" << token_count
+                << " device_sm=" << device_sm << "\n";
     }
     return false;
   }
 
-  const AttentionBackend selected_backend =
-      impl_->backend_policy.Select(backend_selector_config, token_count);
-  if (selected_backend == AttentionBackend::kUnavailable) {
+  const float attn_scale = 1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim));
+  const bool attention_ok =
+      token_count == 1
+          ? RunPagedAttentionDecodeProduction(
+                *query_bf16,
+                *request_context.key_cache(),
+                *request_context.value_cache(),
+                request_context.config().attention_kv_cache,
+                impl_->batch_plan.batch_size,
+                impl_->batch_plan.max_pages_per_sequence,
+                impl_->page_table_k->data(),
+                impl_->seq_len_kv->data(),
+                impl_->seq_len_q->data(),
+                impl_->query_starts->data(),
+                impl_->config.query_head_count,
+                token_count,
+                attn_scale,
+                true,
+                output_bf16)
+          : RunPagedAttentionNanoMultiToken(
+                *query_bf16,
+                *request_context.key_cache(),
+                *request_context.value_cache(),
+                request_context.config().attention_kv_cache,
+                impl_->batch_plan.batch_size,
+                impl_->batch_plan.max_pages_per_sequence,
+                impl_->page_table_k->data(),
+                impl_->seq_len_kv->data(),
+                impl_->seq_len_q->data(),
+                impl_->query_starts->data(),
+                impl_->config.query_head_count,
+                token_count,
+                attn_scale,
+                true,
+                output_bf16);
+  if (!attention_ok) {
     if (debug) {
-      std::cout << "attention_layer: no supported attention backend for token_count="
-                << token_count
-                << " max_kv_tokens=" << total_sequence_length << "\n";
+      std::cout << "attention_layer: native paged attention execution failed\n";
     }
     return false;
   }
-
-  if (selected_backend == AttentionBackend::kCudnnPaged) {
-    const auto attention_config = BuildCudnnPagedAttentionConfig(
-        impl_->batch_plan,
-        impl_->config.query_head_count,
-        token_count,
-        request_context.config().attention_total_pages,
-        0.0f,
-        true,
-        false);
-    if (!attention_config.has_value()) {
-      if (debug) {
-        std::cout << "attention_layer: cuDNN attention config build failed\n";
-      }
-      return false;
-    }
-    const auto attention_plan =
-        CudnnPagedAttentionPlanCache::Global().GetOrCreate(cudnn_handle, *attention_config);
-    if (!attention_plan || !attention_plan->valid()) {
-      if (debug) {
-        std::cout << "attention_layer: cuDNN attention plan lookup failed\n";
-      }
-      return false;
-    }
-
-    const CudnnPagedAttentionExecution execution{
-        query_bf16->data(),
-        request_context.key_cache()->data(),
-        request_context.value_cache()->data(),
-        impl_->seq_len_q->data(),
-        impl_->seq_len_kv->data(),
-        impl_->page_table_k->data(),
-        impl_->page_table_v->data(),
-        output_bf16->data(),
-        nullptr,
-    };
-    if (!attention_plan->Execute(cudnn_handle, execution)) {
-      if (debug) {
-        std::cout << "attention_layer: cuDNN attention execute failed\n";
-      }
-      return false;
-    }
-    if (debug) {
-      std::cout << "attention_layer: using " << AttentionBackendName(selected_backend) << "\n";
-    }
-  } else {
-    const bool attention_ok =
-        selected_backend == AttentionBackend::kNanoDecode
-            ? RunPagedAttentionDecodeProduction(
-                  *query_bf16,
-                  *request_context.key_cache(),
-                  *request_context.value_cache(),
-                  request_context.config().attention_kv_cache,
-                  impl_->batch_plan.batch_size,
-                  impl_->batch_plan.max_pages_per_sequence,
-                  impl_->page_table_k->data(),
-                  impl_->seq_len_kv->data(),
-                  impl_->seq_len_q->data(),
-                  impl_->query_starts->data(),
-                  impl_->config.query_head_count,
-                  token_count,
-                  1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
-                  true,
-                  output_bf16)
-            : selected_backend == AttentionBackend::kNanoMultiToken
-                ? RunPagedAttentionNanoMultiToken(
-                      *query_bf16,
-                      *request_context.key_cache(),
-                      *request_context.value_cache(),
-                      request_context.config().attention_kv_cache,
-                      impl_->batch_plan.batch_size,
-                      impl_->batch_plan.max_pages_per_sequence,
-                      impl_->page_table_k->data(),
-                      impl_->seq_len_kv->data(),
-                      impl_->seq_len_q->data(),
-                      impl_->query_starts->data(),
-                      impl_->config.query_head_count,
-                      token_count,
-                      1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
-                      true,
-                      output_bf16)
-            : RunPagedAttentionDeviceFallback(
-                  *query_bf16,
-                  *request_context.key_cache(),
-                  *request_context.value_cache(),
-                  request_context.config().attention_kv_cache,
-                  impl_->batch_plan.batch_size,
-                  impl_->batch_plan.max_pages_per_sequence,
-                  impl_->page_table_k->data(),
-                  impl_->seq_len_kv->data(),
-                  impl_->seq_len_q->data(),
-                  impl_->query_starts->data(),
-                  impl_->config.query_head_count,
-                  token_count,
-                  1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
-                  true,
-                  output_bf16);
-    if (!attention_ok) {
-      if (debug) {
-        std::cout << "attention_layer: device paged attention execution failed\n";
-      }
-      return false;
-    }
-    if (debug) {
-      std::cout << "attention_layer: using " << AttentionBackendName(selected_backend) << "\n";
-    }
+  if (debug) {
+    std::cout << "attention_layer: using " << NativeAttentionKernelName(token_count) << "\n";
   }
 
   if (!ConvertAttentionOutputBf16ToRowMajorBf16(
@@ -1238,56 +789,6 @@ bool AttentionLayerSlice::Run(
       std::cout << "attention_layer: failed to convert attention output to row-major BF16\n";
     }
     return false;
-  }
-
-  if (selected_backend != AttentionBackend::kCudnnPaged && DeviceAttentionCompareEnabled()) {
-    std::vector<float> q_host = CopyTensorToHostFp32(*q);
-    std::vector<__nv_bfloat16> key_cache_host(request_context.key_cache()->numel());
-    std::vector<__nv_bfloat16> value_cache_host(request_context.value_cache()->numel());
-    std::vector<float> device_attention_output = CopyTensorToHostFp32(*attn_output);
-    if (!q_host.empty() &&
-        !device_attention_output.empty() &&
-        request_context.key_cache()->CopyToHost(key_cache_host.data(), key_cache_host.size()) &&
-        request_context.value_cache()->CopyToHost(value_cache_host.data(), value_cache_host.size())) {
-      const std::vector<__nv_bfloat16> query_host = MatrixToAttentionQueryBf16(
-          q_host,
-          token_count,
-          impl_->config.query_head_count,
-          impl_->config.head_dim);
-      const auto attention_output_host = RunPagedAttentionHost(
-          query_host,
-          key_cache_host,
-          value_cache_host,
-          impl_->batch_plan,
-          impl_->config.query_head_count,
-          std::vector<std::int32_t>(
-              impl_->query_sequence_lengths_host.begin(),
-              impl_->query_sequence_lengths_host.end()),
-          std::vector<std::int32_t>(
-              impl_->query_sequence_starts_host.begin(),
-              impl_->query_sequence_starts_host.end()),
-          token_count,
-          1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
-          true);
-      if (attention_output_host.has_value()) {
-        const std::vector<float> reference_attention_output = AttentionOutputBf16ToMatrix(
-            *attention_output_host,
-            token_count,
-            impl_->config.query_head_count,
-            impl_->config.head_dim);
-        const std::size_t row_width = impl_->config.query_head_count * impl_->config.head_dim;
-        const std::size_t last_row_offset = (token_count - 1) * row_width;
-        std::cout << "device_attention_compare: layer=" << impl_->config.layer_index
-                  << " sequence_start=" << sequence_start
-                  << " total_sequence_length=" << total_sequence_length
-                  << " q_last0=" << q_host[last_row_offset]
-                  << " device_last0=" << device_attention_output[last_row_offset]
-                  << " host_last0=" << reference_attention_output[last_row_offset]
-                  << " max_abs_diff="
-                  << MaxAbsDiff(device_attention_output, reference_attention_output)
-                  << "\n";
-      }
-    }
   }
 
   const bool o_ok = run_linear_bf16(*impl_->o_proj, *attn_output, output);

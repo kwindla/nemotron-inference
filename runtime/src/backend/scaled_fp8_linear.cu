@@ -4,28 +4,16 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
-#include <utility>
 
 #include "nemotron/linear_op_counters.h"
 #include "nemotron/linear_op_trace.h"
-#include "nemotron/linear_reference_kernels.h"
 
 namespace nemotron {
 namespace {
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
-}
-
-bool LinearDeviceFastpathEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
-  if (value == nullptr) {
-    return true;
-  }
-  return std::strcmp(value, "0") != 0;
 }
 
 float ClampScale(float value) {
@@ -107,31 +95,23 @@ void LogGemmExecuteFailure(
 }
 
 std::optional<CublasLtGemmPlan> BuildRuntimeGemmPlan(
-    std::size_t output_rows,
-    std::size_t input_cols,
+    const GemmDescriptor& descriptor,
+    const DeviceDenseWeightFp32& weight,
     std::size_t rows,
     GemmHeuristicCache* heuristic_cache,
-    const float* packed_weight_data,
     GemmPlanFailureStep* failure_step = nullptr) {
   SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
-  GemmDescriptor descriptor;
-  descriptor.tensor_name = "scaled_fp8_linear";
-  descriptor.op_class = "scaled_fp8_linear";
-  descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
-  descriptor.output_rows = output_rows;
-  descriptor.input_cols = input_cols;
-  descriptor.storage_dtype = "fp32";
-  descriptor.compute_dtype = "fp32";
-  descriptor.layout_tag = "row_major";
-  descriptor.alignment_bytes = 16;
-  descriptor.packed_data = reinterpret_cast<const std::uint8_t*>(packed_weight_data);
-  descriptor.packed_nbytes = output_rows * input_cols * sizeof(float);
   const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
   if (!launch_plan.has_value()) {
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildGemmLaunchPlan);
     return std::nullopt;
   }
-  const auto execution = PrepareGemmExecution(*launch_plan, heuristic_cache);
+  GemmLaunchPlan runtime_launch_plan = *launch_plan;
+  runtime_launch_plan.packed_bytes = ByteRangeView{
+      reinterpret_cast<const std::uint8_t*>(weight.data()),
+      weight.numel() * sizeof(float),
+  };
+  const auto execution = PrepareGemmExecution(runtime_launch_plan, heuristic_cache);
   if (!execution.has_value()) {
     SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
     return std::nullopt;
@@ -165,12 +145,8 @@ __global__ void QuantizeFp8RoundTripKernel(
 
 struct ScaledFp8LinearOp::Impl {
   ScaledFp8LinearConfig config;
+  GemmDescriptor descriptor;
   std::unique_ptr<DeviceDenseWeightFp32> weight;
-  float* host_weight_data = nullptr;
-
-  ~Impl() {
-    std::free(host_weight_data);
-  }
 };
 
 std::optional<std::vector<float>> DequantizeScaledFp8WeightToHostFp32(
@@ -239,13 +215,18 @@ std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::Create(const ScaledFp8Line
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->weight = std::move(weight);
-  impl->host_weight_data = nullptr;
-  void* raw = nullptr;
-  if (posix_memalign(&raw, 16, host_weight->size() * sizeof(float)) != 0 || raw == nullptr) {
-    return nullptr;
-  }
-  impl->host_weight_data = reinterpret_cast<float*>(raw);
-  std::memcpy(impl->host_weight_data, host_weight->data(), host_weight->size() * sizeof(float));
+  impl->descriptor.tensor_name = "scaled_fp8_linear";
+  impl->descriptor.op_class = "scaled_fp8_linear";
+  impl->descriptor.kernel_family = GemmKernelFamily::kDenseRowMajor;
+  impl->descriptor.output_rows = config.output_rows;
+  impl->descriptor.input_cols = config.input_cols;
+  impl->descriptor.storage_dtype = "fp32";
+  impl->descriptor.compute_dtype = "fp32";
+  impl->descriptor.layout_tag = "row_major";
+  impl->descriptor.alignment_bytes = 16;
+  impl->descriptor.packed_data =
+      reinterpret_cast<const std::uint8_t*>(impl->weight->data());
+  impl->descriptor.packed_nbytes = host_weight->size() * sizeof(float);
   return std::unique_ptr<ScaledFp8LinearOp>(new ScaledFp8LinearOp(std::move(impl)));
 }
 
@@ -310,86 +291,59 @@ bool ScaledFp8LinearOp::Run(
   auto& counters = GetLinearOpCounters();
   const bool trace_enabled = IsLinearOpTraceEnabled();
   bool plan_build_ok = false;
-  if (LinearDeviceFastpathEnabled()) {
-    const std::size_t rows = activations.shape()[0];
-    GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
-    const auto plan = BuildRuntimeGemmPlan(
-        impl_->config.output_rows,
-        impl_->config.input_cols,
-        rows,
-        heuristic_cache,
-        impl_->host_weight_data,
-        &failure_step);
-    if (plan.has_value()) {
-      plan_build_ok = true;
-      const auto stats = RunDenseRowMajorFp32ToDevice(
-          handle,
-          *plan,
-          *impl_->weight,
-          *quantized_activations,
-          output);
-      if (stats.has_value()) {
-        counters.scaled_fp8_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
-        if (trace_enabled) {
-          AppendLinearOpTraceEntry(LinearOpTraceEntry{
-              "scaled_fp8",
-              GemmKernelFamily::kDenseRowMajor,
-              LinearOpPath::kFastpath,
-              true,
-              true,
-          });
-        }
-        return true;
+  const std::size_t rows = activations.shape()[0];
+  GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
+  const auto plan = BuildRuntimeGemmPlan(
+      impl_->descriptor,
+      *impl_->weight,
+      rows,
+      heuristic_cache,
+      &failure_step);
+  if (plan.has_value()) {
+    plan_build_ok = true;
+    const auto stats = RunDenseRowMajorFp32ToDevice(
+        handle,
+        *plan,
+        *impl_->weight,
+        *quantized_activations,
+        output);
+    if (stats.has_value()) {
+      counters.scaled_fp8_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+      if (trace_enabled) {
+        AppendLinearOpTraceEntry(LinearOpTraceEntry{
+            "scaled_fp8",
+            GemmKernelFamily::kDenseRowMajor,
+            LinearOpPath::kFastpath,
+            true,
+            true,
+        });
       }
-      if (debug) {
-        LogGemmExecuteFailure(
-            rows,
-            impl_->config.output_rows,
-            impl_->config.input_cols);
-      }
-    } else if (debug) {
-      LogGemmPlanBuildFailure(
-          rows,
-          impl_->config.output_rows,
-          impl_->config.input_cols,
-          failure_step);
-    }
-  } else if (debug) {
-    std::cerr << "scaled_fp8_linear: reference path forced\n";
-  }
-
-  counters.scaled_fp8_reference_fallback.fetch_add(1, std::memory_order_relaxed);
-  if (!RunDenseRowMajorHighPrecisionReferenceToDevice(
-          *quantized_activations,
-          *impl_->weight,
-          output)) {
-    if (trace_enabled) {
-      AppendLinearOpTraceEntry(LinearOpTraceEntry{
-          "scaled_fp8",
-          GemmKernelFamily::kDenseRowMajor,
-          LinearOpPath::kReference,
-          plan_build_ok,
-          false,
-      });
+      return true;
     }
     if (debug) {
-      std::cerr << "scaled_fp8_linear: device reference fallback failed\n";
+      LogGemmExecuteFailure(
+          rows,
+          impl_->config.output_rows,
+          impl_->config.input_cols);
     }
-    return false;
+  } else if (debug) {
+    LogGemmPlanBuildFailure(
+        rows,
+        impl_->config.output_rows,
+        impl_->config.input_cols,
+        failure_step);
   }
+
   if (trace_enabled) {
     AppendLinearOpTraceEntry(LinearOpTraceEntry{
         "scaled_fp8",
         GemmKernelFamily::kDenseRowMajor,
-        LinearOpPath::kReference,
+        LinearOpPath::kFastpath,
         plan_build_ok,
-        true,
+        false,
     });
   }
-  if (debug) {
-    std::cerr << "scaled_fp8_linear: device reference fallback\n";
-  }
-  return true;
+  return false;
 }
 
 }  // namespace nemotron

@@ -17,7 +17,6 @@
 
 #include "nemotron/linear_op_counters.h"
 #include "nemotron/linear_op_trace.h"
-#include "nemotron/linear_reference_kernels.h"
 #include "nemotron/primitive_ops.h"
 
 namespace nemotron {
@@ -31,43 +30,6 @@ struct UploadedLinearOp::Impl {
 };
 
 namespace {
-
-constexpr const char* kLinearDeviceFastpathEnvVar =
-    "NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH";
-constexpr const char* kDenseFastpathDisableEnvVar =
-    "NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH";
-constexpr const char* kNvfp4FastpathDisableEnvVar =
-    "NEMOTRON_FORWARD_LINEAR_DISABLE_NVFP4_FASTPATH";
-constexpr const char* kNvfp4ActivationTensorScaleEnvVar =
-    "NEMOTRON_FORWARD_NVFP4_ACTIVATION_TENSOR_SCALE";
-
-bool LinearDeviceFastpathEnabled() {
-  const char* value = std::getenv(kLinearDeviceFastpathEnvVar);
-  if (value == nullptr) {
-    return true;
-  }
-  return std::strcmp(value, "0") != 0;
-}
-
-bool EnvFlagEnabled(const char* env_var) {
-  const char* value = std::getenv(env_var);
-  return value != nullptr && std::strcmp(value, "0") != 0;
-}
-
-std::optional<float> ParsePositiveFloatEnv(const char* env_var) {
-  const char* value = std::getenv(env_var);
-  if (value == nullptr || value[0] == '\0') {
-    return std::nullopt;
-  }
-  errno = 0;
-  char* end = nullptr;
-  const float parsed = std::strtof(value, &end);
-  if (end == value || (end != nullptr && *end != '\0') || errno == ERANGE ||
-      !std::isfinite(parsed) || parsed <= 0.0f) {
-    return std::nullopt;
-  }
-  return parsed;
-}
 
 enum class GemmPlanFailureStep {
   kNone,
@@ -156,64 +118,15 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(
   // support available in the packer utilities, but force the runtime bridge to
   // use the validated 128x4 layout until the 8x4 execute contract is fixed.
   options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
-  const char* raw_value = std::getenv(kNvfp4ActivationTensorScaleEnvVar);
-  if (raw_value == nullptr || raw_value[0] == '\0') {
-    if (debug) {
-      std::cerr << "linear_op: NVFP4 activation pack options for "
-                << descriptor.tensor_name
-                << " M=" << rows
-                << " scale_layout=" << ToString(*options.execution_scale_layout)
-                << " tensor_scale=dynamic\n";
-    }
-    return options;
-  }
-  const auto fixed_tensor_scale = ParsePositiveFloatEnv(kNvfp4ActivationTensorScaleEnvVar);
-  if (!fixed_tensor_scale.has_value()) {
-    if (debug) {
-      std::cerr << "linear_op: ignoring invalid "
-                << kNvfp4ActivationTensorScaleEnvVar
-                << " for " << descriptor.tensor_name << "\n";
-    }
-    return options;
-  }
-  options.fixed_tensor_scale = *fixed_tensor_scale;
   if (debug) {
     std::cerr << "linear_op: NVFP4 activation pack options for "
               << descriptor.tensor_name
               << " M=" << rows
               << " scale_layout=" << ToString(*options.execution_scale_layout)
-              << " tensor_scale=fixed:"
-              << *fixed_tensor_scale
+              << " tensor_scale=dynamic"
               << "\n";
   }
   return options;
-}
-
-std::optional<CublasLtGemmPlan> BuildDescriptorGemmPlan(
-    const GemmDescriptor& descriptor,
-    std::size_t rows,
-    GemmHeuristicCache* heuristic_cache,
-    GemmPlanFailureStep* failure_step = nullptr,
-    CublasLtPlanRejectInfo* reject_info = nullptr) {
-  SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kNone);
-  if (reject_info != nullptr) {
-    *reject_info = CublasLtPlanRejectInfo{};
-  }
-  const auto launch_plan = BuildGemmLaunchPlan(descriptor, rows);
-  if (!launch_plan.has_value()) {
-    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildGemmLaunchPlan);
-    return std::nullopt;
-  }
-  const auto execution = PrepareGemmExecution(*launch_plan, heuristic_cache);
-  if (!execution.has_value()) {
-    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kPrepareGemmExecution);
-    return std::nullopt;
-  }
-  const auto plan = BuildCublasLtGemmPlan(*execution, reject_info);
-  if (!plan.has_value()) {
-    SetGemmPlanFailureStep(failure_step, GemmPlanFailureStep::kBuildCublasLtGemmPlan);
-  }
-  return plan;
 }
 
 std::optional<GemmLaunchPlan> BuildRuntimeLaunchPlan(
@@ -520,56 +433,51 @@ bool UploadedLinearOp::Run(
   }
   switch (impl_->descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor: {
-      if (LinearDeviceFastpathEnabled() && !EnvFlagEnabled(kDenseFastpathDisableEnvVar)) {
-        GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
-        CublasLtPlanRejectInfo reject_info;
-        const auto plan = BuildRuntimeGemmPlan(
-            impl_->descriptor,
-            *impl_->dense_weight_fp32,
-            rows,
-            heuristic_cache,
-            &failure_step,
-            &reject_info);
-        if (plan.has_value()) {
-          plan_build_ok = true;
-          counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
-          if (const auto stats = RunDenseRowMajorFp32ToDevice(
-                  handle,
-                  *plan,
-                  *impl_->dense_weight_fp32,
-                  activations,
-                  output);
-              stats.has_value()) {
-            counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
-            if (trace_enabled) {
-              AppendLinearOpTraceEntry(LinearOpTraceEntry{
-                  impl_->descriptor.tensor_name,
-                  impl_->descriptor.kernel_family,
-                  LinearOpPath::kFastpath,
-                  true,
-                  true,
-              });
-            }
-            return true;
+      GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
+      CublasLtPlanRejectInfo reject_info;
+      const auto plan = BuildRuntimeGemmPlan(
+          impl_->descriptor,
+          *impl_->dense_weight_fp32,
+          rows,
+          heuristic_cache,
+          &failure_step,
+          &reject_info);
+      if (plan.has_value()) {
+        plan_build_ok = true;
+        counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
+        if (const auto stats = RunDenseRowMajorFp32ToDevice(
+                handle,
+                *plan,
+                *impl_->dense_weight_fp32,
+                activations,
+                output);
+            stats.has_value()) {
+          counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+          if (trace_enabled) {
+            AppendLinearOpTraceEntry(LinearOpTraceEntry{
+                impl_->descriptor.tensor_name,
+                impl_->descriptor.kernel_family,
+                LinearOpPath::kFastpath,
+                true,
+                true,
+            });
           }
-          counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
-          if (debug) {
-            LogGemmExecuteFailure(impl_->descriptor, rows, "runtime");
-          }
-        } else {
-          counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
-          if (debug) {
-            LogGemmPlanBuildFailure(
-                impl_->descriptor,
-                rows,
-                "runtime",
-                failure_step,
-                reject_info);
-          }
+          return true;
         }
-      } else if (debug) {
-        std::cerr << "linear_op: dense reference path forced for "
-                  << impl_->descriptor.tensor_name << "\n";
+        counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
+        if (debug) {
+          LogGemmExecuteFailure(impl_->descriptor, rows, "runtime");
+        }
+      } else {
+        counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
+        if (debug) {
+          LogGemmPlanBuildFailure(
+              impl_->descriptor,
+              rows,
+              "runtime",
+              failure_step,
+              reject_info);
+        }
       }
       break;
     }
@@ -579,26 +487,16 @@ bool UploadedLinearOp::Run(
             RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows);
         const std::optional<Nvfp4ScaleLayout> activation_scale_layout =
             pack_options.execution_scale_layout;
-        const bool use_runtime_plan =
-            LinearDeviceFastpathEnabled() &&
-            !EnvFlagEnabled(kNvfp4FastpathDisableEnvVar);
-        const char* plan_source = use_runtime_plan ? "runtime" : "descriptor";
+        const char* plan_source = "runtime";
         GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
         CublasLtPlanRejectInfo reject_info;
-        auto plan = use_runtime_plan
-                        ? BuildRuntimeGemmPlan(
-                              impl_->descriptor,
-                              *impl_->nvfp4_weight,
-                              rows,
-                              heuristic_cache,
-                              &failure_step,
-                              &reject_info)
-                        : BuildDescriptorGemmPlan(
-                              impl_->descriptor,
-                              rows,
-                              heuristic_cache,
-                              &failure_step,
-                              &reject_info);
+        auto plan = BuildRuntimeGemmPlan(
+            impl_->descriptor,
+            *impl_->nvfp4_weight,
+            rows,
+            heuristic_cache,
+            &failure_step,
+            &reject_info);
         if (!plan.has_value() && debug) {
           LogGemmPlanBuildFailure(
               impl_->descriptor,
@@ -671,58 +569,16 @@ bool UploadedLinearOp::Run(
       }
   }
 
-  bool device_reference_ok = false;
-  switch (impl_->descriptor.kernel_family) {
-    case GemmKernelFamily::kDenseRowMajor:
-      counters.dense_reference_fallback.fetch_add(1, std::memory_order_relaxed);
-      device_reference_ok =
-          impl_->dense_weight_fp32 != nullptr &&
-          RunDenseRowMajorHighPrecisionReferenceToDevice(
-              activations,
-              *impl_->dense_weight_fp32,
-              output);
-      break;
-    case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
-      counters.nvfp4_reference_fallback.fetch_add(1, std::memory_order_relaxed);
-      device_reference_ok =
-          impl_->nvfp4_weight != nullptr &&
-          RunNvfp4RowMajorReferenceToDevice(
-              activations,
-              *impl_->nvfp4_weight,
-              output,
-              RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows));
-      break;
-  }
-  if (!device_reference_ok) {
-    if (trace_enabled) {
-      AppendLinearOpTraceEntry(LinearOpTraceEntry{
-          impl_->descriptor.tensor_name,
-          impl_->descriptor.kernel_family,
-          LinearOpPath::kReference,
-          plan_build_ok,
-          false,
-      });
-    }
-    if (debug) {
-      std::cerr << "linear_op: device reference fallback failed for "
-                << impl_->descriptor.tensor_name << "\n";
-    }
-    return false;
-  }
   if (trace_enabled) {
     AppendLinearOpTraceEntry(LinearOpTraceEntry{
         impl_->descriptor.tensor_name,
         impl_->descriptor.kernel_family,
-        LinearOpPath::kReference,
+        LinearOpPath::kFastpath,
         plan_build_ok,
-        true,
+        false,
     });
   }
-  if (debug) {
-    std::cerr << "linear_op: device reference fallback for "
-              << impl_->descriptor.tensor_name << "\n";
-  }
-  return true;
+  return false;
 }
 
 bool UploadedLinearOp::Run(
@@ -750,56 +606,51 @@ bool UploadedLinearOp::Run(
   const bool trace_enabled = IsLinearOpTraceEnabled();
   bool plan_build_ok = false;
 
-  if (LinearDeviceFastpathEnabled() && !EnvFlagEnabled(kDenseFastpathDisableEnvVar)) {
-    GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
-    CublasLtPlanRejectInfo reject_info;
-    const auto plan = BuildRuntimeGemmPlan(
-        impl_->descriptor,
-        *impl_->dense_weight_bf16,
-        rows,
-        heuristic_cache,
-        &failure_step,
-        &reject_info);
-    if (plan.has_value()) {
-      plan_build_ok = true;
-      counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
-      if (const auto stats = RunDenseRowMajorBf16ToDevice(
-              handle,
-              *plan,
-              *impl_->dense_weight_bf16,
-              activations,
-              output);
-          stats.has_value()) {
-        counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
-        if (trace_enabled) {
-          AppendLinearOpTraceEntry(LinearOpTraceEntry{
-              impl_->descriptor.tensor_name,
-              impl_->descriptor.kernel_family,
-              LinearOpPath::kFastpath,
-              true,
-              true,
-          });
-        }
-        return true;
+  GemmPlanFailureStep failure_step = GemmPlanFailureStep::kNone;
+  CublasLtPlanRejectInfo reject_info;
+  const auto plan = BuildRuntimeGemmPlan(
+      impl_->descriptor,
+      *impl_->dense_weight_bf16,
+      rows,
+      heuristic_cache,
+      &failure_step,
+      &reject_info);
+  if (plan.has_value()) {
+    plan_build_ok = true;
+    counters.dense_fastpath_plan_success.fetch_add(1, std::memory_order_relaxed);
+    if (const auto stats = RunDenseRowMajorBf16ToDevice(
+            handle,
+            *plan,
+            *impl_->dense_weight_bf16,
+            activations,
+            output);
+        stats.has_value()) {
+      counters.dense_fastpath_execute.fetch_add(1, std::memory_order_relaxed);
+      if (trace_enabled) {
+        AppendLinearOpTraceEntry(LinearOpTraceEntry{
+            impl_->descriptor.tensor_name,
+            impl_->descriptor.kernel_family,
+            LinearOpPath::kFastpath,
+            true,
+            true,
+        });
       }
-      counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
-      if (debug) {
-        LogGemmExecuteFailure(impl_->descriptor, rows, "runtime");
-      }
-    } else {
-      counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
-      if (debug) {
-        LogGemmPlanBuildFailure(
-            impl_->descriptor,
-            rows,
-            "runtime",
-            failure_step,
-            reject_info);
-      }
+      return true;
     }
-  } else if (debug) {
-    std::cerr << "linear_op: dense BF16 reference path unavailable for "
-              << impl_->descriptor.tensor_name << "\n";
+    counters.dense_fastpath_execute_fail.fetch_add(1, std::memory_order_relaxed);
+    if (debug) {
+      LogGemmExecuteFailure(impl_->descriptor, rows, "runtime");
+    }
+  } else {
+    counters.dense_fastpath_plan_fail.fetch_add(1, std::memory_order_relaxed);
+    if (debug) {
+      LogGemmPlanBuildFailure(
+          impl_->descriptor,
+          rows,
+          "runtime",
+          failure_step,
+          reject_info);
+    }
   }
 
   if (trace_enabled) {

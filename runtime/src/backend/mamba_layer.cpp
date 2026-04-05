@@ -28,19 +28,6 @@ bool starts_with(const std::string& value, const std::string& prefix) {
   return value.compare(0, prefix.size(), prefix) == 0;
 }
 
-#if !defined(NEMOTRON_PRODUCTION_BUILD)
-bool DebugCompareMambaEnabled() {
-  const char* active = std::getenv("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA_ACTIVE");
-  return std::getenv("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA") != nullptr &&
-         (active == nullptr || std::strcmp(active, "0") != 0);
-}
-#endif
-
-bool DecodeScratchEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
-  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
-}
-
 constexpr std::size_t kMambaMultiTokenMaxChunkTokens = 8192;
 
 thread_local MambaLayerExecutionCounters g_mamba_layer_execution_counters;
@@ -51,22 +38,6 @@ void RecordMambaNativeMultiTokenExecution(std::size_t token_count) {
   }
   ++g_mamba_layer_execution_counters.native_multi_token_runs;
   g_mamba_layer_execution_counters.native_multi_token_tokens += token_count;
-}
-
-bool ExperimentalFusedMambaDecodeEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_EXPERIMENTAL_FUSED_MAMBA_DECODE");
-  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
-bool FusedMambaDecodeEnabled() {
-  if (!ExperimentalFusedMambaDecodeEnabled()) {
-    return false;
-  }
-  const char* value = std::getenv("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE");
-  if (value == nullptr || value[0] == '\0') {
-    return true;
-  }
-  return std::strcmp(value, "0") != 0;
 }
 
 const KernelTensorDescriptor* FindExactKernelBinding(
@@ -180,29 +151,6 @@ std::optional<ScaledFp8LinearConfig> BuildScaledFp8LinearConfig(
   config.weight_scale = *weight_scale_value;
   config.input_scale = *input_scale_value;
   return config;
-}
-
-float Sigmoid(float value) {
-  if (value >= 0.0f) {
-    const float exp_neg = std::exp(-value);
-    return 1.0f / (1.0f + exp_neg);
-  }
-  const float exp_pos = std::exp(value);
-  return exp_pos / (1.0f + exp_pos);
-}
-
-float SiLU(float value) {
-  return value * Sigmoid(value);
-}
-
-float Softplus(float value) {
-  if (value > 20.0f) {
-    return value;
-  }
-  if (value < -20.0f) {
-    return std::exp(value);
-  }
-  return std::log1p(std::exp(value));
 }
 
 }  // namespace
@@ -686,7 +634,7 @@ bool MambaLayerSlice::Run(
   DeviceTensorFp32* projected = nullptr;
   DeviceTensorFp32* scan_output = nullptr;
   DeviceTensorFp32* projected_output = nullptr;
-  const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
+  const bool use_decode_scratch = token_count == 1;
   if (use_decode_scratch) {
     normalized_bf16 = impl_->normalized_bf16_scratch.get();
     normalized = impl_->normalized_scratch.get();
@@ -845,211 +793,9 @@ bool MambaLayerSlice::Run(
            cudaStreamSynchronize(nullptr) == cudaSuccess;
   };
 
-#if !defined(NEMOTRON_PRODUCTION_BUILD)
-  const auto run_debug_compared_decode = [&]() -> bool {
-    std::vector<float> projected_host(projected->numel(), 0.0f);
-    std::vector<float> conv_state_host(request_context.mamba_conv_state()->numel(), 0.0f);
-    std::vector<float> ssm_state_host(request_context.mamba_state()->numel(), 0.0f);
-    if (!projected->CopyToHost(projected_host.data(), projected_host.size()) ||
-        !request_context.mamba_conv_state()->CopyToHost(
-            conv_state_host.data(),
-            conv_state_host.size()) ||
-        !request_context.mamba_state()->CopyToHost(
-            ssm_state_host.data(),
-            ssm_state_host.size())) {
-      return false;
-    }
-
-    FusedMambaLayerParams fused_params;
-    fused_params.intermediate_size = impl_->config.intermediate_size;
-    fused_params.num_heads = impl_->config.num_heads;
-    fused_params.head_dim = impl_->config.head_dim;
-    fused_params.state_size = impl_->config.state_size;
-    fused_params.n_groups = impl_->config.n_groups;
-    fused_params.conv_kernel_size = impl_->config.conv_kernel_size;
-    fused_params.conv_state_elems = state_view.conv_state_elems;
-    fused_params.ssm_state_elems = state_view.ssm_state_elems;
-    fused_params.conv_state = state_view.conv_state;
-    fused_params.ssm_state = state_view.ssm_state;
-    fused_params.mixer_rms_epsilon = impl_->config.mixer_rms_epsilon;
-    fused_params.time_step_min = impl_->config.time_step_min;
-    fused_params.mixer_norm_weight = impl_->mixer_norm_weight_device->data();
-    fused_params.conv1d_weight = impl_->conv1d_weight_device->data();
-    fused_params.conv1d_bias = impl_->conv1d_bias_device->data();
-    fused_params.A_log = impl_->A_log_device->data();
-    fused_params.D = impl_->D_device->data();
-    fused_params.dt_bias = impl_->dt_bias_device->data();
-    if (!RunFusedMambaDecode(fused_params, *projected, scan_output)) {
-      return false;
-    }
-
-    std::vector<float> fused_scan_output_host(scan_output->numel(), 0.0f);
-    if (!scan_output->CopyToHost(fused_scan_output_host.data(), fused_scan_output_host.size())) {
-      return false;
-    }
-
-    const std::size_t group_width = impl_->config.num_heads / impl_->config.n_groups;
-    const std::size_t mixer_group_size =
-        impl_->config.intermediate_size / impl_->config.n_groups;
-    float* layer_conv_state =
-        conv_state_host.data() + state_layout.conv_state_offset_elems;
-    float* layer_ssm_state =
-        ssm_state_host.data() + state_layout.ssm_state_offset_elems;
-    const float* projected_row = projected_host.data();
-    const float* gate = projected_row;
-    const float* conv_input = gate + impl_->config.intermediate_size;
-    const float* dt_pre = conv_input + conv_dim;
-    std::vector<float> conv_output(conv_dim, 0.0f);
-    std::vector<float> B_expanded(
-        impl_->config.num_heads * impl_->config.state_size,
-        0.0f);
-    std::vector<float> C_expanded(
-        impl_->config.num_heads * impl_->config.state_size,
-        0.0f);
-    std::vector<float> y(impl_->config.intermediate_size, 0.0f);
-    std::vector<float> reference_scan_output(
-        impl_->config.intermediate_size,
-        0.0f);
-
-    for (std::size_t channel = 0; channel < conv_dim; ++channel) {
-      float* state_row = layer_conv_state + (channel * impl_->config.conv_kernel_size);
-      if (impl_->config.conv_kernel_size > 1) {
-        std::memmove(
-            state_row,
-            state_row + 1,
-            (impl_->config.conv_kernel_size - 1) * sizeof(float));
-      }
-      state_row[impl_->config.conv_kernel_size - 1] = conv_input[channel];
-
-      float accum = impl_->conv1d_bias[channel];
-      const float* weight_row =
-          impl_->conv1d_weight.data() + (channel * impl_->config.conv_kernel_size);
-      for (std::size_t tap = 0; tap < impl_->config.conv_kernel_size; ++tap) {
-        accum += state_row[tap] * weight_row[tap];
-      }
-      conv_output[channel] = SiLU(accum);
-    }
-
-    const float* hidden_after_conv = conv_output.data();
-    const float* B_grouped = hidden_after_conv + impl_->config.intermediate_size;
-    const float* C_grouped =
-        B_grouped + (impl_->config.n_groups * impl_->config.state_size);
-    for (std::size_t head = 0; head < impl_->config.num_heads; ++head) {
-      const std::size_t group = head / group_width;
-      std::memcpy(
-          B_expanded.data() + (head * impl_->config.state_size),
-          B_grouped + (group * impl_->config.state_size),
-          impl_->config.state_size * sizeof(float));
-      std::memcpy(
-          C_expanded.data() + (head * impl_->config.state_size),
-          C_grouped + (group * impl_->config.state_size),
-          impl_->config.state_size * sizeof(float));
-    }
-
-    for (std::size_t head = 0; head < impl_->config.num_heads; ++head) {
-      const float A = -std::exp(impl_->A_log[head]);
-      const float D = impl_->D[head];
-      const float dt_base = dt_pre[head] + impl_->dt_bias[head];
-      const float* B_head = B_expanded.data() + (head * impl_->config.state_size);
-      const float* C_head = C_expanded.data() + (head * impl_->config.state_size);
-      for (std::size_t dim = 0; dim < impl_->config.head_dim; ++dim) {
-        const std::size_t hidden_index = (head * impl_->config.head_dim) + dim;
-        const float hidden_value = hidden_after_conv[hidden_index];
-        const float dt = std::max(Softplus(dt_base), impl_->config.time_step_min);
-        const float decay = std::exp(dt * A);
-        float accum = 0.0f;
-        float* state_row =
-            layer_ssm_state + (hidden_index * impl_->config.state_size);
-        for (std::size_t state = 0; state < impl_->config.state_size; ++state) {
-          const float next =
-              state_row[state] * decay + (dt * B_head[state] * hidden_value);
-          state_row[state] = next;
-          accum += next * C_head[state];
-        }
-        y[hidden_index] = accum + (hidden_value * D);
-      }
-    }
-
-    for (std::size_t group = 0; group < impl_->config.n_groups; ++group) {
-      const std::size_t begin = group * mixer_group_size;
-      const std::size_t end = begin + mixer_group_size;
-      float variance = 0.0f;
-      for (std::size_t i = begin; i < end; ++i) {
-        const float gated = y[i] * SiLU(gate[i]);
-        variance += gated * gated;
-        reference_scan_output[i] = gated;
-      }
-      variance /= static_cast<float>(mixer_group_size);
-      const float rstd =
-          1.0f / std::sqrt(variance + impl_->config.mixer_rms_epsilon);
-      for (std::size_t i = begin; i < end; ++i) {
-        reference_scan_output[i] =
-            reference_scan_output[i] * rstd * impl_->mixer_norm_weight[i];
-      }
-    }
-
-    float max_abs_diff = 0.0f;
-    for (std::size_t i = 0; i < reference_scan_output.size(); ++i) {
-      max_abs_diff = std::max(
-          max_abs_diff,
-          std::fabs(fused_scan_output_host[i] - reference_scan_output[i]));
-    }
-
-    std::vector<float> device_conv_state_host(
-        request_context.mamba_conv_state()->numel(),
-        0.0f);
-    std::vector<float> device_ssm_state_host(
-        request_context.mamba_state()->numel(),
-        0.0f);
-    if (!request_context.mamba_conv_state()->CopyToHost(
-            device_conv_state_host.data(),
-            device_conv_state_host.size()) ||
-        !request_context.mamba_state()->CopyToHost(
-            device_ssm_state_host.data(),
-            device_ssm_state_host.size())) {
-      return false;
-    }
-
-    const float* device_layer_conv_state =
-        device_conv_state_host.data() + state_layout.conv_state_offset_elems;
-    const float* device_layer_ssm_state =
-        device_ssm_state_host.data() + state_layout.ssm_state_offset_elems;
-    float conv_state_max_abs_diff = 0.0f;
-    for (std::size_t i = 0; i < state_view.conv_state_elems; ++i) {
-      conv_state_max_abs_diff = std::max(
-          conv_state_max_abs_diff,
-          std::fabs(device_layer_conv_state[i] - layer_conv_state[i]));
-    }
-    float ssm_state_max_abs_diff = 0.0f;
-    for (std::size_t i = 0; i < state_view.ssm_state_elems; ++i) {
-      ssm_state_max_abs_diff = std::max(
-          ssm_state_max_abs_diff,
-          std::fabs(device_layer_ssm_state[i] - layer_ssm_state[i]));
-    }
-
-    std::cerr << "fused_mamba_compare: layer=" << impl_->config.layer_index
-              << " scan_max_abs_diff=" << max_abs_diff
-              << " conv_state_max_abs_diff=" << conv_state_max_abs_diff
-              << " ssm_state_max_abs_diff=" << ssm_state_max_abs_diff
-              << " fused0="
-              << (fused_scan_output_host.empty() ? 0.0f : fused_scan_output_host.front())
-              << " host0="
-              << (reference_scan_output.empty() ? 0.0f : reference_scan_output.front())
-              << "\n";
-
-    return run_output_projection();
-  };
-#endif
-
-  if (token_count > 1 || trace != nullptr || !FusedMambaDecodeEnabled()) {
+  if (token_count > 1 || trace != nullptr) {
     return run_sequential_path();
   }
-
-#if !defined(NEMOTRON_PRODUCTION_BUILD)
-  if (DebugCompareMambaEnabled()) {
-    return run_debug_compared_decode();
-  }
-#endif
 
   FusedMambaLayerParams fused_params;
   fused_params.intermediate_size = impl_->config.intermediate_size;

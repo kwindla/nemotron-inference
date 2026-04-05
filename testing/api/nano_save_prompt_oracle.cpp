@@ -59,67 +59,8 @@ bool has_cuda_device() {
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
 }
 
-class ScopedEnvOverride {
- public:
-  ScopedEnvOverride(const char* name, const char* value) : name_(name) {
-    const char* existing = std::getenv(name_.c_str());
-    if (existing != nullptr) {
-      had_original_ = true;
-      original_value_ = existing;
-    }
-    if (value == nullptr) {
-      unsetenv(name_.c_str());
-    } else {
-      setenv(name_.c_str(), value, 1);
-    }
-  }
-
-  ~ScopedEnvOverride() {
-    if (had_original_) {
-      setenv(name_.c_str(), original_value_.c_str(), 1);
-    } else {
-      unsetenv(name_.c_str());
-    }
-  }
-
-  ScopedEnvOverride(const ScopedEnvOverride&) = delete;
-  ScopedEnvOverride& operator=(const ScopedEnvOverride&) = delete;
-
- private:
-  std::string name_;
-  std::string original_value_;
-  bool had_original_ = false;
-};
-
-struct PrefillRouteConfig {
-  const char* route_id = "";
-  const char* description = "";
-  bool fused_enabled = false;
-};
-
-class ScopedRouteOverrides {
- public:
-  explicit ScopedRouteOverrides(const PrefillRouteConfig& route)
-      : fused_mamba_(
-            "NEMOTRON_FORWARD_FUSED_MAMBA_DECODE",
-            route.fused_enabled ? "1" : "0"),
-        fused_moe_(
-            "NEMOTRON_FORWARD_FUSED_MOE_DECODE",
-            route.fused_enabled ? "1" : "0") {}
-
-  ScopedRouteOverrides(const ScopedRouteOverrides&) = delete;
-  ScopedRouteOverrides& operator=(const ScopedRouteOverrides&) = delete;
-
- private:
-  ScopedEnvOverride fused_mamba_;
-  ScopedEnvOverride fused_moe_;
-};
-
-constexpr PrefillRouteConfig kRouteA = {
-    "A",
-    "batched prefill + reference decode",
-    false,
-};
+constexpr const char* kExecutionPathId = "native";
+constexpr const char* kExecutionPathDescription = "single native forward path";
 
 struct OracleOptions {
   std::optional<std::filesystem::path> output_path;
@@ -782,15 +723,12 @@ bool run_nano_save_prompt_oracle(const OracleOptions& options) {
   auto request_context = model->CreateRequestContext();
   if (!expect(
           request_context != nullptr && request_context->valid(),
-          "Route A request context should create")) {
+          "request context should create")) {
     return false;
   }
 
-  ScopedRouteOverrides route_overrides(kRouteA);
-  (void)route_overrides;
-
   const auto prefill = RunPrefillBoundary(*model, *request_context, options.prompt_token_ids);
-  if (!expect(prefill.has_value(), "Route A prefill boundary should succeed")) {
+  if (!expect(prefill.has_value(), "prefill boundary should succeed")) {
     return false;
   }
 
@@ -815,14 +753,14 @@ bool run_nano_save_prompt_oracle(const OracleOptions& options) {
         prefill->boundary_logits,
     };
   }
-  oracle.route = kRouteA.route_id;
-  oracle.route_description = kRouteA.description;
+  oracle.route = kExecutionPathId;
+  oracle.route_description = kExecutionPathDescription;
   oracle.timestamp_utc = FormatIso8601Utc(now);
 
   std::int32_t token_id = prefill->selected_token_id;
   for (std::size_t token_index = 1; token_index < options.decode_token_count; ++token_index) {
     const auto next_token_id = RunContinuationStep(*model, *request_context, token_id);
-    if (!expect(next_token_id.has_value(), "Route A continuation step should succeed")) {
+    if (!expect(next_token_id.has_value(), "continuation step should succeed")) {
       return false;
     }
     token_id = *next_token_id;

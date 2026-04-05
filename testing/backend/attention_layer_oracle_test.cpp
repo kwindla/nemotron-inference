@@ -211,8 +211,8 @@ float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs)
 bool run_attention_oracle_fixture() {
   const auto cublas = CublasLtHandle::Create();
   const auto cudnn = CudnnHandle::Create();
-  if (!cublas || !cublas->valid() || !cudnn || !cudnn->valid() || cudnn->version() < 90500) {
-    std::cout << "attention_layer_oracle_test: SKIP (no CUDA device or cuDNN >= 9.5 unavailable)\n";
+  if (!cublas || !cublas->valid() || !cudnn) {
+    std::cout << "attention_layer_oracle_test: SKIP (no CUDA device available)\n";
     return true;
   }
 

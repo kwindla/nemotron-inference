@@ -60,30 +60,6 @@ METRICS: Tuple[MetricSpec, ...] = (
         ),
     ),
     MetricSpec(
-        name="linear_op_counters.dense_reference_fallback",
-        candidate_paths=(
-            ("linear_op_counters", "dense_reference_fallback"),
-            ("benchmark", "linear_op_counters", "dense_reference_fallback"),
-            ("dense_reference_fallback",),
-        ),
-    ),
-    MetricSpec(
-        name="linear_op_counters.nvfp4_reference_fallback",
-        candidate_paths=(
-            ("linear_op_counters", "nvfp4_reference_fallback"),
-            ("benchmark", "linear_op_counters", "nvfp4_reference_fallback"),
-            ("nvfp4_reference_fallback",),
-        ),
-    ),
-    MetricSpec(
-        name="linear_op_counters.scaled_fp8_reference_fallback",
-        candidate_paths=(
-            ("linear_op_counters", "scaled_fp8_reference_fallback"),
-            ("benchmark", "linear_op_counters", "scaled_fp8_reference_fallback"),
-            ("scaled_fp8_reference_fallback",),
-        ),
-    ),
-    MetricSpec(
         name="expert_staging_counters.total_bytes_uploaded",
         candidate_paths=(
             ("expert_staging_counters", "total_bytes_uploaded"),

@@ -298,7 +298,6 @@ bool test_uploaded_linear_op_matches_reference_for_small_m_nvfp4() {
     return false;
   }
 
-  unsetenv("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH");
   GemmHeuristicCache cache;
   if (!expect(
           op->Run(*handle, &cache, *activations, fastpath_output.get()),

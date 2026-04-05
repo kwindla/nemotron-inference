@@ -41,7 +41,7 @@ fi
 
 BUILD_DIR="${NEMOTRON_BUILD_DIR:-}"
 if [[ -z "${BUILD_DIR}" ]]; then
-  for candidate in build-benchmarks build-phase1-tests build-phase1 build; do
+  for candidate in build-sm120-relwithdebinfo; do
     if [[ -x "${ROOT_DIR}/${candidate}/benchmarks/nano_fused_decode/nano_fused_decode_bench" ]]; then
       BUILD_DIR="${candidate}"
       break

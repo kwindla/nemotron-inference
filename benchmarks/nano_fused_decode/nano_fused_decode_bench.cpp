@@ -60,7 +60,6 @@ struct BenchmarkOptions {
   std::size_t decode_token_count = kDefaultDecodeTokenCount;
   std::size_t warmup_iterations = 1;
   std::size_t hot_iterations = 3;
-  bool strict_linear = false;
 };
 
 struct EnvironmentInfo {
@@ -84,8 +83,6 @@ struct BenchmarkResult {
   std::size_t generated_token_count = 0;
   bool fused_mamba_enabled = true;
   bool fused_moe_enabled = true;
-  bool linear_device_fastpath_enabled = false;
-  bool device_token_select_enabled = true;
   bool cudnn_fe_available = false;
   double cold_total_ms = 0.0;
   double cold_prefill_ms = 0.0;
@@ -108,11 +105,6 @@ struct BenchmarkResult {
   std::vector<std::int32_t> generated_token_ids;
 };
 
-struct LinearFallbackObservation {
-  const char* counter_name = "";
-  std::uint64_t count = 0;
-};
-
 bool CheckCuda(cudaError_t status, const char* message) {
   if (status == cudaSuccess) {
     return true;
@@ -125,53 +117,6 @@ bool CheckCuda(cudaError_t status, const char* message) {
 bool has_cuda_device() {
   int device_count = 0;
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
-}
-
-bool EnvEnabledOrDefault(const char* env_var, bool default_enabled) {
-  const char* value = std::getenv(env_var);
-  if (value == nullptr) {
-    return default_enabled;
-  }
-  return value[0] != '\0' && std::string(value) != "0";
-}
-
-const char* EnabledStatus(bool enabled) {
-  return enabled ? "enabled" : "disabled";
-}
-
-std::vector<LinearFallbackObservation> CollectLinearReferenceFallbacks() {
-  const auto& counters = nemotron::GetLinearOpCounters();
-  std::vector<LinearFallbackObservation> fallbacks;
-  fallbacks.reserve(3);
-
-  const auto append_if_nonzero = [&fallbacks](const char* counter_name, const auto& counter) {
-    const std::uint64_t count = counter.load(std::memory_order_relaxed);
-    if (count != 0) {
-      fallbacks.push_back({counter_name, count});
-    }
-  };
-
-  append_if_nonzero("dense_reference_fallback", counters.dense_reference_fallback);
-  append_if_nonzero("nvfp4_reference_fallback", counters.nvfp4_reference_fallback);
-  append_if_nonzero(
-      "scaled_fp8_reference_fallback",
-      counters.scaled_fp8_reference_fallback);
-  return fallbacks;
-}
-
-void PrintUnexpectedLinearFallbacks(
-    std::ostream& stream,
-    const std::vector<LinearFallbackObservation>& fallbacks) {
-  if (fallbacks.empty()) {
-    return;
-  }
-
-  stream << "nano_fused_decode_bench: unexpected linear reference fallbacks while "
-         << "the linear device fastpath was enabled\n";
-  for (const LinearFallbackObservation& fallback : fallbacks) {
-    stream << "nano_fused_decode_bench: operator=" << fallback.counter_name
-           << " reference_fallback_count=" << fallback.count << "\n";
-  }
 }
 
 struct DeviceTokenBuffer {
@@ -283,36 +228,26 @@ std::optional<std::int32_t> ArgMaxTokenId(const std::vector<float>& logits_row) 
 
 std::optional<std::int32_t> SelectContinuationTokenId(
     const nemotron::DeviceTensorFp32& logits_row,
-    bool device_token_select_enabled,
     std::int32_t* device_token_id) {
-  if (device_token_select_enabled) {
-    if (device_token_id == nullptr) {
-      std::cerr << "nano_fused_decode_bench: missing device token buffer\n";
-      return std::nullopt;
-    }
-    if (!nemotron::DeviceArgmax(logits_row, device_token_id)) {
-      std::cerr << "nano_fused_decode_bench: DeviceArgmax failed\n";
-      return std::nullopt;
-    }
-    std::int32_t host_token_id = -1;
-    if (!CheckCuda(
-            cudaMemcpy(
-                &host_token_id,
-                device_token_id,
-                sizeof(host_token_id),
-                cudaMemcpyDeviceToHost),
-            "cudaMemcpy device token id failed")) {
-      return std::nullopt;
-    }
-    return host_token_id;
-  }
-
-  const std::vector<float> host_logits = CopyTensorToHost(logits_row);
-  if (host_logits.empty() && logits_row.numel() != 0) {
-    std::cerr << "nano_fused_decode_bench: failed to copy logits to host\n";
+  if (device_token_id == nullptr) {
+    std::cerr << "nano_fused_decode_bench: missing device token buffer\n";
     return std::nullopt;
   }
-  return ArgMaxTokenId(host_logits);
+  if (!nemotron::DeviceArgmax(logits_row, device_token_id)) {
+    std::cerr << "nano_fused_decode_bench: DeviceArgmax failed\n";
+    return std::nullopt;
+  }
+  std::int32_t host_token_id = -1;
+  if (!CheckCuda(
+          cudaMemcpy(
+              &host_token_id,
+              device_token_id,
+              sizeof(host_token_id),
+              cudaMemcpyDeviceToHost),
+          "cudaMemcpy device token id failed")) {
+    return std::nullopt;
+  }
+  return host_token_id;
 }
 
 std::string EscapeJson(const std::string& text) {
@@ -447,7 +382,6 @@ void PrintUsage(const char* argv0) {
       << "  --manifest <path>           Manifest path. Defaults to NEMOTRON_FORWARD_MANIFEST.\n"
       << "  --mode <phased|steady-state|cached-head|profile-ready>\n"
       << "                             Benchmark mode. Default: phased\n"
-      << "  --strict-linear            Fail if linear fastpath was requested but reference fallbacks occurred.\n"
       << "  --warmup <count>            Warmup iterations. Default: 1\n"
       << "  --iterations <count>        Timed hot iterations. Default: 3\n"
       << "  --decode-tokens <count>     Timed ContinueSingleToken steps for --mode=steady-state\n"
@@ -475,8 +409,6 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
       if (i + 1 >= argc || !ParseBenchmarkMode(argv[++i], &options->mode)) {
         return false;
       }
-    } else if (arg == "--strict-linear") {
-      options->strict_linear = true;
     } else if (arg == "--warmup") {
       if (i + 1 >= argc) {
         return false;
@@ -555,7 +487,6 @@ std::optional<TimedPhasedRun> RunTimedPhasedDecode(
     nemotron::SingleTokenForwardModel& model,
     const std::vector<std::int32_t>& prompt_token_ids,
     const std::string& run_label,
-    bool device_token_select_enabled,
     std::int32_t* device_token_id) {
   auto request_context = model.CreateRequestContext();
   if (request_context == nullptr || !request_context->valid()) {
@@ -634,12 +565,7 @@ std::optional<TimedPhasedRun> RunTimedPhasedDecode(
                 << token_index << "\n";
       return std::nullopt;
     }
-    if (!device_token_select_enabled &&
-        !CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after decode step failed")) {
-      return std::nullopt;
-    }
-    const auto next_token =
-        SelectContinuationTokenId(*step_logits, device_token_select_enabled, device_token_id);
+    const auto next_token = SelectContinuationTokenId(*step_logits, device_token_id);
     if (!next_token.has_value()) {
       std::cerr << "nano_fused_decode_bench: failed to select token at step "
                 << token_index << "\n";
@@ -669,7 +595,6 @@ std::optional<TimedSteadyStateRun> RunTimedSteadyStateDecode(
     const std::vector<std::int32_t>& prompt_token_ids,
     std::size_t decode_token_count,
     const std::string& run_label,
-    bool device_token_select_enabled,
     std::int32_t* device_token_id) {
   auto request_context = model.CreateRequestContext();
   if (request_context == nullptr || !request_context->valid()) {
@@ -744,12 +669,7 @@ std::optional<TimedSteadyStateRun> RunTimedSteadyStateDecode(
                 << step_number << "\n";
       return std::nullopt;
     }
-    if (!device_token_select_enabled &&
-        !CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after decode step failed")) {
-      return std::nullopt;
-    }
-    const auto next_token =
-        SelectContinuationTokenId(*step_logits, device_token_select_enabled, device_token_id);
+    const auto next_token = SelectContinuationTokenId(*step_logits, device_token_id);
     if (!next_token.has_value()) {
       std::cerr << "nano_fused_decode_bench: failed to select token at step "
                 << step_number << "\n";
@@ -774,7 +694,6 @@ std::optional<TimedSteadyStateRun> RunTimedSteadyStateDecode(
 std::optional<TimedProfileReadyRun> RunProfileReadyDecode(
     nemotron::SingleTokenForwardModel& model,
     const std::vector<std::int32_t>& prompt_token_ids,
-    bool device_token_select_enabled,
     std::int32_t* device_token_id) {
   auto request_context = model.CreateRequestContext();
   if (request_context == nullptr || !request_context->valid()) {
@@ -838,8 +757,7 @@ std::optional<TimedProfileReadyRun> RunProfileReadyDecode(
     std::cerr << "nano_fused_decode_bench: ContinueSingleToken failed at step 1\n";
     return std::nullopt;
   }
-  const auto next_token =
-      SelectContinuationTokenId(*step_logits, device_token_select_enabled, device_token_id);
+  const auto next_token = SelectContinuationTokenId(*step_logits, device_token_id);
   if (!next_token.has_value()) {
     std::cerr << "nano_fused_decode_bench: failed to select token at step 1\n";
     return std::nullopt;
@@ -908,10 +826,6 @@ bool WriteJson(
   output << "    \"generated_token_count\": " << result.generated_token_count << ",\n";
   output << "    \"fused_mamba_enabled\": " << (result.fused_mamba_enabled ? "true" : "false") << ",\n";
   output << "    \"fused_moe_enabled\": " << (result.fused_moe_enabled ? "true" : "false") << ",\n";
-  output << "    \"linear_device_fastpath_enabled\": "
-         << (result.linear_device_fastpath_enabled ? "true" : "false") << ",\n";
-  output << "    \"device_token_select_enabled\": "
-         << (result.device_token_select_enabled ? "true" : "false") << ",\n";
   output << "    \"cold_total_ms\": " << std::fixed << std::setprecision(6) << result.cold_total_ms << ",\n";
   output << "    \"cold_prefill_ms\": " << result.cold_prefill_ms << ",\n";
   output << "    \"cold_first_token_ms\": " << result.cold_first_token_ms << ",\n";
@@ -963,8 +877,6 @@ bool WriteJson(
          << counters.dense_fastpath_execute.load(std::memory_order_relaxed) << ",\n";
   output << "    \"dense_fastpath_execute_fail\": "
          << counters.dense_fastpath_execute_fail.load(std::memory_order_relaxed) << ",\n";
-  output << "    \"dense_reference_fallback\": "
-         << counters.dense_reference_fallback.load(std::memory_order_relaxed) << ",\n";
   output << "    \"nvfp4_fastpath_plan_success\": "
          << counters.nvfp4_fastpath_plan_success.load(std::memory_order_relaxed) << ",\n";
   output << "    \"nvfp4_fastpath_plan_fail\": "
@@ -973,12 +885,8 @@ bool WriteJson(
          << counters.nvfp4_fastpath_execute.load(std::memory_order_relaxed) << ",\n";
   output << "    \"nvfp4_fastpath_execute_fail\": "
          << counters.nvfp4_fastpath_execute_fail.load(std::memory_order_relaxed) << ",\n";
-  output << "    \"nvfp4_reference_fallback\": "
-         << counters.nvfp4_reference_fallback.load(std::memory_order_relaxed) << ",\n";
   output << "    \"scaled_fp8_fastpath_execute\": "
-         << counters.scaled_fp8_fastpath_execute.load(std::memory_order_relaxed) << ",\n";
-  output << "    \"scaled_fp8_reference_fallback\": "
-         << counters.scaled_fp8_reference_fallback.load(std::memory_order_relaxed) << "\n";
+         << counters.scaled_fp8_fastpath_execute.load(std::memory_order_relaxed) << "\n";
   output << "  },\n";
   const auto& expert_staging_counters = nemotron::GetExpertStagingCounters();
   output << "  \"expert_staging_counters\": {\n";
@@ -1015,9 +923,6 @@ int main(int argc, char** argv) {
     auto cudnn_handle = nemotron::CudnnHandle::Create();
     return cudnn_handle != nullptr && cudnn_handle->valid();
   }();
-  const bool device_token_select_enabled =
-      EnvEnabledOrDefault("NEMOTRON_FORWARD_DEVICE_TOKEN_SELECT", true);
-
   if (!options.manifest_path.has_value()) {
     const char* manifest_env = std::getenv("NEMOTRON_FORWARD_MANIFEST");
     if (manifest_env != nullptr && manifest_env[0] != '\0') {
@@ -1070,15 +975,12 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
-  ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
-
   const std::vector<std::int32_t>& prompt_token_ids = FixedPromptTokenIds();
   nemotron::ResetLinearOpCounters();
   nemotron::ResetLinearOpTrace();
   nemotron::ResetExpertStagingCounters();
   DeviceTokenBuffer device_token_buffer;
-  if (device_token_select_enabled && !device_token_buffer.Allocate()) {
+  if (!device_token_buffer.Allocate()) {
     return 1;
   }
 
@@ -1092,9 +994,6 @@ int main(int argc, char** argv) {
        options.mode == BenchmarkMode::kCachedHead)
           ? options.decode_token_count
           : (options.mode == BenchmarkMode::kProfileReady ? 1 : kDefaultDecodeTokenCount);
-  result.linear_device_fastpath_enabled =
-      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", true);
-  result.device_token_select_enabled = device_token_select_enabled;
   result.cudnn_fe_available = cudnn_fe_available;
 
   if (options.mode == BenchmarkMode::kSteadyState ||
@@ -1102,15 +1001,13 @@ int main(int argc, char** argv) {
     const char* mode_name = BenchmarkModeCliName(options.mode);
     std::cout << "nano_fused_decode_bench: starting mode=" << mode_name
               << " prompt_tokens=" << prompt_token_ids.size()
-              << " decode_tokens=" << options.decode_token_count
-              << " device_token_select=" << EnabledStatus(device_token_select_enabled) << "\n";
+              << " decode_tokens=" << options.decode_token_count << "\n";
     std::cout.flush();
     const auto steady_state_run = RunTimedSteadyStateDecode(
         *model,
         prompt_token_ids,
         options.decode_token_count,
         mode_name,
-        device_token_select_enabled,
         device_token_buffer.data);
     if (!steady_state_run.has_value()) {
       return 1;
@@ -1139,7 +1036,6 @@ int main(int argc, char** argv) {
               << " decode_mean_ms=" << result.hot_steady_state_mean_ms
               << " decode_min_ms=" << result.hot_steady_state_min_ms
               << " decode_max_ms=" << result.hot_steady_state_max_ms
-              << " device_token_select=" << EnabledStatus(result.device_token_select_enabled)
               << " decode_tokens_per_second="
               << result.steady_state_generated_tokens_per_second
               << "\n";
@@ -1154,13 +1050,11 @@ int main(int argc, char** argv) {
   } else if (options.mode == BenchmarkMode::kProfileReady) {
     std::cout << "nano_fused_decode_bench: starting mode=profile-ready"
               << " prompt_tokens=" << prompt_token_ids.size()
-              << " decode_tokens=1"
-              << " device_token_select=" << EnabledStatus(device_token_select_enabled) << "\n";
+              << " decode_tokens=1\n";
     std::cout.flush();
     const auto profile_ready_run = RunProfileReadyDecode(
         *model,
         prompt_token_ids,
-        device_token_select_enabled,
         device_token_buffer.data);
     if (!profile_ready_run.has_value()) {
       return 1;
@@ -1193,20 +1087,16 @@ int main(int argc, char** argv) {
               << " decode_tokens=" << result.decode_token_count
               << " prefill_ms=" << std::fixed << std::setprecision(3)
               << result.steady_state_prefill_ms
-              << " decode_ms=" << result.hot_steady_state_mean_ms
-              << " device_token_select=" << EnabledStatus(result.device_token_select_enabled)
-              << "\n";
+              << " decode_ms=" << result.hot_steady_state_mean_ms << "\n";
   } else {
     std::cout << "nano_fused_decode_bench: starting cold run"
               << " prompt_tokens=" << prompt_token_ids.size()
-              << " max_new_tokens=" << kDefaultDecodeTokenCount
-              << " device_token_select=" << EnabledStatus(device_token_select_enabled) << "\n";
+              << " max_new_tokens=" << kDefaultDecodeTokenCount << "\n";
     std::cout.flush();
     const auto cold_run = RunTimedPhasedDecode(
         *model,
         prompt_token_ids,
         "cold",
-        device_token_select_enabled,
         device_token_buffer.data);
     if (!cold_run.has_value()) {
       return 1;
@@ -1229,7 +1119,6 @@ int main(int argc, char** argv) {
           *model,
           prompt_token_ids,
           run_label,
-          device_token_select_enabled,
           device_token_buffer.data);
       if (!warmup_run.has_value()) {
         return 1;
@@ -1256,7 +1145,6 @@ int main(int argc, char** argv) {
           *model,
           prompt_token_ids,
           run_label,
-          device_token_select_enabled,
           device_token_buffer.data);
       if (!hot_run.has_value()) {
         return 1;
@@ -1321,7 +1209,6 @@ int main(int argc, char** argv) {
               << " hot_prefill_mean_ms=" << result.hot_prefill_mean_ms
               << " hot_first_token_mean_ms=" << result.hot_first_token_mean_ms
               << " hot_steady_state_mean_ms=" << result.hot_steady_state_mean_ms
-              << " device_token_select=" << EnabledStatus(result.device_token_select_enabled)
               << " steady_state_generated_tokens_per_second="
               << result.steady_state_generated_tokens_per_second
               << "\n";
@@ -1334,23 +1221,6 @@ int main(int argc, char** argv) {
   if (options.json_output_path.has_value() &&
       !WriteJson(*options.json_output_path, *environment_info, result, prompt_token_ids)) {
     return 1;
-  }
-
-  if (options.strict_linear) {
-    bool strict_linear_failed = false;
-    if (result.linear_device_fastpath_enabled) {
-      const std::vector<LinearFallbackObservation> fallbacks =
-          CollectLinearReferenceFallbacks();
-      if (!fallbacks.empty()) {
-        PrintUnexpectedLinearFallbacks(std::cerr, fallbacks);
-        strict_linear_failed = true;
-      }
-    }
-    nemotron::PrintLinearOpTraceSummary(std::cerr);
-    std::cerr.flush();
-    if (strict_linear_failed) {
-      return 1;
-    }
   }
   return 0;
 }

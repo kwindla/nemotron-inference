@@ -116,7 +116,7 @@ add_library(
   nemotron_runtime_backend
   src/backend/cublaslt_handle.cpp
   src/backend/attention_layer.cpp
-  src/backend/attention_device_fallback.cu
+  src/backend/attention_native_kernels.cu
   src/backend/dense_weight.cpp
   src/backend/device_argmax.cu
   src/backend/device_nvfp4_matrix.cu

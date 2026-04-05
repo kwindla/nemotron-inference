@@ -57,11 +57,6 @@ bool PrefillTraceEnabled() {
   return enabled;
 }
 
-bool DecodeScratchEnabled() {
-  const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_SCRATCH");
-  return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
-}
-
 bool DecodeLayerNormDebugEnabled() {
   const char* value = std::getenv("NEMOTRON_FORWARD_DECODE_LAYER_NORMS");
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
@@ -153,7 +148,7 @@ std::size_t ConfiguredMoePrefillCapacityTokens(const SingleTokenForwardConfig& c
       kDefaultMoePrefillCapacityTokens);
 }
 
-std::size_t FallbackMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
+std::size_t ResolveMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
   return config.moe_prefill_window_tokens > 0
              ? config.moe_prefill_window_tokens
              : std::size_t{1};
@@ -189,7 +184,7 @@ std::size_t EffectiveMoePrefillWindowTokens(
   const std::size_t resolved_capacity =
       workspace != nullptr && workspace->valid() && workspace->token_capacity() != 0
           ? workspace->token_capacity()
-          : FallbackMoePrefillWindowTokens(config);
+          : ResolveMoePrefillWindowTokens(config);
   return std::min(token_count, resolved_capacity);
 }
 
@@ -933,7 +928,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
   if (plan->attention_layer_count != 0) {
     cudnn = CudnnHandle::Create();
     if (!cudnn) {
-      return debug_fail("attention backend handle creation failed");
+      return debug_fail("attention handle creation failed");
     }
   }
 
@@ -961,7 +956,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
     }
   }
   impl->layers.reserve(plan->layers.size());
-  const std::size_t fallback_moe_window_tokens = FallbackMoePrefillWindowTokens(config);
+  const std::size_t moe_window_tokens = ResolveMoePrefillWindowTokens(config);
 
   for (const ForwardLayerPlanEntry& plan_entry : plan->layers) {
     const LayerScheduleEntry* layer = schedule.FindLayer(plan_entry.layer_index);
@@ -1032,7 +1027,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
         expert_config.n_routed_experts = config.n_routed_experts;
         expert_config.top_k = config.experts_per_token;
-        expert_config.max_token_count = fallback_moe_window_tokens;
+        expert_config.max_token_count = moe_window_tokens;
         expert_config.n_group = config.expert_n_group;
         expert_config.topk_group = config.expert_topk_group;
         expert_config.rms_epsilon = config.layer_norm_epsilon;
@@ -1548,7 +1543,7 @@ bool SingleTokenForwardModel::RunTokens(
   }
 
   if (impl_->plan.attention_layer_count != 0 && impl_->cudnn == nullptr) {
-    std::cerr << "single_token_forward_model: attention backend handle unavailable\n";
+    std::cerr << "single_token_forward_model: attention handle unavailable\n";
     return false;
   }
   if (reset_request_state) {
@@ -1602,7 +1597,7 @@ bool SingleTokenForwardModel::RunTokens(
   DeviceTensorBf16* current = nullptr;
   DeviceTensorBf16* residual_tensor = nullptr;
   DeviceTensorBf16* next = nullptr;
-  const bool use_decode_scratch = token_count == 1 && DecodeScratchEnabled();
+  const bool use_decode_scratch = token_count == 1;
   if (use_decode_scratch) {
     hidden_view = CreateDecodeRowView(request_context.hidden(), impl_->config.hidden_size);
     residual_view = CreateDecodeRowView(request_context.residual(), impl_->config.hidden_size);

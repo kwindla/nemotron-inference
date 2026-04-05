@@ -202,13 +202,6 @@ bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
     return true;
   }
 
-  ScopedEnvVar scoped_unified("NEMOTRON_FORWARD_UNIFIED_FUSED");
-  ScopedEnvVar scoped_prefill("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-  ScopedEnvVar scoped_dense_fastpath("NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH");
-  unsetenv("NEMOTRON_FORWARD_UNIFIED_FUSED");
-  unsetenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-  setenv("NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH", "1", 1);
-
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
     std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device or cublasLt unavailable)\n";
@@ -348,16 +341,6 @@ bool test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() {
       !expect(cudaDeviceSynchronize() == cudaSuccess, "batch run should synchronize")) {
     return false;
   }
-
-  const auto& counters = GetExpertStagingCounters();
-  if (!expect(
-          counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
-          "unified fused batch run should not invoke the host routing adapter") ||
-      !expect(
-          counters.host_routing_tensor_copies.load(std::memory_order_relaxed) == 0,
-          "unified fused batch run should not copy canonical routing tensors to host")) {
-    return false;
-  }
   return true;
 }
 
@@ -366,15 +349,10 @@ bool test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging()
     std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
     return true;
   }
-
-  ScopedEnvVar scoped_unified("NEMOTRON_FORWARD_UNIFIED_FUSED");
-  ScopedEnvVar scoped_prefill("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
   ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
   ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
-  ScopedEnvVar scoped_dense_fastpath("NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH");
   setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "1", 1);
   setenv("NEMOTRON_EXPERT_MONOLITHIC", "1", 1);
-  setenv("NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH", "1", 1);
 
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
@@ -524,10 +502,7 @@ bool test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging()
           "resident fastpath run should not stage any routed experts") ||
       !expect(
           first_counters.total_bytes_uploaded.load(std::memory_order_relaxed) == 0,
-          "resident fastpath run should not upload routed expert bytes at execution time") ||
-      !expect(
-          first_counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
-          "resident fastpath run should not invoke the host routing adapter")) {
+          "resident fastpath run should not upload routed expert bytes at execution time")) {
     return false;
   }
 
@@ -544,10 +519,7 @@ bool test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging()
           "second resident fastpath run should not stage any routed experts") ||
       !expect(
           second_counters.total_bytes_uploaded.load(std::memory_order_relaxed) == 0,
-          "second resident fastpath run should not upload routed expert bytes at execution time") ||
-      !expect(
-          second_counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
-          "second resident fastpath run should not invoke the host routing adapter")) {
+          "second resident fastpath run should not upload routed expert bytes at execution time")) {
     return false;
   }
 
@@ -572,22 +544,11 @@ bool test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging()
   return true;
 }
 
-bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
+bool test_direct_moe_rejects_non_nvfp4_configuration() {
   if (!has_cuda_device()) {
     std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
     return true;
   }
-
-  ScopedEnvVar scoped_unified("NEMOTRON_FORWARD_UNIFIED_FUSED");
-  ScopedEnvVar scoped_prefill("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-  ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
-  ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
-  ScopedEnvVar scoped_dense_fastpath("NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH");
-  unsetenv("NEMOTRON_FORWARD_UNIFIED_FUSED");
-  unsetenv("NEMOTRON_FORWARD_FUSED_MOE_PREFILL");
-  setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "0", 1);
-  setenv("NEMOTRON_EXPERT_MONOLITHIC", "0", 1);
-  setenv("NEMOTRON_FORWARD_LINEAR_DISABLE_DENSE_FASTPATH", "1", 1);
 
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
@@ -616,24 +577,18 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
       make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
   const auto gate_weight_descriptor =
       make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
-  auto shared_up_descriptor =
-      make_owned_nvfp4_descriptor(
+  const auto shared_up_descriptor =
+      make_dense_descriptor(
           mixer_prefix + ".shared_experts.up_proj.weight",
           shared_up_values,
           kIntermediateSize,
           kHiddenSize);
-  auto shared_down_descriptor =
-      make_owned_nvfp4_descriptor(
+  const auto shared_down_descriptor =
+      make_dense_descriptor(
           mixer_prefix + ".shared_experts.down_proj.weight",
           shared_down_values,
           kHiddenSize,
           kIntermediateSize);
-  if (!expect(shared_up_descriptor.has_value(), "shared up NVFP4 descriptor should build") ||
-      !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
-    return false;
-  }
-  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
-  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
 
   std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
   std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
@@ -641,8 +596,8 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
   bindings.input_norm_weight = &input_norm_descriptor;
   bindings.gate_weight = &gate_weight_descriptor;
   bindings.gate_score_correction_bias = &gate_bias_descriptor;
-  bindings.shared_up_gemm_weight = &shared_up_descriptor->descriptor;
-  bindings.shared_down_gemm_weight = &shared_down_descriptor->descriptor;
+  bindings.shared_up_gemm_weight = &shared_up_descriptor;
+  bindings.shared_down_gemm_weight = &shared_down_descriptor;
   bindings.routed_experts.resize(kRoutedExperts);
   for (std::size_t expert_index = 0; expert_index < kRoutedExperts; ++expert_index) {
     const std::string expert_prefix =
@@ -699,33 +654,11 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
   config.norm_topk_prob = true;
 
   auto slice = ExpertLayerSlice::Create(config, bindings);
-  if (!expect(slice != nullptr && slice->valid(), "nonresident expert layer slice should create")) {
-    return false;
-  }
-
-  std::vector<float> input_values(kTokenCount * kHiddenSize, 0.0f);
-  for (std::size_t token = 0; token < kTokenCount; ++token) {
-    for (std::size_t dim = 0; dim < kHiddenSize; ++dim) {
-      input_values[token * kHiddenSize + dim] =
-          (static_cast<float>(((token + 1) * 11 + (dim * 5)) % 41) - 20.0f) * 0.03125f;
-    }
-  }
-
-  auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  auto batch_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  if (!expect(batch_input != nullptr && batch_output != nullptr,
-              "batched tensors should allocate") ||
-      !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
-              "batched input should upload")) {
-    return false;
-  }
-
-  GemmHeuristicCache heuristic_cache;
   ResetExpertStagingCounters();
   if (!expect(
-          slice->Run(*cublas, &heuristic_cache, *batch_input, batch_output.get(), nullptr),
-          "nonresident batch run should succeed through fallback") ||
-      !expect(cudaDeviceSynchronize() == cudaSuccess, "fallback batch run should synchronize")) {
+          slice == nullptr || !slice->valid(),
+          "direct MoE should reject non-NVFP4 configuration at creation time") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "rejected create should leave device usable")) {
     return false;
   }
 
@@ -738,10 +671,7 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
           "nonresident routed weights should not stage routed experts") ||
       !expect(
           counters.total_bytes_uploaded.load(std::memory_order_relaxed) == 0,
-          "nonresident routed weights should not upload routed expert bytes at run time") ||
-      !expect(
-          counters.host_routing_adapter_calls.load(std::memory_order_relaxed) == 0,
-          "nonresident fallback should not route through the batched host adapter fast path")) {
+          "rejected direct MoE config should not upload routed expert bytes")) {
     return false;
   }
   return true;
@@ -752,7 +682,7 @@ bool test_nonresident_routed_weights_reject_fastpath_and_use_fallback() {
 int main() {
   return test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() &&
                  test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging() &&
-                 test_nonresident_routed_weights_reject_fastpath_and_use_fallback()
+                 test_direct_moe_rejects_non_nvfp4_configuration()
              ? 0
              : 1;
 }

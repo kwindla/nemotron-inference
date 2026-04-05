@@ -1173,10 +1173,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
-  ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
-  ScopedEnvOverride linear_device_fastpath("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", "1");
-
   if (!HasCudaDevice()) {
     std::cout << "nano_prefix_cache_ttft_bench: skipped (no CUDA device available)\n";
     return 0;

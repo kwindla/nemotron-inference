@@ -112,17 +112,6 @@ cublasLtMatmulMatrixScale_t ToCublasScaleMode(CublasLtScaleMode scale_mode) {
   return CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
 }
 
-std::optional<float> ReadTensorScaleHostFallback(const float* device_ptr) {
-  if (device_ptr == nullptr) {
-    return std::nullopt;
-  }
-  float host_value = 0.0f;
-  if (!CheckCuda(cudaMemcpy(&host_value, device_ptr, sizeof(host_value), cudaMemcpyDeviceToHost))) {
-    return std::nullopt;
-  }
-  return host_value;
-}
-
 struct CachedNvfp4MatmulKey {
   std::uintptr_t handle = 0;
   int device = -1;
@@ -705,8 +694,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
     const float* activation_tensor_scale_device,
     const Nvfp4PackedMatrixDeviceView& weights,
     const float* weight_tensor_scale_device,
-    DeviceTensorFp32* output,
-    bool allow_tensor_scale_host_fallback) {
+    DeviceTensorFp32* output) {
   const auto prepared = PrepareNvfp4MatmulCall(handle, plan, activations, weights, output);
   if (!prepared.has_value()) {
     return std::nullopt;
@@ -728,28 +716,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
         prepared->resources->device_beta,
         CUBLASLT_POINTER_MODE_DEVICE);
   }
-
-  if (!allow_tensor_scale_host_fallback) {
-    return std::nullopt;
-  }
-
-  const auto activation_tensor_scale_host =
-      ReadTensorScaleHostFallback(activation_tensor_scale_device);
-  const auto weight_tensor_scale_host =
-      ReadTensorScaleHostFallback(weight_tensor_scale_device);
-  if (!activation_tensor_scale_host.has_value() ||
-      !weight_tensor_scale_host.has_value()) {
-    return std::nullopt;
-  }
-
-  const float alpha = *activation_tensor_scale_host * *weight_tensor_scale_host;
-  const float beta = 0.0f;
-  return ExecutePreparedNvfp4Matmul(
-      handle,
-      *prepared,
-      &alpha,
-      &beta,
-      CUBLASLT_POINTER_MODE_HOST);
+  return std::nullopt;
 }
 
 std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32AccumToDevice(
@@ -791,8 +758,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options,
-    bool allow_tensor_scale_host_fallback) {
+    const Nvfp4PackOptions& pack_options) {
   if (!weights.valid()) {
     return std::nullopt;
   }
@@ -807,8 +773,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
       packed->device_tensor_scale_ptr(),
       weights,
       weights.tensor_scale_data,
-      output,
-      allow_tensor_scale_host_fallback);
+      output);
   if (!stats.has_value()) {
     return std::nullopt;
   }
@@ -827,16 +792,14 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options,
-    bool allow_tensor_scale_host_fallback) {
+    const Nvfp4PackOptions& pack_options) {
   return RunNvfp4RowMajorFp32SourceToDevice(
       handle,
       plan,
       activations,
       MakeNvfp4PackedMatrixDeviceView(weights),
       output,
-      pack_options,
-      allow_tensor_scale_host_fallback);
+      pack_options);
 }
 
 }  // namespace nemotron

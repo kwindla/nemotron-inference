@@ -336,16 +336,6 @@ target_compile_features(nano_attention_layer_integration_test PRIVATE cxx_std_17
 nemotron_add_test(nano_attention_layer_integration_test)
 
 add_executable(
-  attention_backend_policy_test
-  backend/attention_backend_policy_test.cpp
-)
-
-target_link_libraries(attention_backend_policy_test PRIVATE nemotron_runtime_backend)
-target_compile_features(attention_backend_policy_test PRIVATE cxx_std_17)
-
-nemotron_add_test(attention_backend_policy_test)
-
-add_executable(
   primitive_ops_test
   backend/primitive_ops_test.cpp
 )
@@ -355,17 +345,15 @@ target_compile_features(primitive_ops_test PRIVATE cxx_std_17)
 
 nemotron_add_test(primitive_ops_test)
 
-if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
-  add_executable(
-    attention_layer_test
-    backend/attention_layer_test.cpp
-  )
+add_executable(
+  attention_layer_test
+  backend/attention_layer_test.cpp
+)
 
-  target_link_libraries(attention_layer_test PRIVATE nemotron_runtime_backend)
-  target_compile_features(attention_layer_test PRIVATE cxx_std_17)
+target_link_libraries(attention_layer_test PRIVATE nemotron_runtime_backend)
+target_compile_features(attention_layer_test PRIVATE cxx_std_17)
 
-  nemotron_add_test(attention_layer_test)
-endif()
+nemotron_add_test(attention_layer_test)
 
 add_executable(
   nvfp4_weight_test

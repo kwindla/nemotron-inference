@@ -18,7 +18,7 @@ DEFAULT_MANIFEST = (
 )
 DEFAULT_PROMPTS_FILE = REPO_ROOT / "testing" / "oracle" / "prompts.json"
 ORACLE_GLOB = "nano_*_token_oracle_*.json"
-BUILD_DIR_CANDIDATES = ("build", "build-phase1-tests", "build-phase1", "build-benchmarks")
+BUILD_DIR_CANDIDATES = ("build-sm120-relwithdebinfo",)
 
 
 def git_output(cwd: pathlib.Path, *args: str) -> str | None:

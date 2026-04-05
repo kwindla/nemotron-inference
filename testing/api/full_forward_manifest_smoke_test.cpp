@@ -186,18 +186,6 @@ bool env_enabled(const char* env_var) {
   return value != nullptr && std::string(value) != "0";
 }
 
-std::optional<std::size_t> env_size_t(const char* env_var) {
-  const char* value = std::getenv(env_var);
-  if (value == nullptr || *value == '\0') {
-    return std::nullopt;
-  }
-  try {
-    return static_cast<std::size_t>(std::stoull(value));
-  } catch (...) {
-    return std::nullopt;
-  }
-}
-
 struct SplitPrefillComparison {
   std::vector<float> full_row;
   std::vector<float> split_row;
@@ -743,62 +731,6 @@ bool run_full_forward_manifest_smoke() {
       turn1_identity.token_ids.size() + turn1_result.generated_token_ids.size();
   const std::size_t turn2_suffix_tokens =
       turn2_identity.token_ids.size() - turn2_reused_prefix_tokens;
-  if (const auto stop_layer_index = env_size_t("NEMOTRON_FORWARD_COMPARE_SPLIT_PREFILL_LAYER");
-      stop_layer_index.has_value()) {
-    const bool activate_fused_moe_compare = env_enabled("NEMOTRON_FORWARD_COMPARE_FUSED_MOE");
-    const bool activate_device_attention_compare = env_enabled("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION");
-    const bool activate_fused_mamba_compare = env_enabled("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA");
-    if (activate_fused_moe_compare) {
-      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MOE_ACTIVE", "1", 1);
-    }
-    if (activate_device_attention_compare) {
-      setenv("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION_ACTIVE", "1", 1);
-    }
-    if (activate_fused_mamba_compare) {
-      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA_ACTIVE", "1", 1);
-    }
-    const auto comparison = compare_split_prefill_rows(
-        *model,
-        turn2_identity.token_ids,
-        turn2_reused_prefix_tokens,
-        config,
-        *stop_layer_index);
-    if (activate_fused_moe_compare) {
-      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MOE_ACTIVE", "0", 1);
-    }
-    if (activate_device_attention_compare) {
-      setenv("NEMOTRON_FORWARD_COMPARE_DEVICE_ATTENTION_ACTIVE", "0", 1);
-    }
-    if (activate_fused_mamba_compare) {
-      setenv("NEMOTRON_FORWARD_COMPARE_FUSED_MAMBA_ACTIVE", "0", 1);
-    }
-    if (!expect(
-            comparison.has_value(),
-            "targeted split-prefill layer comparison should succeed")) {
-      return false;
-    }
-    const auto full_argmax = argmax_token_id(comparison->full_row);
-    const auto split_argmax = argmax_token_id(comparison->split_row);
-    std::cout << "targeted_split_prefill: layer_index=" << *stop_layer_index
-              << " max_abs_diff=" << max_abs_diff(comparison->full_row, comparison->split_row)
-              << " request_state_match=" << comparison->request_state_match;
-    if (full_argmax.has_value()) {
-      std::cout << " full_argmax=" << *full_argmax;
-    }
-    if (split_argmax.has_value()) {
-      std::cout << " split_argmax=" << *split_argmax;
-    }
-    if (!comparison->full_row.empty() && !comparison->split_row.empty()) {
-      std::cout << " full0=" << comparison->full_row.front()
-                << " split0=" << comparison->split_row.front();
-    }
-    std::cout << "\n";
-    return full_argmax.has_value() &&
-           split_argmax.has_value() &&
-           *full_argmax == *split_argmax &&
-           max_abs_diff(comparison->full_row, comparison->split_row) <= 1.0e-3f &&
-           comparison->request_state_match;
-  }
   auto turn2_full_prefill_context = model->CreateRequestContext();
   auto turn2_split_prefill_context = model->CreateRequestContext();
   if (!expect(

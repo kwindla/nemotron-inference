@@ -65,26 +65,18 @@ bool EnvEnabledOrDefault(const char* env_var, bool default_enabled) {
   return value[0] != '\0' && std::string(value) != "0";
 }
 
-struct LinearFallbackObservation {
-  const char* counter_name = "";
-  std::uint64_t count = 0;
-};
-
 struct LinearCounterSnapshot {
   std::uint64_t dense_fastpath_plan_success = 0;
   std::uint64_t dense_fastpath_plan_fail = 0;
   std::uint64_t dense_fastpath_execute = 0;
   std::uint64_t dense_fastpath_execute_fail = 0;
-  std::uint64_t dense_reference_fallback = 0;
 
   std::uint64_t nvfp4_fastpath_plan_success = 0;
   std::uint64_t nvfp4_fastpath_plan_fail = 0;
   std::uint64_t nvfp4_fastpath_execute = 0;
   std::uint64_t nvfp4_fastpath_execute_fail = 0;
-  std::uint64_t nvfp4_reference_fallback = 0;
 
   std::uint64_t scaled_fp8_fastpath_execute = 0;
-  std::uint64_t scaled_fp8_reference_fallback = 0;
 };
 
 LinearCounterSnapshot SnapshotLinearOpCounters() {
@@ -98,8 +90,6 @@ LinearCounterSnapshot SnapshotLinearOpCounters() {
       counters.dense_fastpath_execute.load(std::memory_order_relaxed);
   snapshot.dense_fastpath_execute_fail =
       counters.dense_fastpath_execute_fail.load(std::memory_order_relaxed);
-  snapshot.dense_reference_fallback =
-      counters.dense_reference_fallback.load(std::memory_order_relaxed);
 
   snapshot.nvfp4_fastpath_plan_success =
       counters.nvfp4_fastpath_plan_success.load(std::memory_order_relaxed);
@@ -109,13 +99,9 @@ LinearCounterSnapshot SnapshotLinearOpCounters() {
       counters.nvfp4_fastpath_execute.load(std::memory_order_relaxed);
   snapshot.nvfp4_fastpath_execute_fail =
       counters.nvfp4_fastpath_execute_fail.load(std::memory_order_relaxed);
-  snapshot.nvfp4_reference_fallback =
-      counters.nvfp4_reference_fallback.load(std::memory_order_relaxed);
 
   snapshot.scaled_fp8_fastpath_execute =
       counters.scaled_fp8_fastpath_execute.load(std::memory_order_relaxed);
-  snapshot.scaled_fp8_reference_fallback =
-      counters.scaled_fp8_reference_fallback.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -130,8 +116,6 @@ LinearCounterSnapshot AddLinearCounterSnapshots(
   sum.dense_fastpath_execute = lhs.dense_fastpath_execute + rhs.dense_fastpath_execute;
   sum.dense_fastpath_execute_fail =
       lhs.dense_fastpath_execute_fail + rhs.dense_fastpath_execute_fail;
-  sum.dense_reference_fallback =
-      lhs.dense_reference_fallback + rhs.dense_reference_fallback;
 
   sum.nvfp4_fastpath_plan_success =
       lhs.nvfp4_fastpath_plan_success + rhs.nvfp4_fastpath_plan_success;
@@ -140,13 +124,9 @@ LinearCounterSnapshot AddLinearCounterSnapshots(
   sum.nvfp4_fastpath_execute = lhs.nvfp4_fastpath_execute + rhs.nvfp4_fastpath_execute;
   sum.nvfp4_fastpath_execute_fail =
       lhs.nvfp4_fastpath_execute_fail + rhs.nvfp4_fastpath_execute_fail;
-  sum.nvfp4_reference_fallback =
-      lhs.nvfp4_reference_fallback + rhs.nvfp4_reference_fallback;
 
   sum.scaled_fp8_fastpath_execute =
       lhs.scaled_fp8_fastpath_execute + rhs.scaled_fp8_fastpath_execute;
-  sum.scaled_fp8_reference_fallback =
-      lhs.scaled_fp8_reference_fallback + rhs.scaled_fp8_reference_fallback;
   return sum;
 }
 
@@ -164,9 +144,6 @@ void RestoreLinearOpCounters(const LinearCounterSnapshot& snapshot) {
   counters.dense_fastpath_execute_fail.store(
       snapshot.dense_fastpath_execute_fail,
       std::memory_order_relaxed);
-  counters.dense_reference_fallback.store(
-      snapshot.dense_reference_fallback,
-      std::memory_order_relaxed);
 
   counters.nvfp4_fastpath_plan_success.store(
       snapshot.nvfp4_fastpath_plan_success,
@@ -180,15 +157,9 @@ void RestoreLinearOpCounters(const LinearCounterSnapshot& snapshot) {
   counters.nvfp4_fastpath_execute_fail.store(
       snapshot.nvfp4_fastpath_execute_fail,
       std::memory_order_relaxed);
-  counters.nvfp4_reference_fallback.store(
-      snapshot.nvfp4_reference_fallback,
-      std::memory_order_relaxed);
 
   counters.scaled_fp8_fastpath_execute.store(
       snapshot.scaled_fp8_fastpath_execute,
-      std::memory_order_relaxed);
-  counters.scaled_fp8_reference_fallback.store(
-      snapshot.scaled_fp8_reference_fallback,
       std::memory_order_relaxed);
 }
 
@@ -197,46 +168,11 @@ void PrintLayerProbeLinearCounters(
     const LinearCounterSnapshot& snapshot) {
   std::cout << "nano_16_token_correctness_test: layer_probe layer_index="
             << layer_index
-            << " linear_counters dense_ref=" << snapshot.dense_reference_fallback
-            << " nvfp4_ref=" << snapshot.nvfp4_reference_fallback
-            << " fp8_ref=" << snapshot.scaled_fp8_reference_fallback << "\n";
+            << " linear_counters dense_plan_fail=" << snapshot.dense_fastpath_plan_fail
+            << " dense_execute_fail=" << snapshot.dense_fastpath_execute_fail
+            << " nvfp4_plan_fail=" << snapshot.nvfp4_fastpath_plan_fail
+            << " nvfp4_execute_fail=" << snapshot.nvfp4_fastpath_execute_fail << "\n";
   std::cout.flush();
-}
-
-std::vector<LinearFallbackObservation> CollectLinearReferenceFallbacks() {
-  const auto& counters = nemotron::GetLinearOpCounters();
-  std::vector<LinearFallbackObservation> fallbacks;
-  fallbacks.reserve(3);
-
-  const auto append_if_nonzero = [&fallbacks](const char* counter_name, const auto& counter) {
-    const std::uint64_t count = counter.load(std::memory_order_relaxed);
-    if (count != 0) {
-      fallbacks.push_back({counter_name, count});
-    }
-  };
-
-  append_if_nonzero("dense_reference_fallback", counters.dense_reference_fallback);
-  append_if_nonzero("nvfp4_reference_fallback", counters.nvfp4_reference_fallback);
-  append_if_nonzero(
-      "scaled_fp8_reference_fallback",
-      counters.scaled_fp8_reference_fallback);
-  return fallbacks;
-}
-
-void PrintUnexpectedLinearFallbackWarning(
-    std::ostream& stream,
-    const std::vector<LinearFallbackObservation>& fallbacks) {
-  if (fallbacks.empty()) {
-    return;
-  }
-
-  stream << "WARNING: nano_16_token_correctness_test: unexpected linear reference fallbacks "
-         << "while the linear device fastpath was enabled\n";
-  for (const LinearFallbackObservation& fallback : fallbacks) {
-    stream << "WARNING: nano_16_token_correctness_test: operator="
-           << fallback.counter_name
-           << " reference_fallback_count=" << fallback.count << "\n";
-  }
 }
 
 struct ExpertStagingSnapshot {
@@ -309,138 +245,43 @@ class ScopedExpertStagingCounterReport {
 
 class ScopedLinearCounterReport {
  public:
-  ScopedLinearCounterReport(
-      bool strict_linear_enabled,
-      bool linear_device_fastpath_enabled)
-      : strict_linear_enabled_(strict_linear_enabled),
-        linear_device_fastpath_enabled_(linear_device_fastpath_enabled) {
+  ScopedLinearCounterReport() {
     nemotron::ResetLinearOpCounters();
   }
 
   ~ScopedLinearCounterReport() {
     nemotron::PrintLinearOpCounterSummary(std::cout);
     std::cout.flush();
-
-    if (!strict_linear_enabled_ || !linear_device_fastpath_enabled_) {
-      return;
-    }
-
-    const std::vector<LinearFallbackObservation> fallbacks =
-        CollectLinearReferenceFallbacks();
-    if (fallbacks.empty()) {
-      return;
-    }
-
-    PrintUnexpectedLinearFallbackWarning(std::cerr, fallbacks);
-    std::cerr.flush();
   }
 
   ScopedLinearCounterReport(const ScopedLinearCounterReport&) = delete;
   ScopedLinearCounterReport& operator=(const ScopedLinearCounterReport&) = delete;
-
- private:
-  bool strict_linear_enabled_ = false;
-  bool linear_device_fastpath_enabled_ = false;
-};
-
-class ScopedEnvOverride {
- public:
-  ScopedEnvOverride(const char* name, const char* value) : name_(name) {
-    const char* existing = std::getenv(name_.c_str());
-    if (existing != nullptr) {
-      had_original_ = true;
-      original_value_ = existing;
-    }
-    if (value == nullptr) {
-      unsetenv(name_.c_str());
-    } else {
-      setenv(name_.c_str(), value, 1);
-    }
-  }
-
-  ~ScopedEnvOverride() {
-    if (had_original_) {
-      setenv(name_.c_str(), original_value_.c_str(), 1);
-    } else {
-      unsetenv(name_.c_str());
-    }
-  }
-
-  ScopedEnvOverride(const ScopedEnvOverride&) = delete;
-  ScopedEnvOverride& operator=(const ScopedEnvOverride&) = delete;
-
- private:
-  std::string name_;
-  std::string original_value_;
-  bool had_original_ = false;
 };
 
 struct PrefillRouteConfig {
   const char* route_id = "";
   const char* description = "";
-  bool fused_mamba_decode_enabled = false;
-  bool fused_moe_decode_enabled = false;
   bool sequential_prefill_enabled = false;
 };
 
-std::string RouteFlagOverrideEnvName(
-    const PrefillRouteConfig& route,
-    const char* flag_name) {
-  return std::string("NEMOTRON_NANO_ROUTE_") + route.route_id + "_" + flag_name;
-}
-
-bool RouteFlagEnabled(
-    const PrefillRouteConfig& route,
-    const char* flag_name,
-    bool default_value) {
-  const std::string env_name = RouteFlagOverrideEnvName(route, flag_name);
-  const char* value = std::getenv(env_name.c_str());
-  if (value == nullptr || value[0] == '\0') {
-    return default_value;
-  }
-  return std::strcmp(value, "0") != 0;
-}
-
 class ScopedRouteOverrides {
  public:
-  explicit ScopedRouteOverrides(const PrefillRouteConfig& route)
-      : fused_mamba_(
-            "NEMOTRON_FORWARD_FUSED_MAMBA_DECODE",
-            RouteFlagEnabled(
-                    route,
-                    "FUSED_MAMBA_DECODE",
-                    route.fused_mamba_decode_enabled)
-                ? "1"
-                : "0"),
-        fused_moe_(
-            "NEMOTRON_FORWARD_FUSED_MOE_DECODE",
-            RouteFlagEnabled(
-                    route,
-                    "FUSED_MOE_DECODE",
-                    route.fused_moe_decode_enabled)
-                ? "1"
-                : "0") {}
+  explicit ScopedRouteOverrides(const PrefillRouteConfig& route) {
+    (void)route;
+  }
 
   ScopedRouteOverrides(const ScopedRouteOverrides&) = delete;
   ScopedRouteOverrides& operator=(const ScopedRouteOverrides&) = delete;
-
- private:
-  ScopedEnvOverride fused_mamba_;
-  ScopedEnvOverride fused_moe_;
 };
 
 constexpr PrefillRouteConfig kRouteA = {
-    "A",
-    "sequential single-token baseline",
-    false,
-    false,
+    "baseline",
+    "sequential single-token contract replay",
     true,
 };
 constexpr PrefillRouteConfig kRouteC = {
-    "C",
-    "batched prefill (GPU Mamba prefill) + fused decode",
-    true,
-    true,
+    "native",
+    "native batched prefill + decode",
     false,
 };
 
@@ -451,7 +292,7 @@ std::string PairId(
 }
 
 std::string RouteLabel(const PrefillRouteConfig& route) {
-  return std::string("Route ") + route.route_id;
+  return route.route_id;
 }
 
 std::string RouteDetail(const PrefillRouteConfig& route) {
@@ -980,8 +821,8 @@ void PrintPrefillSummaryTable(
   const std::streamsize previous_precision = std::cout.precision();
 
   std::cout << "nano_16_token_correctness_test: prefill route legend "
-            << "A=(" << kRouteA.description << "), "
-            << "C=(" << kRouteC.description << ")\n";
+            << kRouteA.route_id << "=(" << kRouteA.description << "), "
+            << kRouteC.route_id << "=(" << kRouteC.description << ")\n";
   std::cout << "nano_16_token_correctness_test: prefill comparison matrix\n";
   std::cout << std::left << std::setw(8) << "pair"
             << std::setw(12) << "lhs_token"
@@ -1530,19 +1371,13 @@ bool run_nano_correctness_gate() {
     return false;
   }
 
-  const bool strict_linear_enabled =
-      EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_LINEAR", false);
   const bool strict_expert_staging_enabled =
       EnvEnabledOrDefault("NEMOTRON_NANO_16_STRICT_EXPERT_STAGING", false);
-  const bool linear_device_fastpath_enabled =
-      EnvEnabledOrDefault("NEMOTRON_FORWARD_LINEAR_DEVICE_FASTPATH", true);
   const bool capture_embedding_trace =
       EnvEnabledOrDefault("NEMOTRON_NANO_16_TRACE_EMBEDDING", false);
   ScopedExpertStagingCounterReport expert_staging_counter_report(
       strict_expert_staging_enabled);
-  ScopedLinearCounterReport linear_counter_report(
-      strict_linear_enabled,
-      linear_device_fastpath_enabled);
+  ScopedLinearCounterReport linear_counter_report;
 
   const char* oracle_env = std::getenv("NEMOTRON_NANO_16_ORACLE_PATH");
   const bool using_saved_oracle = oracle_env != nullptr && oracle_env[0] != '\0';
@@ -1555,7 +1390,7 @@ bool run_nano_correctness_gate() {
     std::cout << "nano_16_token_correctness_test: using saved oracle from "
               << saved_oracle->path.string() << "\n";
   } else {
-    std::cout << "nano_16_token_correctness_test: running live Route A reference\n";
+    std::cout << "nano_16_token_correctness_test: running live baseline contract reference\n";
   }
   std::cout.flush();
 
@@ -1567,10 +1402,10 @@ bool run_nano_correctness_gate() {
   if ((!using_saved_oracle &&
        !expect(
            route_a_context != nullptr && route_a_context->valid(),
-           "Route A request context should create")) ||
+           "baseline request context should create")) ||
       !expect(
           route_c_context != nullptr && route_c_context->valid(),
-          "Route C request context should create")) {
+          "native request context should create")) {
     return false;
   }
 
@@ -1582,8 +1417,8 @@ bool run_nano_correctness_gate() {
   const auto route_c_prefill =
       RunPrefillBoundary(*model, kRouteC, *route_c_context, capture_embedding_trace);
   if ((!using_saved_oracle &&
-       !expect(route_a_live_prefill.has_value(), "Route A prefill boundary should succeed")) ||
-      !expect(route_c_prefill.has_value(), "Route C prefill boundary should succeed")) {
+       !expect(route_a_live_prefill.has_value(), "baseline prefill boundary should succeed")) ||
+      !expect(route_c_prefill.has_value(), "native prefill boundary should succeed")) {
     return false;
   }
   const BoundaryObservation route_a_prefill =
@@ -1615,7 +1450,7 @@ bool run_nano_correctness_gate() {
           *route_c_context,
           consume_token,
           token_index);
-      if (!expect(route_c_step.has_value(), "Route C continuation boundary should succeed")) {
+      if (!expect(route_c_step.has_value(), "native continuation boundary should succeed")) {
         return false;
       }
 
@@ -1651,13 +1486,13 @@ bool run_nano_correctness_gate() {
         RunContinuationBoundary(*model, kRouteA, *route_a_context, route_a_token, token_index);
     const auto route_c_step =
         RunContinuationBoundary(*model, kRouteC, *route_c_context, route_c_token, token_index);
-    if (!expect(route_a_step.has_value(), "Route A continuation boundary should succeed") ||
-        !expect(route_c_step.has_value(), "Route C continuation boundary should succeed")) {
+    if (!expect(route_a_step.has_value(), "baseline continuation boundary should succeed") ||
+        !expect(route_c_step.has_value(), "native continuation boundary should succeed")) {
       return false;
     }
     if (route_a_step->selected_token_id != route_c_step->selected_token_id) {
       PrintBoundaryMismatch("decode", token_index, kRouteA, *route_a_step, kRouteC, *route_c_step);
-      std::cerr << "route_a_top1=[" << TopKSummary(route_a_step->logits_row, 1) << "]\n";
+      std::cerr << "baseline_top1=[" << TopKSummary(route_a_step->logits_row, 1) << "]\n";
       std::cerr << "generated_tokens_before_divergence=[";
       PrintTokenSequence(std::cerr, generated_token_ids);
       std::cerr << "]\n";

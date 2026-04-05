@@ -19,9 +19,6 @@
 namespace nemotron {
 namespace {
 
-constexpr const char* kNvfp4ActivationTensorScaleEnvVar =
-    "NEMOTRON_FORWARD_NVFP4_ACTIVATION_TENSOR_SCALE";
-
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
@@ -43,29 +40,9 @@ bool CopyDeviceBufferToHost(
              cudaMemcpyDeviceToHost));
 }
 
-std::optional<float> ParsePositiveFloatEnv(const char* env_var) {
-  const char* value = std::getenv(env_var);
-  if (value == nullptr || value[0] == '\0') {
-    return std::nullopt;
-  }
-
-  errno = 0;
-  char* end = nullptr;
-  const float parsed = std::strtof(value, &end);
-  if (end == value || (end != nullptr && *end != '\0') || errno == ERANGE ||
-      !std::isfinite(parsed) || parsed <= 0.0f) {
-    return std::nullopt;
-  }
-  return parsed;
-}
-
 Nvfp4PackOptions RuntimeMoeNvfp4PackOptions() {
   Nvfp4PackOptions options;
   options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
-  if (const auto fixed_tensor_scale = ParsePositiveFloatEnv(kNvfp4ActivationTensorScaleEnvVar);
-      fixed_tensor_scale.has_value()) {
-    options.fixed_tensor_scale = *fixed_tensor_scale;
-  }
   return options;
 }
 
@@ -366,7 +343,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
            pack_options)
            .has_value() ||
       // The caller already updated the BF16 residual buffer at the layer entry.
-      // This backend must return only the MoE delta, not input + delta.
+      // This path must return only the MoE delta, not input + delta.
       !ResidualAddFp32(*routed_output, *output, output.get())) {
     return false;
   }

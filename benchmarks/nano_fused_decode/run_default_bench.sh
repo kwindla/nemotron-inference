@@ -13,7 +13,7 @@ fi
 
 BUILD_DIR="${NEMOTRON_BUILD_DIR:-}"
 if [[ -z "${BUILD_DIR}" ]]; then
-  for candidate in build-benchmarks build-phase1-tests build-phase1 build; do
+  for candidate in build-sm120-relwithdebinfo; do
     if [[ -x "${ROOT_DIR}/${candidate}/benchmarks/nano_fused_decode/nano_fused_decode_bench" ]]; then
       BUILD_DIR="${candidate}"
       break
@@ -107,14 +107,11 @@ required_linear = (
     "dense_fastpath_plan_fail",
     "dense_fastpath_execute",
     "dense_fastpath_execute_fail",
-    "dense_reference_fallback",
     "nvfp4_fastpath_plan_success",
     "nvfp4_fastpath_plan_fail",
     "nvfp4_fastpath_execute",
     "nvfp4_fastpath_execute_fail",
-    "nvfp4_reference_fallback",
     "scaled_fp8_fastpath_execute",
-    "scaled_fp8_reference_fallback",
 )
 required_expert = (
     "total_bytes_uploaded",
@@ -123,7 +120,7 @@ required_expert = (
     "staging_elapsed_us",
 )
 
-for field in ("mode", "device_token_select_enabled"):
+for field in ("mode",):
     if field not in benchmark:
         raise KeyError(f"benchmark.{field}")
 for field in required_linear:

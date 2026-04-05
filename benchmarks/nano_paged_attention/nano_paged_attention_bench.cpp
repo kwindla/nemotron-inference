@@ -18,8 +18,6 @@
 
 namespace {
 
-using nemotron::attention_harness::AttentionExecutionBackend;
-using nemotron::attention_harness::AttentionExecutionBackendName;
 using nemotron::attention_harness::CaseSpec;
 using nemotron::attention_harness::Runner;
 
@@ -30,7 +28,6 @@ struct BenchmarkOptions {
   std::optional<std::filesystem::path> json_output_path;
   bool list_cases_only = false;
   bool enable_nvtx = true;
-  AttentionExecutionBackend backend = AttentionExecutionBackend::kNanoMultiToken;
 };
 
 struct EnvironmentInfo {
@@ -109,23 +106,7 @@ void PrintUsage(const char* argv0) {
       << "  --warmup <count>             Warmup iterations, default: 1\n"
       << "  --iterations <count>         Hot timed iterations, default: 5\n"
       << "  --json-output <path>         Write JSON results to a file\n"
-      << "  --backend <name>            One of: nano_multi_token, device_fallback\n"
       << "  --disable-nvtx              Disable NVTX ranges for profiler traces\n";
-}
-
-bool ParseBackend(std::string_view value, AttentionExecutionBackend* backend) {
-  if (backend == nullptr) {
-    return false;
-  }
-  if (value == "nano_multi_token") {
-    *backend = AttentionExecutionBackend::kNanoMultiToken;
-    return true;
-  }
-  if (value == "device_fallback") {
-    *backend = AttentionExecutionBackend::kDeviceFallback;
-    return true;
-  }
-  return false;
 }
 
 bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
@@ -164,13 +145,6 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
         return false;
       }
       options->json_output_path = std::filesystem::path(argv[++i]);
-    } else if (arg == "--backend") {
-      if (i + 1 >= argc) {
-        return false;
-      }
-      if (!ParseBackend(argv[++i], &options->backend)) {
-        return false;
-      }
     } else if (arg == "--disable-nvtx") {
       options->enable_nvtx = false;
     } else if (arg == "--help" || arg == "-h") {
@@ -223,7 +197,7 @@ std::vector<const CaseSpec*> SelectCases(const BenchmarkOptions& options) {
 std::optional<BenchmarkResult> RunCase(
     const CaseSpec& spec,
     const BenchmarkOptions& options) {
-  auto runner = Runner::Create(spec, options.backend);
+  auto runner = Runner::Create(spec);
   if (!runner) {
     return std::nullopt;
   }
@@ -256,7 +230,7 @@ std::optional<BenchmarkResult> RunCase(
   BenchmarkResult result;
   result.case_name = spec.name;
   result.phase = spec.phase;
-  result.backend = AttentionExecutionBackendName(options.backend);
+  result.backend = "nano_multi_token";
   result.prefix_tokens = spec.prefix_tokens;
   result.query_tokens = spec.query_tokens;
   result.total_sequence_tokens = spec.total_sequence_tokens;

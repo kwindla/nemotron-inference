@@ -26,16 +26,13 @@ void ResetLinearOpCounters() {
   ResetCounter(&counters.dense_fastpath_plan_fail);
   ResetCounter(&counters.dense_fastpath_execute);
   ResetCounter(&counters.dense_fastpath_execute_fail);
-  ResetCounter(&counters.dense_reference_fallback);
 
   ResetCounter(&counters.nvfp4_fastpath_plan_success);
   ResetCounter(&counters.nvfp4_fastpath_plan_fail);
   ResetCounter(&counters.nvfp4_fastpath_execute);
   ResetCounter(&counters.nvfp4_fastpath_execute_fail);
-  ResetCounter(&counters.nvfp4_reference_fallback);
 
   ResetCounter(&counters.scaled_fp8_fastpath_execute);
-  ResetCounter(&counters.scaled_fp8_reference_fallback);
 }
 
 void PrintLinearOpCounterSummary(std::ostream& stream) {
@@ -49,8 +46,6 @@ void PrintLinearOpCounterSummary(std::ostream& stream) {
          << LoadCounter(counters.dense_fastpath_execute)
          << " dense_fastpath_execute_fail="
          << LoadCounter(counters.dense_fastpath_execute_fail)
-         << " dense_reference_fallback="
-         << LoadCounter(counters.dense_reference_fallback)
          << " nvfp4_fastpath_plan_success="
          << LoadCounter(counters.nvfp4_fastpath_plan_success)
          << " nvfp4_fastpath_plan_fail="
@@ -59,12 +54,8 @@ void PrintLinearOpCounterSummary(std::ostream& stream) {
          << LoadCounter(counters.nvfp4_fastpath_execute)
          << " nvfp4_fastpath_execute_fail="
          << LoadCounter(counters.nvfp4_fastpath_execute_fail)
-         << " nvfp4_reference_fallback="
-         << LoadCounter(counters.nvfp4_reference_fallback)
          << " scaled_fp8_fastpath_execute="
          << LoadCounter(counters.scaled_fp8_fastpath_execute)
-         << " scaled_fp8_reference_fallback="
-         << LoadCounter(counters.scaled_fp8_reference_fallback)
          << "\n";
 }
 

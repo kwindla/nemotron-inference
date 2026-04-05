@@ -1,6 +1,6 @@
 #pragma once
 
-#include "nemotron/attention_device_fallback.h"
+#include "nemotron/attention_native_kernels.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/paged_attention_plan.h"
 #include "nemotron/paged_kv_cache.h"
@@ -30,21 +30,6 @@ constexpr std::size_t kKvHeadCount = 2;
 constexpr std::size_t kHeadDim = 128;
 constexpr std::size_t kTokensPerPage = 16;
 constexpr std::size_t kMaxNanoMultiTokenQueryTokens = 1024;
-
-enum class AttentionExecutionBackend {
-  kDeviceFallback = 0,
-  kNanoMultiToken,
-};
-
-inline const char* AttentionExecutionBackendName(AttentionExecutionBackend backend) {
-  switch (backend) {
-    case AttentionExecutionBackend::kDeviceFallback:
-      return "device_fallback";
-    case AttentionExecutionBackend::kNanoMultiToken:
-      return "nano_multi_token";
-  }
-  return "unknown";
-}
 
 struct CaseSpec {
   std::string name;
@@ -404,10 +389,8 @@ inline float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>&
 
 class Runner {
  public:
-  static std::unique_ptr<Runner> Create(
-      const CaseSpec& spec,
-      AttentionExecutionBackend backend = AttentionExecutionBackend::kNanoMultiToken) {
-    auto runner = std::unique_ptr<Runner>(new Runner(spec, backend));
+  static std::unique_ptr<Runner> Create(const CaseSpec& spec) {
+    auto runner = std::unique_ptr<Runner>(new Runner(spec));
     if (!runner->Initialize()) {
       return nullptr;
     }
@@ -458,8 +441,7 @@ class Runner {
       }
     }
 
-    if (backend_ == AttentionExecutionBackend::kNanoMultiToken &&
-        spec_.query_tokens > kMaxNanoMultiTokenQueryTokens) {
+    if (spec_.query_tokens > kMaxNanoMultiTokenQueryTokens) {
       return RunNanoMultiTokenChunked(emit_nvtx);
     }
 
@@ -477,47 +459,23 @@ class Runner {
 
     {
       ScopedNvtxRange range(emit_nvtx, spec_.name + ".attention");
-      switch (backend_) {
-        case AttentionExecutionBackend::kNanoMultiToken:
-          if (!RunPagedAttentionNanoMultiToken(
-                  *query_attention_,
-                  *key_cache_,
-                  *value_cache_,
-                  cache_config_,
-                  kBatchSize,
-                  batch_plan_.max_pages_per_sequence,
-                  page_table_->data(),
-                  sequence_lengths_->data(),
-                  query_sequence_lengths_->data(),
-                  query_starts_->data(),
-                  kQueryHeadCount,
-                  spec_.query_tokens,
-                  1.0f / std::sqrt(static_cast<float>(kHeadDim)),
-                  spec_.causal,
-                  output_attention_.get())) {
-            return false;
-          }
-          break;
-        case AttentionExecutionBackend::kDeviceFallback:
-          if (!RunPagedAttentionDeviceFallback(
-                  *query_attention_,
-                  *key_cache_,
-                  *value_cache_,
-                  cache_config_,
-                  kBatchSize,
-                  batch_plan_.max_pages_per_sequence,
-                  page_table_->data(),
-                  sequence_lengths_->data(),
-                  query_sequence_lengths_->data(),
-                  query_starts_->data(),
-                  kQueryHeadCount,
-                  spec_.query_tokens,
-                  1.0f / std::sqrt(static_cast<float>(kHeadDim)),
-                  spec_.causal,
-                  output_attention_.get())) {
-            return false;
-          }
-          break;
+      if (!RunPagedAttentionNanoMultiToken(
+              *query_attention_,
+              *key_cache_,
+              *value_cache_,
+              cache_config_,
+              kBatchSize,
+              batch_plan_.max_pages_per_sequence,
+              page_table_->data(),
+              sequence_lengths_->data(),
+              query_sequence_lengths_->data(),
+              query_starts_->data(),
+              kQueryHeadCount,
+              spec_.query_tokens,
+              1.0f / std::sqrt(static_cast<float>(kHeadDim)),
+              spec_.causal,
+              output_attention_.get())) {
+        return false;
       }
     }
 
@@ -566,11 +524,10 @@ class Runner {
         spec_.query_tokens,
         spec_.prefix_tokens,
         spec_.causal);
-  }
+ }
 
  private:
-  Runner(CaseSpec spec, AttentionExecutionBackend backend)
-      : spec_(std::move(spec)), backend_(backend) {}
+  explicit Runner(CaseSpec spec) : spec_(std::move(spec)) {}
 
   bool Initialize() {
     if (!HasCudaDevice() ||
@@ -864,7 +821,6 @@ class Runner {
   }
 
   CaseSpec spec_;
-  AttentionExecutionBackend backend_ = AttentionExecutionBackend::kDeviceFallback;
   AttentionKvCacheConfig cache_config_{};
   PagedAttentionBatchPlan batch_plan_{};
   std::size_t total_pages_ = 0;
