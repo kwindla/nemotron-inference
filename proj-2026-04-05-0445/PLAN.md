@@ -130,12 +130,18 @@ the result will leave a large known cost untouched.
   - or replace it with a different activation/input contract.
   Do not start grouped routed-expert work until this is explicit.
 
-  **Decision**: Eliminate runtime FP32→NVFP4 packing entirely. The grouped
-  MoE kernel (step 3) will accept BF16 activations directly and quantize
-  on-the-fly during GEMM tile loads, like vLLM and TRT-LLM do. This removes
-  16.9% of GPU time (10.7% packing + 6.2% max-abs). The current per-expert
-  cuBLASLt path requires pre-packed NVFP4 activations, which is a hard
-  contract limitation of cuBLASLt — this is why we need our own kernel.
+  **Decision (revised after TRT-LLM investigation)**: Keep FP4×FP4 on the
+  tensor cores — that is what cuBLASLt, vLLM, and TRT-LLM all do. The
+  problem is not that activations are quantized to NVFP4; the problem is
+  that the current path quantizes **per expert** inside the per-expert host
+  loop. The fix is:
+  1. Quantize activations to NVFP4 **once per layer** (one kernel launch)
+  2. Grouped FP4×FP4 GEMM for all experts in one launch using SM120
+     tensor core MMA instructions
+  TRT-LLM does exactly this: separate `fp4_quantize()` kernel, then
+  grouped CUTLASS FP4×FP4 GEMM. An earlier scaffold kernel using scalar
+  `Nvfp4RowMajorDot()` was removed because it bypassed tensor cores
+  entirely — the production kernel must use FP4×FP4 MMA.
 
   Key files:
   `runtime/src/backend/fused_moe_prefill.cu`,
@@ -143,20 +149,29 @@ the result will leave a large known cost untouched.
   `runtime/src/backend/device_nvfp4_matrix.cu`,
   `runtime/src/api/single_token_forward_model.cpp`
 
-- [ ] **3. Prototype reduced-launch routed-expert execution**
-  Revisit grouped routed-expert execution with the new profile in mind. The
-  candidate design is still "routing separate, grouped expert execution,
-  finalize explicit", informed by vLLM and TRT-LLM prior art. But the first
-  production-form prototype should be judged against the post-attention
-  baseline, not the old 6-second TTFT world.
+- [ ] **3. Grouped FP4×FP4 tensor core MoE kernel**
+  Write a single CUDA kernel that processes all routed experts in one launch
+  using SM120 FP4×FP4→FP32 tensor core MMA instructions. The architecture:
+  1. **Quantize activations to NVFP4 once** — one kernel converts the full
+     BF16 normalized input to block-scaled FP4 + scales. (Matches TRT-LLM's
+     `fp4_quantize()` step.)
+  2. **Grouped GEMM** — one kernel launch for all experts. Each block
+     handles one (expert, tile) pair. Both activations and weights are FP4.
+     CUTLASS-style tiled GEMM with warp-level MMA instructions. Fuse ReLU²
+     between up and down projections. Weighted scatter to output.
+  3. Wire into `expert_layer.cpp` behind an env-var gate, compare against
+     the cuBLASLt path for correctness.
   Exit criterion:
-  - lower routed-path GPU time than the current per-expert path
+  - lower routed-path GPU time than the current per-expert cuBLASLt path
   - no regression in correctness on real Nano weights
-  - a clear story for how input packing is handled
+  - FP4×FP4 on tensor cores, not scalar dot products
   Key files:
+  `runtime/src/backend/fused_moe_grouped.cu` (new),
   `runtime/src/backend/expert_layer.cpp`,
-  `runtime/src/backend/fused_moe_prefill.cu`,
   `runtime/src/backend/expert_routing_device.cu`
+  Reference:
+  `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/`,
+  `third_party/TensorRT-LLM/cpp/tensorrt_llm/thop/fp4Quantize.cpp`
 
 - [ ] **4. Reduce routed dispatch/finalize and allocator churn**
   The current post-attention profile still shows meaningful routed non-GEMM
@@ -233,7 +248,7 @@ the result will leave a large known cost untouched.
 
 All future steps in this plan are measured against the baselines above.
 Success means materially reducing routed-MoE and/or Mamba kernel time
-without regressing correctness (62/62 ctest), decode throughput, or
+without regressing correctness (ctest green), decode throughput, or
 attention prefill latency.
 
 ## Verification Policy
@@ -260,8 +275,8 @@ attention prefill latency.
 |---|------|--------|-------|
 | 0 | Freeze the post-attention baseline and root-cause profile | done | `1024` cold TTFT `440.312 ms`, `4096` cold TTFT `1369.694 ms`, attention now about `6%` of GPU kernel time |
 | 1 | Lock the revised optimization contract | done | Baseline frozen below |
-| 2 | Decide routed-expert input format and packing strategy | done | Eliminate packing; kernel accepts BF16 directly, quantizes on-the-fly |
-| 3 | Prototype reduced-launch routed-expert execution | pending | |
+| 2 | Decide routed-expert input format and packing strategy | done | FP4×FP4 on tensor cores; quantize activations once per layer, grouped GEMM for all experts |
+| 3 | Grouped FP4×FP4 tensor core MoE kernel | pending | Scaffold using scalar Nvfp4RowMajorDot was reverted — production kernel must use MMA |
 | 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
 | 5 | Optimize Mamba prefill | pending | |
 | 6 | Re-profile and choose the next default workstream | pending | |
