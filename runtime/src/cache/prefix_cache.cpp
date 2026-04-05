@@ -340,7 +340,14 @@ PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
   if (!impl_->enabled || impl_->state_arena == nullptr) {
     return 0;
   }
-  const auto state = SnapshotRequestState(*impl_->state_arena, request_context, state_label);
+  auto state = SnapshotRequestState(*impl_->state_arena, request_context, state_label);
+  if (!state.has_value() && DropUniqueConversationHeadForRetry(conversation_id)) {
+    // Committed-head replacement only needs one resident snapshot in steady
+    // state. When the prior head is unique to this conversation, retry once
+    // after freeing it so very large prefixes can advance under a tight
+    // reusable-state budget.
+    state = SnapshotRequestState(*impl_->state_arena, request_context, state_label);
+  }
   if (!state.has_value()) {
     return 0;
   }
@@ -639,6 +646,30 @@ void PrefixCache::RemoveConversationRole(PrefixNodeId node_id, const std::string
   if (!impl_->NodeHasRoles(node)) {
     impl_->RemoveNode(node_id);
   }
+}
+
+bool PrefixCache::DropUniqueConversationHeadForRetry(const std::string& conversation_id) {
+  auto head_it = impl_->committed_heads.find(conversation_id);
+  if (head_it == impl_->committed_heads.end()) {
+    return false;
+  }
+
+  auto node_it = impl_->nodes.find(head_it->second);
+  if (node_it == impl_->nodes.end()) {
+    impl_->committed_heads.erase(head_it);
+    return false;
+  }
+
+  const Impl::CacheNode& node = node_it->second;
+  if (node.is_global_root ||
+      node.committed_conversations.size() != 1 ||
+      node.committed_conversations.count(conversation_id) == 0) {
+    return false;
+  }
+
+  impl_->committed_heads.erase(head_it);
+  RemoveConversationRole(node.id, conversation_id);
+  return true;
 }
 
 void PrefixCache::EvictToBudget() {

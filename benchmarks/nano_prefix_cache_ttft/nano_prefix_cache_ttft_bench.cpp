@@ -86,6 +86,10 @@ struct BenchmarkOptions {
   std::size_t measured_iterations = kDefaultIterations;
   std::size_t tail_token_count = kDefaultTailTokenCount;
   std::size_t moe_prefill_window_tokens = 0;
+  std::size_t target_active_requests = 1;
+  bool skip_commit_snapshot = false;
+  std::vector<std::size_t> prefix_lengths;
+  std::vector<std::string> case_filters;
 };
 
 enum class Scenario {
@@ -298,7 +302,8 @@ void PrintUsage(const char* argv0) {
   std::cerr
       << "Usage: " << argv0
       << " [--warmup <count>] [--iterations <count>] [--tail-token-count <count>]"
-      << " [--moe-prefill-window-tokens <count>]\n"
+      << " [--moe-prefill-window-tokens <count>] [--target-active-requests <count>]"
+      << " [--prefix-length <count>] [--case <case-name>] [--skip-commit-snapshot]\n"
       << "  Manifest path is read from NEMOTRON_FORWARD_MANIFEST.\n"
       << "  --warmup <count>      Discarded warmup iterations per case. Default: 1\n"
       << "  --iterations <count>  Measured iterations per case (must be >= 5). Default: 5\n"
@@ -306,7 +311,14 @@ void PrintUsage(const char* argv0) {
       << "                        Tail token count for resumed-prefix cases. Default: 32\n"
       << "  --moe-prefill-window-tokens <count>\n"
       << "                        Explicit SingleTokenForwardConfig.moe_prefill_window_tokens.\n"
-      << "                        Default: 0 (use the runtime production default).\n";
+      << "                        Default: 0 (use the runtime production default).\n"
+      << "  --target-active-requests <count>\n"
+      << "                        Runtime bootstrap target active requests. Default: 1\n"
+      << "  --prefix-length <count>\n"
+      << "                        Prefix length to benchmark. Repeatable. Defaults: 256, 1024, 4096\n"
+      << "  --case <case-name>    Run only the named benchmark case. Repeatable.\n"
+      << "  --skip-commit-snapshot\n"
+      << "                        Skip publishing the next committed snapshot after resumed decode.\n";
 }
 
 bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
@@ -332,6 +344,23 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
           !ParseNonNegativeSizeT(argv[++i], &options->moe_prefill_window_tokens)) {
         return false;
       }
+    } else if (arg == "--target-active-requests") {
+      if (i + 1 >= argc || !ParsePositiveSizeT(argv[++i], &options->target_active_requests)) {
+        return false;
+      }
+    } else if (arg == "--prefix-length") {
+      std::size_t prefix_length = 0;
+      if (i + 1 >= argc || !ParsePositiveSizeT(argv[++i], &prefix_length)) {
+        return false;
+      }
+      options->prefix_lengths.push_back(prefix_length);
+    } else if (arg == "--case") {
+      if (i + 1 >= argc) {
+        return false;
+      }
+      options->case_filters.push_back(argv[++i]);
+    } else if (arg == "--skip-commit-snapshot") {
+      options->skip_commit_snapshot = true;
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage(argv[0]);
       std::exit(0);
@@ -369,14 +398,16 @@ std::optional<ResolvedMoePrefillSettings> ResolveMoePrefillSettingsForHeader(
   return resolved;
 }
 
-nemotron::RuntimeBootstrapOptions MakeOptions(std::size_t max_context_tokens) {
+nemotron::RuntimeBootstrapOptions MakeOptions(
+    std::size_t max_context_tokens,
+    std::size_t target_active_requests) {
   nemotron::RuntimeBootstrapOptions options;
   options.service_target.total_memory_bytes = GiB(32);
   options.service_target.weights_bytes = GiB(20);
   options.service_target.workspace_bytes = GiB(1);
   options.service_target.graph_bytes = 512ULL * 1024 * 1024;
   options.service_target.safety_headroom_bytes = GiB(1);
-  options.service_target.target_active_requests = 1;
+  options.service_target.target_active_requests = target_active_requests;
   options.service_target.target_context_tokens = max_context_tokens;
   options.use_fp16_mamba_state = false;
   options.reusable_node_metadata_bytes = 4096;
@@ -425,6 +456,17 @@ std::string CaseName(const CaseSpec& spec) {
     name += std::to_string(spec.tail_token_count);
   }
   return name;
+}
+
+bool CaseSelected(
+    const BenchmarkOptions& options,
+    const CaseSpec& spec) {
+  if (options.case_filters.empty()) {
+    return true;
+  }
+  const std::string name = CaseName(spec);
+  return std::find(options.case_filters.begin(), options.case_filters.end(), name) !=
+         options.case_filters.end();
 }
 
 std::vector<std::int32_t> MakeTokenIds(
@@ -608,7 +650,7 @@ std::optional<ColdPassResult> RunColdPass(
     return std::nullopt;
   }
   auto prompt_logits =
-      nemotron::DeviceTensorFp32::Create({prompt_token_ids.size(), model.config().vocab_size});
+      nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
   auto step_logits = nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
   if (prompt_logits == nullptr || !prompt_logits->valid() ||
       step_logits == nullptr || !step_logits->valid()) {
@@ -635,12 +677,7 @@ std::optional<ColdPassResult> RunColdPass(
     return std::nullopt;
   }
 
-  auto prompt_final_row = CreateLastRowView(*prompt_logits);
-  if (prompt_final_row == nullptr || !prompt_final_row->valid()) {
-    std::cerr << "nano_prefix_cache_ttft_bench: failed to create cold prompt row view\n";
-    return std::nullopt;
-  }
-  const auto first_token_id = SelectTokenId(*prompt_final_row, device_token_id);
+  const auto first_token_id = SelectTokenId(*prompt_logits, device_token_id);
   if (!first_token_id.has_value()) {
     std::cerr << "nano_prefix_cache_ttft_bench: failed to select cold first token\n";
     return std::nullopt;
@@ -680,7 +717,7 @@ std::optional<SeededCacheState> SeedPrefixCache(
     return std::nullopt;
   }
   auto prompt_logits =
-      nemotron::DeviceTensorFp32::Create({prefix_identity.token_ids.size(), model.config().vocab_size});
+      nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
   if (prompt_logits == nullptr || !prompt_logits->valid()) {
     std::cerr << "nano_prefix_cache_ttft_bench: failed to allocate cache seed prompt logits\n";
     return std::nullopt;
@@ -694,12 +731,7 @@ std::optional<SeededCacheState> SeedPrefixCache(
     return std::nullopt;
   }
 
-  auto prompt_final_row = CreateLastRowView(*prompt_logits);
-  if (prompt_final_row == nullptr || !prompt_final_row->valid()) {
-    std::cerr << "nano_prefix_cache_ttft_bench: failed to create cache seed row view\n";
-    return std::nullopt;
-  }
-  std::vector<float> boundary_logits = CopyTensorToHost(*prompt_final_row);
+  std::vector<float> boundary_logits = CopyTensorToHost(*prompt_logits);
   if (boundary_logits.empty()) {
     std::cerr << "nano_prefix_cache_ttft_bench: failed to copy cache seed boundary logits\n";
     return std::nullopt;
@@ -744,6 +776,7 @@ std::optional<IterationMetrics> RunResumeIteration(
     const std::vector<std::int32_t>& prefix_token_ids,
     const std::vector<std::int32_t>& tail_token_ids,
     std::size_t iteration_index,
+    bool skip_commit_snapshot,
     std::int32_t* device_token_id) {
   if (scenario != Scenario::kCommittedHead && scenario != Scenario::kGlobalRoot) {
     return std::nullopt;
@@ -751,12 +784,12 @@ std::optional<IterationMetrics> RunResumeIteration(
 
   const std::vector<std::int32_t> full_prompt_token_ids =
       ConcatTokenIds(prefix_token_ids, tail_token_ids);
+  prefix_cache.Clear();
   const auto cold = RunColdPass(model, full_prompt_token_ids, device_token_id);
   if (!cold.has_value()) {
     return std::nullopt;
   }
 
-  prefix_cache.Clear();
   const std::string conversation_id =
       std::string(ScenarioName(scenario)) + "_iter_" + std::to_string(iteration_index);
   const auto prefix_identity = MakeIdentity(prefix_token_ids, model_id);
@@ -794,7 +827,7 @@ std::optional<IterationMetrics> RunResumeIteration(
   }
 
   auto tail_logits =
-      nemotron::DeviceTensorFp32::Create({tail_token_ids.size(), model.config().vocab_size});
+      nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
   auto step_logits = nemotron::DeviceTensorFp32::Create({1, model.config().vocab_size});
   if (tail_logits == nullptr || !tail_logits->valid() ||
       step_logits == nullptr || !step_logits->valid()) {
@@ -829,12 +862,7 @@ std::optional<IterationMetrics> RunResumeIteration(
     return std::nullopt;
   }
 
-  auto tail_final_row = CreateLastRowView(*tail_logits);
-  if (tail_final_row == nullptr || !tail_final_row->valid()) {
-    std::cerr << "nano_prefix_cache_ttft_bench: failed to create tail row view\n";
-    return std::nullopt;
-  }
-  const auto first_token_id = SelectTokenId(*tail_final_row, device_token_id);
+  const auto first_token_id = SelectTokenId(*tail_logits, device_token_id);
   if (!first_token_id.has_value()) {
     std::cerr << "nano_prefix_cache_ttft_bench: failed to select resumed first token\n";
     return std::nullopt;
@@ -858,20 +886,22 @@ std::optional<IterationMetrics> RunResumeIteration(
     return std::nullopt;
   }
 
-  auto committed_identity = full_identity;
-  committed_identity.token_ids.push_back(*first_token_id);
-  if (!timer.Measure(
-          "PublishConversationHeadSnapshot",
-          [&]() {
-            return prefix_cache.PublishConversationHeadSnapshot(
-                       conversation_id,
-                       committed_identity,
-                       *request_context,
-                       conversation_id + "/committed",
-                       &boundary_logits) != 0;
-          },
-          &metrics.commit_latency_ms.emplace())) {
-    return std::nullopt;
+  if (!skip_commit_snapshot) {
+    auto committed_identity = full_identity;
+    committed_identity.token_ids.push_back(*first_token_id);
+    if (!timer.Measure(
+            "PublishConversationHeadSnapshot",
+            [&]() {
+              return prefix_cache.PublishConversationHeadSnapshot(
+                         conversation_id,
+                         committed_identity,
+                         *request_context,
+                         conversation_id + "/committed",
+                         &boundary_logits) != 0;
+            },
+            &metrics.commit_latency_ms.emplace())) {
+      return std::nullopt;
+    }
   }
 
   metrics.hot_prefix_ttft_ms =
@@ -1182,11 +1212,24 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  std::vector<std::size_t> prefix_lengths = options.prefix_lengths;
+  if (prefix_lengths.empty()) {
+    prefix_lengths.assign(
+        std::begin(kPrefixLengths),
+        std::end(kPrefixLengths));
+  }
+  std::sort(prefix_lengths.begin(), prefix_lengths.end());
+  prefix_lengths.erase(
+      std::unique(prefix_lengths.begin(), prefix_lengths.end()),
+      prefix_lengths.end());
+
   const std::size_t max_total_prompt_tokens =
-      kPrefixLengths[(sizeof(kPrefixLengths) / sizeof(kPrefixLengths[0])) - 1] +
+      prefix_lengths.back() +
       options.tail_token_count;
   auto runtime_options =
-      MakeOptions(max_total_prompt_tokens + kFirstDecodeTokenCount);
+      MakeOptions(
+          max_total_prompt_tokens + kFirstDecodeTokenCount,
+          options.target_active_requests);
   auto runtime_environment =
       nemotron::RuntimeEnvironment::BuildFromManifestFile(manifest_path, runtime_options);
   if (runtime_environment == nullptr) {
@@ -1218,14 +1261,35 @@ int main(int argc, char** argv) {
   }
 
   std::vector<CaseSpec> cases;
-  for (const std::size_t prefix_length : kPrefixLengths) {
-    cases.push_back(CaseSpec{Scenario::kCold, prefix_length, 0});
+  for (const std::size_t prefix_length : prefix_lengths) {
+    const CaseSpec spec{Scenario::kCold, prefix_length, 0};
+    if (CaseSelected(options, spec)) {
+      cases.push_back(spec);
+    }
   }
-  for (const std::size_t prefix_length : kPrefixLengths) {
-    cases.push_back(CaseSpec{Scenario::kCommittedHead, prefix_length, options.tail_token_count});
+  for (const std::size_t prefix_length : prefix_lengths) {
+    const CaseSpec spec{Scenario::kCommittedHead, prefix_length, options.tail_token_count};
+    if (CaseSelected(options, spec)) {
+      cases.push_back(spec);
+    }
   }
-  for (const std::size_t prefix_length : kPrefixLengths) {
-    cases.push_back(CaseSpec{Scenario::kGlobalRoot, prefix_length, options.tail_token_count});
+  for (const std::size_t prefix_length : prefix_lengths) {
+    const CaseSpec spec{Scenario::kGlobalRoot, prefix_length, options.tail_token_count};
+    if (CaseSelected(options, spec)) {
+      cases.push_back(spec);
+    }
+  }
+  if (cases.empty()) {
+    std::cerr << "nano_prefix_cache_ttft_bench: no cases selected";
+    if (!options.case_filters.empty()) {
+      std::cerr << " (requested:";
+      for (const std::string& name : options.case_filters) {
+        std::cerr << " " << name;
+      }
+      std::cerr << ")";
+    }
+    std::cerr << "\n";
+    return 1;
   }
 
   std::cout << std::unitbuf;
@@ -1234,6 +1298,7 @@ int main(int argc, char** argv) {
             << " warmup_iterations=" << options.warmup_iterations
             << " measured_iterations=" << options.measured_iterations
             << " tail_token_count=" << options.tail_token_count
+            << " target_active_requests=" << options.target_active_requests
             << " moe_prefill_window_tokens_cli=" << resolved_moe_prefill->cli_window_tokens
             << " resolved_runtime_moe_prefill_capacity_tokens="
             << resolved_moe_prefill->runtime_capacity_tokens
@@ -1278,6 +1343,7 @@ int main(int argc, char** argv) {
             prefix_token_ids,
             tail_token_ids,
             iteration,
+            options.skip_commit_snapshot,
             device_token_buffer.data());
         if (!metrics.has_value()) {
           return 1;

@@ -1,5 +1,6 @@
 #include "nemotron/prefix_cache.h"
 #include "nemotron/request_context.h"
+#include "nemotron/state_snapshot.h"
 
 #include <cuda_bf16.h>
 
@@ -461,6 +462,85 @@ bool test_snapshot_publish_and_restore_round_trip() {
          expect(arena.current_bytes() == 0, "clearing the cache should release the cached snapshot bytes");
 }
 
+bool test_snapshot_publish_retries_by_replacing_unique_conversation_head() {
+  auto first = RequestExecutionContext::Create(make_request_config());
+  auto second = RequestExecutionContext::Create(make_request_config());
+  auto restored = RequestExecutionContext::Create(make_request_config());
+  if (!first || !second || !restored || !first->valid() || !second->valid() || !restored->valid()) {
+    std::cout << "prefix_cache_test: SKIP replacement retry (no CUDA device available)\n";
+    return true;
+  }
+
+  constexpr std::size_t kFirstTokenCount = 4;
+  constexpr std::size_t kSecondTokenCount = 5;
+  if (!expect(first->SetSequenceLength(kFirstTokenCount), "first snapshot source should allocate") ||
+      !expect(second->SetSequenceLength(kSecondTokenCount), "second snapshot source should allocate")) {
+    return false;
+  }
+
+  const std::size_t second_descriptor_bytes =
+      nemotron::RequiredKvSnapshotBytes(*second) +
+      nemotron::RequiredMambaSnapshotBytes(*second);
+  if (!expect(second_descriptor_bytes != 0, "replacement retry test should compute a non-zero descriptor size")) {
+    return false;
+  }
+
+  ReusableStateArena arena(second_descriptor_bytes);
+  PrefixCache cache(/*max_bytes=*/second_descriptor_bytes + 4096, &arena);
+
+  const std::vector<float> first_boundary_logits = {1.0f, 2.0f, 3.0f};
+  const auto first_node = cache.PublishConversationHeadSnapshot(
+      "conv-retry",
+      make_identity({1, 2, 3, 4}),
+      *first,
+      "prefix-cache-retry/first",
+      &first_boundary_logits);
+  if (!expect(first_node != 0, "first committed-head snapshot should publish")) {
+    return false;
+  }
+
+  const std::vector<float> second_boundary_logits = {-2.0f, 4.0f, -8.0f, 16.0f};
+  const auto second_node = cache.PublishConversationHeadSnapshot(
+      "conv-retry",
+      make_identity({1, 2, 3, 4, 5}),
+      *second,
+      "prefix-cache-retry/second",
+      &second_boundary_logits);
+  if (!expect(
+          second_node != 0,
+          "second committed-head snapshot should retry after replacing the unique old head") ||
+      !expect(
+          cache.CommittedHeadForConversation("conv-retry").has_value() &&
+              *cache.CommittedHeadForConversation("conv-retry") == second_node,
+          "conversation should point at the replacement head") ||
+      !expect(!cache.Describe(first_node).has_value(), "old committed head should be removed after replacement") ||
+      !expect(arena.current_bytes() == second_descriptor_bytes, "arena bytes should reflect only the replacement descriptor")) {
+    return false;
+  }
+
+  CacheLookupRequest request;
+  request.identity = make_identity({1, 2, 3, 4, 5, 6});
+  request.conversation_id = "conv-retry";
+  const auto match = cache.Lookup(request);
+  if (!expect(match.hit(), "replacement committed head should still be discoverable by lookup") ||
+      !expect(match.node_id == second_node, "lookup should resolve to the replacement committed head") ||
+      !expect(match.matched_token_count == kSecondTokenCount, "replacement match length should equal the new prefix")) {
+    return false;
+  }
+
+  const auto cached_boundary_logits = cache.CopyBoundaryLogits(second_node);
+  return expect(
+             cached_boundary_logits.has_value() && *cached_boundary_logits == second_boundary_logits,
+             "replacement committed head should preserve its new boundary logits") &&
+         expect(
+             cache.RestoreMatchState(match, *restored),
+             "replacement committed head should restore request state") &&
+         expect(
+             restored->sequence_length() == kSecondTokenCount &&
+                 restored->decode_position() == kSecondTokenCount,
+             "replacement restore should resume at the updated prefix boundary");
+}
+
 }  // namespace
 
 int main() {
@@ -477,7 +557,8 @@ int main() {
       test_eviction_by_bytes_clears_mappings() &&
       test_cache_eviction_releases_owned_state() &&
       test_replacing_node_state_releases_old_owned_state() &&
-      test_snapshot_publish_and_restore_round_trip();
+      test_snapshot_publish_and_restore_round_trip() &&
+      test_snapshot_publish_retries_by_replacing_unique_conversation_head();
 
   if (!ok) {
     return 1;

@@ -20,6 +20,18 @@ constexpr int kPagedAttentionDecodeHeadDim = 128;
 constexpr int kPagedAttentionDecodeDimsPerLane =
     kPagedAttentionDecodeHeadDim / kPagedAttentionDecodeWarpSize;
 constexpr unsigned int kPagedAttentionDecodeFullMask = 0xffffffffu;
+constexpr int kPagedAttentionMultiTokenProductionBlockSize = 256;
+constexpr int kPagedAttentionMultiTokenWarpSize = 32;
+constexpr int kPagedAttentionMultiTokenWarpsPerBlock =
+    kPagedAttentionMultiTokenProductionBlockSize / kPagedAttentionMultiTokenWarpSize;
+constexpr int kPagedAttentionMultiTokenQueryHeadsPerWarp = 2;
+constexpr int kPagedAttentionMultiTokenQueryHeadsPerBlock =
+    kPagedAttentionMultiTokenWarpsPerBlock * kPagedAttentionMultiTokenQueryHeadsPerWarp;
+constexpr int kPagedAttentionMultiTokenHeadDim = 128;
+constexpr int kPagedAttentionMultiTokenDimsPerLane =
+    kPagedAttentionMultiTokenHeadDim / kPagedAttentionMultiTokenWarpSize;
+constexpr unsigned int kPagedAttentionMultiTokenFullMask = 0xffffffffu;
+constexpr std::size_t kPagedAttentionMultiTokenMaxQueryTokens = 1024;
 
 static_assert(
     kPagedAttentionDecodeProductionBlockSize == 2 * kPagedAttentionDecodeHeadDim,
@@ -27,6 +39,13 @@ static_assert(
 static_assert(
     kPagedAttentionDecodeHeadDim % kPagedAttentionDecodeWarpSize == 0,
     "Decode kernel requires a whole-number dim shard per lane.");
+static_assert(
+    kPagedAttentionMultiTokenProductionBlockSize ==
+        2 * kPagedAttentionMultiTokenHeadDim,
+    "Multi-token block shape assumes one thread per staged K/V element.");
+static_assert(
+    kPagedAttentionMultiTokenHeadDim % kPagedAttentionMultiTokenWarpSize == 0,
+    "Multi-token kernel requires a whole-number dim shard per lane.");
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -458,6 +477,174 @@ __global__ void PagedAttentionDecodeProductionKernel(
   }
 }
 
+// First production-form Nano multi-token kernel. One block owns a single
+// (batch, kv_head, query_token) slice, stages each visible K/V vector once in
+// shared memory, and computes all query heads in that GQA group together.
+__global__ void PagedAttentionNanoMultiTokenKernel(
+    const __nv_bfloat16* query,
+    const __nv_bfloat16* key_cache,
+    const __nv_bfloat16* value_cache,
+    std::size_t batch_size,
+    std::size_t query_head_count,
+    std::size_t kv_head_count,
+    std::size_t max_query_tokens,
+    std::size_t head_dim,
+    std::size_t tokens_per_page,
+    std::size_t max_pages_per_sequence,
+    const std::int32_t* page_table,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* query_sequence_lengths,
+    const std::int32_t* query_sequence_starts,
+    float attn_scale,
+    bool causal,
+    __nv_bfloat16* output) {
+  __shared__ float shared_key[kPagedAttentionMultiTokenHeadDim];
+  __shared__ float shared_value[kPagedAttentionMultiTokenHeadDim];
+  __shared__ std::size_t shared_kv_base;
+  __shared__ int shared_kv_valid;
+
+  const std::size_t block_index = static_cast<std::size_t>(blockIdx.x);
+  const std::size_t batch = block_index / (kv_head_count * max_query_tokens);
+  if (batch >= batch_size) {
+    return;
+  }
+
+  const std::size_t batch_rem = block_index % (kv_head_count * max_query_tokens);
+  const std::size_t kv_head = batch_rem / max_query_tokens;
+  const std::size_t q_token = batch_rem % max_query_tokens;
+
+  const std::size_t q_tokens = static_cast<std::size_t>(query_sequence_lengths[batch]);
+  if (q_token >= q_tokens) {
+    return;
+  }
+
+  const std::size_t q_start = static_cast<std::size_t>(query_sequence_starts[batch]);
+  const std::size_t kv_tokens = static_cast<std::size_t>(sequence_lengths[batch]);
+  const std::size_t visible_kv_tokens =
+      causal ? min(kv_tokens, q_start + q_token + 1u) : kv_tokens;
+  const std::size_t queries_per_kv_head = query_head_count / kv_head_count;
+  const std::size_t query_head_group_start = kv_head * queries_per_kv_head;
+  const std::size_t query_head_group_end = query_head_group_start + queries_per_kv_head;
+
+  const std::size_t warp =
+      static_cast<std::size_t>(threadIdx.x) / kPagedAttentionMultiTokenWarpSize;
+  const std::size_t lane =
+      static_cast<std::size_t>(threadIdx.x) % kPagedAttentionMultiTokenWarpSize;
+  const std::size_t dim_base = lane * kPagedAttentionMultiTokenDimsPerLane;
+  const std::size_t warp_query_head_start =
+      query_head_group_start + (warp * kPagedAttentionMultiTokenQueryHeadsPerWarp);
+
+  const std::size_t query_heads[kPagedAttentionMultiTokenQueryHeadsPerWarp] = {
+      warp_query_head_start,
+      warp_query_head_start + 1u};
+  const bool head_valid[kPagedAttentionMultiTokenQueryHeadsPerWarp] = {
+      query_heads[0] < query_head_group_end,
+      query_heads[1] < query_head_group_end};
+
+  float query_frag[kPagedAttentionMultiTokenQueryHeadsPerWarp]
+                  [kPagedAttentionMultiTokenDimsPerLane] = {};
+  float output_frag[kPagedAttentionMultiTokenQueryHeadsPerWarp]
+                   [kPagedAttentionMultiTokenDimsPerLane] = {};
+  float max_score[kPagedAttentionMultiTokenQueryHeadsPerWarp] = {-INFINITY, -INFINITY};
+  float sum_exp[kPagedAttentionMultiTokenQueryHeadsPerWarp] = {0.0f, 0.0f};
+
+  for (int head_slot = 0; head_slot < kPagedAttentionMultiTokenQueryHeadsPerWarp; ++head_slot) {
+    if (!head_valid[head_slot]) {
+      continue;
+    }
+    const std::size_t q_base =
+        (((batch * query_head_count) + query_heads[head_slot]) * max_query_tokens + q_token) *
+        head_dim;
+    for (int dim_offset = 0; dim_offset < kPagedAttentionMultiTokenDimsPerLane; ++dim_offset) {
+      query_frag[head_slot][dim_offset] =
+          __bfloat162float(query[q_base + dim_base + static_cast<std::size_t>(dim_offset)]);
+    }
+  }
+
+  for (std::size_t kv_token = 0; kv_token < visible_kv_tokens; ++kv_token) {
+    if (threadIdx.x == 0) {
+      shared_kv_valid = 0;
+      const std::size_t page_slot = kv_token / tokens_per_page;
+      const std::size_t page_offset = kv_token % tokens_per_page;
+      if (page_slot < max_pages_per_sequence) {
+        const std::int32_t page_id =
+            page_table[batch * max_pages_per_sequence + page_slot];
+        if (page_id >= 0) {
+          shared_kv_base =
+              ((((static_cast<std::size_t>(page_id) * kv_head_count) + kv_head) *
+                tokens_per_page) +
+               page_offset) *
+              head_dim;
+          shared_kv_valid = 1;
+        }
+      }
+    }
+    __syncthreads();
+
+    if (shared_kv_valid != 0) {
+      if (threadIdx.x < kPagedAttentionMultiTokenHeadDim) {
+        shared_key[threadIdx.x] =
+            __bfloat162float(key_cache[shared_kv_base + static_cast<std::size_t>(threadIdx.x)]);
+      } else {
+        const int value_dim = threadIdx.x - kPagedAttentionMultiTokenHeadDim;
+        shared_value[value_dim] =
+            __bfloat162float(value_cache[shared_kv_base + static_cast<std::size_t>(value_dim)]);
+      }
+      __syncthreads();
+
+      float key_frag[kPagedAttentionMultiTokenDimsPerLane];
+      float value_frag[kPagedAttentionMultiTokenDimsPerLane];
+      for (int dim_offset = 0; dim_offset < kPagedAttentionMultiTokenDimsPerLane; ++dim_offset) {
+        const std::size_t dim = dim_base + static_cast<std::size_t>(dim_offset);
+        key_frag[dim_offset] = shared_key[dim];
+        value_frag[dim_offset] = shared_value[dim];
+      }
+
+      for (int head_slot = 0; head_slot < kPagedAttentionMultiTokenQueryHeadsPerWarp; ++head_slot) {
+        if (!head_valid[head_slot]) {
+          continue;
+        }
+
+        float score = 0.0f;
+        for (int dim_offset = 0; dim_offset < kPagedAttentionMultiTokenDimsPerLane; ++dim_offset) {
+          score = __fmaf_rn(query_frag[head_slot][dim_offset], key_frag[dim_offset], score);
+        }
+        score = WarpReduceSum(score);
+        score = __shfl_sync(kPagedAttentionMultiTokenFullMask, score, 0);
+
+        const float scaled_score = __fmul_rn(score, attn_scale);
+        const float new_max = fmaxf(max_score[head_slot], scaled_score);
+        const float correction = expf(max_score[head_slot] - new_max);
+        const float weight = expf(scaled_score - new_max);
+        for (int dim_offset = 0; dim_offset < kPagedAttentionMultiTokenDimsPerLane; ++dim_offset) {
+          output_frag[head_slot][dim_offset] =
+              __fmaf_rn(weight,
+                        value_frag[dim_offset],
+                        output_frag[head_slot][dim_offset] * correction);
+        }
+        sum_exp[head_slot] = __fmaf_rn(sum_exp[head_slot], correction, weight);
+        max_score[head_slot] = new_max;
+      }
+    }
+
+    __syncthreads();
+  }
+
+  for (int head_slot = 0; head_slot < kPagedAttentionMultiTokenQueryHeadsPerWarp; ++head_slot) {
+    if (!head_valid[head_slot]) {
+      continue;
+    }
+    const float inv_sum = sum_exp[head_slot] > 0.0f ? (1.0f / sum_exp[head_slot]) : 0.0f;
+    const std::size_t q_base =
+        (((batch * query_head_count) + query_heads[head_slot]) * max_query_tokens + q_token) *
+        head_dim;
+    for (int dim_offset = 0; dim_offset < kPagedAttentionMultiTokenDimsPerLane; ++dim_offset) {
+      output[q_base + dim_base + static_cast<std::size_t>(dim_offset)] =
+          __float2bfloat16(output_frag[head_slot][dim_offset] * inv_sum);
+    }
+  }
+}
+
 }  // namespace
 
 bool ConvertRowMajorFp32ToAttentionQueryBf16(
@@ -700,6 +887,72 @@ bool RunPagedAttentionDecodeProduction(
   PagedAttentionDecodeProductionKernel<<<
       static_cast<unsigned int>(block_count),
       kPagedAttentionDecodeProductionBlockSize>>>(
+      query.data(),
+      key_cache.data(),
+      value_cache.data(),
+      batch_size,
+      query_head_count,
+      cache_config.kv_head_count,
+      max_query_tokens,
+      cache_config.head_dim,
+      cache_config.tokens_per_page,
+      max_pages_per_sequence,
+      page_table_device,
+      sequence_lengths_device,
+      query_sequence_lengths_device,
+      query_sequence_starts_device,
+      attn_scale,
+      causal,
+      output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool RunPagedAttentionNanoMultiToken(
+    const DeviceTensorBf16& query,
+    const DeviceTensorBf16& key_cache,
+    const DeviceTensorBf16& value_cache,
+    const AttentionKvCacheConfig& cache_config,
+    std::size_t batch_size,
+    std::size_t max_pages_per_sequence,
+    const std::int32_t* page_table_device,
+    const std::int32_t* sequence_lengths_device,
+    const std::int32_t* query_sequence_lengths_device,
+    const std::int32_t* query_sequence_starts_device,
+    std::size_t query_head_count,
+    std::size_t max_query_tokens,
+    float attn_scale,
+    bool causal,
+    DeviceTensorBf16* output) {
+  if (!query.valid() ||
+      !key_cache.valid() ||
+      !value_cache.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      page_table_device == nullptr ||
+      sequence_lengths_device == nullptr ||
+      query_sequence_lengths_device == nullptr ||
+      query_sequence_starts_device == nullptr ||
+      batch_size == 0 ||
+      query_head_count == 0 ||
+      max_query_tokens <= 1 ||
+      max_query_tokens > kPagedAttentionMultiTokenMaxQueryTokens ||
+      cache_config.kv_head_count == 0 ||
+      cache_config.head_dim != static_cast<std::size_t>(kPagedAttentionMultiTokenHeadDim) ||
+      cache_config.tokens_per_page == 0 ||
+      max_pages_per_sequence == 0 ||
+      (query_head_count % cache_config.kv_head_count) != 0 ||
+      (query_head_count / cache_config.kv_head_count) >
+          static_cast<std::size_t>(kPagedAttentionMultiTokenQueryHeadsPerBlock) ||
+      query.numel() != batch_size * query_head_count * max_query_tokens * cache_config.head_dim ||
+      output->numel() != query.numel()) {
+    return false;
+  }
+
+  const std::size_t block_count =
+      batch_size * cache_config.kv_head_count * max_query_tokens;
+  PagedAttentionNanoMultiTokenKernel<<<
+      static_cast<unsigned int>(block_count),
+      kPagedAttentionMultiTokenProductionBlockSize>>>(
       query.data(),
       key_cache.data(),
       value_cache.data(),

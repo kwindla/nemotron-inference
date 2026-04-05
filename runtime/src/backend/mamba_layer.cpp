@@ -41,6 +41,8 @@ bool DecodeScratchEnabled() {
   return value == nullptr || (value[0] != '\0' && std::string(value) != "0");
 }
 
+constexpr std::size_t kMambaMultiTokenMaxChunkTokens = 8192;
+
 thread_local MambaLayerExecutionCounters g_mamba_layer_execution_counters;
 
 void RecordMambaNativeMultiTokenExecution(std::size_t token_count) {
@@ -631,6 +633,38 @@ bool MambaLayerSlice::Run(
   const std::size_t token_count = input.shape()[0];
   if (token_count == 0) {
     return false;
+  }
+
+  if (trace == nullptr && token_count > kMambaMultiTokenMaxChunkTokens) {
+    const std::size_t hidden_size = impl_->config.hidden_size;
+    for (std::size_t chunk_start = 0; chunk_start < token_count;
+         chunk_start += kMambaMultiTokenMaxChunkTokens) {
+      const std::size_t chunk_tokens =
+          std::min(kMambaMultiTokenMaxChunkTokens, token_count - chunk_start);
+      auto input_chunk = DeviceTensorBf16::CreateView(
+          {chunk_tokens, hidden_size},
+          input.data() + (chunk_start * hidden_size));
+      auto residual_chunk = DeviceTensorBf16::CreateView(
+          {chunk_tokens, hidden_size},
+          residual->data() + (chunk_start * hidden_size));
+      auto output_chunk = DeviceTensorBf16::CreateView(
+          {chunk_tokens, hidden_size},
+          output->data() + (chunk_start * hidden_size));
+      if (input_chunk == nullptr ||
+          residual_chunk == nullptr ||
+          output_chunk == nullptr ||
+          !Run(
+              cublas_handle,
+              heuristic_cache,
+              request_context,
+              *input_chunk,
+              residual_chunk.get(),
+              output_chunk.get(),
+              nullptr)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   if (token_count > 1) {

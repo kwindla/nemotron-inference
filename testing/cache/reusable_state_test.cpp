@@ -73,23 +73,23 @@ bool test_single_allocation_has_expected_kind_and_label() {
          expect(view->label == "kv-buffer", "label should round-trip through the arena");
 }
 
-bool test_released_regions_are_recycled_and_coalesced() {
+bool test_released_capacity_is_reusable() {
   ReusableStateArena arena(/*max_bytes=*/3072);
   const auto first = arena.Allocate(ReusableStateKind::kAttentionKv, 1024, "slot-a");
   const auto second = arena.Allocate(ReusableStateKind::kMambaRecurrent, 2048, "slot-b");
   arena.Release(first);
   arena.Release(second);
 
-  const auto recycled = arena.Allocate(ReusableStateKind::kAttentionKv, 3072, "slot-merged");
+  const auto recycled = arena.Allocate(ReusableStateKind::kAttentionKv, 3072, "slot-reused");
   const auto recycled_view = arena.Describe(recycled.id);
   arena.Release(recycled);
 
-  return expect(first.valid() && second.valid(), "initial allocations should consume the full slab") &&
-         expect(recycled.valid(), "released regions should coalesce into a recyclable slab range") &&
+  return expect(first.valid() && second.valid(), "initial allocations should consume the full budget") &&
+         expect(recycled.valid(), "released bytes should be reusable for a later allocation") &&
          expect(
              recycled_view.has_value() && recycled_view->bytes == 3072,
-             "recycled allocation should span the full merged slab range") &&
-         expect(arena.current_bytes() == 0, "releasing the recycled region should return the slab to idle");
+             "reused allocation should span the full arena budget") &&
+         expect(arena.current_bytes() == 0, "releasing the reused allocation should return the arena to idle");
 }
 
 }  // namespace
@@ -100,7 +100,7 @@ int main() {
       test_retain_increments_refcount_without_duplicate_bytes() &&
       test_capacity_limit_rejects_large_descriptor() &&
       test_single_allocation_has_expected_kind_and_label() &&
-      test_released_regions_are_recycled_and_coalesced();
+      test_released_capacity_is_reusable();
 
   if (!ok) {
     return 1;

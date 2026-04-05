@@ -179,6 +179,22 @@ bool IsNanoDecodeShape(const AttentionBackendSelectorConfig& config) {
          !config.generate_stats;
 }
 
+constexpr std::size_t kNanoMultiTokenMaxQueryTokens = 1024;
+
+bool IsNanoMultiTokenShape(const AttentionBackendSelectorConfig& config) {
+  return config.batch_size >= 1 &&
+         config.batch_size <= 4 &&
+         config.query_head_count == 32 &&
+         config.max_query_tokens >= 2 &&
+         config.max_query_tokens <= kNanoMultiTokenMaxQueryTokens &&
+         config.cache_config.dtype == KvCacheDataType::kBf16 &&
+         config.cache_config.kv_head_count == 2 &&
+         config.cache_config.head_dim == 128 &&
+         config.cache_config.tokens_per_page == 16 &&
+         config.causal &&
+         !config.generate_stats;
+}
+
 const KernelTensorDescriptor* FindKernelBinding(
     const LayerScheduleEntry& layer,
     const KernelCatalog& kernel_catalog,
@@ -497,6 +513,8 @@ const char* AttentionBackendName(AttentionBackend backend) {
       return "cudnn_paged";
     case AttentionBackend::kNanoDecode:
       return "nano_decode";
+    case AttentionBackend::kNanoMultiToken:
+      return "nano_multi_token";
     case AttentionBackend::kDeviceFallback:
       return "device_fallback";
     case AttentionBackend::kUnavailable:
@@ -535,10 +553,15 @@ bool AttentionBackendPolicy::Supports(
   }
 
   switch (backend) {
-    case AttentionBackend::kCudnnPaged:
-      return config.cudnn_available && config.cudnn_version >= 90500;
     case AttentionBackend::kNanoDecode:
       return token_count == 1 && device_sm >= 100 && IsNanoDecodeShape(config);
+    case AttentionBackend::kNanoMultiToken:
+      return token_count >= 2 &&
+             token_count <= kNanoMultiTokenMaxQueryTokens &&
+             device_sm >= 120 &&
+             IsNanoMultiTokenShape(config);
+    case AttentionBackend::kCudnnPaged:
+      return config.cudnn_available && config.cudnn_version >= 90500;
     case AttentionBackend::kDeviceFallback:
       return !config.generate_stats;
     case AttentionBackend::kUnavailable:
@@ -551,9 +574,10 @@ AttentionBackend AttentionBackendPolicy::Select(
     const AttentionBackendSelectorConfig& config,
     std::size_t token_count) const {
   const int device_sm = GetCurrentDeviceSmVersion();
-  constexpr std::array<AttentionBackend, 3> kPriorityOrder = {
-      AttentionBackend::kCudnnPaged,
+  constexpr std::array<AttentionBackend, 4> kPriorityOrder = {
       AttentionBackend::kNanoDecode,
+      AttentionBackend::kNanoMultiToken,
+      AttentionBackend::kCudnnPaged,
       AttentionBackend::kDeviceFallback,
   };
   for (const AttentionBackend backend : kPriorityOrder) {
@@ -794,6 +818,49 @@ bool AttentionLayerSlice::Run(
       std::cout << "attention_layer: request context KV config mismatch\n";
     }
     return false;
+  }
+
+  if (token_count > kNanoMultiTokenMaxQueryTokens &&
+      impl_->config.query_head_count == 32 &&
+      impl_->config.kv_head_count == 2 &&
+      impl_->config.head_dim == 128 &&
+      request_context.config().attention_kv_cache.tokens_per_page == 16) {
+    const std::size_t hidden_size = impl_->config.hidden_size;
+    for (std::size_t chunk_start = 0; chunk_start < token_count;
+         chunk_start += kNanoMultiTokenMaxQueryTokens) {
+      const std::size_t chunk_tokens =
+          std::min(kNanoMultiTokenMaxQueryTokens, token_count - chunk_start);
+      auto input_chunk = DeviceTensorBf16::CreateView(
+          {chunk_tokens, hidden_size},
+          input.data() + (chunk_start * hidden_size));
+      auto residual_chunk = DeviceTensorBf16::CreateView(
+          {chunk_tokens, hidden_size},
+          residual->data() + (chunk_start * hidden_size));
+      auto output_chunk = DeviceTensorBf16::CreateView(
+          {chunk_tokens, hidden_size},
+          output->data() + (chunk_start * hidden_size));
+      if (input_chunk == nullptr ||
+          residual_chunk == nullptr ||
+          output_chunk == nullptr ||
+          !Run(
+              cublas_handle,
+              cudnn_handle,
+              heuristic_cache,
+              request_context,
+              sequence_start + chunk_start,
+              sequence_start + chunk_start + chunk_tokens,
+              *input_chunk,
+              residual_chunk.get(),
+              output_chunk.get())) {
+        if (debug) {
+          std::cout << "attention_layer: chunked multi-token execution failed"
+                    << " chunk_start=" << chunk_start
+                    << " chunk_tokens=" << chunk_tokens << "\n";
+        }
+        return false;
+      }
+    }
+    return true;
   }
 
   if (token_count > 1) {
@@ -1117,6 +1184,23 @@ bool AttentionLayerSlice::Run(
                   1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
                   true,
                   output_bf16)
+            : selected_backend == AttentionBackend::kNanoMultiToken
+                ? RunPagedAttentionNanoMultiToken(
+                      *query_bf16,
+                      *request_context.key_cache(),
+                      *request_context.value_cache(),
+                      request_context.config().attention_kv_cache,
+                      impl_->batch_plan.batch_size,
+                      impl_->batch_plan.max_pages_per_sequence,
+                      impl_->page_table_k->data(),
+                      impl_->seq_len_kv->data(),
+                      impl_->seq_len_q->data(),
+                      impl_->query_starts->data(),
+                      impl_->config.query_head_count,
+                      token_count,
+                      1.0f / std::sqrt(static_cast<float>(impl_->config.head_dim)),
+                      true,
+                      output_bf16)
             : RunPagedAttentionDeviceFallback(
                   *query_bf16,
                   *request_context.key_cache(),

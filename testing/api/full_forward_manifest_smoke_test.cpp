@@ -204,6 +204,12 @@ struct SplitPrefillComparison {
   bool request_state_match = false;
 };
 
+struct BoundaryOnlyPrefillComparison {
+  std::vector<float> full_row;
+  std::vector<float> boundary_row;
+  bool request_state_match = false;
+};
+
 std::optional<SplitPrefillComparison> compare_split_prefill_rows(
     const nemotron::SingleTokenForwardModel& model,
     const std::vector<std::int32_t>& token_ids,
@@ -295,6 +301,49 @@ std::optional<SplitPrefillComparison> compare_split_prefill_rows(
     return std::nullopt;
   }
   return comparison;
+}
+
+std::optional<BoundaryOnlyPrefillComparison> compare_boundary_only_prefill_row(
+    const nemotron::SingleTokenForwardModel& model,
+    const std::vector<std::int32_t>& token_ids,
+    const nemotron::SingleTokenForwardConfig& config) {
+  if (token_ids.size() <= 1) {
+    return std::nullopt;
+  }
+
+  auto full_context = model.CreateRequestContext();
+  auto boundary_context = model.CreateRequestContext();
+  if (full_context == nullptr || !full_context->valid() ||
+      boundary_context == nullptr || !boundary_context->valid()) {
+    return std::nullopt;
+  }
+
+  auto full_logits = nemotron::DeviceTensorFp32::Create({token_ids.size(), config.vocab_size});
+  auto boundary_logits = nemotron::DeviceTensorFp32::Create({1, config.vocab_size});
+  if (full_logits == nullptr || !full_logits->valid() ||
+      boundary_logits == nullptr || !boundary_logits->valid()) {
+    return std::nullopt;
+  }
+
+  if (!model.RunPrefill(token_ids.data(), token_ids.size(), *full_context, full_logits.get()) ||
+      !model.RunPrefill(token_ids.data(), token_ids.size(), *boundary_context, boundary_logits.get())) {
+    return std::nullopt;
+  }
+
+  BoundaryOnlyPrefillComparison comparison;
+  comparison.request_state_match =
+      full_context->sequence_length() == boundary_context->sequence_length() &&
+      full_context->decode_position() == boundary_context->decode_position();
+
+  const std::vector<float> full_logits_host = copy_tensor_to_host(*full_logits);
+  comparison.full_row = slice_row(
+      full_logits_host,
+      token_ids.size() - 1,
+      config.vocab_size);
+  comparison.boundary_row = copy_tensor_to_host(*boundary_logits);
+  return comparison.full_row.empty() || comparison.boundary_row.empty()
+             ? std::nullopt
+             : std::optional<BoundaryOnlyPrefillComparison>(std::move(comparison));
 }
 
 void maybe_print_first_split_prefill_divergent_layer(
@@ -601,6 +650,24 @@ bool run_full_forward_manifest_smoke() {
           "decode position should stay aligned with the committed sequence length")) {
     return false;
   }
+
+  const std::vector<std::int32_t> boundary_only_prompt = {1, 7, 9, 13};
+  const auto boundary_only_comparison =
+      compare_boundary_only_prefill_row(*model, boundary_only_prompt, config);
+  if (!expect(
+          boundary_only_comparison.has_value(),
+          "boundary-only prefill logits comparison should succeed") ||
+      !expect(
+          boundary_only_comparison->request_state_match,
+          "boundary-only prefill should preserve request state") ||
+      !expect(
+          max_abs_diff(
+              boundary_only_comparison->full_row,
+              boundary_only_comparison->boundary_row) <= 1.0e-3f,
+          "boundary-only prefill row should match the full prefill boundary row")) {
+    return false;
+  }
+
   if (!decode_result.hit_eos) {
     if (!expect(
             decode_result.generated_token_ids.size() == decode_config.max_new_tokens,

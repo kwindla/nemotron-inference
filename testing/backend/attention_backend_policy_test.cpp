@@ -127,11 +127,38 @@ bool TestPolicySupportsExactNanoDecodeShape() {
              "Nano decode backend should reject insufficient device capability");
 }
 
+bool TestPolicySupportsAndSelectsNanoMultiTokenShape() {
+  AttentionBackendPolicy policy;
+  const AttentionBackendSelectorConfig nano_multi_config =
+      MakeSelectorConfig(/*query_head_count=*/32, /*kv_head_count=*/2, /*head_dim=*/128, /*tokens_per_page=*/16,
+                         /*max_query_tokens=*/256, /*max_kv_tokens=*/8192, /*cudnn_available=*/true, /*cudnn_version=*/90500);
+  const AttentionBackendSelectorConfig generic_cudnn_config =
+      MakeSelectorConfig(/*query_head_count=*/8, /*kv_head_count=*/2, /*head_dim=*/128, /*tokens_per_page=*/16,
+                         /*max_query_tokens=*/256, /*max_kv_tokens=*/8192, /*cudnn_available=*/true, /*cudnn_version=*/90500);
+
+  return expect(
+             policy.Supports(AttentionBackend::kNanoMultiToken, nano_multi_config, /*token_count=*/256, /*device_sm=*/120),
+             "Nano multi-token backend should support the exact Nano multi-token shape") &&
+         expect(
+             !policy.Supports(AttentionBackend::kNanoMultiToken, nano_multi_config, /*token_count=*/1025, /*device_sm=*/120),
+             "Nano multi-token backend should reject requests above the fixed chunk size") &&
+         expect(
+             !policy.Supports(AttentionBackend::kNanoMultiToken, generic_cudnn_config, /*token_count=*/256, /*device_sm=*/120),
+             "Nano multi-token backend should reject non-Nano shapes") &&
+         expect(
+             policy.Select(nano_multi_config, /*token_count=*/256) == AttentionBackend::kNanoMultiToken,
+             "Exact Nano multi-token shapes should prefer the native multi-token backend over cuDNN") &&
+         expect(
+             policy.Select(generic_cudnn_config, /*token_count=*/256) == AttentionBackend::kCudnnPaged,
+             "Generic supported shapes may still use cuDNN when the Nano path does not apply");
+}
+
 }  // namespace
 
 int main() {
   if (!TestPolicyIgnoresLegacyEnvOverrides() ||
-      !TestPolicySupportsExactNanoDecodeShape()) {
+      !TestPolicySupportsExactNanoDecodeShape() ||
+      !TestPolicySupportsAndSelectsNanoMultiTokenShape()) {
     return 1;
   }
   std::cout << "attention_backend_policy_test: PASS\n";

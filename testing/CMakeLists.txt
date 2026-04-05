@@ -299,6 +299,43 @@ target_compile_features(request_context_test PRIVATE cxx_std_17)
 nemotron_add_test(request_context_test)
 
 add_executable(
+  nano_paged_attention_test
+  backend/nano_paged_attention_test.cpp
+)
+
+target_include_directories(
+  nano_paged_attention_test
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}/benchmarks/nano_paged_attention
+)
+
+target_link_libraries(
+  nano_paged_attention_test
+  PRIVATE
+    nemotron_runtime_backend
+    ${CMAKE_DL_LIBS}
+)
+
+target_compile_features(nano_paged_attention_test PRIVATE cxx_std_17)
+
+nemotron_add_test(nano_paged_attention_test)
+
+add_executable(
+  nano_attention_layer_integration_test
+  backend/nano_attention_layer_integration_test.cpp
+)
+
+target_link_libraries(
+  nano_attention_layer_integration_test
+  PRIVATE
+    nemotron_runtime_backend
+)
+
+target_compile_features(nano_attention_layer_integration_test PRIVATE cxx_std_17)
+
+nemotron_add_test(nano_attention_layer_integration_test)
+
+add_executable(
   attention_backend_policy_test
   backend/attention_backend_policy_test.cpp
 )

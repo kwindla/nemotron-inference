@@ -118,6 +118,7 @@ class PrefixCache {
   void AssignConversationHead(PrefixNodeId node_id, const std::string& conversation_id);
   void AssignGlobalRoot(PrefixNodeId node_id);
   void RemoveConversationRole(PrefixNodeId node_id, const std::string& conversation_id);
+  bool DropUniqueConversationHeadForRetry(const std::string& conversation_id);
   void EvictToBudget();
   bool PrefixMatches(const SerializedPromptIdentity& cached, const SerializedPromptIdentity& request) const;
   std::size_t PrefixMatchLength(

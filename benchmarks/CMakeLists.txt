@@ -5,6 +5,7 @@ add_subdirectory(gb10_nvfp4_gemm)
 add_subdirectory(gb10_nvfp4_contract)
 add_subdirectory(nano_mamba)
 add_subdirectory(nano_fused_decode)
+add_subdirectory(nano_paged_attention)
 add_subdirectory(nano_prefix_cache_ttft)
 
 if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)

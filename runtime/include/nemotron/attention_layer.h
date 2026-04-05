@@ -20,6 +20,7 @@ enum class AttentionBackend {
   kUnavailable = 0,
   kCudnnPaged,
   kNanoDecode,
+  kNanoMultiToken,
   kDeviceFallback,
 };
 

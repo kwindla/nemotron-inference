@@ -1491,8 +1491,14 @@ bool SingleTokenForwardModel::RunTokens(
       continuation_position_ok && request_context.config().max_tokens >= total_sequence_length;
   const bool have_logits = logits != nullptr;
   const bool logits_valid = have_logits && logits->valid();
-  const std::vector<std::size_t> expected_logits_shape = {token_count, impl_->config.vocab_size};
-  const bool logits_shape_ok = logits_valid && logits->shape() == expected_logits_shape;
+  const std::vector<std::size_t> expected_full_logits_shape = {token_count, impl_->config.vocab_size};
+  const std::vector<std::size_t> expected_boundary_logits_shape = {1, impl_->config.vocab_size};
+  const bool logits_shape_ok =
+      logits_valid &&
+      (logits->shape() == expected_full_logits_shape ||
+       logits->shape() == expected_boundary_logits_shape);
+  const bool boundary_only_logits =
+      logits_shape_ok && logits->shape() == expected_boundary_logits_shape;
   const bool prefill_trace_enabled =
       token_count > 1 && PrefillTraceEnabled();
 
@@ -1534,8 +1540,10 @@ bool SingleTokenForwardModel::RunTokens(
       }
       std::cerr << "]";
     }
-    std::cerr << " expected_logits_shape=[" << expected_logits_shape[0]
-              << "," << expected_logits_shape[1] << "]\n";
+    std::cerr << " expected_full_logits_shape=[" << expected_full_logits_shape[0]
+              << "," << expected_full_logits_shape[1] << "]"
+              << " expected_boundary_logits_shape=[" << expected_boundary_logits_shape[0]
+              << "," << expected_boundary_logits_shape[1] << "]\n";
     return false;
   }
 
@@ -1879,7 +1887,23 @@ bool SingleTokenForwardModel::RunTokens(
     }
   }
 
-  auto logits_bf16 = DeviceTensorBf16::Create({token_count, impl_->config.vocab_size});
+  DeviceTensorBf16* lm_head_input = logits_input;
+  std::unique_ptr<DeviceTensorBf16> boundary_logits_input_view;
+  const std::size_t logits_row_count = boundary_only_logits ? std::size_t{1} : token_count;
+  if (boundary_only_logits && token_count > 1) {
+    boundary_logits_input_view = CreateTokenRangeView(
+        logits_input,
+        token_count - 1,
+        1,
+        impl_->config.hidden_size);
+    if (boundary_logits_input_view == nullptr || !boundary_logits_input_view->valid()) {
+      std::cerr << "single_token_forward_model: boundary logits input view creation failed\n";
+      return false;
+    }
+    lm_head_input = boundary_logits_input_view.get();
+  }
+
+  auto logits_bf16 = DeviceTensorBf16::Create({logits_row_count, impl_->config.vocab_size});
   if (!logits_bf16 || !logits_bf16->valid()) {
     std::cerr << "single_token_forward_model: BF16 logits scratch allocation failed\n";
     return false;
@@ -1888,13 +1912,13 @@ bool SingleTokenForwardModel::RunTokens(
       (impl_->lm_head_op->Run(
            *impl_->cublas,
            impl_->heuristic_cache.get(),
-           *logits_input,
+           *lm_head_input,
            logits_bf16.get()) &&
        CastTensorBf16ToFp32(*logits_bf16, logits)) ||
       ([&]() -> bool {
-        auto logits_input_fp32 = DeviceTensorFp32::Create(logits_input->shape());
+        auto logits_input_fp32 = DeviceTensorFp32::Create(lm_head_input->shape());
         return logits_input_fp32 != nullptr &&
-               CastTensorBf16ToFp32(*logits_input, logits_input_fp32.get()) &&
+               CastTensorBf16ToFp32(*lm_head_input, logits_input_fp32.get()) &&
                impl_->lm_head_op->Run(
                    *impl_->cublas,
                    impl_->heuristic_cache.get(),

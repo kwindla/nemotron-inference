@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <limits>
-#include <map>
 #include <unordered_map>
 #include <utility>
 
@@ -15,55 +14,13 @@ bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
 
+void ClearCudaErrorState() {
+  static_cast<void>(cudaGetLastError());
+}
+
 bool HasCudaDevice() {
   int device_count = 0;
   return CheckCuda(cudaGetDeviceCount(&device_count)) && device_count > 0;
-}
-
-void* ByteOffset(void* base, std::size_t offset) {
-  return static_cast<std::byte*>(base) + offset;
-}
-
-const void* ByteOffset(const void* base, std::size_t offset) {
-  return static_cast<const std::byte*>(base) + offset;
-}
-
-std::map<std::size_t, std::size_t>::iterator FindFirstFit(
-    std::map<std::size_t, std::size_t>& free_regions,
-    std::size_t bytes) {
-  for (auto it = free_regions.begin(); it != free_regions.end(); ++it) {
-    if (it->second >= bytes) {
-      return it;
-    }
-  }
-  return free_regions.end();
-}
-
-void InsertFreeRegion(
-    std::map<std::size_t, std::size_t>& free_regions,
-    std::size_t offset,
-    std::size_t bytes) {
-  if (bytes == 0) {
-    return;
-  }
-
-  auto next = free_regions.lower_bound(offset);
-  if (next != free_regions.begin()) {
-    auto prev = std::prev(next);
-    if (prev->first + prev->second == offset) {
-      offset = prev->first;
-      bytes += prev->second;
-      free_regions.erase(prev);
-    }
-  }
-
-  next = free_regions.lower_bound(offset);
-  if (next != free_regions.end() && offset + bytes == next->first) {
-    bytes += next->second;
-    free_regions.erase(next);
-  }
-
-  free_regions.emplace(offset, bytes);
 }
 
 }  // namespace
@@ -75,15 +32,12 @@ struct ReusableStateArena::Impl {
     std::string label;
     std::size_t bytes = 0;
     std::size_t ref_count = 0;
-    std::size_t slab_offset = 0;
+    void* device_storage = nullptr;
   };
 
   ReusableStateId next_id = 1;
   std::size_t current_bytes = 0;
-  void* device_slab = nullptr;
-  bool device_storage_init_failed = false;
   std::unordered_map<ReusableStateId, StateAllocation> allocations;
-  std::map<std::size_t, std::size_t> free_regions;
 };
 
 bool ReusableStateHandle::valid() const {
@@ -111,15 +65,15 @@ std::size_t ReusableStateDescriptor::total_bytes() const {
 }
 
 ReusableStateArena::ReusableStateArena(std::size_t max_bytes)
-    : max_bytes_(max_bytes), impl_(std::make_unique<Impl>()) {
-  if (max_bytes_ != 0) {
-    impl_->free_regions.emplace(0, max_bytes_);
-  }
-}
+    : max_bytes_(max_bytes), impl_(std::make_unique<Impl>()) {}
 
 ReusableStateArena::~ReusableStateArena() {
-  if (impl_ != nullptr && impl_->device_slab != nullptr) {
-    cudaFree(impl_->device_slab);
+  if (impl_ != nullptr) {
+    for (auto& [_, allocation] : impl_->allocations) {
+      if (allocation.device_storage != nullptr) {
+        cudaFree(allocation.device_storage);
+      }
+    }
   }
 }
 
@@ -130,53 +84,23 @@ ReusableStateHandle ReusableStateArena::Allocate(
     ReusableStateKind kind,
     std::size_t bytes,
     const std::string& label) {
-  if (bytes == 0 ||
-      bytes > max_bytes_ ||
-      impl_->current_bytes + bytes > max_bytes_ ||
-      impl_->device_storage_init_failed) {
+  if (bytes == 0 || bytes > max_bytes_ || impl_->current_bytes + bytes > max_bytes_) {
     return {};
   }
 
-  // Lazy slab allocation: defer cudaMalloc until the first real allocation so
-  // the slab does not compete with model weight uploads for VRAM.
-  if (impl_->device_slab == nullptr && !impl_->device_storage_init_failed &&
-      max_bytes_ != 0 && HasCudaDevice()) {
-    // Cap the slab to actual free VRAM minus headroom for execution scratch.
-    constexpr std::size_t kExecutionHeadroomBytes = 512ull * 1024 * 1024;  // 512 MiB
-    std::size_t free_bytes = 0;
-    std::size_t total_bytes = 0;
-    if (CheckCuda(cudaMemGetInfo(&free_bytes, &total_bytes)) &&
-        free_bytes > kExecutionHeadroomBytes) {
-      const std::size_t available = free_bytes - kExecutionHeadroomBytes;
-      if (available < max_bytes_) {
-        max_bytes_ = available;
-        impl_->free_regions.clear();
-        impl_->free_regions.emplace(0, max_bytes_);
-        impl_->current_bytes = 0;
-      }
-    }
-    if (max_bytes_ < bytes || !CheckCuda(cudaMalloc(&impl_->device_slab, max_bytes_))) {
-      impl_->device_storage_init_failed = true;
+  void* device_storage = nullptr;
+  if (HasCudaDevice()) {
+    if (!CheckCuda(cudaMalloc(&device_storage, bytes))) {
+      // Snapshot publish may intentionally retry after a handled allocation
+      // failure, so clear the sticky runtime error before returning.
+      ClearCudaErrorState();
       return {};
     }
-  }
-
-  auto free_it = FindFirstFit(impl_->free_regions, bytes);
-  if (free_it == impl_->free_regions.end()) {
-    return {};
-  }
-
-  const std::size_t slab_offset = free_it->first;
-  const std::size_t free_bytes = free_it->second;
-  impl_->free_regions.erase(free_it);
-  if (free_bytes > bytes) {
-    impl_->free_regions.emplace(slab_offset + bytes, free_bytes - bytes);
-  }
-
-  if (impl_->device_slab != nullptr &&
-      !CheckCuda(cudaMemset(ByteOffset(impl_->device_slab, slab_offset), 0, bytes))) {
-    InsertFreeRegion(impl_->free_regions, slab_offset, bytes);
-    return {};
+    if (!CheckCuda(cudaMemset(device_storage, 0, bytes))) {
+      cudaFree(device_storage);
+      ClearCudaErrorState();
+      return {};
+    }
   }
 
   ReusableStateHandle handle;
@@ -190,7 +114,7 @@ ReusableStateHandle ReusableStateArena::Allocate(
                                             label,
                                             bytes,
                                             1,
-                                            slab_offset,
+                                            device_storage,
                                         });
   impl_->current_bytes += bytes;
   return handle;
@@ -270,17 +194,11 @@ void ReusableStateArena::Release(const ReusableStateHandle& handle) {
 
   --it->second.ref_count;
   if (it->second.ref_count == 0) {
-    InsertFreeRegion(impl_->free_regions, it->second.slab_offset, it->second.bytes);
+    if (it->second.device_storage != nullptr) {
+      cudaFree(it->second.device_storage);
+    }
     impl_->current_bytes -= it->second.bytes;
     impl_->allocations.erase(it);
-
-    // When the slab is completely empty, release it back to CUDA so execution
-    // scratch and KV pages can use the VRAM. The slab will be lazily
-    // re-allocated on the next Allocate() call.
-    if (impl_->allocations.empty() && impl_->device_slab != nullptr) {
-      cudaFree(impl_->device_slab);
-      impl_->device_slab = nullptr;
-    }
   }
 }
 
@@ -301,10 +219,10 @@ bool ReusableStateArena::CopyFromDevice(
   if (it == impl_->allocations.end() ||
       it->second.kind != handle.kind ||
       it->second.bytes != handle.bytes ||
-      impl_->device_slab == nullptr) {
+      it->second.device_storage == nullptr) {
     return false;
   }
-  void* device_dst = ByteOffset(impl_->device_slab, it->second.slab_offset + offset_bytes);
+  void* device_dst = static_cast<std::byte*>(it->second.device_storage) + offset_bytes;
   return CheckCuda(cudaMemcpy(device_dst, device_src, bytes, cudaMemcpyDeviceToDevice));
 }
 
@@ -320,10 +238,11 @@ bool ReusableStateArena::CopyToDevice(
   if (it == impl_->allocations.end() ||
       it->second.kind != handle.kind ||
       it->second.bytes != handle.bytes ||
-      impl_->device_slab == nullptr) {
+      it->second.device_storage == nullptr) {
     return false;
   }
-  const void* device_src = ByteOffset(impl_->device_slab, it->second.slab_offset + offset_bytes);
+  const void* device_src =
+      static_cast<const std::byte*>(it->second.device_storage) + offset_bytes;
   return CheckCuda(cudaMemcpy(device_dst, device_src, bytes, cudaMemcpyDeviceToDevice));
 }
 
@@ -338,7 +257,7 @@ std::optional<ReusableStateView> ReusableStateArena::Describe(ReusableStateId id
       it->second.label,
       it->second.bytes,
       it->second.ref_count,
-      impl_->device_slab != nullptr,
+      it->second.device_storage != nullptr,
   };
 }
 
