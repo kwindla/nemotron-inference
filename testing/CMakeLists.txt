@@ -235,16 +235,6 @@ target_compile_features(expert_layer_fastpath_test PRIVATE cxx_std_17)
 nemotron_add_test(expert_layer_fastpath_test)
 
 add_executable(
-  fused_moe_grouped_test
-  backend/fused_moe_grouped_test.cpp
-)
-
-target_link_libraries(fused_moe_grouped_test PRIVATE nemotron_runtime_backend)
-target_compile_features(fused_moe_grouped_test PRIVATE cxx_std_17)
-
-nemotron_add_test(fused_moe_grouped_test)
-
-add_executable(
   device_nvfp4_matrix_test
   backend/device_nvfp4_matrix_test.cpp
 )
