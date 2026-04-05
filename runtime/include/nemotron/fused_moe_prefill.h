@@ -35,8 +35,6 @@ struct FusedMoePrefillParams {
   float* gather_scratch = nullptr;
   float* expert_up_scratch = nullptr;
   float* shared_up_scratch = nullptr;
-  float* nvfp4_pack_scratch = nullptr;
-  float* grouped_workspace_scratch = nullptr;
   const int* expert_offsets = nullptr;
   const int* sorted_token_indices = nullptr;
   const float* sorted_token_weights = nullptr;

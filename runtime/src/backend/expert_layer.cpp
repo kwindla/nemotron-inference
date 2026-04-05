@@ -1208,10 +1208,6 @@ struct ExpertLayerSlice::Impl {
 
   DeviceTensorFp32* ResolveFusedPrefillSharedUpScratch() const;
 
-  DeviceTensorFp32* ResolveFusedPrefillNvfp4PackScratch() const;
-
-  DeviceTensorFp32* ResolveFusedPrefillGroupedWorkspaceScratch() const;
-
   std::size_t ResolveMultiTokenCapacity() const;
 
   void ResetBackendDispatchState(
@@ -1477,24 +1473,6 @@ DeviceTensorFp32* ExpertLayerSlice::Impl::ResolveFusedPrefillSharedUpScratch() c
   return fused_prefill_shared_up_scratch.get();
 }
 
-DeviceTensorFp32* ExpertLayerSlice::Impl::ResolveFusedPrefillNvfp4PackScratch() const {
-  if (backend_dispatch_state.workspace != nullptr &&
-      backend_dispatch_state.workspace->fused_prefill_nvfp4_pack_scratch != nullptr &&
-      backend_dispatch_state.workspace->fused_prefill_nvfp4_pack_scratch->valid()) {
-    return backend_dispatch_state.workspace->fused_prefill_nvfp4_pack_scratch.get();
-  }
-  return nullptr;
-}
-
-DeviceTensorFp32* ExpertLayerSlice::Impl::ResolveFusedPrefillGroupedWorkspaceScratch() const {
-  if (backend_dispatch_state.workspace != nullptr &&
-      backend_dispatch_state.workspace->fused_prefill_grouped_workspace_scratch != nullptr &&
-      backend_dispatch_state.workspace->fused_prefill_grouped_workspace_scratch->valid()) {
-    return backend_dispatch_state.workspace->fused_prefill_grouped_workspace_scratch.get();
-  }
-  return nullptr;
-}
-
 std::size_t ExpertLayerSlice::Impl::ResolveMultiTokenCapacity() const {
   if (backend_dispatch_state.workspace != nullptr && backend_dispatch_state.workspace->valid()) {
     return backend_dispatch_state.workspace->token_capacity();
@@ -1628,9 +1606,7 @@ bool ExpertLayerSlice::Impl::SupportsUnifiedFusedBackend(
          expert_up_scratch != nullptr &&
          expert_up_scratch->valid() &&
          shared_up_scratch != nullptr &&
-         shared_up_scratch->valid() &&
-         ResolveFusedPrefillNvfp4PackScratch() != nullptr &&
-         ResolveFusedPrefillGroupedWorkspaceScratch() != nullptr;
+         shared_up_scratch->valid();
 }
 
 bool ExpertLayerSlice::Impl::SupportsBatchedCublasLtBackend(
@@ -1684,8 +1660,6 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   DeviceTensorFp32* gather_owner = ResolveFusedPrefillGatherScratch();
   DeviceTensorFp32* expert_up_owner = ResolveFusedPrefillExpertUpScratch();
   DeviceTensorFp32* shared_up_owner = ResolveFusedPrefillSharedUpScratch();
-  DeviceTensorFp32* nvfp4_pack_owner = ResolveFusedPrefillNvfp4PackScratch();
-  DeviceTensorFp32* grouped_workspace_owner = ResolveFusedPrefillGroupedWorkspaceScratch();
   if (routing == nullptr ||
       routed_output_owner == nullptr ||
       gather_owner == nullptr ||
