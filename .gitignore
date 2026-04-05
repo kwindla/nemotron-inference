@@ -12,3 +12,4 @@ claude-todo.md
 /codex-jobs/
 proj-*/codex-jobs/*.log
 vllm-env/
+third_party/TensorRT-LLM/
