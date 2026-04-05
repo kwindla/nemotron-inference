@@ -106,7 +106,7 @@ the result will leave a large known cost untouched.
   `step9_runs/20260405T/post_attention_ttft.txt`,
   `step9_runs/20260405T/post_attention_1024_stats.txt`
 
-- [ ] **1. Lock the revised optimization contract**
+- [x] **1. Lock the revised optimization contract**
   Rewrite the implementation contract around the post-attention profile:
   routed-MoE/input-packing work plus Mamba, not attention. Freeze the target
   metric set for future comparisons:
@@ -182,6 +182,52 @@ the result will leave a large known cost untouched.
   `PLAN.md`,
   `TODO.md`
 
+## Frozen Baseline (post-attention, SM120, 2026-04-05)
+
+### Cold Prefill TTFT
+
+| Prompt | Median | p95 |
+|--------|--------|-----|
+| 256 tokens | 293 ms | 396 ms |
+| 1024 tokens | 440 ms | 444 ms |
+| 4096 tokens | 1,370 ms | 1,374 ms |
+
+### Cached Prefix + 32 Tail Tokens
+
+| Prefix | Cold TTFT | Hot-prefix TTFT | Tail Prefill | Speedup |
+|--------|-----------|-----------------|--------------|---------|
+| 4096 + 32 | 1,551 ms | 210 ms | 172 ms | 7.4x |
+| 8192 + 32 | 3,241 ms | 243 ms | 184 ms | 13.4x |
+| 32768 + 32 | 20,200 ms | 500 ms | 308 ms | 40.4x |
+| 65536 + 32 | 63,395 ms | 845 ms | 477 ms | 75.1x |
+
+### Kernel Time Split (1024-token cold, nsys)
+
+| Component | Share |
+|-----------|-------|
+| MambaSsdPrefill | 28.7% |
+| Mamba other (conv + group norm) | 2.6% |
+| Routed NVFP4 GEMM | 26.3% |
+| PackRowMajorFp32ToNvfp4 | 10.7% |
+| ComputeGlobalMaxAbs | 6.2% |
+| Routed dispatch/finalize | 8.4% |
+| Attention (prefill + decode) | 6.0% |
+| **Mamba total** | **31.3%** |
+| **Routed MoE total** | **51.6%** |
+
+### Decode (unchanged)
+
+| Metric | Value |
+|--------|-------|
+| Steady-state | 64.6 tok/s |
+
+### Optimization Contract
+
+All future steps in this plan are measured against the baselines above.
+Success means materially reducing routed-MoE and/or Mamba kernel time
+without regressing correctness (62/62 ctest), decode throughput, or
+attention prefill latency.
+
 ## Verification Policy
 
 ### Tier 1: after each implementation step
@@ -205,7 +251,7 @@ the result will leave a large known cost untouched.
 | # | Step | Status | Notes |
 |---|------|--------|-------|
 | 0 | Freeze the post-attention baseline and root-cause profile | done | `1024` cold TTFT `440.312 ms`, `4096` cold TTFT `1369.694 ms`, attention now about `6%` of GPU kernel time |
-| 1 | Lock the revised optimization contract | pending | |
+| 1 | Lock the revised optimization contract | done | Baseline frozen below |
 | 2 | Decide routed-expert input format and packing strategy | pending | |
 | 3 | Prototype reduced-launch routed-expert execution | pending | |
 | 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
