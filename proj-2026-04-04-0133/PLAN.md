@@ -309,32 +309,40 @@ NEMOTRON_FORWARD_MANIFEST="${NEMOTRON_FORWARD_MANIFEST}" \
 | 9 | Revisit cache allocator and page/snapshot ownership | done | 275459c | Removed prompt_head; LRU eviction + trie global-root lookup; slab allocator; snapshot layout metadata + restore validation |
 | 10 | Multi-turn prefix reuse regression and final verification sweep | done | 3ad38d3 | multi_turn_prefix_reuse_test (60/60 green); docs/intentional_divergences.md; Tier 2 verification pending |
 
-## Current Synthesis (2026-04-04 post-fix rerun)
+## Final Synthesis (2026-04-04 plan complete)
 
-The critical path has shifted again:
+All 10 plan steps are closed. Tier 2 verification is complete.
 
-1. **7f is no longer the blocker.**
-   The split-prefill / fused-decode handoff bug was fixed, the long-prompt `nano_save_prompt_oracle` path is healthy again, and the post-fix vLLM compare returned exact-token parity on `short_chat`.
+### Test suite
+`ctest`: 60/60 green. Includes `multi_turn_prefix_reuse_test` (committed-head, global-root, KV+Mamba round-trip, cold-vs-restored token match).
 
-2. **The smoke / inference / oracle surface is live again.**
-   As of the latest rerun, `ctest --test-dir build --output-on-failure` is green (`57/57`). That includes `full_forward_manifest_smoke_test`, `nano_16_token_correctness_test`, `nano_save_prompt_oracle`, `prefill_prefix_oracle_test`, `single_token_decode_oracle_test`, `expert_layer_oracle_test`, and `mamba_layer_oracle_test`.
+### Correctness
+- `verify_correctness.sh`: PASS — `generated_tokens_match=True`, `boundary_token_match=True`
+- vLLM exact-token parity: `token_match=exact` for all 16 decode tokens on `short_chat`
+  `runtime == vllm == [1784, 3330, 17000, 10693, 1278, 3403, 1429, 1078, 15187, 6918, 1082, 2918, 46103, 1034, 1321, 7545]`
+- Zero `dense_reference_fallback`, `nvfp4_reference_fallback`, `host_routing_adapter_calls`
 
-3. **Step 8 is no longer blocked on broken tests, but it is not fully complete.**
-   The generator/test contract has been tightened enough for the current oracle gates to pass: the Python dumpers now model BF16 residual mutation and NVFP4 projection semantics closely enough for this branch, and the tests that still rely on approximate host-side modeling use explicit functional envelopes. The remaining step-8 work is coverage expansion: more representative Nano fixtures, especially the second expert/Mamba layers and the attention-side fixture called out in the step text.
+### Decode performance (RTX 5090)
+- `steady_state_mean_ms=15.36`, `65.1 tok/s` (phased bench, hot)
+- `decode_cublaslt`: 64.0 tok/s, `unified_fused`: 62.3 tok/s, `default`: 62.3 tok/s
 
-4. **The last independent ctest blocker was a test-harness bug, not a runtime hot-path regression.**
-   `expert_layer_fastpath_test` was flaky because its shared NVFP4 test descriptors carried stale `tensor_scale` pointers after move construction. Rebinding the owned descriptors stabilized the test, and the target now passes repeated stress runs.
+### Prefix cache TTFT (RTX 5090, 4-token tail)
+| Prefix | Cold TTFT | Cached TTFT | Speedup |
+|--------|-----------|-------------|---------|
+| 256 | 3.2 s | 155 ms | 20.7x |
+| 1024 | 16.6 s | 501 ms | 33.2x |
+| 4096 | 175.8 s | OOM | — |
 
-5. **The decode performance sanity check remains healthy.**
-   The fresh `nano_fused_decode_bench` rerun reported `hot_steady_state_mean_ms=15.597` and `steady_state_generated_tokens_per_second=64.116`, with `dense_reference_fallback=0`, `nvfp4_reference_fallback=0`, `host_routing_adapter_calls=0`, and `host_routing_tensor_copies=0`.
+4096 cached OOMs because the snapshot (~400+ MB KV+Mamba state) exceeds remaining VRAM after model weights on 32GB. The slab allocator now releases VRAM when empty (lazy alloc + release on clear), which fixed the 1024 case that previously OOM'd.
 
-6. **The BF16 execution contract is still open for multi-token requests.**
-   The latest fixes proved correctness, but they also made the current production shape more obvious: attention, expert, and Mamba currently satisfy `token_count > 1` by replaying the one-token path row by row. That may be acceptable as a temporary correctness bridge, but it is still an accidental divergence until we either replace it with true multi-token execution or explicitly keep and justify it with measurements.
+### Multi-token execution
+Zero row replay across all layers at all prefix lengths. Native multi-token paths confirmed via per-layer execution counters wired into benchmark artifacts.
 
-## Immediate Execution Order
+### Post-plan fixes
+- `3accc5a`: Lazy VRAM-aware slab allocation (defer cudaMalloc until first use, cap to actual free VRAM)
+- `4ea52fc`: Release slab VRAM when prefix cache is fully empty (fixes cross-case OOM in benchmarks)
 
-1. Resume **7e** and clean up the residual-add / bootstrap contract while the verification surface is green and the oracle set is still small enough to rebaseline cheaply.
-2. Close **7g** immediately after `7e`: decide whether the current token-by-token BF16 multi-token bridge is temporary or intentional, and either remove it from the hot path or document and benchmark it as an explicit divergence.
-3. Finish the broader fixture expansion in **8** only after **7e** and **7g** stabilize the BF16 execution contract.
-4. Start **9** once step **8** coverage is genuinely complete or explicitly descoped; the next architectural work should be cache allocator and snapshot/page ownership, not more ad hoc oracle repair.
-5. Reserve **10** for the final integrated sweep after steps **7e**, **7g**, **8**, and **9** are all genuinely closed.
+### Known limitations
+- 4096-token prefix caching exceeds RTX 5090 32GB budget with desktop compositor running
+- `bench_full_comparison.sh` vLLM section untested (requires headless session for VRAM)
+- Cold prefill is MoE-window-chunked and slow at longer contexts (16.6s for 1024 tokens)
