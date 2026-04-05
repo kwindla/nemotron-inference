@@ -88,7 +88,7 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 
   Key files: `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`
 
-- [ ] **5. Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks**
+- [x] **5. Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks**
   Validate the runtime with the optimized default path on the same 1024-token cold-prefill and cached 1024 + 4 tail cases used for baseline measurement. Success means:
 
   - expert-layer `window_count` collapses to `1` on the target 5090 production case
@@ -119,5 +119,5 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 | 1 | Add prefill tracing and capture a production-relevant baseline | done | dfbf62a | |
 | 2 | Introduce request-scoped full multi-token expert workspace | done | b074667 | |
 | 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | done | 0e2aa05 | |
-| 4 | Make the benchmark follow the production runtime default | done | PENDING | |
-| 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | pending | — | |
+| 4 | Make the benchmark follow the production runtime default | done | 9e4e0a7 | |
+| 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | done | PENDING | Cold 1024: 16.6s→6.0s (2.8x); cold 256: 3.2s→0.7s (4.4x); decode 64.6 tok/s (no regression); reduced-capacity fallback verified |

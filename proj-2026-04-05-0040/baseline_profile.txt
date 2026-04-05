@@ -1,0 +1,200 @@
+nano_prefix_cache_ttft_bench: manifest="artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json" model_id=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 warmup_iterations=0 measured_iterations=5 tail_token_count=4 moe_prefill_window_tokens=4
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix256
+  iteration 1/5 measure
+single_token_forward_model: prefill_trace layer=0 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=7.56162
+single_token_forward_model: prefill_trace layer=1 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=184.72
+single_token_forward_model: prefill_trace layer=2 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.42362
+single_token_forward_model: prefill_trace layer=3 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=143.506
+single_token_forward_model: prefill_trace layer=4 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=51.4629
+single_token_forward_model: prefill_trace layer=5 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=85.2636
+single_token_forward_model: prefill_trace layer=6 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=131.65
+single_token_forward_model: prefill_trace layer=7 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.4804
+single_token_forward_model: prefill_trace layer=8 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=121.612
+single_token_forward_model: prefill_trace layer=9 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.43037
+single_token_forward_model: prefill_trace layer=10 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=125.823
+single_token_forward_model: prefill_trace layer=11 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.86737
+single_token_forward_model: prefill_trace layer=12 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=68.4087
+single_token_forward_model: prefill_trace layer=13 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=111.518
+single_token_forward_model: prefill_trace layer=14 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.46203
+single_token_forward_model: prefill_trace layer=15 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=93.5117
+single_token_forward_model: prefill_trace layer=16 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.30469
+single_token_forward_model: prefill_trace layer=17 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=99.8559
+single_token_forward_model: prefill_trace layer=18 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.5398
+single_token_forward_model: prefill_trace layer=19 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=66.4983
+single_token_forward_model: prefill_trace layer=20 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=101.502
+single_token_forward_model: prefill_trace layer=21 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.34396
+single_token_forward_model: prefill_trace layer=22 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=97.9691
+single_token_forward_model: prefill_trace layer=23 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.27093
+single_token_forward_model: prefill_trace layer=24 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=100.532
+single_token_forward_model: prefill_trace layer=25 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.58428
+single_token_forward_model: prefill_trace layer=26 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=65.2443
+single_token_forward_model: prefill_trace layer=27 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=113.451
+single_token_forward_model: prefill_trace layer=28 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.4305
+single_token_forward_model: prefill_trace layer=29 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=119.87
+single_token_forward_model: prefill_trace layer=30 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.63333
+single_token_forward_model: prefill_trace layer=31 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=120.205
+single_token_forward_model: prefill_trace layer=32 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.53563
+single_token_forward_model: prefill_trace layer=33 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=68.2312
+single_token_forward_model: prefill_trace layer=34 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=113.79
+single_token_forward_model: prefill_trace layer=35 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.34555
+single_token_forward_model: prefill_trace layer=36 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=120.142
+single_token_forward_model: prefill_trace layer=37 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.38134
+single_token_forward_model: prefill_trace layer=38 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=118.12
+single_token_forward_model: prefill_trace layer=39 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.31065
+single_token_forward_model: prefill_trace layer=40 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=122.131
+single_token_forward_model: prefill_trace layer=41 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.61493
+single_token_forward_model: prefill_trace layer=42 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=65.9903
+single_token_forward_model: prefill_trace layer=43 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=118.92
+single_token_forward_model: prefill_trace layer=44 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.39975
+single_token_forward_model: prefill_trace layer=45 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=136.8
+single_token_forward_model: prefill_trace layer=46 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.42346
+single_token_forward_model: prefill_trace layer=47 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=123.285
+single_token_forward_model: prefill_trace layer=48 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.37478
+single_token_forward_model: prefill_trace layer=49 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=114.968
+single_token_forward_model: prefill_trace layer=50 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.38859
+single_token_forward_model: prefill_trace layer=51 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=122.582
+  iteration 2/5 measure
+single_token_forward_model: prefill_trace layer=0 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.25825
+single_token_forward_model: prefill_trace layer=1 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=145.732
+single_token_forward_model: prefill_trace layer=2 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.3379
+single_token_forward_model: prefill_trace layer=3 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=143.917
+single_token_forward_model: prefill_trace layer=4 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.45492
+single_token_forward_model: prefill_trace layer=5 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=67.1941
+single_token_forward_model: prefill_trace layer=6 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=134.266
+single_token_forward_model: prefill_trace layer=7 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.4157
+single_token_forward_model: prefill_trace layer=8 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=122.586
+single_token_forward_model: prefill_trace layer=9 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.41027
+single_token_forward_model: prefill_trace layer=10 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=125.493
+single_token_forward_model: prefill_trace layer=11 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.607
+single_token_forward_model: prefill_trace layer=12 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=66.3171
+single_token_forward_model: prefill_trace layer=13 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=108.733
+single_token_forward_model: prefill_trace layer=14 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.34317
+single_token_forward_model: prefill_trace layer=15 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=92.672
+single_token_forward_model: prefill_trace layer=16 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.33795
+single_token_forward_model: prefill_trace layer=17 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=98.8722
+single_token_forward_model: prefill_trace layer=18 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.50238
+single_token_forward_model: prefill_trace layer=19 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=66.5516
+single_token_forward_model: prefill_trace layer=20 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=100.774
+single_token_forward_model: prefill_trace layer=21 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.36893
+single_token_forward_model: prefill_trace layer=22 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=98.5465
+single_token_forward_model: prefill_trace layer=23 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.38538
+single_token_forward_model: prefill_trace layer=24 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=101.255
+single_token_forward_model: prefill_trace layer=25 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.59818
+single_token_forward_model: prefill_trace layer=26 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=67.2371
+single_token_forward_model: prefill_trace layer=27 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=112.193
+single_token_forward_model: prefill_trace layer=28 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.41948
+single_token_forward_model: prefill_trace layer=29 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=117.401
+single_token_forward_model: prefill_trace layer=30 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.41304
+single_token_forward_model: prefill_trace layer=31 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=117.363
+single_token_forward_model: prefill_trace layer=32 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.53503
+single_token_forward_model: prefill_trace layer=33 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=67.4561
+single_token_forward_model: prefill_trace layer=34 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=113.814
+single_token_forward_model: prefill_trace layer=35 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.35701
+single_token_forward_model: prefill_trace layer=36 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=119.593
+single_token_forward_model: prefill_trace layer=37 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.36722
+single_token_forward_model: prefill_trace layer=38 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=118.674
+single_token_forward_model: prefill_trace layer=39 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.38951
+single_token_forward_model: prefill_trace layer=40 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=124.353
+single_token_forward_model: prefill_trace layer=41 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.60658
+single_token_forward_model: prefill_trace layer=42 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=69.4161
+single_token_forward_model: prefill_trace layer=43 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=118.242
+single_token_forward_model: prefill_trace layer=44 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.60877
+single_token_forward_model: prefill_trace layer=45 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=133.463
+single_token_forward_model: prefill_trace layer=46 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.38345
+single_token_forward_model: prefill_trace layer=47 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=120.118
+single_token_forward_model: prefill_trace layer=48 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.28121
+single_token_forward_model: prefill_trace layer=49 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=112.314
+single_token_forward_model: prefill_trace layer=50 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.34428
+single_token_forward_model: prefill_trace layer=51 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=121.73
+  iteration 3/5 measure
+single_token_forward_model: prefill_trace layer=0 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.25143
+single_token_forward_model: prefill_trace layer=1 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=146.612
+single_token_forward_model: prefill_trace layer=2 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.49024
+single_token_forward_model: prefill_trace layer=3 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=147.392
+single_token_forward_model: prefill_trace layer=4 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.61007
+single_token_forward_model: prefill_trace layer=5 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=68.2278
+single_token_forward_model: prefill_trace layer=6 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=135.122
+single_token_forward_model: prefill_trace layer=7 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.43733
+single_token_forward_model: prefill_trace layer=8 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=124.777
+single_token_forward_model: prefill_trace layer=9 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.41487
+single_token_forward_model: prefill_trace layer=10 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=124.9
+single_token_forward_model: prefill_trace layer=11 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.59363
+single_token_forward_model: prefill_trace layer=12 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=68.2556
+single_token_forward_model: prefill_trace layer=13 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=109.67
+single_token_forward_model: prefill_trace layer=14 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.40522
+single_token_forward_model: prefill_trace layer=15 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=93.8346
+single_token_forward_model: prefill_trace layer=16 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.39871
+single_token_forward_model: prefill_trace layer=17 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=101.108
+single_token_forward_model: prefill_trace layer=18 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.71438
+single_token_forward_model: prefill_trace layer=19 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=67.1175
+single_token_forward_model: prefill_trace layer=20 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=103.911
+single_token_forward_model: prefill_trace layer=21 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.44817
+single_token_forward_model: prefill_trace layer=22 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=99.9238
+single_token_forward_model: prefill_trace layer=23 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.42959
+single_token_forward_model: prefill_trace layer=24 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=103.359
+single_token_forward_model: prefill_trace layer=25 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.62182
+single_token_forward_model: prefill_trace layer=26 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=65.976
+single_token_forward_model: prefill_trace layer=27 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=109.598
+single_token_forward_model: prefill_trace layer=28 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.33478
+single_token_forward_model: prefill_trace layer=29 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=116.058
+single_token_forward_model: prefill_trace layer=30 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.32836
+single_token_forward_model: prefill_trace layer=31 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=116.827
+single_token_forward_model: prefill_trace layer=32 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.50589
+single_token_forward_model: prefill_trace layer=33 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=68.1314
+single_token_forward_model: prefill_trace layer=34 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=113.196
+single_token_forward_model: prefill_trace layer=35 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.34852
+single_token_forward_model: prefill_trace layer=36 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=120.939
+single_token_forward_model: prefill_trace layer=37 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.43943
+single_token_forward_model: prefill_trace layer=38 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=119.847
+single_token_forward_model: prefill_trace layer=39 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.42801
+single_token_forward_model: prefill_trace layer=40 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=124.18
+single_token_forward_model: prefill_trace layer=41 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.56779
+single_token_forward_model: prefill_trace layer=42 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=67.5131
+single_token_forward_model: prefill_trace layer=43 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=116.456
+single_token_forward_model: prefill_trace layer=44 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.377
+single_token_forward_model: prefill_trace layer=45 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=131.59
+single_token_forward_model: prefill_trace layer=46 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.37917
+single_token_forward_model: prefill_trace layer=47 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=120.117
+single_token_forward_model: prefill_trace layer=48 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.36281
+single_token_forward_model: prefill_trace layer=49 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=111.964
+single_token_forward_model: prefill_trace layer=50 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.32549
+single_token_forward_model: prefill_trace layer=51 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=121.627
+  iteration 4/5 measure
+single_token_forward_model: prefill_trace layer=0 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.27624
+single_token_forward_model: prefill_trace layer=1 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=147.327
+single_token_forward_model: prefill_trace layer=2 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.46359
+single_token_forward_model: prefill_trace layer=3 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=147.341
+single_token_forward_model: prefill_trace layer=4 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.65769
+single_token_forward_model: prefill_trace layer=5 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=66.169
+single_token_forward_model: prefill_trace layer=6 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=132.17
+single_token_forward_model: prefill_trace layer=7 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.54449
+single_token_forward_model: prefill_trace layer=8 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=120.642
+single_token_forward_model: prefill_trace layer=9 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.36351
+single_token_forward_model: prefill_trace layer=10 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=123.601
+single_token_forward_model: prefill_trace layer=11 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.50636
+single_token_forward_model: prefill_trace layer=12 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=66.7159
+single_token_forward_model: prefill_trace layer=13 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=109.189
+single_token_forward_model: prefill_trace layer=14 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.37024
+single_token_forward_model: prefill_trace layer=15 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=93.9205
+single_token_forward_model: prefill_trace layer=16 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.46848
+single_token_forward_model: prefill_trace layer=17 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=100.75
+single_token_forward_model: prefill_trace layer=18 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.55887
+single_token_forward_model: prefill_trace layer=19 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=69.2718
+single_token_forward_model: prefill_trace layer=20 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=103.934
+single_token_forward_model: prefill_trace layer=21 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.4372
+single_token_forward_model: prefill_trace layer=22 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=101.082
+single_token_forward_model: prefill_trace layer=23 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.42023
+single_token_forward_model: prefill_trace layer=24 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=100.15
+single_token_forward_model: prefill_trace layer=25 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.54658
+single_token_forward_model: prefill_trace layer=26 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=66.3498
+single_token_forward_model: prefill_trace layer=27 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=110.498
+single_token_forward_model: prefill_trace layer=28 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.39289
+single_token_forward_model: prefill_trace layer=29 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=116.246
+single_token_forward_model: prefill_trace layer=30 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.36935
+single_token_forward_model: prefill_trace layer=31 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=116.542
+single_token_forward_model: prefill_trace layer=32 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.49327
+single_token_forward_model: prefill_trace layer=33 kind=attention token_count=256 effective_moe_window_tokens=4 wall_ms=67.9194
+single_token_forward_model: prefill_trace layer=34 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=115.89
+single_token_forward_model: prefill_trace layer=35 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.56326
+single_token_forward_model: prefill_trace layer=36 kind=expert token_count=256 effective_moe_window_tokens=4 window_count=64 wall_ms=122.64
+single_token_forward_model: prefill_trace layer=37 kind=mamba token_count=256 effective_moe_window_tokens=4 wall_ms=1.40703
