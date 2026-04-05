@@ -120,7 +120,7 @@ the result will leave a large known cost untouched.
   `ATTENTION_PLAN.md`,
   `post_attention_root_cause.md`
 
-- [ ] **2. Decide the routed-expert input format and packing strategy**
+- [x] **2. Decide the routed-expert input format and packing strategy**
   The current runtime spends a large share of GPU time in:
   - `PackRowMajorFp32ToNvfp4Kernel`
   - `ComputeGlobalMaxAbsKernel`
@@ -129,6 +129,14 @@ the result will leave a large known cost untouched.
   - fuse it into a reduced-launch routed path,
   - or replace it with a different activation/input contract.
   Do not start grouped routed-expert work until this is explicit.
+
+  **Decision**: Eliminate runtime FP32→NVFP4 packing entirely. The grouped
+  MoE kernel (step 3) will accept BF16 activations directly and quantize
+  on-the-fly during GEMM tile loads, like vLLM and TRT-LLM do. This removes
+  16.9% of GPU time (10.7% packing + 6.2% max-abs). The current per-expert
+  cuBLASLt path requires pre-packed NVFP4 activations, which is a hard
+  contract limitation of cuBLASLt — this is why we need our own kernel.
+
   Key files:
   `runtime/src/backend/fused_moe_prefill.cu`,
   `runtime/src/backend/expert_layer.cpp`,
@@ -252,7 +260,7 @@ attention prefill latency.
 |---|------|--------|-------|
 | 0 | Freeze the post-attention baseline and root-cause profile | done | `1024` cold TTFT `440.312 ms`, `4096` cold TTFT `1369.694 ms`, attention now about `6%` of GPU kernel time |
 | 1 | Lock the revised optimization contract | done | Baseline frozen below |
-| 2 | Decide routed-expert input format and packing strategy | pending | |
+| 2 | Decide routed-expert input format and packing strategy | done | Eliminate packing; kernel accepts BF16 directly, quantizes on-the-fly |
 | 3 | Prototype reduced-launch routed-expert execution | pending | |
 | 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
 | 5 | Optimize Mamba prefill | pending | |
