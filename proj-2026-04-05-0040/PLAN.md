@@ -120,4 +120,4 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 | 2 | Introduce request-scoped full multi-token expert workspace | done | b074667 | |
 | 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | done | 0e2aa05 | |
 | 4 | Make the benchmark follow the production runtime default | done | 9e4e0a7 | |
-| 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | done | PENDING | Cold 1024: 16.6s→6.0s (2.8x); cold 256: 3.2s→0.7s (4.4x); decode 64.6 tok/s (no regression); reduced-capacity fallback verified |
+| 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | done | 945bbf6 | Cold 1024: 16.6s→6.0s (2.8x); cold 256: 3.2s→0.7s (4.4x); decode 64.6 tok/s (no regression); reduced-capacity fallback verified |
