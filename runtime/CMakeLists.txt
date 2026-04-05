@@ -1,7 +1,6 @@
 find_package(CUDAToolkit REQUIRED)
 
 set(NEMOTRON_CUDNN_FRONTEND_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cudnn-frontend/include")
-set(NEMOTRON_CUTLASS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass/include")
 find_path(
   NEMOTRON_CUDNN_INCLUDE_DIR
   cudnn.h
@@ -169,7 +168,6 @@ target_include_directories(
   nemotron_runtime_backend
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${NEMOTRON_CUTLASS_INCLUDE_DIR}
 )
 
 if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
