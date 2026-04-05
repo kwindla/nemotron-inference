@@ -79,7 +79,7 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 
   Key files: `runtime/include/nemotron/single_token_forward_model.h`, `runtime/src/api/single_token_forward_model.cpp`, `runtime/include/nemotron/request_context.h`, `runtime/src/backend/request_context.cpp`, `runtime/include/nemotron/expert_layer.h`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **4. Make the benchmark follow the production runtime default**
+- [x] **4. Make the benchmark follow the production runtime default**
   Change `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp` so `--moe-prefill-window-tokens` accepts `0` via `ParseNonNegativeSizeT`, and stop rewriting omitted `0` to `tail_token_count`.
 
   The benchmark should log both the explicit CLI value and the resolved runtime MoE prefill capacity/window so that benchmark output matches production behavior rather than masking it.
@@ -118,6 +118,6 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 |---|------|--------|--------|-------|
 | 1 | Add prefill tracing and capture a production-relevant baseline | done | dfbf62a | |
 | 2 | Introduce request-scoped full multi-token expert workspace | done | b074667 | |
-| 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | done | PENDING | |
-| 4 | Make the benchmark follow the production runtime default | pending | — | |
+| 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | done | 0e2aa05 | |
+| 4 | Make the benchmark follow the production runtime default | done | PENDING | |
 | 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | pending | — | |

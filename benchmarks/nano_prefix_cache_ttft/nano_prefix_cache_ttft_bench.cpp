@@ -306,7 +306,7 @@ void PrintUsage(const char* argv0) {
       << "                        Tail token count for resumed-prefix cases. Default: 32\n"
       << "  --moe-prefill-window-tokens <count>\n"
       << "                        Explicit SingleTokenForwardConfig.moe_prefill_window_tokens.\n"
-      << "                        Defaults to --tail-token-count when omitted.\n";
+      << "                        Default: 0 (use the runtime production default).\n";
 }
 
 bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
@@ -329,7 +329,7 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
       }
     } else if (arg == "--moe-prefill-window-tokens") {
       if (i + 1 >= argc ||
-          !ParsePositiveSizeT(argv[++i], &options->moe_prefill_window_tokens)) {
+          !ParseNonNegativeSizeT(argv[++i], &options->moe_prefill_window_tokens)) {
         return false;
       }
     } else if (arg == "--help" || arg == "-h") {
@@ -340,6 +340,33 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
     }
   }
   return options->measured_iterations >= kDefaultIterations;
+}
+
+struct ResolvedMoePrefillSettings {
+  std::size_t cli_window_tokens = 0;
+  std::size_t runtime_capacity_tokens = 0;
+  std::size_t runtime_window_tokens = 1;
+};
+
+std::optional<ResolvedMoePrefillSettings> ResolveMoePrefillSettingsForHeader(
+    const nemotron::SingleTokenForwardModel& model) {
+  auto request_context = model.CreateRequestContext();
+  if (request_context == nullptr || !request_context->valid()) {
+    std::cerr << "nano_prefix_cache_ttft_bench: failed to create request context for header"
+              << " MoE prefill resolution\n";
+    return std::nullopt;
+  }
+
+  ResolvedMoePrefillSettings resolved;
+  resolved.cli_window_tokens = model.config().moe_prefill_window_tokens;
+  resolved.runtime_capacity_tokens = request_context->config().moe_prefill_capacity_tokens;
+  if (const nemotron::MoePrefillWorkspace* workspace = request_context->moe_prefill_workspace();
+      workspace != nullptr && workspace->valid() && workspace->token_capacity() != 0) {
+    resolved.runtime_window_tokens = workspace->token_capacity();
+  } else if (resolved.cli_window_tokens != 0) {
+    resolved.runtime_window_tokens = resolved.cli_window_tokens;
+  }
+  return resolved;
 }
 
 nemotron::RuntimeBootstrapOptions MakeOptions(std::size_t max_context_tokens) {
@@ -1115,9 +1142,6 @@ int main(int argc, char** argv) {
     PrintUsage(argv[0]);
     return 1;
   }
-  if (options.moe_prefill_window_tokens == 0) {
-    options.moe_prefill_window_tokens = options.tail_token_count;
-  }
 
   ScopedEnvOverride fused_mamba("NEMOTRON_FORWARD_FUSED_MAMBA_DECODE", "1");
   ScopedEnvOverride fused_moe("NEMOTRON_FORWARD_FUSED_MOE_DECODE", "1");
@@ -1188,6 +1212,10 @@ int main(int argc, char** argv) {
   if (!device_token_buffer.Allocate()) {
     return 1;
   }
+  const auto resolved_moe_prefill = ResolveMoePrefillSettingsForHeader(*model);
+  if (!resolved_moe_prefill.has_value()) {
+    return 1;
+  }
 
   std::vector<CaseSpec> cases;
   for (const std::size_t prefix_length : kPrefixLengths) {
@@ -1206,7 +1234,11 @@ int main(int argc, char** argv) {
             << " warmup_iterations=" << options.warmup_iterations
             << " measured_iterations=" << options.measured_iterations
             << " tail_token_count=" << options.tail_token_count
-            << " moe_prefill_window_tokens=" << options.moe_prefill_window_tokens
+            << " moe_prefill_window_tokens_cli=" << resolved_moe_prefill->cli_window_tokens
+            << " resolved_runtime_moe_prefill_capacity_tokens="
+            << resolved_moe_prefill->runtime_capacity_tokens
+            << " resolved_runtime_moe_prefill_window_tokens="
+            << resolved_moe_prefill->runtime_window_tokens
             << "\n";
 
   for (const CaseSpec& spec : cases) {
