@@ -1,0 +1,27 @@
+{
+  "environment": {
+    "device_name": "NVIDIA GeForce RTX 5090",
+    "runtime_version": 13000,
+    "driver_version": 13000,
+    "compute_capability_major": 12,
+    "compute_capability_minor": 0
+  },
+  "results": [
+    {
+      "case_name": "prefill_q256",
+      "phase": "cold_prefill",
+      "backend": "device_fallback",
+      "prefix_tokens": 0,
+      "query_tokens": 256,
+      "total_sequence_tokens": 256,
+      "total_pages": 16,
+      "warmup_iterations": 0,
+      "hot_iterations": 1,
+      "cold_total_ms": 65.7400,
+      "hot_mean_ms": 66.6639,
+      "hot_min_ms": 66.6639,
+      "hot_max_ms": 66.6639,
+      "query_tokens_per_second": 3840.16
+    }
+  ]
+}

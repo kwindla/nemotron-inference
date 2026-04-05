@@ -1,0 +1,30 @@
+nano_prefix_cache_ttft_bench: manifest="artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json" model_id=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 warmup_iterations=0 measured_iterations=5 tail_token_count=32 target_active_requests=1 moe_prefill_window_tokens_cli=0 resolved_runtime_moe_prefill_capacity_tokens=4096 resolved_runtime_moe_prefill_window_tokens=4096
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix32768_tail32
+  iteration 1/5 measure
+  iteration 2/5 measure
+  iteration 3/5 measure
+  iteration 4/5 measure
+  iteration 5/5 measure
+
+Case: cached_committed_head_prefix32768_tail32 (total_prompt_tokens=32800)
+  cold TTFT                   : median=20200.210 ms p95=20223.472 ms
+  restore latency             : median=4.238 ms p95=4.431 ms
+  tail prefill latency        : median=307.933 ms p95=312.096 ms
+  first-token decode latency  : median=186.758 ms p95=187.468 ms
+  commit/snapshot latency     : median=7.176 ms p95=7.230 ms
+  hot-prefix TTFT             : median=499.605 ms p95=502.923 ms
+  speedup factor              : median=40.413x p95=40.593x
+  prefix snapshot size        : median=2148657773 bytes p95=2148657773 bytes
+  matched prefix token count  : median=32768 tokens p95=32768 tokens
+  attention native multi-token runs: median=396 runs p95=396 runs
+  attention native multi-token tokens: median=393600 tokens p95=393600 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=414 runs p95=414 runs
+  expert native multi-token tokens: median=1508800 tokens p95=1508800 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=1508800 tokens p95=1508800 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens

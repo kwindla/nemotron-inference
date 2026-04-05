@@ -1,0 +1,30 @@
+nano_prefix_cache_ttft_bench: manifest="artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json" model_id=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 warmup_iterations=0 measured_iterations=5 tail_token_count=32 target_active_requests=4 moe_prefill_window_tokens_cli=0 resolved_runtime_moe_prefill_capacity_tokens=4096 resolved_runtime_moe_prefill_window_tokens=4096
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix8192_tail32
+  iteration 1/5 measure
+  iteration 2/5 measure
+  iteration 3/5 measure
+  iteration 4/5 measure
+  iteration 5/5 measure
+
+Case: cached_committed_head_prefix8192_tail32 (total_prompt_tokens=8224)
+  cold TTFT                   : median=3220.462 ms p95=3366.168 ms
+  restore latency             : median=1.136 ms p95=1.142 ms
+  tail prefill latency        : median=186.219 ms p95=187.906 ms
+  first-token decode latency  : median=58.165 ms p95=58.511 ms
+  commit/snapshot latency     : median=2.237 ms p95=2.329 ms
+  hot-prefix TTFT             : median=245.513 ms p95=247.389 ms
+  speedup factor              : median=13.127x p95=13.899x
+  prefix snapshot size        : median=575695469 bytes p95=575695469 bytes
+  matched prefix token count  : median=8192 tokens p95=8192 tokens
+  attention native multi-token runs: median=108 runs p95=108 runs
+  attention native multi-token tokens: median=98688 tokens p95=98688 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=138 runs p95=138 runs
+  expert native multi-token tokens: median=378304 tokens p95=378304 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=378304 tokens p95=378304 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens

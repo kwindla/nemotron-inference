@@ -1,0 +1,23 @@
+# vLLM attention oracle: quick validation config for script and environment.
+
+model:
+  num_layers: 6
+  num_q_heads: 32
+  num_kv_heads: 2
+  head_dim: 128
+  block_size: 16
+
+batch_specs:
+  - "q256"
+
+backends:
+  - FLASH_ATTN
+  - FLASHINFER
+  - TRITON_ATTN
+
+device: "cuda:0"
+repeats: 1
+warmup_iters: 1
+profile_memory: false
+kv_cache_dtype: auto
+cuda_graphs: true

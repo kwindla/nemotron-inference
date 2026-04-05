@@ -1,0 +1,27 @@
+# vLLM attention oracle: representative 4-request matrix for Nano on RTX 5090.
+
+model:
+  num_layers: 6
+  num_q_heads: 32
+  num_kv_heads: 2
+  head_dim: 128
+  block_size: 16
+
+batch_specs:
+  - "4q256"
+  - "4q1k"
+  - "4q128s8k"
+  - "4q256s32k"
+  - "4q1ks64k"
+
+backends:
+  - FLASH_ATTN
+  - FLASHINFER
+  - TRITON_ATTN
+
+device: "cuda:0"
+repeats: 5
+warmup_iters: 3
+profile_memory: false
+kv_cache_dtype: auto
+cuda_graphs: true

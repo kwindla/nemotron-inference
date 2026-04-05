@@ -1,0 +1,3 @@
+expert_layer_create: skipping residency for layer 38: free_vram_mib=109 minimum_headroom_mib=2560
+expert_layer_create: skipping residency for layer 40: free_vram_mib=67 minimum_headroom_mib=2560
+FAIL: forward model should build

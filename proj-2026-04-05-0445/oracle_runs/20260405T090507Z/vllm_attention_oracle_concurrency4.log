@@ -1,0 +1,31 @@
+vLLM Attention Benchmark
+Loading config from: 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/vllm_attention_oracle
+_concurrency4.yaml
+
+Backends: FLASH_ATTN, FLASHINFER, TRITON_ATTN
+Batch specs: 4q256, 4q1k, 4q128s8k, 4q256s32k, 4q1ks64k
+KV cache dtype: auto
+CUDA graphs: True
+
+Benchmarking:   0%|          | 0/15 [00:00<?, ?it/s]Benchmarking:   7%|▋         | 1/15 [00:01<00:21,  1.55s/it]Benchmarking:  13%|█▎        | 2/15 [00:02<00:14,  1.11s/it]Benchmarking:  20%|██        | 3/15 [00:02<00:09,  1.23it/s]Benchmarking:  27%|██▋       | 4/15 [00:03<00:06,  1.67it/s]Benchmarking:  33%|███▎      | 5/15 [00:03<00:04,  2.08it/s]Benchmarking:  40%|████      | 6/15 [00:03<00:03,  2.42it/s]Benchmarking:  47%|████▋     | 7/15 [00:03<00:03,  2.65it/s]Benchmarking:  53%|█████▎    | 8/15 [00:04<00:02,  2.83it/s]Benchmarking:  60%|██████    | 9/15 [00:04<00:02,  2.96it/s]Benchmarking:  67%|██████▋   | 10/15 [00:05<00:01,  2.62it/s]Benchmarking:  73%|███████▎  | 11/15 [00:05<00:01,  2.44it/s]Benchmarking:  80%|████████  | 12/15 [00:06<00:01,  2.24it/s]Benchmarking:  87%|████████▋ | 13/15 [00:07<00:01,  1.34it/s]Benchmarking:  93%|█████████▎| 14/15 [00:08<00:00,  1.08it/s]Benchmarking: 100%|██████████| 15/15 [00:10<00:00,  1.28s/it]Benchmarking: 100%|██████████| 15/15 [00:10<00:00,  1.38it/s]
+
+Results:
+                          Attention Benchmark Results                           
+┏━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃           ┃         ┃       ┃ FLAS… ┃ FLAS… ┃ FLAS… ┃ FLAS… ┃ TRITO… ┃ TRIT… ┃
+┃ Batch     ┃         ┃ Batch ┃  Time ┃    vs ┃  Time ┃    vs ┃   Time ┃    vs ┃
+┃ Spec      ┃ Type    ┃  Size ┃   (s) ┃  Best ┃   (s) ┃  Best ┃    (s) ┃  Best ┃
+┡━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ 4q128s8k  │ extend  │     4 │ 0.00… │ 106.… │ 0.00… │ 100.… │ 0.000… │ 165.… │
+│ 4q256     │ prefill │     4 │ 0.00… │ 100.… │ 0.00… │ 105.… │ 0.000… │ 117.… │
+│ 4q256s32k │ extend  │     4 │ 0.00… │ 110.… │ 0.00… │ 100.… │ 0.005… │ 163.… │
+│ 4q1k      │ prefill │     4 │ 0.00… │ 109.… │ 0.00… │ 100.… │ 0.000… │ 158.… │
+│ 4q1ks64k  │ extend  │     4 │ 0.02… │ 108.… │ 0.02… │ 100.… │ 0.038… │ 172.… │
+└───────────┴─────────┴───────┴───────┴───────┴───────┴───────┴────────┴───────┘
+Saved CSV results to 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/oracle_runs/20260405T
+090507Z/vllm_attention_oracle_concurrency4.csv
+Saved JSON results to 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/oracle_runs/20260405T
+090507Z/vllm_attention_oracle_concurrency4.json

@@ -1,0 +1,27 @@
+vLLM Attention Benchmark
+Loading config from: 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/vllm_attention_oracle
+_smoke.yaml
+
+Backends: FLASH_ATTN, FLASHINFER, TRITON_ATTN
+Batch specs: q256
+KV cache dtype: auto
+CUDA graphs: True
+
+Benchmarking:   0%|          | 0/3 [00:00<?, ?it/s]Benchmarking:  33%|███▎      | 1/3 [00:01<00:03,  1.59s/it]Benchmarking:  67%|██████▋   | 2/3 [00:02<00:01,  1.13s/it]Benchmarking: 100%|██████████| 3/3 [00:02<00:00,  1.35it/s]Benchmarking: 100%|██████████| 3/3 [00:02<00:00,  1.12it/s]
+
+Results:
+                          Attention Benchmark Results                           
+┏━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃       ┃         ┃       ┃ FLASH… ┃ FLASH… ┃ FLASH… ┃ FLASH… ┃ TRITO… ┃ TRIT… ┃
+┃ Batch ┃         ┃ Batch ┃   Time ┃     vs ┃   Time ┃     vs ┃   Time ┃    vs ┃
+┃ Spec  ┃ Type    ┃  Size ┃    (s) ┃   Best ┃    (s) ┃   Best ┃    (s) ┃  Best ┃
+┡━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ q256  │ prefill │     1 │ 0.000… │ 100.0% │ 0.000… │ 195.8% │ 0.000… │ 111.… │
+└───────┴─────────┴───────┴────────┴────────┴────────┴────────┴────────┴───────┘
+Saved CSV results to 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/oracle_runs/20260405T
+090317Z/vllm_attention_oracle_smoke.csv
+Saved JSON results to 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/oracle_runs/20260405T
+090317Z/vllm_attention_oracle_smoke.json

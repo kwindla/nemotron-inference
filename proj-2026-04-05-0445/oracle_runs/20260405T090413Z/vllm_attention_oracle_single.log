@@ -1,0 +1,42 @@
+vLLM Attention Benchmark
+Loading config from: 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/vllm_attention_oracle
+_single.yaml
+
+Backends: FLASH_ATTN, FLASHINFER, TRITON_ATTN
+Batch specs: q256, q1k, q4k, q128s8k, q256s8k, q512s8k, q1ks8k, q128s32k, 
+q256s32k, q512s32k, q1ks32k, q128s64k, q256s64k, q512s64k, q1ks64k
+KV cache dtype: auto
+CUDA graphs: True
+
+Benchmarking:   0%|          | 0/45 [00:00<?, ?it/s]Benchmarking:   2%|▏         | 1/45 [00:01<01:12,  1.65s/it]Benchmarking:   4%|▍         | 2/45 [00:02<00:49,  1.15s/it]Benchmarking:   7%|▋         | 3/45 [00:02<00:31,  1.32it/s]Benchmarking:   9%|▉         | 4/45 [00:03<00:23,  1.77it/s]Benchmarking:  11%|█         | 5/45 [00:03<00:18,  2.14it/s]Benchmarking:  13%|█▎        | 6/45 [00:03<00:15,  2.49it/s]Benchmarking:  16%|█▌        | 7/45 [00:03<00:13,  2.72it/s]Benchmarking:  18%|█▊        | 8/45 [00:04<00:12,  2.89it/s]Benchmarking:  20%|██        | 9/45 [00:04<00:12,  2.94it/s]Benchmarking:  22%|██▏       | 10/45 [00:04<00:11,  3.03it/s]Benchmarking:  24%|██▍       | 11/45 [00:05<00:10,  3.19it/s]Benchmarking:  27%|██▋       | 12/45 [00:05<00:10,  3.27it/s]Benchmarking:  29%|██▉       | 13/45 [00:05<00:09,  3.31it/s]Benchmarking:  31%|███       | 14/45 [00:05<00:09,  3.25it/s]Benchmarking:  33%|███▎      | 15/45 [00:06<00:09,  3.29it/s]Benchmarking:  36%|███▌      | 16/45 [00:06<00:08,  3.29it/s]Benchmarking:  38%|███▊      | 17/45 [00:06<00:08,  3.37it/s]Benchmarking:  40%|████      | 18/45 [00:07<00:08,  3.31it/s]Benchmarking:  42%|████▏     | 19/45 [00:07<00:08,  3.24it/s]Benchmarking:  44%|████▍     | 20/45 [00:07<00:07,  3.23it/s]Benchmarking:  47%|████▋     | 21/45 [00:08<00:07,  3.19it/s]Benchmarking:  49%|████▉     | 22/45 [00:08<00:07,  3.21it/s]Benchmarking:  51%|█████     | 23/45 [00:08<00:06,  3.30it/s]Benchmarking:  53%|█████▎    | 24/45 [00:09<00:06,  3.25it/s]Benchmarking:  56%|█████▌    | 25/45 [00:09<00:06,  3.24it/s]Benchmarking:  58%|█████▊    | 26/45 [00:09<00:05,  3.29it/s]Benchmarking:  60%|██████    | 27/45 [00:10<00:05,  3.11it/s]Benchmarking:  62%|██████▏   | 28/45 [00:10<00:05,  3.05it/s]Benchmarking:  64%|██████▍   | 29/45 [00:10<00:05,  2.97it/s]Benchmarking:  67%|██████▋   | 30/45 [00:11<00:05,  2.77it/s]Benchmarking:  69%|██████▉   | 31/45 [00:11<00:05,  2.52it/s]Benchmarking:  71%|███████   | 32/45 [00:12<00:05,  2.43it/s]Benchmarking:  73%|███████▎  | 33/45 [00:12<00:05,  2.23it/s]Benchmarking:  76%|███████▌  | 34/45 [00:12<00:04,  2.36it/s]Benchmarking:  78%|███████▊  | 35/45 [00:13<00:03,  2.55it/s]Benchmarking:  80%|████████  | 36/45 [00:13<00:03,  2.58it/s]Benchmarking:  82%|████████▏ | 37/45 [00:14<00:03,  2.60it/s]Benchmarking:  84%|████████▍ | 38/45 [00:14<00:02,  2.72it/s]Benchmarking:  87%|████████▋ | 39/45 [00:14<00:02,  2.61it/s]Benchmarking:  89%|████████▉ | 40/45 [00:15<00:02,  2.50it/s]Benchmarking:  91%|█████████ | 41/45 [00:15<00:01,  2.44it/s]Benchmarking:  93%|█████████▎| 42/45 [00:16<00:01,  2.22it/s]Benchmarking:  96%|█████████▌| 43/45 [00:16<00:01,  1.94it/s]Benchmarking:  98%|█████████▊| 44/45 [00:17<00:00,  1.86it/s]Benchmarking: 100%|██████████| 45/45 [00:18<00:00,  1.63it/s]Benchmarking: 100%|██████████| 45/45 [00:18<00:00,  2.47it/s]
+
+Results:
+                          Attention Benchmark Results                           
+┏━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃          ┃         ┃       ┃ FLAS… ┃ FLAS… ┃ FLASH… ┃ FLAS… ┃ TRITO… ┃ TRIT… ┃
+┃ Batch    ┃         ┃ Batch ┃  Time ┃    vs ┃   Time ┃    vs ┃   Time ┃    vs ┃
+┃ Spec     ┃ Type    ┃  Size ┃   (s) ┃  Best ┃    (s) ┃  Best ┃    (s) ┃  Best ┃
+┡━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ q128s8k  │ extend  │     1 │ 0.00… │ 238.… │ 0.000… │ 100.… │ 0.000… │ 265.… │
+│ q128s32k │ extend  │     1 │ 0.00… │ 268.… │ 0.000… │ 100.… │ 0.001… │ 326.… │
+│ q128s64k │ extend  │     1 │ 0.00… │ 269.… │ 0.000… │ 100.… │ 0.002… │ 328.… │
+│ q256     │ prefill │     1 │ 0.00… │ 100.… │ 0.000… │ 211.… │ 0.000… │ 117.… │
+│ q256s8k  │ extend  │     1 │ 0.00… │ 125.… │ 0.000… │ 100.… │ 0.000… │ 221.… │
+│ q256s32k │ extend  │     1 │ 0.00… │ 136.… │ 0.000… │ 100.… │ 0.001… │ 235.… │
+│ q256s64k │ extend  │     1 │ 0.00… │ 137.… │ 0.001… │ 100.… │ 0.003… │ 238.… │
+│ q512s8k  │ extend  │     1 │ 0.00… │ 101.… │ 0.000… │ 100.… │ 0.000… │ 159.… │
+│ q512s32k │ extend  │     1 │ 0.00… │ 108.… │ 0.001… │ 100.… │ 0.002… │ 168.… │
+│ q512s64k │ extend  │     1 │ 0.00… │ 109.… │ 0.003… │ 100.… │ 0.005… │ 170.… │
+│ q1k      │ prefill │     1 │ 0.00… │ 100.… │ 0.000… │ 134.… │ 0.000… │ 142.… │
+│ q1ks8k   │ extend  │     1 │ 0.00… │ 102.… │ 0.000… │ 100.… │ 0.001… │ 154.… │
+│ q1ks32k  │ extend  │     1 │ 0.00… │ 108.… │ 0.003… │ 100.… │ 0.005… │ 160.… │
+│ q1ks64k  │ extend  │     1 │ 0.00… │ 109.… │ 0.006… │ 100.… │ 0.010… │ 162.… │
+│ q4k      │ prefill │     1 │ 0.00… │ 101.… │ 0.000… │ 100.… │ 0.001… │ 159.… │
+└──────────┴─────────┴───────┴───────┴───────┴────────┴───────┴────────┴───────┘
+Saved CSV results to 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/oracle_runs/20260405T
+090413Z/vllm_attention_oracle_single.csv
+Saved JSON results to 
+/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445/oracle_runs/20260405T
+090413Z/vllm_attention_oracle_single.json

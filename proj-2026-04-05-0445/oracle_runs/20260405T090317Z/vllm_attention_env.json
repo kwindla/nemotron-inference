@@ -1,0 +1,30 @@
+{
+  "current_platform_capability": [
+    12,
+    0
+  ],
+  "current_platform_device_name": "cuda",
+  "current_platform_family100": false,
+  "current_platform_is_cuda": true,
+  "cwd": "/home/khkramer/src/nemotron-inference",
+  "module_flash_attn": "ModuleNotFoundError: No module named 'flash_attn'",
+  "module_flashinfer": "import_ok",
+  "module_triton": "import_ok",
+  "platform": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
+  "py_env_pythonpath": "/home/khkramer/src/nemotron-inference/third_party/vllm",
+  "py_executable": "/home/khkramer/.pyenv/versions/3.12.10/bin/python3",
+  "py_path_prefix": [
+    "/home/khkramer/src/nemotron-inference/third_party/vllm/benchmarks/attention_benchmarks",
+    "/home/khkramer/src/nemotron-inference/proj-2026-04-05-0445",
+    "/home/khkramer/src/nemotron-inference/third_party/vllm",
+    "/home/khkramer/.pyenv/versions/3.12.10/lib/python312.zip",
+    "/home/khkramer/.pyenv/versions/3.12.10/lib/python3.12"
+  ],
+  "python": "3.12.10 (main, May 18 2025, 17:22:01) [GCC 14.2.0]",
+  "resolved_vllm_benchmark_dtype": "torch.bfloat16",
+  "supports_trtllm_attention": false,
+  "torch_cuda_version": "12.8",
+  "torch_device_name": "NVIDIA GeForce RTX 5090",
+  "torch_version": "2.10.0+cu128",
+  "vllm_module": "/home/khkramer/src/nemotron-inference/third_party/vllm/vllm/__init__.py"
+}

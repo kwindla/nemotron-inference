@@ -1,0 +1,37 @@
+# vLLM attention oracle: primary single-request matrix for Nano on RTX 5090.
+
+model:
+  num_layers: 6
+  num_q_heads: 32
+  num_kv_heads: 2
+  head_dim: 128
+  block_size: 16
+
+batch_specs:
+  - "q256"
+  - "q1k"
+  - "q4k"
+  - "q128s8k"
+  - "q256s8k"
+  - "q512s8k"
+  - "q1ks8k"
+  - "q128s32k"
+  - "q256s32k"
+  - "q512s32k"
+  - "q1ks32k"
+  - "q128s64k"
+  - "q256s64k"
+  - "q512s64k"
+  - "q1ks64k"
+
+backends:
+  - FLASH_ATTN
+  - FLASHINFER
+  - TRITON_ATTN
+
+device: "cuda:0"
+repeats: 5
+warmup_iters: 3
+profile_memory: false
+kv_cache_dtype: auto
+cuda_graphs: true
