@@ -64,14 +64,6 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
     const DeviceTensorFp32& source,
     const Nvfp4PackOptions& options = {});
 
-bool PackDeviceRowMajorFp32ToNvfp4Raw(
-    const DeviceTensorFp32& source,
-    std::uint8_t* packed_data,
-    std::uint8_t* block_scales_data,
-    std::uint8_t* matmul_block_scales_data,
-    float* tensor_scale_data,
-    const Nvfp4PackOptions& options = {});
-
 bool MultiplyDeviceTensorScales(
     const float* activation_tensor_scale_device,
     const float* weight_tensor_scale_device,

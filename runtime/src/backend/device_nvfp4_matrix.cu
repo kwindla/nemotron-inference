@@ -371,31 +371,6 @@ bool DeviceNvfp4Matrix::PackInto(
     return false;
   }
 
-  return PackDeviceRowMajorFp32ToNvfp4Raw(
-      source,
-      impl_->packed_data,
-      impl_->block_scales_data,
-      impl_->matmul_block_scales_data,
-      reinterpret_cast<float*>(impl_->tensor_scale_data),
-      options);
-}
-
-bool PackDeviceRowMajorFp32ToNvfp4Raw(
-    const DeviceTensorFp32& source,
-    std::uint8_t* packed_data,
-    std::uint8_t* block_scales_data,
-    std::uint8_t* matmul_block_scales_data,
-    float* tensor_scale_data,
-    const Nvfp4PackOptions& options) {
-  if (!source.valid() || source.shape().size() != 2 || packed_data == nullptr || matmul_block_scales_data == nullptr || tensor_scale_data == nullptr) {
-    return false;
-  }
-
-  const std::size_t rows = source.shape()[0];
-  const std::size_t cols = source.shape()[1];
-  const Nvfp4ScaleLayout scale_layout =
-      ResolveActivationNvfp4ScaleLayout(rows, options.execution_scale_layout);
-
   const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols, scale_layout);
   if (!layout.has_value()) {
     return false;
@@ -406,6 +381,7 @@ bool PackDeviceRowMajorFp32ToNvfp4Raw(
     return false;
   }
 
+  auto* tensor_scale_data = reinterpret_cast<float*>(impl_->tensor_scale_data);
   if (fixed_tensor_scale.has_value()) {
     const float host_tensor_scale = *fixed_tensor_scale;
     if (!CheckCuda(cudaMemcpy(
@@ -417,7 +393,7 @@ bool PackDeviceRowMajorFp32ToNvfp4Raw(
     }
   } else {
     auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
-    if (!CheckCuda(cudaMemset(global_max_bits, 0, sizeof(float)))) {
+    if (!CheckCuda(cudaMemset(global_max_bits, 0, impl_->tensor_scale_nbytes))) {
       return false;
     }
 
@@ -446,9 +422,9 @@ bool PackDeviceRowMajorFp32ToNvfp4Raw(
   const std::size_t grid_size = (total_blocks + kThreadsPerBlock - 1u) / kThreadsPerBlock;
   
   if (!CheckCuda(cudaMemset(
-          matmul_block_scales_data,
+          impl_->matmul_block_scales_data,
           0,
-          layout->nbytes()))) {
+          impl_->matmul_block_scales_nbytes))) {
     return false;
   }
 
@@ -459,9 +435,9 @@ bool PackDeviceRowMajorFp32ToNvfp4Raw(
       layout->padded_blocks_per_row,
       scale_layout,
       tensor_scale_data,
-      packed_data,
-      block_scales_data,
-      matmul_block_scales_data);
+      impl_->packed_data,
+      impl_->block_scales_data,
+      impl_->matmul_block_scales_data);
   if (!CheckCuda(cudaGetLastError())) {
     return false;
   }
