@@ -17,8 +17,6 @@
 
 #pragma GCC diagnostic pop
 
-#include <vector>
-
 namespace nemotron {
 namespace {
 
@@ -88,30 +86,6 @@ using InternalLayoutSFB = typename GemmKernel::CollectiveMainloop::InternalLayou
 
 using ElemFP4 = cutlass::float_e2m1_t;
 
-template <typename IntT>
-CUTLASS_HOST_DEVICE
-cute::Stride<IntT, cute::Int<1>, cute::Int<0>>
-MakeGroupedPackedStride(
-    cute::Stride<IntT, cute::Int<1>, cute::Int<0>>,
-    int64_t dim0,
-    int64_t dim1) {
-  auto stride = cute::Stride<IntT, cute::Int<1>, cute::Int<0>>{};
-  cute::get<0>(stride) = static_cast<IntT>(dim1);
-  return stride;
-}
-
-template <typename IntT>
-CUTLASS_HOST_DEVICE
-cute::Stride<cute::Int<1>, IntT, cute::Int<0>>
-MakeGroupedPackedStride(
-    cute::Stride<cute::Int<1>, IntT, cute::Int<0>>,
-    int64_t dim0,
-    int64_t dim1) {
-  auto stride = cute::Stride<cute::Int<1>, IntT, cute::Int<0>>{};
-  cute::get<1>(stride) = static_cast<IntT>(dim0);
-  return stride;
-}
-
 // ── Device kernel to set up per-expert workspace arrays ─────────────────
 
 struct WorkspaceLayout {
@@ -129,6 +103,46 @@ struct WorkspaceLayout {
   float* alpha_values;
   const float** alpha_ptrs;
 };
+
+__global__ void SetupWorkspaceKernel(
+    WorkspaceLayout ws,
+    const std::uint8_t* const* packed_A,
+    const std::uint8_t* const* scales_A,
+    const float* const* global_A,
+    const std::uint8_t* const* packed_B,
+    const std::uint8_t* const* scales_B,
+    const float* const* global_B,
+    float* const* output_D,
+    const std::int32_t* token_counts,
+    int K, int N, int num_experts) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_experts) return;
+
+  const int M = token_counts[i];
+  ws.shapes[i] = cute::make_shape(int64_t(M), int64_t(N), int64_t(K));
+
+  ws.ptr_A[i] = reinterpret_cast<const ElemFP4*>(packed_A[i]);
+  ws.ptr_B[i] = reinterpret_cast<const ElemFP4*>(packed_B[i]);
+  ws.ptr_D[i] = output_D[i];
+
+  ws.ptr_SFA[i] = reinterpret_cast<const ElementSF*>(scales_A[i]);
+  ws.ptr_SFB[i] = reinterpret_cast<const ElementSF*>(scales_B[i]);
+
+  ws.dA[i] = cute::make_int_tuple_from<InternalStrideA>(int64_t(K), int64_t(0));
+  ws.dB[i] = cute::make_int_tuple_from<InternalStrideB>(int64_t(K), int64_t(0));
+  ws.dD[i] = cute::make_int_tuple_from<InternalStrideD>(int64_t(N), int64_t(0));
+
+  ws.layout_SFA[i] = BlkScaledConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(M, N, K, 1));
+  ws.layout_SFB[i] = BlkScaledConfig::tile_atom_to_shape_SFB(
+      cute::make_shape(M, N, K, 1));
+
+  // alpha = activation_global_scale × weight_global_scale
+  const float act_scale = (global_A[i] != nullptr) ? *global_A[i] : 1.0f;
+  const float wt_scale = (global_B[i] != nullptr) ? *global_B[i] : 1.0f;
+  ws.alpha_values[i] = act_scale * wt_scale;
+  ws.alpha_ptrs[i] = &ws.alpha_values[i];
+}
 
 // ── Workspace size calculation ──────────────────────────────────────────
 
@@ -193,116 +207,6 @@ bool RunGroupedFp4Gemm(
     return false;
   }
 
-  std::vector<std::int32_t> token_counts_host(num_experts, 0);
-  if (num_experts > 0 &&
-      cudaMemcpy(
-          token_counts_host.data(),
-          token_counts,
-          sizeof(std::int32_t) * static_cast<std::size_t>(num_experts),
-          cudaMemcpyDeviceToHost) != cudaSuccess) {
-    return false;
-  }
-
-  std::vector<typename ProblemShape::UnderlyingProblemShape> host_shapes(
-      num_experts);
-  std::vector<const std::uint8_t*> packed_A_host(num_experts, nullptr);
-  std::vector<const std::uint8_t*> scales_A_host(num_experts, nullptr);
-  std::vector<const float*> global_A_host(num_experts, nullptr);
-  std::vector<const std::uint8_t*> packed_B_host(num_experts, nullptr);
-  std::vector<const std::uint8_t*> scales_B_host(num_experts, nullptr);
-  std::vector<const float*> global_B_host(num_experts, nullptr);
-  std::vector<float*> output_D_host(num_experts, nullptr);
-  if (num_experts > 0 &&
-      (cudaMemcpy(
-           packed_A_host.data(),
-           packed_A,
-           sizeof(const std::uint8_t*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess ||
-       cudaMemcpy(
-           scales_A_host.data(),
-           scales_A,
-           sizeof(const std::uint8_t*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess ||
-       cudaMemcpy(
-           global_A_host.data(),
-           global_A,
-           sizeof(const float*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess ||
-       cudaMemcpy(
-           packed_B_host.data(),
-           packed_B,
-           sizeof(const std::uint8_t*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess ||
-       cudaMemcpy(
-           scales_B_host.data(),
-           scales_B,
-           sizeof(const std::uint8_t*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess ||
-       cudaMemcpy(
-           global_B_host.data(),
-           global_B,
-           sizeof(const float*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess ||
-       cudaMemcpy(
-           output_D_host.data(),
-           output_D,
-           sizeof(float*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyDeviceToHost) != cudaSuccess)) {
-    return false;
-  }
-
-  std::vector<const ElemFP4*> ptr_A_host(num_experts, nullptr);
-  std::vector<const ElemFP4*> ptr_B_host(num_experts, nullptr);
-  std::vector<float*> ptr_D_host(num_experts, nullptr);
-  std::vector<const ElementSF*> ptr_SFA_host(num_experts, nullptr);
-  std::vector<const ElementSF*> ptr_SFB_host(num_experts, nullptr);
-  std::vector<InternalStrideA> dA_host(num_experts);
-  std::vector<InternalStrideB> dB_host(num_experts);
-  std::vector<InternalStrideD> dD_host(num_experts);
-  std::vector<InternalLayoutSFA> layout_SFA_host(num_experts);
-  std::vector<InternalLayoutSFB> layout_SFB_host(num_experts);
-  std::vector<float> alpha_values_host(num_experts, 1.0f);
-  for (int i = 0; i < num_experts; ++i) {
-    const auto index = static_cast<std::size_t>(i);
-    const int M = token_counts_host[index];
-    host_shapes[index] = cute::make_shape(int64_t(M), int64_t(N), int64_t(K));
-    ptr_A_host[index] = reinterpret_cast<const ElemFP4*>(packed_A_host[index]);
-    ptr_B_host[index] = reinterpret_cast<const ElemFP4*>(packed_B_host[index]);
-    ptr_D_host[index] = output_D_host[index];
-    ptr_SFA_host[index] = reinterpret_cast<const ElementSF*>(scales_A_host[index]);
-    ptr_SFB_host[index] = reinterpret_cast<const ElementSF*>(scales_B_host[index]);
-    dA_host[index] =
-        MakeGroupedPackedStride(InternalStrideA{}, int64_t(M), int64_t(K));
-    dB_host[index] =
-        MakeGroupedPackedStride(InternalStrideB{}, int64_t(N), int64_t(K));
-    dD_host[index] =
-        MakeGroupedPackedStride(InternalStrideD{}, int64_t(M), int64_t(N));
-    layout_SFA_host[index] =
-        BlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
-    layout_SFB_host[index] =
-        BlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
-
-    float act_scale = 1.0f;
-    float wt_scale = 1.0f;
-    if (global_A_host[index] != nullptr &&
-        cudaMemcpy(
-            &act_scale,
-            global_A_host[index],
-            sizeof(float),
-            cudaMemcpyDeviceToHost) != cudaSuccess) {
-      return false;
-    }
-    if (global_B_host[index] != nullptr &&
-        cudaMemcpy(
-            &wt_scale,
-            global_B_host[index],
-            sizeof(float),
-            cudaMemcpyDeviceToHost) != cudaSuccess) {
-      return false;
-    }
-    alpha_values_host[index] = act_scale * wt_scale;
-  }
-
   // Sub-allocate device arrays from workspace slab
   SlabAllocator slab{static_cast<std::uint8_t*>(workspace.data)};
   WorkspaceLayout ws;
@@ -323,86 +227,19 @@ bool RunGroupedFp4Gemm(
   void* cutlass_ws = slab.base + ((slab.offset + 127) & ~127);
   std::size_t cutlass_ws_bytes = workspace.nbytes - ((slab.offset + 127) & ~127);
 
-  std::vector<const float*> alpha_ptrs_host(num_experts, nullptr);
-  for (int i = 0; i < num_experts; ++i) {
-    alpha_ptrs_host[static_cast<std::size_t>(i)] = ws.alpha_values + i;
-  }
-
-  if (num_experts > 0 &&
-      (cudaMemcpy(
-           ws.shapes,
-           host_shapes.data(),
-           sizeof(typename ProblemShape::UnderlyingProblemShape) *
-               static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.ptr_A,
-           ptr_A_host.data(),
-           sizeof(const ElemFP4*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.ptr_B,
-           ptr_B_host.data(),
-           sizeof(const ElemFP4*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.ptr_D,
-           ptr_D_host.data(),
-           sizeof(float*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.ptr_SFA,
-           ptr_SFA_host.data(),
-           sizeof(const ElementSF*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.ptr_SFB,
-           ptr_SFB_host.data(),
-           sizeof(const ElementSF*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.dA,
-           dA_host.data(),
-           sizeof(InternalStrideA) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.dB,
-           dB_host.data(),
-           sizeof(InternalStrideB) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.dD,
-           dD_host.data(),
-           sizeof(InternalStrideD) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.layout_SFA,
-           layout_SFA_host.data(),
-           sizeof(InternalLayoutSFA) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.layout_SFB,
-           layout_SFB_host.data(),
-           sizeof(InternalLayoutSFB) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.alpha_values,
-           alpha_values_host.data(),
-           sizeof(float) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess ||
-       cudaMemcpy(
-           ws.alpha_ptrs,
-           alpha_ptrs_host.data(),
-           sizeof(const float*) * static_cast<std::size_t>(num_experts),
-           cudaMemcpyHostToDevice) != cudaSuccess)) {
-    return false;
-  }
+  // Launch setup kernel
+  constexpr int kThreads = 128;
+  const int blocks = (num_experts + kThreads - 1) / kThreads;
+  SetupWorkspaceKernel<<<blocks, kThreads, 0, stream>>>(
+      ws, packed_A, scales_A, global_A,
+      packed_B, scales_B, global_B,
+      output_D, token_counts, K, N, num_experts);
+  if (cudaGetLastError() != cudaSuccess) return false;
 
   // Build CUTLASS arguments
-  typename Gemm::Arguments args{};
+  typename Gemm::Arguments args;
   args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
-  args.problem_shape =
-      ProblemShape{num_experts, ws.shapes, host_shapes.data()};
+  args.problem_shape = ProblemShape{num_experts, ws.shapes, nullptr};
 
   args.mainloop.ptr_A = ws.ptr_A;
   args.mainloop.dA = ws.dA;
@@ -417,13 +254,8 @@ bool RunGroupedFp4Gemm(
   args.epilogue.dC = ws.dD;
   args.epilogue.ptr_D = ws.ptr_D;
   args.epilogue.dD = ws.dD;
-  args.epilogue.thread.alpha_ptr = nullptr;
-  args.epilogue.thread.beta_ptr = nullptr;
   args.epilogue.thread.alpha_ptr_array = ws.alpha_ptrs;
-  args.epilogue.thread.beta_ptr_array = nullptr;
-  args.epilogue.thread.dAlpha = {_0{}, _0{}, 1};
-  args.epilogue.thread.dBeta = {_0{}, _0{}, 0};
-  args.epilogue.thread.alpha = 0.0f;
+  args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta = 0.0f;
 
   args.hw_info.device_id = 0;
