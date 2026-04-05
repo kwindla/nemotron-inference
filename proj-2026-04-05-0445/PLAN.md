@@ -155,7 +155,7 @@ This is too large to treat “full `64k` MoE prefill window” as the default op
   The current source tree defaults `CMAKE_CUDA_ARCHITECTURES` to `120`, but the existing `build/CMakeCache.txt` is still pinned to `75`. Before doing any MoE kernel work, wipe or move aside the stale build directory, create dedicated build dirs such as `build-sm120-relwithdebinfo` and `build-sm120-release`, reconfigure from scratch with `-DCMAKE_CUDA_ARCHITECTURES=120`, rebuild, and rerun the current correctness + TTFT baseline on the fresh `SM120` binaries. Capture the exact toolchain tuple in the project notes: GPU = RTX 5090 (consumer Blackwell, SM120), driver = 580.65.06, CUDA toolkit = 13.0, build arch = 120. Record whether the refreshed baseline still matches the claimed 6.0s / 16.6s TTFT figures; if it does not, update the targets in this plan before proceeding.
   Key files: `CMakeLists.txt`, `build/CMakeCache.txt`, `proj-2026-04-05-0445/final_profile.txt`
 
-- [ ] **1. Capture a fresh root-cause profile on the SM120 baseline**
+- [x] **1. Capture a fresh root-cause profile on the SM120 baseline**
   On the fresh `SM120` build, collect one Nsight Systems trace and one Nsight Compute profile for the existing prefill path on the representative workload (`1024`-token cold TTFT, real Nano weights). The purpose is to validate how much time is actually spent in: routing kernels, host-side device-to-host synchronization/copies, per-expert cuBLASLt launch overhead, shared expert kernels, and residual/finalize work. Save the findings in `proj-2026-04-05-0445/baseline_root_cause.md` and update this plan if grouped routed experts are not the dominant remaining bottleneck.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/expert_routing_device.cu`, `proj-2026-04-05-0445/baseline_root_cause.md`
 
@@ -202,8 +202,8 @@ This is too large to treat “full `64k` MoE prefill window” as the default op
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 0 | Reconfigure for RTX 5090 / SM120 and refresh the baseline | done | PENDING | GPU=RTX 5090 SM120, driver=580.65.06, CUDA=13.0, arch=120. Cold 1024 TTFT=5971ms (confirmed, matches SM75 baseline) |
-| 1 | Capture a fresh root-cause profile on the SM120 baseline | pending | — | |
+| 0 | Reconfigure for RTX 5090 / SM120 and refresh the baseline | done | 3c22632 | GPU=RTX 5090 SM120, driver=580.65.06, CUDA=13.0, arch=120. Cold 1024 TTFT=5971ms (confirmed, matches SM75 baseline) |
+| 1 | Capture a fresh root-cause profile on the SM120 baseline | done | PENDING | PagedAttentionDeviceFallback is 98.7% of GPU time. MoE GEMMs are only 0.2%. Plan needs revision. |
 | 2 | Lock down the specialized implementation contract and runtime policy | pending | — | |
 | 3 | Define the combine/finalize strategy before writing the kernel | pending | — | |
 | 4 | Fused grouped kernel scaffold with naive GEMM | pending | — | |
