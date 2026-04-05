@@ -1,0 +1,7 @@
+add_executable(
+  nemotron_interactive_forward_server
+  nemotron_interactive_forward_server.cpp
+)
+
+target_link_libraries(nemotron_interactive_forward_server PRIVATE nemotron_runtime_api)
+target_compile_features(nemotron_interactive_forward_server PRIVATE cxx_std_17)
