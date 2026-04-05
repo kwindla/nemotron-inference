@@ -276,7 +276,7 @@ attention prefill latency.
 | 0 | Freeze the post-attention baseline and root-cause profile | done | `1024` cold TTFT `440.312 ms`, `4096` cold TTFT `1369.694 ms`, attention now about `6%` of GPU kernel time |
 | 1 | Lock the revised optimization contract | done | Baseline frozen below |
 | 2 | Decide routed-expert input format and packing strategy | done | FP4×FP4 on tensor cores; quantize activations once per layer, grouped GEMM for all experts |
-| 3 | Grouped FP4×FP4 tensor core MoE kernel | in-progress | `d5998e6` (fused quantization), CUTLASS integration pending |
-| 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
+| 3 | Grouped FP4×FP4 tensor core MoE kernel | done | `a12ef41` (CUTLASS smoke test), `5b131b5` (Grouped MoE Kernel) |
+| 4 | Reduce routed dispatch/finalize and allocator churn | done | `1844f4e` (Zero-alloc prefill wiring, workspace routing) |
 | 5 | Optimize Mamba prefill | pending | |
 | 6 | Re-profile and choose the next default workstream | pending | |

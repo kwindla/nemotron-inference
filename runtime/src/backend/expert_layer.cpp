@@ -1797,6 +1797,10 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.gather_scratch = gather_scratch->data();
   params.expert_up_scratch = expert_up_scratch->data();
   params.shared_up_scratch = shared_up_scratch->data();
+  params.nvfp4_pack_scratch =
+      nvfp4_pack_owner != nullptr ? nvfp4_pack_owner->data() : nullptr;
+  params.grouped_workspace_scratch =
+      grouped_workspace_owner != nullptr ? grouped_workspace_owner->data() : nullptr;
   params.expert_offsets = routing->expert_offsets();
   params.sorted_token_indices = routing->sorted_token_indices();
   params.sorted_token_weights = routing->sorted_token_weights();
