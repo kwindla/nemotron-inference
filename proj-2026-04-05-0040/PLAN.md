@@ -52,7 +52,7 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 
   Key files: `runtime/src/api/single_token_forward_model.cpp`, `benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench.cpp`
 
-- [ ] **2. Introduce request-scoped full multi-token expert workspace**
+- [x] **2. Introduce request-scoped full multi-token expert workspace**
   Decouple multi-token MoE capacity from per-layer scratch ownership. Keep the existing per-slice decode scratch for `token_count == 1`, but add a request-scoped workspace owned by `RequestExecutionContext` for expert prefill.
 
   This workspace must include all large multi-token expert temporaries needed by the hot path:
@@ -116,8 +116,8 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Add prefill tracing and capture a production-relevant baseline | done | PENDING | |
-| 2 | Introduce request-scoped full multi-token expert workspace | pending | — | |
+| 1 | Add prefill tracing and capture a production-relevant baseline | done | dfbf62a | |
+| 2 | Introduce request-scoped full multi-token expert workspace | done | PENDING | |
 | 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | pending | — | |
 | 4 | Make the benchmark follow the production runtime default | pending | — | |
 | 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | pending | — | |

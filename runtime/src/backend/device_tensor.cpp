@@ -23,6 +23,14 @@ struct DeviceTensorBf16::Impl {
   bool owns_data = false;
 };
 
+struct DeviceTensorInt32::Impl {
+  std::vector<std::size_t> shape;
+  std::size_t numel = 0;
+  std::size_t bytes = 0;
+  std::int32_t* data = nullptr;
+  bool owns_data = false;
+};
+
 namespace {
 
 bool CheckCuda(cudaError_t status) {
@@ -223,6 +231,94 @@ bool DeviceTensorBf16::CopyToHost(__nv_bfloat16* host_data, std::size_t count) c
 }
 
 bool DeviceTensorBf16::FillZero() {
+  return valid() && CheckCuda(cudaMemset(data(), 0, bytes()));
+}
+
+std::unique_ptr<DeviceTensorInt32> DeviceTensorInt32::Create(std::vector<std::size_t> shape) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || !HasCudaDevice()) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(std::int32_t);
+  impl->owns_data = true;
+  if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->data), impl->bytes))) {
+    return nullptr;
+  }
+  return std::unique_ptr<DeviceTensorInt32>(new DeviceTensorInt32(std::move(impl)));
+}
+
+std::unique_ptr<DeviceTensorInt32> DeviceTensorInt32::CreateView(
+    std::vector<std::size_t> shape,
+    std::int32_t* data) {
+  const std::size_t numel = NumelFromShape(shape);
+  if (numel == 0 || data == nullptr) {
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<Impl>();
+  impl->shape = std::move(shape);
+  impl->numel = numel;
+  impl->bytes = numel * sizeof(std::int32_t);
+  impl->data = data;
+  impl->owns_data = false;
+  return std::unique_ptr<DeviceTensorInt32>(new DeviceTensorInt32(std::move(impl)));
+}
+
+DeviceTensorInt32::DeviceTensorInt32(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+DeviceTensorInt32::DeviceTensorInt32(DeviceTensorInt32&&) noexcept = default;
+
+DeviceTensorInt32& DeviceTensorInt32::operator=(DeviceTensorInt32&&) noexcept = default;
+
+DeviceTensorInt32::~DeviceTensorInt32() {
+  if (impl_ && impl_->owns_data && impl_->data != nullptr) {
+    cudaFree(impl_->data);
+  }
+}
+
+bool DeviceTensorInt32::valid() const {
+  return impl_ != nullptr && impl_->data != nullptr && impl_->numel > 0;
+}
+
+const std::vector<std::size_t>& DeviceTensorInt32::shape() const {
+  static const std::vector<std::size_t> kEmpty;
+  if (!impl_) {
+    return kEmpty;
+  }
+  return impl_->shape;
+}
+
+std::size_t DeviceTensorInt32::numel() const {
+  return impl_ ? impl_->numel : 0;
+}
+
+std::size_t DeviceTensorInt32::bytes() const {
+  return impl_ ? impl_->bytes : 0;
+}
+
+std::int32_t* DeviceTensorInt32::data() const {
+  return impl_ ? impl_->data : nullptr;
+}
+
+bool DeviceTensorInt32::CopyFromHost(const std::int32_t* host_data, std::size_t count) {
+  return valid() &&
+         host_data != nullptr &&
+         count == numel() &&
+         CheckCuda(cudaMemcpy(data(), host_data, bytes(), cudaMemcpyHostToDevice));
+}
+
+bool DeviceTensorInt32::CopyToHost(std::int32_t* host_data, std::size_t count) const {
+  return valid() &&
+         host_data != nullptr &&
+         count == numel() &&
+         CheckCuda(cudaMemcpy(host_data, data(), bytes(), cudaMemcpyDeviceToHost));
+}
+
+bool DeviceTensorInt32::FillZero() {
   return valid() && CheckCuda(cudaMemset(data(), 0, bytes()));
 }
 

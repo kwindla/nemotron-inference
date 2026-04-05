@@ -1,5 +1,6 @@
 #include "nemotron/request_context.h"
 
+#include <limits>
 #include <utility>
 
 namespace nemotron {
@@ -30,7 +31,137 @@ bool HandlesSatisfyLayerInvariant(
   return true;
 }
 
+bool TensorMatchesShape(
+    const DeviceTensorBf16* tensor,
+    std::size_t dim0,
+    std::size_t dim1) {
+  return tensor != nullptr &&
+         tensor->valid() &&
+         tensor->shape().size() == 2 &&
+         tensor->shape()[0] == dim0 &&
+         tensor->shape()[1] == dim1;
+}
+
+bool TensorMatchesShape(
+    const DeviceTensorFp32* tensor,
+    std::size_t dim0,
+    std::size_t dim1) {
+  return tensor != nullptr &&
+         tensor->valid() &&
+         tensor->shape().size() == 2 &&
+         tensor->shape()[0] == dim0 &&
+         tensor->shape()[1] == dim1;
+}
+
+bool TensorMatchesShape(
+    const DeviceTensorInt32* tensor,
+    std::size_t dim0,
+    std::size_t dim1) {
+  return tensor != nullptr &&
+         tensor->valid() &&
+         tensor->shape().size() == 2 &&
+         tensor->shape()[0] == dim0 &&
+         tensor->shape()[1] == dim1;
+}
+
+bool SameWorkspaceConfig(
+    const MoePrefillWorkspaceConfig& lhs,
+    const MoePrefillWorkspaceConfig& rhs) {
+  return lhs.hidden_size == rhs.hidden_size &&
+         lhs.num_experts == rhs.num_experts &&
+         lhs.top_k == rhs.top_k &&
+         lhs.routed_expert_intermediate_size == rhs.routed_expert_intermediate_size &&
+         lhs.shared_expert_intermediate_size == rhs.shared_expert_intermediate_size;
+}
+
 }  // namespace
+
+std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
+    std::size_t token_capacity,
+    const MoePrefillWorkspaceConfig& config) {
+  if (token_capacity == 0 ||
+      config.hidden_size == 0 ||
+      config.num_experts == 0 ||
+      config.top_k == 0 ||
+      config.top_k > config.num_experts ||
+      config.routed_expert_intermediate_size == 0 ||
+      config.shared_expert_intermediate_size == 0 ||
+      token_capacity > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
+    return nullptr;
+  }
+
+  const std::size_t selection_capacity = token_capacity * config.top_k;
+  auto workspace = std::make_unique<MoePrefillWorkspace>();
+  workspace->config = config;
+  workspace->token_capacity_value = token_capacity;
+  workspace->normalized_bf16 = DeviceTensorBf16::Create({token_capacity, config.hidden_size});
+  workspace->input_fp32 = DeviceTensorFp32::Create({token_capacity, config.hidden_size});
+  workspace->normalized = DeviceTensorFp32::Create({token_capacity, config.hidden_size});
+  workspace->router_logits = DeviceTensorFp32::Create({token_capacity, config.num_experts});
+  workspace->output_fp32 = DeviceTensorFp32::Create({token_capacity, config.hidden_size});
+  workspace->topk_ids = DeviceTensorInt32::Create({token_capacity, config.top_k});
+  workspace->topk_weights = DeviceTensorFp32::Create({token_capacity, config.top_k});
+  workspace->fused_prefill_routing =
+      DeviceExpertRouting::Create(config.num_experts, selection_capacity);
+  workspace->fused_prefill_routed_output_scratch =
+      DeviceTensorFp32::Create({token_capacity, config.hidden_size});
+  workspace->fused_prefill_gather_scratch =
+      DeviceTensorFp32::Create({selection_capacity, config.hidden_size});
+  workspace->fused_prefill_expert_up_scratch =
+      DeviceTensorFp32::Create({selection_capacity, config.routed_expert_intermediate_size});
+  workspace->fused_prefill_shared_up_scratch =
+      DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
+  if (!workspace->valid()) {
+    return nullptr;
+  }
+  return workspace;
+}
+
+bool MoePrefillWorkspace::valid() const {
+  if (token_capacity_value == 0 ||
+      config.hidden_size == 0 ||
+      config.num_experts == 0 ||
+      config.top_k == 0 ||
+      config.top_k > config.num_experts ||
+      config.routed_expert_intermediate_size == 0 ||
+      config.shared_expert_intermediate_size == 0 ||
+      token_capacity_value > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
+    return false;
+  }
+
+  const std::size_t selection_capacity = token_capacity_value * config.top_k;
+  return TensorMatchesShape(normalized_bf16.get(), token_capacity_value, config.hidden_size) &&
+         TensorMatchesShape(input_fp32.get(), token_capacity_value, config.hidden_size) &&
+         TensorMatchesShape(normalized.get(), token_capacity_value, config.hidden_size) &&
+         TensorMatchesShape(router_logits.get(), token_capacity_value, config.num_experts) &&
+         TensorMatchesShape(output_fp32.get(), token_capacity_value, config.hidden_size) &&
+         TensorMatchesShape(topk_ids.get(), token_capacity_value, config.top_k) &&
+         TensorMatchesShape(topk_weights.get(), token_capacity_value, config.top_k) &&
+         fused_prefill_routing != nullptr &&
+         fused_prefill_routing->valid() &&
+         fused_prefill_routing->n_experts() == config.num_experts &&
+         fused_prefill_routing->selection_count() >= selection_capacity &&
+         TensorMatchesShape(
+             fused_prefill_routed_output_scratch.get(),
+             token_capacity_value,
+             config.hidden_size) &&
+         TensorMatchesShape(
+             fused_prefill_gather_scratch.get(),
+             selection_capacity,
+             config.hidden_size) &&
+         TensorMatchesShape(
+             fused_prefill_expert_up_scratch.get(),
+             selection_capacity,
+             config.routed_expert_intermediate_size) &&
+         TensorMatchesShape(
+             fused_prefill_shared_up_scratch.get(),
+             token_capacity_value,
+             config.shared_expert_intermediate_size);
+}
+
+std::size_t MoePrefillWorkspace::token_capacity() const {
+  return token_capacity_value;
+}
 
 std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
     const RequestExecutionConfig& config) {
@@ -152,6 +283,9 @@ bool RequestExecutionContext::valid() const {
       (!key_cache_ || !key_cache_->valid() || !value_cache_ || !value_cache_->valid())) {
     return false;
   }
+  if (moe_prefill_workspace_ != nullptr && !moe_prefill_workspace_->valid()) {
+    return false;
+  }
   return true;
 }
 
@@ -223,6 +357,14 @@ const DeviceTensorBf16* RequestExecutionContext::value_cache() const {
   return value_cache_.get();
 }
 
+MoePrefillWorkspace* RequestExecutionContext::moe_prefill_workspace() {
+  return moe_prefill_workspace_.get();
+}
+
+const MoePrefillWorkspace* RequestExecutionContext::moe_prefill_workspace() const {
+  return moe_prefill_workspace_.get();
+}
+
 bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
   if (!kv_arena_.has_value()) {
     return token_count == 0;
@@ -251,6 +393,27 @@ bool RequestExecutionContext::EnsureAttentionTokens(std::size_t token_count) {
       return false;
     }
   }
+  return true;
+}
+
+bool RequestExecutionContext::EnsureMoePrefillWorkspace(
+    std::size_t token_capacity,
+    const MoePrefillWorkspaceConfig& config) {
+  if (token_capacity == 0) {
+    return false;
+  }
+  if (moe_prefill_workspace_ != nullptr &&
+      moe_prefill_workspace_->valid() &&
+      SameWorkspaceConfig(moe_prefill_workspace_->config, config) &&
+      moe_prefill_workspace_->token_capacity() >= token_capacity) {
+    return true;
+  }
+
+  auto workspace = MoePrefillWorkspace::Create(token_capacity, config);
+  if (!workspace) {
+    return false;
+  }
+  moe_prefill_workspace_ = std::move(workspace);
   return true;
 }
 

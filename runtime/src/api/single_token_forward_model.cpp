@@ -121,6 +121,19 @@ std::size_t EffectiveMoePrefillWindowTokens(const SingleTokenForwardConfig& conf
              : config.max_tokens;
 }
 
+MoePrefillWorkspaceConfig BuildMoePrefillWorkspaceConfig(
+    const SingleTokenForwardConfig& config) {
+  MoePrefillWorkspaceConfig workspace_config;
+  workspace_config.hidden_size = config.hidden_size;
+  workspace_config.num_experts = config.n_routed_experts;
+  workspace_config.top_k = config.experts_per_token;
+  workspace_config.routed_expert_intermediate_size =
+      config.routed_expert_intermediate_size;
+  workspace_config.shared_expert_intermediate_size =
+      config.shared_expert_intermediate_size;
+  return workspace_config;
+}
+
 const char* ForwardLayerKindName(ForwardLayerKind kind) {
   switch (kind) {
     case ForwardLayerKind::kAttention:
@@ -1408,6 +1421,25 @@ bool SingleTokenForwardModel::RunTokens(
     return false;
   }
 
+  MoePrefillWorkspace* moe_prefill_workspace = nullptr;
+  if (token_count > 1 && impl_->plan.expert_layer_count != 0) {
+    const MoePrefillWorkspaceConfig workspace_config =
+        BuildMoePrefillWorkspaceConfig(impl_->config);
+    if (!request_context.EnsureMoePrefillWorkspace(token_count, workspace_config)) {
+      if (debug) {
+        std::cout << "single_token_forward_model: request-scoped MoE prefill workspace unavailable"
+                  << " token_count=" << token_count << "\n";
+      }
+    } else {
+      MoePrefillWorkspace* allocated_workspace = request_context.moe_prefill_workspace();
+      if (allocated_workspace != nullptr &&
+          allocated_workspace->valid() &&
+          allocated_workspace->token_capacity() >= token_count) {
+        moe_prefill_workspace = allocated_workspace;
+      }
+    }
+  }
+
   std::unique_ptr<DeviceTensorBf16> hidden_owned;
   std::unique_ptr<DeviceTensorBf16> residual_owned;
   std::unique_ptr<DeviceTensorBf16> scratch_owned;
@@ -1573,7 +1605,8 @@ bool SingleTokenForwardModel::RunTokens(
                         *current_chunk,
                         residual_chunk.get(),
                         next_chunk.get(),
-                        nullptr);
+                        nullptr,
+                        moe_prefill_workspace);
               if (!ran) {
                 break;
               }
@@ -1585,7 +1618,8 @@ bool SingleTokenForwardModel::RunTokens(
                 *current,
                 residual_tensor,
                 next,
-                nullptr);
+                nullptr,
+                moe_prefill_workspace);
           }
         }
         if (debug && (!created || !valid_slice || !ran)) {

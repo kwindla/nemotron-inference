@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "nemotron/device_tensor.h"
+#include "nemotron/expert_routing_device.h"
 #include "nemotron/paged_kv_cache.h"
 
 namespace nemotron {
@@ -18,6 +19,38 @@ struct RequestExecutionConfig {
   std::size_t attention_total_pages = 0;
   std::size_t mamba_conv_state_bytes_fp32 = 0;
   std::size_t mamba_state_bytes_fp32 = 0;
+};
+
+struct MoePrefillWorkspaceConfig {
+  std::size_t hidden_size = 0;
+  std::size_t num_experts = 0;
+  std::size_t top_k = 0;
+  std::size_t routed_expert_intermediate_size = 0;
+  std::size_t shared_expert_intermediate_size = 0;
+};
+
+struct MoePrefillWorkspace {
+  static std::unique_ptr<MoePrefillWorkspace> Create(
+      std::size_t token_capacity,
+      const MoePrefillWorkspaceConfig& config);
+
+  bool valid() const;
+  std::size_t token_capacity() const;
+
+  MoePrefillWorkspaceConfig config;
+  std::size_t token_capacity_value = 0;
+  std::unique_ptr<DeviceTensorBf16> normalized_bf16;
+  std::unique_ptr<DeviceTensorFp32> input_fp32;
+  std::unique_ptr<DeviceTensorFp32> normalized;
+  std::unique_ptr<DeviceTensorFp32> router_logits;
+  std::unique_ptr<DeviceTensorFp32> output_fp32;
+  std::unique_ptr<DeviceTensorInt32> topk_ids;
+  std::unique_ptr<DeviceTensorFp32> topk_weights;
+  std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
 };
 
 class RequestExecutionContext {
@@ -50,8 +83,13 @@ class RequestExecutionContext {
   const DeviceTensorBf16* key_cache() const;
   DeviceTensorBf16* value_cache();
   const DeviceTensorBf16* value_cache() const;
+  MoePrefillWorkspace* moe_prefill_workspace();
+  const MoePrefillWorkspace* moe_prefill_workspace() const;
 
   bool EnsureAttentionTokens(std::size_t token_count);
+  bool EnsureMoePrefillWorkspace(
+      std::size_t token_capacity,
+      const MoePrefillWorkspaceConfig& config);
   std::size_t allocated_kv_pages() const;
   std::size_t allocated_kv_pages(std::size_t layer_index) const;
   // These page handles are the live request-owned KV allocation. Snapshots copy
@@ -82,6 +120,7 @@ class RequestExecutionContext {
   std::unique_ptr<DeviceTensorFp32> mamba_state_;
   std::unique_ptr<DeviceTensorBf16> key_cache_;
   std::unique_ptr<DeviceTensorBf16> value_cache_;
+  std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace_;
   std::optional<PagedKvCacheArena> kv_arena_;
   std::vector<std::vector<KvPageHandle>> kv_pages_by_layer_;
   std::size_t sequence_length_ = 0;
