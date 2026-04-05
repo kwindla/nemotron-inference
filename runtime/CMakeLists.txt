@@ -129,6 +129,7 @@ add_library(
   src/backend/expert_staging_counters.cpp
   src/backend/fused_mamba_decode.cu
   src/backend/fused_moe_decode.cu
+  src/backend/fused_moe_grouped.cu
   src/backend/fused_moe_prefill.cu
   src/backend/linear_op.cpp
   src/backend/linear_op_counters.cpp

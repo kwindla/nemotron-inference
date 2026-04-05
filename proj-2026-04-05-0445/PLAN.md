@@ -143,7 +143,7 @@ the result will leave a large known cost untouched.
   `runtime/src/backend/device_nvfp4_matrix.cu`,
   `runtime/src/api/single_token_forward_model.cpp`
 
-- [ ] **3. Prototype reduced-launch routed-expert execution**
+- [x] **3. Prototype reduced-launch routed-expert execution**
   Revisit grouped routed-expert execution with the new profile in mind. The
   candidate design is still "routing separate, grouped expert execution,
   finalize explicit", informed by vLLM and TRT-LLM prior art. But the first
@@ -261,7 +261,7 @@ attention prefill latency.
 | 0 | Freeze the post-attention baseline and root-cause profile | done | `1024` cold TTFT `440.312 ms`, `4096` cold TTFT `1369.694 ms`, attention now about `6%` of GPU kernel time |
 | 1 | Lock the revised optimization contract | done | Baseline frozen below |
 | 2 | Decide routed-expert input format and packing strategy | done | Eliminate packing; kernel accepts BF16 directly, quantizes on-the-fly |
-| 3 | Prototype reduced-launch routed-expert execution | pending | |
+| 3 | Prototype reduced-launch routed-expert execution | done | FusedGroupedMoeKernel scaffold, 63/63 green |
 | 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
 | 5 | Optimize Mamba prefill | pending | |
 | 6 | Re-profile and choose the next default workstream | pending | |
