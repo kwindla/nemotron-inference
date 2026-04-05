@@ -6,6 +6,70 @@
 namespace nemotron {
 namespace {
 
+std::optional<std::size_t> CheckedMul(std::size_t lhs, std::size_t rhs) {
+  if (lhs == 0 || rhs == 0) {
+    return std::size_t{0};
+  }
+  if (lhs > (std::numeric_limits<std::size_t>::max() / rhs)) {
+    return std::nullopt;
+  }
+  return lhs * rhs;
+}
+
+std::optional<std::size_t> CheckedAdd(std::size_t lhs, std::size_t rhs) {
+  if (lhs > (std::numeric_limits<std::size_t>::max() - rhs)) {
+    return std::nullopt;
+  }
+  return lhs + rhs;
+}
+
+std::optional<std::size_t> MatrixBytes(
+    std::size_t rows,
+    std::size_t cols,
+    std::size_t element_bytes) {
+  const auto numel = CheckedMul(rows, cols);
+  if (!numel.has_value()) {
+    return std::nullopt;
+  }
+  return CheckedMul(*numel, element_bytes);
+}
+
+bool WorkspaceConfigSupported(const MoePrefillWorkspaceConfig& config) {
+  return config.hidden_size != 0 &&
+         config.num_experts != 0 &&
+         config.num_experts <= kMaxDeviceExpertRoutingExperts &&
+         config.top_k != 0 &&
+         config.top_k <= config.num_experts &&
+         config.routed_expert_intermediate_size != 0 &&
+         config.shared_expert_intermediate_size != 0;
+}
+
+std::optional<std::size_t> DeviceExpertRoutingBytes(
+    std::size_t n_experts,
+    std::size_t selection_count) {
+  std::size_t total = 0;
+  const auto add_bytes = [&](std::size_t count, std::size_t element_bytes) -> bool {
+    const auto bytes = CheckedMul(count, element_bytes);
+    if (!bytes.has_value()) {
+      return false;
+    }
+    const auto next_total = CheckedAdd(total, *bytes);
+    if (!next_total.has_value()) {
+      return false;
+    }
+    total = *next_total;
+    return true;
+  };
+  return add_bytes(n_experts, sizeof(int)) &&
+                 add_bytes(n_experts + 1, sizeof(int)) &&
+                 add_bytes(selection_count, sizeof(int)) &&
+                 add_bytes(selection_count, sizeof(float)) &&
+                 add_bytes(1, sizeof(int)) &&
+                 add_bytes(n_experts, sizeof(int))
+             ? std::optional<std::size_t>(total)
+             : std::nullopt;
+}
+
 bool HandlesSatisfyLayerInvariant(
     const AttentionKvCacheConfig& config,
     const std::vector<KvPageHandle>& pages,
@@ -76,17 +140,57 @@ bool SameWorkspaceConfig(
 
 }  // namespace
 
+std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
+    std::size_t token_capacity,
+    const MoePrefillWorkspaceConfig& config) {
+  if (token_capacity == 0 || !WorkspaceConfigSupported(config)) {
+    return std::nullopt;
+  }
+
+  const auto selection_capacity = CheckedMul(token_capacity, config.top_k);
+  if (!selection_capacity.has_value()) {
+    return std::nullopt;
+  }
+
+  std::size_t total = 0;
+  const auto add_bytes = [&](std::optional<std::size_t> bytes) -> bool {
+    if (!bytes.has_value()) {
+      return false;
+    }
+    const auto next_total = CheckedAdd(total, *bytes);
+    if (!next_total.has_value()) {
+      return false;
+    }
+    total = *next_total;
+    return true;
+  };
+
+  return add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(__nv_bfloat16))) &&
+                 add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(MatrixBytes(token_capacity, config.num_experts, sizeof(float))) &&
+                 add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(MatrixBytes(token_capacity, config.top_k, sizeof(int))) &&
+                 add_bytes(MatrixBytes(token_capacity, config.top_k, sizeof(float))) &&
+                 add_bytes(DeviceExpertRoutingBytes(config.num_experts, *selection_capacity)) &&
+                 add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(MatrixBytes(*selection_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(MatrixBytes(
+                     *selection_capacity,
+                     config.routed_expert_intermediate_size,
+                     sizeof(float))) &&
+                 add_bytes(MatrixBytes(
+                     token_capacity,
+                     config.shared_expert_intermediate_size,
+                     sizeof(float)))
+             ? std::optional<std::size_t>(total)
+             : std::nullopt;
+}
+
 std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
     std::size_t token_capacity,
     const MoePrefillWorkspaceConfig& config) {
-  if (token_capacity == 0 ||
-      config.hidden_size == 0 ||
-      config.num_experts == 0 ||
-      config.top_k == 0 ||
-      config.top_k > config.num_experts ||
-      config.routed_expert_intermediate_size == 0 ||
-      config.shared_expert_intermediate_size == 0 ||
-      token_capacity > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
+  if (!BytesForTokenCapacity(token_capacity, config).has_value()) {
     return nullptr;
   }
 
@@ -119,12 +223,7 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
 
 bool MoePrefillWorkspace::valid() const {
   if (token_capacity_value == 0 ||
-      config.hidden_size == 0 ||
-      config.num_experts == 0 ||
-      config.top_k == 0 ||
-      config.top_k > config.num_experts ||
-      config.routed_expert_intermediate_size == 0 ||
-      config.shared_expert_intermediate_size == 0 ||
+      !WorkspaceConfigSupported(config) ||
       token_capacity_value > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
     return false;
   }
@@ -228,6 +327,16 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
     }
   }
 
+  std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace;
+  if (config.moe_prefill_capacity_tokens > 1) {
+    moe_prefill_workspace = MoePrefillWorkspace::Create(
+        config.moe_prefill_capacity_tokens,
+        config.moe_prefill_workspace_config);
+    if (!moe_prefill_workspace) {
+      return nullptr;
+    }
+  }
+
   return std::unique_ptr<RequestExecutionContext>(new RequestExecutionContext(
       config,
       std::move(hidden),
@@ -237,6 +346,7 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
       std::move(mamba_state),
       std::move(key_cache),
       std::move(value_cache),
+      std::move(moe_prefill_workspace),
       std::move(kv_arena)));
 }
 
@@ -249,6 +359,7 @@ RequestExecutionContext::RequestExecutionContext(
     std::unique_ptr<DeviceTensorFp32> mamba_state,
     std::unique_ptr<DeviceTensorBf16> key_cache,
     std::unique_ptr<DeviceTensorBf16> value_cache,
+    std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace,
     std::optional<PagedKvCacheArena> kv_arena)
     : config_(std::move(config)),
       hidden_(std::move(hidden)),
@@ -258,6 +369,7 @@ RequestExecutionContext::RequestExecutionContext(
       mamba_state_(std::move(mamba_state)),
       key_cache_(std::move(key_cache)),
       value_cache_(std::move(value_cache)),
+      moe_prefill_workspace_(std::move(moe_prefill_workspace)),
       kv_arena_(std::move(kv_arena)),
       kv_pages_by_layer_(config_.attention_kv_cache.layer_count) {}
 
@@ -281,6 +393,13 @@ bool RequestExecutionContext::valid() const {
   }
   if (config_.attention_kv_cache.layer_count != 0 &&
       (!key_cache_ || !key_cache_->valid() || !value_cache_ || !value_cache_->valid())) {
+    return false;
+  }
+  if (config_.moe_prefill_capacity_tokens > 1 &&
+      (moe_prefill_workspace_ == nullptr ||
+       !moe_prefill_workspace_->valid() ||
+       !SameWorkspaceConfig(moe_prefill_workspace_->config, config_.moe_prefill_workspace_config) ||
+       moe_prefill_workspace_->token_capacity() < config_.moe_prefill_capacity_tokens)) {
     return false;
   }
   if (moe_prefill_workspace_ != nullptr && !moe_prefill_workspace_->valid()) {

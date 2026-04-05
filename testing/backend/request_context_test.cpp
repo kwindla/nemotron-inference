@@ -37,6 +37,17 @@ RequestExecutionConfig make_config() {
   return config;
 }
 
+RequestExecutionConfig make_moe_workspace_config() {
+  RequestExecutionConfig config = make_config();
+  config.moe_prefill_workspace_config.hidden_size = config.hidden_size;
+  config.moe_prefill_workspace_config.num_experts = 8;
+  config.moe_prefill_workspace_config.top_k = 2;
+  config.moe_prefill_workspace_config.routed_expert_intermediate_size = 24;
+  config.moe_prefill_workspace_config.shared_expert_intermediate_size = 48;
+  config.moe_prefill_capacity_tokens = 5;
+  return config;
+}
+
 bool test_request_context_allocates_buffers_and_kv_pages() {
   auto context = RequestExecutionContext::Create(make_config());
   if (!context || !context->valid()) {
@@ -199,12 +210,41 @@ bool test_request_context_reset_restores_exact_page_allocation_order() {
              "reset plus same-token restore should reproduce the exact layer-1 page allocation");
 }
 
+bool test_request_context_preallocates_moe_prefill_workspace() {
+  const RequestExecutionConfig config = make_moe_workspace_config();
+  auto context = RequestExecutionContext::Create(config);
+  if (!context || !context->valid()) {
+    std::cout << "request_context_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  const auto* workspace = context->moe_prefill_workspace();
+  return expect(workspace != nullptr, "request context should preallocate the MoE prefill workspace") &&
+         expect(workspace->valid(), "preallocated MoE workspace should be valid") &&
+         expect(workspace->token_capacity() == config.moe_prefill_capacity_tokens,
+                "workspace token capacity should match the request config") &&
+         expect(
+             workspace->normalized_bf16 != nullptr &&
+                 workspace->normalized_bf16->shape() ==
+                     std::vector<std::size_t>({config.moe_prefill_capacity_tokens, config.hidden_size}),
+             "workspace BF16 normalization buffer should match the configured token capacity") &&
+         expect(
+             workspace->fused_prefill_expert_up_scratch != nullptr &&
+                 workspace->fused_prefill_expert_up_scratch->shape() ==
+                     std::vector<std::size_t>({
+                         config.moe_prefill_capacity_tokens *
+                             config.moe_prefill_workspace_config.top_k,
+                         config.moe_prefill_workspace_config.routed_expert_intermediate_size}),
+             "workspace routed-up scratch should match the configured selection capacity");
+}
+
 }  // namespace
 
 int main() {
   if (!test_request_context_allocates_buffers_and_kv_pages() ||
       !test_request_context_reset_releases_pages_and_clears_positions() ||
-      !test_request_context_reset_restores_exact_page_allocation_order()) {
+      !test_request_context_reset_restores_exact_page_allocation_order() ||
+      !test_request_context_preallocates_moe_prefill_workspace()) {
     return 1;
   }
   std::cout << "request_context_test: PASS\n";

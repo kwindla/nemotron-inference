@@ -27,7 +27,8 @@ struct SingleTokenForwardConfig {
   std::size_t total_layer_count = 0;
   std::size_t vocab_size = 0;
   std::size_t max_tokens = 1;
-  std::size_t moe_prefill_window_tokens = 0;  // 0 = use max_tokens (current behavior)
+  std::size_t moe_prefill_capacity_tokens = 0;  // 0 = use the runtime default capacity policy
+  std::size_t moe_prefill_window_tokens = 0;  // 0 = use the resolved request-scoped MoE capacity
 
   std::size_t attention_head_count = 0;
   std::size_t attention_kv_head_count = 0;

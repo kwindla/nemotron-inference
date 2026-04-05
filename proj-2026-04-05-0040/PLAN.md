@@ -66,7 +66,7 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 
   Key files: `runtime/include/nemotron/request_context.h`, `runtime/src/backend/request_context.cpp`, `runtime/include/nemotron/expert_layer.h`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/api/single_token_forward_model.cpp`
 
-- [ ] **3. Add an explicit production MoE prefill capacity policy and budget it with request creation**
+- [x] **3. Add an explicit production MoE prefill capacity policy and budget it with request creation**
   Add a MoE-prefill-capacity setting that is separate from `max_tokens`. This may be expressed as capacity-in-tokens, workspace-budget-bytes, or an equivalent bounded policy, but it must remain distinct from request-context capacity.
 
   Resolve the effective MoE prefill capacity when creating / admitting a request context using live VRAM budget inputs and reserve policy. Extend the request-budget sizing path so MoE prefill workspace bytes are budgeted together with hidden/residual/KV/state bytes, rather than being an untracked extra allocation.
@@ -117,7 +117,7 @@ Local reference: `third_party/vllm/vllm/model_executor/layers/fused_moe/`
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Add prefill tracing and capture a production-relevant baseline | done | dfbf62a | |
-| 2 | Introduce request-scoped full multi-token expert workspace | done | PENDING | |
-| 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | pending | — | |
+| 2 | Introduce request-scoped full multi-token expert workspace | done | b074667 | |
+| 3 | Add an explicit production MoE prefill capacity policy and budget it with request creation | done | PENDING | |
 | 4 | Make the benchmark follow the production runtime default | pending | — | |
 | 5 | Validate both full-batch and bounded-fallback production behavior, then revisit secondary bottlenecks | pending | — | |

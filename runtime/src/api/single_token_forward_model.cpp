@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -39,6 +40,7 @@ namespace {
 
 constexpr std::size_t kBytesPerMiB = 1024ull * 1024ull;
 constexpr std::size_t kDefaultForwardVramReserveMiB = 512ull;
+constexpr std::size_t kDefaultMoePrefillCapacityTokens = 4096ull;
 
 struct CudaMemInfo {
   std::size_t free_bytes = 0;
@@ -115,12 +117,6 @@ std::unique_ptr<DeviceTensorBf16> CreateDecodeRowView(
   return CreateTokenRangeView(buffer, 0, 1, hidden_size);
 }
 
-std::size_t EffectiveMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
-  return config.moe_prefill_window_tokens > 0
-             ? config.moe_prefill_window_tokens
-             : config.max_tokens;
-}
-
 MoePrefillWorkspaceConfig BuildMoePrefillWorkspaceConfig(
     const SingleTokenForwardConfig& config) {
   MoePrefillWorkspaceConfig workspace_config;
@@ -132,6 +128,69 @@ MoePrefillWorkspaceConfig BuildMoePrefillWorkspaceConfig(
   workspace_config.shared_expert_intermediate_size =
       config.shared_expert_intermediate_size;
   return workspace_config;
+}
+
+std::size_t ParseEnvSizeT(const char* env_var, std::size_t default_value) {
+  const char* value = std::getenv(env_var);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+  char* parse_end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(value, &parse_end, 10);
+  if (errno != 0 || parse_end == value || (parse_end != nullptr && *parse_end != '\0')) {
+    return default_value;
+  }
+  return static_cast<std::size_t>(parsed);
+}
+
+std::size_t ConfiguredMoePrefillCapacityTokens(const SingleTokenForwardConfig& config) {
+  if (config.moe_prefill_capacity_tokens > 0) {
+    return config.moe_prefill_capacity_tokens;
+  }
+  return ParseEnvSizeT(
+      "NEMOTRON_MOE_PREFILL_CAPACITY_TOKENS",
+      kDefaultMoePrefillCapacityTokens);
+}
+
+std::size_t FallbackMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
+  return config.moe_prefill_window_tokens > 0
+             ? config.moe_prefill_window_tokens
+             : std::size_t{1};
+}
+
+std::size_t RequestMoePrefillCapacityTokens(
+    const SingleTokenForwardConfig& config,
+    std::size_t request_max_tokens) {
+  if (request_max_tokens == 0) {
+    return 0;
+  }
+  std::size_t resolved_capacity =
+      std::min(ConfiguredMoePrefillCapacityTokens(config), request_max_tokens);
+  if (config.moe_prefill_window_tokens > 0) {
+    resolved_capacity = std::min(resolved_capacity, config.moe_prefill_window_tokens);
+  }
+  if (resolved_capacity <= 1) {
+    return 0;
+  }
+  const auto workspace_bytes = MoePrefillWorkspace::BytesForTokenCapacity(
+      resolved_capacity,
+      BuildMoePrefillWorkspaceConfig(config));
+  return workspace_bytes.has_value() ? resolved_capacity : 0;
+}
+
+std::size_t EffectiveMoePrefillWindowTokens(
+    const SingleTokenForwardConfig& config,
+    std::size_t token_count,
+    const MoePrefillWorkspace* workspace) {
+  if (token_count == 0) {
+    return 0;
+  }
+  const std::size_t resolved_capacity =
+      workspace != nullptr && workspace->valid() && workspace->token_capacity() != 0
+          ? workspace->token_capacity()
+          : FallbackMoePrefillWindowTokens(config);
+  return std::min(token_count, resolved_capacity);
 }
 
 const char* ForwardLayerKindName(ForwardLayerKind kind) {
@@ -171,22 +230,9 @@ void LogPrefillLayerTrace(
   std::cerr << " wall_ms=" << wall_time_ms << "\n";
 }
 
-std::size_t ParseEnvMiB(const char* env_var, std::size_t default_value_mib) {
-  const char* value = std::getenv(env_var);
-  if (value == nullptr || value[0] == '\0') {
-    return default_value_mib;
-  }
-  char* parse_end = nullptr;
-  errno = 0;
-  const unsigned long long parsed = std::strtoull(value, &parse_end, 10);
-  if (errno != 0 || parse_end == value || (parse_end != nullptr && *parse_end != '\0')) {
-    return default_value_mib;
-  }
-  return static_cast<std::size_t>(parsed);
-}
-
 std::size_t ForwardVramReserveBytes() {
-  return ParseEnvMiB("NEMOTRON_FORWARD_VRAM_RESERVE_MB", kDefaultForwardVramReserveMiB) * kBytesPerMiB;
+  return ParseEnvSizeT("NEMOTRON_FORWARD_VRAM_RESERVE_MB", kDefaultForwardVramReserveMiB) *
+         kBytesPerMiB;
 }
 
 std::optional<CudaMemInfo> QueryCudaMemInfo(cudaError_t* status_out = nullptr) {
@@ -217,9 +263,40 @@ std::size_t EffectiveScratchTokens(const RequestExecutionConfig& config, std::si
   return std::min(config.scratch_tokens, max_tokens);
 }
 
-std::size_t RequestActivationBytes(const RequestExecutionConfig& config, std::size_t max_tokens) {
+std::optional<std::size_t> CheckedMul(std::size_t lhs, std::size_t rhs) {
+  if (lhs == 0 || rhs == 0) {
+    return std::size_t{0};
+  }
+  if (lhs > (std::numeric_limits<std::size_t>::max() / rhs)) {
+    return std::nullopt;
+  }
+  return lhs * rhs;
+}
+
+std::optional<std::size_t> CheckedAdd(std::size_t lhs, std::size_t rhs) {
+  if (lhs > (std::numeric_limits<std::size_t>::max() - rhs)) {
+    return std::nullopt;
+  }
+  return lhs + rhs;
+}
+
+std::optional<std::size_t> RequestActivationBytes(
+    const RequestExecutionConfig& config,
+    std::size_t max_tokens) {
   const std::size_t scratch_tokens = EffectiveScratchTokens(config, max_tokens);
-  return ((2 * max_tokens) + scratch_tokens) * config.hidden_size * sizeof(__nv_bfloat16);
+  const auto doubled_tokens = CheckedMul(2, max_tokens);
+  if (!doubled_tokens.has_value()) {
+    return std::nullopt;
+  }
+  const auto activation_tokens = CheckedAdd(*doubled_tokens, scratch_tokens);
+  if (!activation_tokens.has_value()) {
+    return std::nullopt;
+  }
+  const auto activation_elems = CheckedMul(*activation_tokens, config.hidden_size);
+  if (!activation_elems.has_value()) {
+    return std::nullopt;
+  }
+  return CheckedMul(*activation_elems, sizeof(__nv_bfloat16));
 }
 
 std::size_t KvPagesForTokens(const RequestExecutionConfig& config, std::size_t max_tokens) {
@@ -245,17 +322,41 @@ std::optional<std::size_t> KvCacheBytesForTokens(
   return KvPagesForTokens(config, max_tokens) * geometry->bytes_per_page;
 }
 
+std::optional<std::size_t> MoePrefillWorkspaceBytesForTokens(
+    const RequestExecutionConfig& config,
+    std::size_t max_tokens) {
+  if (config.moe_prefill_capacity_tokens <= 1 || max_tokens == 0) {
+    return std::size_t{0};
+  }
+  return MoePrefillWorkspace::BytesForTokenCapacity(
+      std::min(config.moe_prefill_capacity_tokens, max_tokens),
+      config.moe_prefill_workspace_config);
+}
+
 std::optional<std::size_t> RequestContextBytesForTokens(
     const RequestExecutionConfig& config,
     std::size_t max_tokens) {
+  const auto activation_bytes = RequestActivationBytes(config, max_tokens);
   const auto kv_bytes = KvCacheBytesForTokens(config, max_tokens);
-  if (!kv_bytes.has_value()) {
+  const auto moe_prefill_workspace_bytes = MoePrefillWorkspaceBytesForTokens(config, max_tokens);
+  if (!activation_bytes.has_value() ||
+      !kv_bytes.has_value() ||
+      !moe_prefill_workspace_bytes.has_value()) {
     return std::nullopt;
   }
-  return RequestActivationBytes(config, max_tokens) +
-         config.mamba_conv_state_bytes_fp32 +
-         config.mamba_state_bytes_fp32 +
-         *kv_bytes;
+  const auto activation_and_conv = CheckedAdd(*activation_bytes, config.mamba_conv_state_bytes_fp32);
+  if (!activation_and_conv.has_value()) {
+    return std::nullopt;
+  }
+  const auto add_mamba = CheckedAdd(*activation_and_conv, config.mamba_state_bytes_fp32);
+  if (!add_mamba.has_value()) {
+    return std::nullopt;
+  }
+  const auto add_kv = CheckedAdd(*add_mamba, *kv_bytes);
+  if (!add_kv.has_value()) {
+    return std::nullopt;
+  }
+  return CheckedAdd(*add_kv, *moe_prefill_workspace_bytes);
 }
 
 std::optional<RequestExecutionConfig> BuildMeasuredBudgetRequestConfig(
@@ -319,6 +420,12 @@ std::optional<RequestExecutionConfig> BuildMeasuredBudgetRequestConfig(
                               ? 0
                               : std::min(base_config.scratch_tokens, capped.max_tokens);
   capped.attention_total_pages = KvPagesForTokens(base_config, capped.max_tokens);
+  capped.moe_prefill_capacity_tokens = base_config.moe_prefill_capacity_tokens == 0
+                                           ? 0
+                                           : std::min(base_config.moe_prefill_capacity_tokens, capped.max_tokens);
+  if (capped.moe_prefill_capacity_tokens <= 1) {
+    capped.moe_prefill_capacity_tokens = 0;
+  }
 
   if (debug) {
     const auto capped_bytes = RequestContextBytesForTokens(capped, capped.max_tokens);
@@ -328,6 +435,9 @@ std::optional<RequestExecutionConfig> BuildMeasuredBudgetRequestConfig(
               << " capped_mib=" << ((capped_bytes.has_value() ? *capped_bytes : 0) / kBytesPerMiB)
               << " requested_max_tokens=" << base_config.max_tokens
               << " capped_max_tokens=" << capped.max_tokens
+              << " requested_moe_prefill_capacity_tokens="
+              << base_config.moe_prefill_capacity_tokens
+              << " capped_moe_prefill_capacity_tokens=" << capped.moe_prefill_capacity_tokens
               << " requested_attention_total_pages=" << base_config.attention_total_pages
               << " capped_attention_total_pages=" << capped.attention_total_pages
               << "\n";
@@ -694,6 +804,11 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
   plan.request_config.scratch_tokens = config.max_tokens;
   plan.request_config.mamba_conv_state_bytes_fp32 = mamba_conv_offset * sizeof(float);
   plan.request_config.mamba_state_bytes_fp32 = mamba_state_offset * sizeof(float);
+  plan.request_config.moe_prefill_workspace_config = BuildMoePrefillWorkspaceConfig(config);
+  if (plan.expert_layer_count != 0) {
+    plan.request_config.moe_prefill_capacity_tokens =
+        RequestMoePrefillCapacityTokens(config, config.max_tokens);
+  }
   if (plan.attention_layer_count != 0) {
     plan.request_config.attention_kv_cache.layer_count = max_layer_index + 1;
     plan.request_config.attention_kv_cache.kv_head_count = config.attention_kv_head_count;
@@ -846,7 +961,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
     }
   }
   impl->layers.reserve(plan->layers.size());
-  const std::size_t effective_moe_window_tokens = EffectiveMoePrefillWindowTokens(config);
+  const std::size_t fallback_moe_window_tokens = FallbackMoePrefillWindowTokens(config);
 
   for (const ForwardLayerPlanEntry& plan_entry : plan->layers) {
     const LayerScheduleEntry* layer = schedule.FindLayer(plan_entry.layer_index);
@@ -917,7 +1032,7 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
         expert_config.n_routed_experts = config.n_routed_experts;
         expert_config.top_k = config.experts_per_token;
-        expert_config.max_token_count = effective_moe_window_tokens;
+        expert_config.max_token_count = fallback_moe_window_tokens;
         expert_config.n_group = config.expert_n_group;
         expert_config.topk_group = config.expert_topk_group;
         expert_config.rms_epsilon = config.layer_norm_epsilon;
@@ -983,16 +1098,37 @@ std::unique_ptr<RequestExecutionContext> SingleTokenForwardModel::CreateRequestC
   }
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   RequestExecutionConfig request_config = impl_->plan.request_config;
-  if (impl_->post_weight_free_vram_bytes.has_value()) {
+  std::optional<std::size_t> measured_free_vram_bytes;
+  {
+    cudaError_t mem_info_status = cudaSuccess;
+    const auto mem_info = QueryCudaMemInfo(&mem_info_status);
+    if (mem_info.has_value()) {
+      measured_free_vram_bytes = mem_info->free_bytes;
+      if (debug) {
+        LogCudaMemInfo("request_context_vram", *mem_info, impl_->vram_reserve_bytes);
+      }
+    } else if (impl_->post_weight_free_vram_bytes.has_value()) {
+      measured_free_vram_bytes = impl_->post_weight_free_vram_bytes;
+      if (debug) {
+        std::cerr << "single_token_forward_model: request-context cudaMemGetInfo failed, "
+                  << "falling back to post-weight snapshot: "
+                  << cudaGetErrorString(mem_info_status) << "\n";
+      }
+    } else if (debug) {
+      std::cerr << "single_token_forward_model: request-context cudaMemGetInfo failed: "
+                << cudaGetErrorString(mem_info_status) << "\n";
+    }
+  }
+  if (measured_free_vram_bytes.has_value()) {
     const auto capped_config = BuildMeasuredBudgetRequestConfig(
         request_config,
-        *impl_->post_weight_free_vram_bytes,
+        *measured_free_vram_bytes,
         impl_->vram_reserve_bytes,
         debug);
     if (!capped_config.has_value()) {
       if (debug) {
         std::cerr << "single_token_forward_model: request context sizing failed against measured VRAM"
-                  << " free_vram_mib=" << (*impl_->post_weight_free_vram_bytes / kBytesPerMiB)
+                  << " free_vram_mib=" << (*measured_free_vram_bytes / kBytesPerMiB)
                   << " reserve_mib=" << (impl_->vram_reserve_bytes / kBytesPerMiB)
                   << "\n";
       }
@@ -1357,8 +1493,6 @@ bool SingleTokenForwardModel::RunTokens(
   const bool logits_valid = have_logits && logits->valid();
   const std::vector<std::size_t> expected_logits_shape = {token_count, impl_->config.vocab_size};
   const bool logits_shape_ok = logits_valid && logits->shape() == expected_logits_shape;
-  const std::size_t effective_moe_window_tokens =
-      EffectiveMoePrefillWindowTokens(impl_->config);
   const bool prefill_trace_enabled =
       token_count > 1 && PrefillTraceEnabled();
 
@@ -1423,22 +1557,33 @@ bool SingleTokenForwardModel::RunTokens(
 
   MoePrefillWorkspace* moe_prefill_workspace = nullptr;
   if (token_count > 1 && impl_->plan.expert_layer_count != 0) {
-    const MoePrefillWorkspaceConfig workspace_config =
-        BuildMoePrefillWorkspaceConfig(impl_->config);
-    if (!request_context.EnsureMoePrefillWorkspace(token_count, workspace_config)) {
+    const RequestExecutionConfig& request_config = request_context.config();
+    if (request_config.moe_prefill_capacity_tokens != 0 &&
+        !request_context.EnsureMoePrefillWorkspace(
+            request_config.moe_prefill_capacity_tokens,
+            request_config.moe_prefill_workspace_config)) {
       if (debug) {
         std::cout << "single_token_forward_model: request-scoped MoE prefill workspace unavailable"
-                  << " token_count=" << token_count << "\n";
+                  << " token_count=" << token_count
+                  << " policy_capacity=" << request_config.moe_prefill_capacity_tokens
+                  << "\n";
       }
     } else {
       MoePrefillWorkspace* allocated_workspace = request_context.moe_prefill_workspace();
       if (allocated_workspace != nullptr &&
           allocated_workspace->valid() &&
-          allocated_workspace->token_capacity() >= token_count) {
+          allocated_workspace->token_capacity() != 0) {
         moe_prefill_workspace = allocated_workspace;
       }
     }
   }
+  const std::size_t effective_moe_window_tokens =
+      token_count > 1 && impl_->plan.expert_layer_count != 0
+          ? EffectiveMoePrefillWindowTokens(
+                impl_->config,
+                token_count,
+                moe_prefill_workspace)
+          : token_count;
 
   std::unique_ptr<DeviceTensorBf16> hidden_owned;
   std::unique_ptr<DeviceTensorBf16> residual_owned;

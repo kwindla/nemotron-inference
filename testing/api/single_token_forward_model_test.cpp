@@ -84,6 +84,7 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
   config.total_layer_count = 8;
   config.vocab_size = 256;
   config.max_tokens = 4;
+  config.moe_prefill_capacity_tokens = 6;
   config.attention_head_count = 4;
   config.attention_kv_head_count = 1;
   config.attention_head_dim = 16;
@@ -141,6 +142,14 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
                 "forward plan should preserve configured token capacity") &&
          expect(plan->request_config.scratch_tokens == config.max_tokens,
                 "forward plan should size scratch tokens to the configured token capacity") &&
+         expect(plan->request_config.moe_prefill_capacity_tokens == config.max_tokens,
+                "MoE prefill workspace capacity should be capped by the request token capacity") &&
+         expect(plan->request_config.moe_prefill_workspace_config.hidden_size == config.hidden_size,
+                "request config should preserve MoE workspace hidden size") &&
+         expect(plan->request_config.moe_prefill_workspace_config.num_experts == config.n_routed_experts,
+                "request config should preserve MoE workspace expert count") &&
+         expect(plan->request_config.moe_prefill_workspace_config.top_k == config.experts_per_token,
+                "request config should preserve MoE workspace top-k width") &&
          expect(plan->request_config.attention_kv_cache.layer_count == 8,
                 "KV layer count should span the maximum layer index") &&
          expect(plan->request_config.attention_total_pages == 8,

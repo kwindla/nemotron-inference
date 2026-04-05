@@ -11,16 +11,6 @@
 
 namespace nemotron {
 
-struct RequestExecutionConfig {
-  std::size_t hidden_size = 0;
-  std::size_t max_tokens = 0;
-  std::size_t scratch_tokens = 0;
-  AttentionKvCacheConfig attention_kv_cache;
-  std::size_t attention_total_pages = 0;
-  std::size_t mamba_conv_state_bytes_fp32 = 0;
-  std::size_t mamba_state_bytes_fp32 = 0;
-};
-
 struct MoePrefillWorkspaceConfig {
   std::size_t hidden_size = 0;
   std::size_t num_experts = 0;
@@ -29,7 +19,22 @@ struct MoePrefillWorkspaceConfig {
   std::size_t shared_expert_intermediate_size = 0;
 };
 
+struct RequestExecutionConfig {
+  std::size_t hidden_size = 0;
+  std::size_t max_tokens = 0;
+  std::size_t scratch_tokens = 0;
+  AttentionKvCacheConfig attention_kv_cache;
+  std::size_t attention_total_pages = 0;
+  std::size_t mamba_conv_state_bytes_fp32 = 0;
+  std::size_t mamba_state_bytes_fp32 = 0;
+  MoePrefillWorkspaceConfig moe_prefill_workspace_config;
+  std::size_t moe_prefill_capacity_tokens = 0;
+};
+
 struct MoePrefillWorkspace {
+  static std::optional<std::size_t> BytesForTokenCapacity(
+      std::size_t token_capacity,
+      const MoePrefillWorkspaceConfig& config);
   static std::unique_ptr<MoePrefillWorkspace> Create(
       std::size_t token_capacity,
       const MoePrefillWorkspaceConfig& config);
@@ -110,6 +115,7 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorFp32> mamba_state,
       std::unique_ptr<DeviceTensorBf16> key_cache,
       std::unique_ptr<DeviceTensorBf16> value_cache,
+      std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace,
       std::optional<PagedKvCacheArena> kv_arena);
 
   RequestExecutionConfig config_;
