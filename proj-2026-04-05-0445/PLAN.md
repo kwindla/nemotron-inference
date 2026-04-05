@@ -158,7 +158,7 @@ the result will leave a large known cost untouched.
   `runtime/src/backend/fused_moe_prefill.cu`,
   `runtime/src/backend/expert_routing_device.cu`
 
-- [ ] **4. Reduce routed dispatch/finalize and allocator churn**
+- [x] **4. Reduce routed dispatch/finalize and allocator churn**
   The current post-attention profile still shows meaningful routed non-GEMM
   work plus noticeable `cudaMalloc` / `cudaFree` traffic in CUDA API time.
   After step 3 exists, reduce the residual routing/finalize overhead and remove
@@ -262,6 +262,6 @@ attention prefill latency.
 | 1 | Lock the revised optimization contract | done | Baseline frozen below |
 | 2 | Decide routed-expert input format and packing strategy | done | Eliminate packing; kernel accepts BF16 directly, quantizes on-the-fly |
 | 3 | Prototype reduced-launch routed-expert execution | done | FusedGroupedMoeKernel scaffold, 63/63 green |
-| 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
+| 4 | Reduce routed dispatch/finalize and allocator churn | done | Wired into expert_layer.cpp behind NEMOTRON_FORWARD_GROUPED_MOE_PREFILL=1; precision diverges from cuBLASLt path (expected: different quantization) |
 | 5 | Optimize Mamba prefill | pending | |
 | 6 | Re-profile and choose the next default workstream | pending | |
