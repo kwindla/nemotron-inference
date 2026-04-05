@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "nemotron/gemm_execution.h"
+#include "nemotron/fused_moe_grouped.h"
 #include "nemotron/gemm_planner.h"
 #include "nemotron/nvfp4_gemm_runner.h"
 #include "nemotron/nvfp4_packing.h"
@@ -240,94 +241,217 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   }
 
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
+
+  const int max_experts = params.n_routed_experts;
+  
+  std::vector<const std::uint8_t*> h_up_A_ptr(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_up_A_scale(max_experts, nullptr);
+  std::vector<const float*> h_up_A_global(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_up_B_ptr(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_up_B_scale(max_experts, nullptr);
+  std::vector<const float*> h_up_B_global(max_experts, nullptr);
+  std::vector<float*> h_up_D_ptr(max_experts, nullptr);
+  std::vector<int32_t> h_expert_token_counts(max_experts, 0);
+
+  std::vector<const std::uint8_t*> h_down_A_ptr(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_down_A_scale(max_experts, nullptr);
+  std::vector<const float*> h_down_A_global(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_down_B_ptr(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_down_B_scale(max_experts, nullptr);
+  std::vector<const float*> h_down_B_global(max_experts, nullptr);
+  std::vector<float*> h_down_D_ptr(max_experts, nullptr);
+
+  std::uint8_t* pack_scratch_base = reinterpret_cast<std::uint8_t*>(params.nvfp4_pack_scratch);
+  std::size_t pack_offset = 0;
+
+  auto alloc_pack = [&](std::size_t bytes, std::size_t alignment = 128) -> std::uint8_t* {
+      pack_offset = (pack_offset + alignment - 1) & ~(alignment - 1);
+      std::uint8_t* ptr = pack_scratch_base + pack_offset;
+      pack_offset += bytes;
+      return ptr;
+  };
+
+  // Phase 1: Up Proj Packing
   for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
     const int expert_id_int = active_expert_ids_host[active_slot];
-    if (expert_id_int < 0) {
-      return false;
-    }
+    if (expert_id_int < 0) return false;
     const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
-    if (expert_id >= params.n_routed_experts ||
-        !ValidFusedNvfp4WeightView(routed_up_host[expert_id]) ||
-        !ValidFusedNvfp4WeightView(routed_down_host[expert_id]) ||
-        !DescriptorMatchesWeightView(
-            params.routed_up_descriptors[expert_id],
-            routed_up_host[expert_id]) ||
-        !DescriptorMatchesWeightView(
-            params.routed_down_descriptors[expert_id],
-            routed_down_host[expert_id])) {
-      return false;
-    }
 
     const int expert_offset_int = expert_offsets_host[expert_id];
     const int next_expert_offset_int = expert_offsets_host[expert_id + 1];
-    if (expert_offset_int < 0 ||
-        next_expert_offset_int < expert_offset_int) {
-      return false;
-    }
     const std::size_t expert_offset = static_cast<std::size_t>(expert_offset_int);
-    const std::size_t expert_token_count =
-        static_cast<std::size_t>(next_expert_offset_int - expert_offset_int);
-    if (expert_token_count == 0) {
-      continue;
-    }
+    const std::size_t expert_token_count = static_cast<std::size_t>(next_expert_offset_int - expert_offset_int);
+    if (expert_token_count == 0) continue;
 
     auto gather_view = DeviceTensorFp32::CreateView(
         {expert_token_count, params.hidden_size},
         params.gather_scratch + (expert_offset * params.hidden_size));
-    auto expert_up_view = DeviceTensorFp32::CreateView(
-        {expert_token_count, params.routed_expert_intermediate_size},
-        params.expert_up_scratch +
-            (expert_offset * params.routed_expert_intermediate_size));
-    if (!gather_view || !expert_up_view) {
+    
+    if (!GatherRowsFp32(*normalized, params.sorted_token_indices + expert_offset, gather_view.get())) {
       return false;
     }
 
-    const Nvfp4PackedMatrixDeviceView up_weight_view =
-        MakeNvfp4PackedMatrixDeviceView(routed_up_host[expert_id]);
-    const Nvfp4PackedMatrixDeviceView down_weight_view =
-        MakeNvfp4PackedMatrixDeviceView(routed_down_host[expert_id]);
-    const auto routed_up_plan = BuildRuntimeNvfp4GemmPlan(
-        *params.routed_up_descriptors[expert_id],
-        up_weight_view,
-        expert_token_count,
-        params.heuristic_cache);
-    const auto routed_down_plan = BuildRuntimeNvfp4GemmPlan(
-        *params.routed_down_descriptors[expert_id],
-        down_weight_view,
-        expert_token_count,
-        params.heuristic_cache);
-    if (!up_weight_view.valid() ||
-        !down_weight_view.valid() ||
-        !routed_up_plan.has_value() ||
-        !routed_down_plan.has_value() ||
-        !GatherRowsFp32(
-             *normalized,
-             params.sorted_token_indices + expert_offset,
-             gather_view.get()) ||
-        !RunNvfp4RowMajorFp32SourceToDevice(
-             *params.cublas_handle,
-             *routed_up_plan,
-             *gather_view,
-             up_weight_view,
-             expert_up_view.get(),
-             pack_options)
-             .has_value() ||
-        !Relu2InPlaceFp32(expert_up_view.get()) ||
-        !RunNvfp4RowMajorFp32SourceToDevice(
-             *params.cublas_handle,
-             *routed_down_plan,
-             *expert_up_view,
-             down_weight_view,
-             gather_view.get(),
-             pack_options)
-             .has_value() ||
-        !ScatterAddWeightedRowsFp32(
+    std::size_t packed_bytes = expert_token_count * (params.hidden_size / 2);
+    std::size_t padded_rows = (expert_token_count + 127) & ~127;
+    std::size_t scale_bytes = (padded_rows / 128) * (params.hidden_size / 16) * 512;
+    std::size_t block_scale_bytes = expert_token_count * (params.hidden_size / 16);
+
+    std::uint8_t* packed_data = alloc_pack(packed_bytes);
+    std::uint8_t* block_scales = alloc_pack(block_scale_bytes);
+    std::uint8_t* matmul_scales = alloc_pack(scale_bytes);
+    float* tensor_scale = reinterpret_cast<float*>(alloc_pack(sizeof(float), 4));
+
+    if (!PackDeviceRowMajorFp32ToNvfp4Raw(
+            *gather_view, packed_data, block_scales, matmul_scales, tensor_scale, pack_options)) {
+        return false;
+    }
+
+    h_expert_token_counts[expert_id] = expert_token_count;
+    h_up_A_ptr[expert_id] = packed_data;
+    h_up_A_scale[expert_id] = matmul_scales;
+    h_up_A_global[expert_id] = tensor_scale;
+
+    h_up_B_ptr[expert_id] = routed_up_host[expert_id].packed_data;
+    h_up_B_scale[expert_id] = routed_up_host[expert_id].matmul_block_scales_data;
+    h_up_B_global[expert_id] = routed_up_host[expert_id].tensor_scale_data;
+
+    h_up_D_ptr[expert_id] = params.expert_up_scratch + (expert_offset * params.routed_expert_intermediate_size);
+  }
+
+  std::uint8_t* ws_base = reinterpret_cast<std::uint8_t*>(params.grouped_workspace_scratch);
+  std::size_t ws_offset = 0;
+  auto alloc_ws = [&](std::size_t bytes, std::size_t alignment = 16) -> std::uint8_t* {
+      ws_offset = (ws_offset + alignment - 1) & ~(alignment - 1);
+      std::uint8_t* ptr = ws_base + ws_offset;
+      ws_offset += bytes;
+      return ptr;
+  };
+
+  auto copy_to_ws = [&](const auto& vec) {
+      using T = typename std::decay<decltype(vec)>::type::value_type;
+      std::size_t bytes = vec.size() * sizeof(T);
+      T* d_ptr = reinterpret_cast<T*>(alloc_ws(bytes));
+      cudaMemcpyAsync(d_ptr, vec.data(), bytes, cudaMemcpyHostToDevice, 0);
+      return d_ptr;
+  };
+
+  auto d_up_A_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_A_ptr));
+  auto d_up_A_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_A_scale));
+  auto d_up_A_global = reinterpret_cast<const float**>(copy_to_ws(h_up_A_global));
+  auto d_up_B_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_B_ptr));
+  auto d_up_B_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_B_scale));
+  auto d_up_B_global = reinterpret_cast<const float**>(copy_to_ws(h_up_B_global));
+  auto d_up_D_ptr = reinterpret_cast<float**>(copy_to_ws(h_up_D_ptr));
+  auto d_expert_token_counts = reinterpret_cast<const int32_t*>(copy_to_ws(h_expert_token_counts));
+
+  Nvfp4GroupedMoEWorkspace cutlass_ws;
+  ws_offset = (ws_offset + 127) & ~127;
+  cutlass_ws.data = ws_base + ws_offset;
+  cutlass_ws.nbytes = GetNvfp4GroupedMoEWorkspaceSize(max_experts);
+
+  if (!RunNvfp4GroupedMoEFp32AccumToDevice(
+        d_up_A_ptr, d_up_A_scale, d_up_A_global,
+        d_up_B_ptr, d_up_B_scale, d_up_B_global,
+        d_up_D_ptr, d_expert_token_counts,
+        params.hidden_size, params.routed_expert_intermediate_size, max_experts,
+        cutlass_ws, 0)) {
+      return false;
+  }
+
+  // Phase 2: Relu, Pack, and Down Proj setup
+  for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
+    const int expert_id_int = active_expert_ids_host[active_slot];
+    const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
+    const int expert_offset_int = expert_offsets_host[expert_id];
+    const int next_expert_offset_int = expert_offsets_host[expert_id + 1];
+    const std::size_t expert_offset = static_cast<std::size_t>(expert_offset_int);
+    const std::size_t expert_token_count = static_cast<std::size_t>(next_expert_offset_int - expert_offset_int);
+    if (expert_token_count == 0) continue;
+
+    auto expert_up_view = DeviceTensorFp32::CreateView(
+        {expert_token_count, params.routed_expert_intermediate_size},
+        params.expert_up_scratch + (expert_offset * params.routed_expert_intermediate_size));
+
+    if (!Relu2InPlaceFp32(expert_up_view.get())) {
+      return false;
+    }
+
+    std::size_t packed_bytes = expert_token_count * (params.routed_expert_intermediate_size / 2);
+    std::size_t padded_rows = (expert_token_count + 127) & ~127;
+    std::size_t scale_bytes = (padded_rows / 128) * (params.routed_expert_intermediate_size / 16) * 512;
+    std::size_t block_scale_bytes = expert_token_count * (params.routed_expert_intermediate_size / 16);
+
+    std::uint8_t* packed_data = alloc_pack(packed_bytes);
+    std::uint8_t* block_scales = alloc_pack(block_scale_bytes);
+    std::uint8_t* matmul_scales = alloc_pack(scale_bytes);
+    float* tensor_scale = reinterpret_cast<float*>(alloc_pack(sizeof(float), 4));
+
+    if (!PackDeviceRowMajorFp32ToNvfp4Raw(
+            *expert_up_view, packed_data, block_scales, matmul_scales, tensor_scale, pack_options)) {
+        return false;
+    }
+
+    h_down_A_ptr[expert_id] = packed_data;
+    h_down_A_scale[expert_id] = matmul_scales;
+    h_down_A_global[expert_id] = tensor_scale;
+
+    h_down_B_ptr[expert_id] = routed_down_host[expert_id].packed_data;
+    h_down_B_scale[expert_id] = routed_down_host[expert_id].matmul_block_scales_data;
+    h_down_B_global[expert_id] = routed_down_host[expert_id].tensor_scale_data;
+
+    h_down_D_ptr[expert_id] = params.gather_scratch + (expert_offset * params.hidden_size);
+  }
+
+  // Reuse the ws_base for down proj pointers
+  ws_offset = 0;
+  auto d_down_A_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_A_ptr));
+  auto d_down_A_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_A_scale));
+  auto d_down_A_global = reinterpret_cast<const float**>(copy_to_ws(h_down_A_global));
+  auto d_down_B_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_B_ptr));
+  auto d_down_B_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_B_scale));
+  auto d_down_B_global = reinterpret_cast<const float**>(copy_to_ws(h_down_B_global));
+  auto d_down_D_ptr = reinterpret_cast<float**>(copy_to_ws(h_down_D_ptr));
+
+  if (!RunNvfp4GroupedMoEFp32AccumToDevice(
+        d_down_A_ptr, d_down_A_scale, d_down_A_global,
+        d_down_B_ptr, d_down_B_scale, d_down_B_global,
+        d_down_D_ptr, d_expert_token_counts,
+        params.routed_expert_intermediate_size, params.hidden_size, max_experts,
+        cutlass_ws, 0)) {
+      return false;
+  }
+
+  // Phase 3: ScatterAdd
+  auto routed_output_view = DeviceTensorFp32::CreateView(
+      {params.token_count, params.hidden_size},
+      params.routed_output);
+  if (!routed_output_view) return false;
+
+  for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
+    const int expert_id_int = active_expert_ids_host[active_slot];
+    const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
+    
+    const int expert_offset_int = expert_offsets_host[expert_id];
+    const int next_expert_offset_int = expert_offsets_host[expert_id + 1];
+    const std::size_t expert_offset = static_cast<std::size_t>(expert_offset_int);
+    const std::size_t expert_token_count = static_cast<std::size_t>(next_expert_offset_int - expert_offset_int);
+    if (expert_token_count == 0) continue;
+
+    auto gather_view = DeviceTensorFp32::CreateView(
+        {expert_token_count, params.hidden_size},
+        params.gather_scratch + (expert_offset * params.hidden_size));
+
+    if (!ScatterAddWeightedRowsFp32(
              *gather_view,
              params.sorted_token_indices + expert_offset,
              params.sorted_token_weights + expert_offset,
-             routed_output.get())) {
+             routed_output_view.get())) {
       return false;
     }
+  }
+  
+  if (cudaStreamSynchronize(0) != cudaSuccess) {
+      return false;
   }
 
   const Nvfp4PackedMatrixDeviceView shared_up_weight_view =

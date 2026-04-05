@@ -215,6 +215,10 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       DeviceTensorFp32::Create({selection_capacity, config.routed_expert_intermediate_size});
   workspace->fused_prefill_shared_up_scratch =
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
+  workspace->fused_prefill_nvfp4_pack_scratch =
+      DeviceTensorFp32::Create({(selection_capacity + config.num_experts * 128) * config.hidden_size / sizeof(float), 1});
+  workspace->fused_prefill_grouped_workspace_scratch =
+      DeviceTensorFp32::Create({config.num_experts * 1024 * 1024 / sizeof(float), 1});
   if (!workspace->valid()) {
     return nullptr;
   }

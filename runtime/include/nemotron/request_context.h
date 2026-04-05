@@ -56,6 +56,8 @@ struct MoePrefillWorkspace {
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_nvfp4_pack_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_grouped_workspace_scratch;
 };
 
 class RequestExecutionContext {
