@@ -4,6 +4,12 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
 
 namespace nemotron {
 namespace {
@@ -25,6 +31,70 @@ constexpr int kStatePassingTile = 512;
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
 }
+
+struct ChunkedScanDumpConfig {
+  bool enabled = false;
+  std::string root;
+  int target_layer = -1;
+  int current_layer = -1;
+
+  static ChunkedScanDumpConfig FromEnv() {
+    ChunkedScanDumpConfig config;
+    const char* layer_env = std::getenv("NEMOTRON_DUMP_CHUNKED_SCAN_LAYER");
+    const char* root_env = std::getenv("NEMOTRON_DUMP_CHUNKED_SCAN_ROOT");
+    if (layer_env != nullptr && root_env != nullptr) {
+      config.target_layer = std::atoi(layer_env);
+      config.root = std::string(root_env) + "/runtime";
+      config.enabled = true;
+    }
+    return config;
+  }
+
+  bool ShouldDump() {
+    if (!enabled) return false;
+    ++current_layer;
+    return current_layer == target_layer;
+  }
+};
+
+bool DumpDeviceFp32(const float* device_ptr, std::size_t count,
+                    const std::filesystem::path& path, cudaStream_t stream) {
+  if (count == 0) return true;
+  std::vector<float> host(count);
+  if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+  if (cudaMemcpy(host.data(), device_ptr, count * sizeof(float),
+                 cudaMemcpyDeviceToHost) != cudaSuccess)
+    return false;
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(host.data()),
+            static_cast<std::streamsize>(count * sizeof(float)));
+  std::cerr << "dump: " << path.string() << " (" << count << " floats)\n";
+  return out.good();
+}
+
+bool DumpDeviceBf16(const __nv_bfloat16* device_ptr, std::size_t count,
+                    const std::filesystem::path& path, cudaStream_t stream) {
+  if (count == 0) return true;
+  std::vector<__nv_bfloat16> host(count);
+  if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+  if (cudaMemcpy(host.data(), device_ptr, count * sizeof(__nv_bfloat16),
+                 cudaMemcpyDeviceToHost) != cudaSuccess)
+    return false;
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  // Write as FP32 for easy comparison
+  std::vector<float> fp32(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    fp32[i] = __bfloat162float(host[i]);
+  }
+  out.write(reinterpret_cast<const char*>(fp32.data()),
+            static_cast<std::streamsize>(count * sizeof(float)));
+  std::cerr << "dump: " << path.string() << " (" << count << " bf16->fp32)\n";
+  return out.good();
+}
+
+static thread_local ChunkedScanDumpConfig g_chunked_scan_dump;
 
 __device__ __forceinline__ float SigmoidDevice(float value) {
   if (value >= 0.0f) {
@@ -1267,6 +1337,15 @@ bool MambaChunkedScanPrefillBf16(
     return false;
   }
 
+  // Initialize dump config on first call
+  static bool dump_config_initialized = false;
+  if (!dump_config_initialized) {
+    g_chunked_scan_dump = ChunkedScanDumpConfig::FromEnv();
+    dump_config_initialized = true;
+  }
+  const bool dump_this_layer = g_chunked_scan_dump.ShouldDump();
+  const std::string dump_root = dump_this_layer ? g_chunked_scan_dump.root : "";
+
   const std::size_t token_count = projected.shape()[0];
   const std::size_t chunk_count = (token_count + chunk_size - 1) / chunk_size;
   const std::size_t dt_required = chunk_count * num_heads * chunk_size;
@@ -1277,6 +1356,23 @@ bool MambaChunkedScanPrefillBf16(
       workspace->state_scratch->numel() < state_required ||
       workspace->cb_chunk->numel() < cb_required) {
     return false;
+  }
+
+  // Dump inputs before any kernels
+  if (dump_this_layer) {
+    std::cerr << "chunked_scan_dump: layer " << g_chunked_scan_dump.target_layer
+              << " T=" << token_count << " C=" << chunk_count << "\n";
+    const std::filesystem::path dr(dump_root);
+    // conv_output contains X, B, C
+    DumpDeviceBf16(conv_output.data(), conv_output.numel(), dr / "conv_output_fp32.bin", stream);
+    // dt_pre is in projected[:, I+conv_dim : I+conv_dim+H]
+    // We dump the full projected buffer and let the comparison script slice it
+    DumpDeviceBf16(projected.data(), projected.numel(), dr / "projected_fp32.bin", stream);
+    DumpDeviceFp32(a_log.data(), a_log.numel(), dr / "a_log_fp32.bin", stream);
+    DumpDeviceFp32(dt_bias.data(), dt_bias.numel(), dr / "dt_bias_fp32.bin", stream);
+    DumpDeviceFp32(d.data(), d.numel(), dr / "d_fp32.bin", stream);
+    DumpDeviceFp32(ssm_state->data() + ssm_state_offset_elems,
+                   intermediate_size * state_size, dr / "ssm_state_in_fp32.bin", stream);
   }
 
   const dim3 chunk_cumsum_grid(
@@ -1301,6 +1397,11 @@ bool MambaChunkedScanPrefillBf16(
   if (!CheckCuda(cudaGetLastError())) {
     return false;
   }
+  if (dump_this_layer) {
+    const std::filesystem::path dr(dump_root);
+    DumpDeviceFp32(workspace->dt_chunk->data(), dt_required, dr / "dt_chunk_fp32.bin", stream);
+    DumpDeviceFp32(workspace->dA_cumsum->data(), dt_required, dr / "dA_cumsum_fp32.bin", stream);
+  }
 
   const dim3 chunk_state_grid(
       static_cast<unsigned int>(kMambaFixedHeads * (kMambaFixedStateSize / kChunkStateNTile)),
@@ -1324,6 +1425,10 @@ bool MambaChunkedScanPrefillBf16(
   if (!CheckCuda(cudaGetLastError())) {
     return false;
   }
+  if (dump_this_layer) {
+    const std::filesystem::path dr(dump_root);
+    DumpDeviceFp32(workspace->state_scratch->data(), state_required, dr / "chunk_delta_fp32.bin", stream);
+  }
 
   const dim3 state_passing_grid(
       static_cast<unsigned int>(
@@ -1346,6 +1451,12 @@ bool MambaChunkedScanPrefillBf16(
   if (!CheckCuda(cudaGetLastError())) {
     return false;
   }
+  if (dump_this_layer) {
+    const std::filesystem::path dr(dump_root);
+    DumpDeviceFp32(workspace->state_scratch->data(), state_required, dr / "boundary_state_fp32.bin", stream);
+    DumpDeviceFp32(ssm_state->data() + ssm_state_offset_elems,
+                   intermediate_size * state_size, dr / "ssm_state_out_fp32.bin", stream);
+  }
 
   const dim3 bmm_chunk_grid(
       static_cast<unsigned int>(
@@ -1366,6 +1477,10 @@ bool MambaChunkedScanPrefillBf16(
           workspace->cb_chunk->data());
   if (!CheckCuda(cudaGetLastError())) {
     return false;
+  }
+  if (dump_this_layer) {
+    const std::filesystem::path dr(dump_root);
+    DumpDeviceFp32(workspace->cb_chunk->data(), cb_required, dr / "cb_chunk_fp32.bin", stream);
   }
 
   const dim3 chunk_scan_grid(
@@ -1394,7 +1509,14 @@ bool MambaChunkedScanPrefillBf16(
           workspace->state_scratch->data(),
           workspace->cb_chunk->data(),
           y_output->data());
-  return CheckCuda(cudaGetLastError());
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+  if (dump_this_layer) {
+    const std::filesystem::path dr(dump_root);
+    DumpDeviceBf16(y_output->data(), y_output->numel(), dr / "y_output_fp32.bin", stream);
+  }
+  return true;
 }
 
 bool MambaSelectiveStateUpdateDecodeFp32(
