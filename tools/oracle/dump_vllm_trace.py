@@ -337,7 +337,7 @@ def build_llm(model_dir: str, prompt_token_count: int, decode_steps: int) -> LLM
         trust_remote_code=True,
         enforce_eager=True,
         max_model_len=prompt_token_count + decode_steps,
-        max_num_batched_tokens=prompt_token_count,
+        max_num_batched_tokens=prompt_token_count + decode_steps,
         max_num_seqs=1,
         enable_chunked_prefill=False,
     )

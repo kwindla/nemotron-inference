@@ -316,7 +316,11 @@ add_executable(
   backend/expert_layer3_fastpath_microharness_test.cpp
 )
 
-target_link_libraries(expert_layer3_fastpath_microharness_test PRIVATE nemotron_runtime_backend)
+target_link_libraries(
+  expert_layer3_fastpath_microharness_test
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_api)
 target_compile_definitions(
   expert_layer3_fastpath_microharness_test
   PRIVATE
@@ -469,6 +473,15 @@ target_compile_features(nvfp4_scale_helper_test PRIVATE cxx_std_17)
 nemotron_add_test(nvfp4_scale_helper_test)
 
 add_executable(
+  nvfp4_pack_scale_semantics_test
+  backend/nvfp4_pack_scale_semantics_test.cpp
+)
+
+target_compile_features(nvfp4_pack_scale_semantics_test PRIVATE cxx_std_17)
+
+nemotron_add_test(nvfp4_pack_scale_semantics_test)
+
+add_executable(
   nvfp4_packing_test
   backend/nvfp4_packing_test.cpp
 )
@@ -543,7 +556,11 @@ add_executable(
   backend/mamba_layer_oracle_test.cpp
 )
 
-target_link_libraries(mamba_layer_oracle_test PRIVATE nemotron_runtime_backend)
+target_link_libraries(
+  mamba_layer_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_loader)
 target_compile_features(mamba_layer_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   mamba_layer_oracle_test
@@ -558,7 +575,11 @@ add_executable(
   backend/mamba_layer_oracle_test.cpp
 )
 
-target_link_libraries(mamba_layer18_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
+target_link_libraries(
+  mamba_layer18_runtime_input_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_loader)
 target_compile_features(mamba_layer18_runtime_input_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   mamba_layer18_runtime_input_oracle_test
@@ -573,7 +594,11 @@ add_executable(
   backend/mamba_layer_oracle_test.cpp
 )
 
-target_link_libraries(mamba_layer13_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
+target_link_libraries(
+  mamba_layer13_runtime_input_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_loader)
 target_compile_features(mamba_layer13_runtime_input_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   mamba_layer13_runtime_input_oracle_test
@@ -588,7 +613,11 @@ add_executable(
   backend/mamba_layer_oracle_test.cpp
 )
 
-target_link_libraries(mamba_layer9_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
+target_link_libraries(
+  mamba_layer9_runtime_input_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_loader)
 target_compile_features(mamba_layer9_runtime_input_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   mamba_layer9_runtime_input_oracle_test
@@ -603,7 +632,11 @@ add_executable(
   backend/mamba_layer_oracle_test.cpp
 )
 
-target_link_libraries(mamba_layer15_runtime_input_oracle_test PRIVATE nemotron_runtime_backend)
+target_link_libraries(
+  mamba_layer15_runtime_input_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_loader)
 target_compile_features(mamba_layer15_runtime_input_oracle_test PRIVATE cxx_std_17)
 target_compile_definitions(
   mamba_layer15_runtime_input_oracle_test
@@ -766,6 +799,7 @@ target_compile_definitions(
   expert_layer3_prefix_replay_test
   PRIVATE
     NEMOTRON_PREFILL_PREFIX_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefix_prefill_short_chat_layer7_t4_oracle_v2"
+    NEMOTRON_EXPERT_LAYER_PREFIX_INPUT_FIXTURE_ROOT="${CMAKE_SOURCE_DIR}/../proj-2026-04-04-nvfp4-activation-quant-alignment/layer3-prefix-oracle.tkvkh2"
 )
 
 nemotron_add_test(expert_layer3_prefix_replay_test)
