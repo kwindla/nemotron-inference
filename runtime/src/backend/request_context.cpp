@@ -3,6 +3,8 @@
 #include <limits>
 #include <utility>
 
+#include "nemotron/fused_moe_grouped.h"
+
 namespace nemotron {
 namespace {
 
@@ -21,6 +23,27 @@ std::optional<std::size_t> CheckedAdd(std::size_t lhs, std::size_t rhs) {
     return std::nullopt;
   }
   return lhs + rhs;
+}
+
+std::optional<std::size_t> RoundUpBytes(
+    std::size_t bytes,
+    std::size_t alignment) {
+  if (alignment == 0) {
+    return bytes;
+  }
+  const auto adjusted = CheckedAdd(bytes, alignment - 1u);
+  if (!adjusted.has_value()) {
+    return std::nullopt;
+  }
+  return (*adjusted / alignment) * alignment;
+}
+
+std::optional<std::size_t> Fp32TensorElementsForBytes(std::size_t bytes) {
+  const auto rounded = RoundUpBytes(bytes, sizeof(float));
+  if (!rounded.has_value()) {
+    return std::nullopt;
+  }
+  return *rounded / sizeof(float);
 }
 
 std::optional<std::size_t> MatrixBytes(
@@ -138,6 +161,14 @@ bool SameWorkspaceConfig(
          lhs.shared_expert_intermediate_size == rhs.shared_expert_intermediate_size;
 }
 
+std::optional<std::size_t> GroupedMoeScratchBytes(
+    const MoePrefillWorkspaceConfig& config) {
+  if (!WorkspaceConfigSupported(config)) {
+    return std::nullopt;
+  }
+  return GroupedMoeWorkspaceBytes(static_cast<int>(config.num_experts));
+}
+
 }  // namespace
 
 std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
@@ -182,7 +213,8 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(
                      token_capacity,
                      config.shared_expert_intermediate_size,
-                     sizeof(float)))
+                     sizeof(float))) &&
+                 add_bytes(GroupedMoeScratchBytes(config))
              ? std::optional<std::size_t>(total)
              : std::nullopt;
 }
@@ -217,8 +249,16 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
   workspace->fused_prefill_nvfp4_pack_scratch =
       DeviceTensorFp32::Create({(selection_capacity + config.num_experts * 128) * config.hidden_size / sizeof(float), 1});
+  const auto grouped_workspace_bytes = GroupedMoeScratchBytes(config);
+  const auto grouped_workspace_elements =
+      grouped_workspace_bytes.has_value()
+          ? Fp32TensorElementsForBytes(*grouped_workspace_bytes)
+          : std::nullopt;
+  if (!grouped_workspace_elements.has_value()) {
+    return nullptr;
+  }
   workspace->fused_prefill_grouped_workspace_scratch =
-      DeviceTensorFp32::Create({config.num_experts * 1024 * 1024 / sizeof(float), 1});
+      DeviceTensorFp32::Create({*grouped_workspace_elements, 1});
   if (!workspace->valid()) {
     return nullptr;
   }
@@ -233,6 +273,11 @@ bool MoePrefillWorkspace::valid() const {
   }
 
   const std::size_t selection_capacity = token_capacity_value * config.top_k;
+  const auto grouped_workspace_bytes = GroupedMoeScratchBytes(config);
+  const auto grouped_workspace_elements =
+      grouped_workspace_bytes.has_value()
+          ? Fp32TensorElementsForBytes(*grouped_workspace_bytes)
+          : std::nullopt;
   return TensorMatchesShape(normalized_bf16.get(), token_capacity_value, config.hidden_size) &&
          TensorMatchesShape(input_fp32.get(), token_capacity_value, config.hidden_size) &&
          TensorMatchesShape(normalized.get(), token_capacity_value, config.hidden_size) &&
@@ -259,7 +304,12 @@ bool MoePrefillWorkspace::valid() const {
          TensorMatchesShape(
              fused_prefill_shared_up_scratch.get(),
              token_capacity_value,
-             config.shared_expert_intermediate_size);
+             config.shared_expert_intermediate_size) &&
+         grouped_workspace_elements.has_value() &&
+         TensorMatchesShape(
+             fused_prefill_grouped_workspace_scratch.get(),
+             *grouped_workspace_elements,
+             1);
 }
 
 std::size_t MoePrefillWorkspace::token_capacity() const {

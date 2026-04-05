@@ -2,10 +2,10 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 #include <optional>
 #include <vector>
 
@@ -23,6 +23,7 @@ namespace {
 
 constexpr const char* kNvfp4ActivationTensorScaleEnvVar =
     "NEMOTRON_FORWARD_NVFP4_ACTIVATION_TENSOR_SCALE";
+constexpr std::size_t kMinGroupedCutlassRows = 128;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -243,32 +244,40 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
 
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
 
-  const int max_experts = params.n_routed_experts;
-  
-  std::vector<const std::uint8_t*> h_up_A_ptr(max_experts, nullptr);
-  std::vector<const std::uint8_t*> h_up_A_scale(max_experts, nullptr);
-  std::vector<const float*> h_up_A_global(max_experts, nullptr);
-  std::vector<const std::uint8_t*> h_up_B_ptr(max_experts, nullptr);
-  std::vector<const std::uint8_t*> h_up_B_scale(max_experts, nullptr);
-  std::vector<const float*> h_up_B_global(max_experts, nullptr);
-  std::vector<float*> h_up_D_ptr(max_experts, nullptr);
-  std::vector<int32_t> h_expert_token_counts(max_experts, 0);
+  std::vector<const std::uint8_t*> h_up_A_ptr(active_expert_count, nullptr);
+  std::vector<const std::uint8_t*> h_up_A_scale(active_expert_count, nullptr);
+  std::vector<const float*> h_up_A_global(active_expert_count, nullptr);
+  std::vector<const std::uint8_t*> h_up_B_ptr(active_expert_count, nullptr);
+  std::vector<const std::uint8_t*> h_up_B_scale(active_expert_count, nullptr);
+  std::vector<const float*> h_up_B_global(active_expert_count, nullptr);
+  std::vector<float*> h_up_D_ptr(active_expert_count, nullptr);
+  std::vector<int32_t> h_expert_token_counts(active_expert_count, 0);
 
-  std::vector<const std::uint8_t*> h_down_A_ptr(max_experts, nullptr);
-  std::vector<const std::uint8_t*> h_down_A_scale(max_experts, nullptr);
-  std::vector<const float*> h_down_A_global(max_experts, nullptr);
-  std::vector<const std::uint8_t*> h_down_B_ptr(max_experts, nullptr);
-  std::vector<const std::uint8_t*> h_down_B_scale(max_experts, nullptr);
-  std::vector<const float*> h_down_B_global(max_experts, nullptr);
-  std::vector<float*> h_down_D_ptr(max_experts, nullptr);
+  std::vector<const std::uint8_t*> h_down_A_ptr(active_expert_count, nullptr);
+  std::vector<const std::uint8_t*> h_down_A_scale(active_expert_count, nullptr);
+  std::vector<const float*> h_down_A_global(active_expert_count, nullptr);
+  std::vector<const std::uint8_t*> h_down_B_ptr(active_expert_count, nullptr);
+  std::vector<const std::uint8_t*> h_down_B_scale(active_expert_count, nullptr);
+  std::vector<const float*> h_down_B_global(active_expert_count, nullptr);
+  std::vector<float*> h_down_D_ptr(active_expert_count, nullptr);
 
   std::uint8_t* pack_scratch_base = reinterpret_cast<std::uint8_t*>(params.nvfp4_pack_scratch);
   std::size_t pack_offset = 0;
+
+  std::uint8_t* ws_base = reinterpret_cast<std::uint8_t*>(params.grouped_workspace_scratch);
+  std::size_t ws_offset = 0;
 
   auto alloc_pack = [&](std::size_t bytes, std::size_t alignment = 128) -> std::uint8_t* {
       pack_offset = (pack_offset + alignment - 1) & ~(alignment - 1);
       std::uint8_t* ptr = pack_scratch_base + pack_offset;
       pack_offset += bytes;
+      return ptr;
+  };
+
+  auto alloc_ws = [&](std::size_t bytes, std::size_t alignment = 16) -> std::uint8_t* {
+      ws_offset = (ws_offset + alignment - 1) & ~(alignment - 1);
+      std::uint8_t* ptr = ws_base + ws_offset;
+      ws_offset += bytes;
       return ptr;
   };
 
@@ -307,59 +316,174 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
         return false;
     }
 
-    h_expert_token_counts[expert_id] = expert_token_count;
-    h_up_A_ptr[expert_id] = packed_data;
-    h_up_A_scale[expert_id] = matmul_scales;
-    h_up_A_global[expert_id] = tensor_scale;
+    h_expert_token_counts[active_slot] = expert_token_count;
+    h_up_A_ptr[active_slot] = packed_data;
+    h_up_A_scale[active_slot] = matmul_scales;
+    h_up_A_global[active_slot] = tensor_scale;
 
-    h_up_B_ptr[expert_id] = routed_up_host[expert_id].packed_data;
-    h_up_B_scale[expert_id] = routed_up_host[expert_id].matmul_block_scales_data;
-    h_up_B_global[expert_id] = routed_up_host[expert_id].tensor_scale_data;
+    h_up_B_ptr[active_slot] = routed_up_host[expert_id].packed_data;
+    if (h_up_B_ptr[active_slot] == nullptr) {
+      return false;
+    }
+    h_up_B_scale[active_slot] = routed_up_host[expert_id].matmul_block_scales_data;
+    h_up_B_global[active_slot] = routed_up_host[expert_id].tensor_scale_data;
 
-    h_up_D_ptr[expert_id] = params.expert_up_scratch + (expert_offset * params.routed_expert_intermediate_size);
+    h_up_D_ptr[active_slot] =
+        params.expert_up_scratch + (expert_offset * params.routed_expert_intermediate_size);
   }
 
-  std::uint8_t* ws_base = reinterpret_cast<std::uint8_t*>(params.grouped_workspace_scratch);
-  std::size_t ws_offset = 0;
-  auto alloc_ws = [&](std::size_t bytes, std::size_t alignment = 16) -> std::uint8_t* {
-      ws_offset = (ws_offset + alignment - 1) & ~(alignment - 1);
-      std::uint8_t* ptr = ws_base + ws_offset;
-      ws_offset += bytes;
-      return ptr;
-  };
+  std::vector<int> cutlass_slots;
+  std::vector<int> fallback_slots;
+  cutlass_slots.reserve(static_cast<std::size_t>(active_expert_count));
+  fallback_slots.reserve(static_cast<std::size_t>(active_expert_count));
+  for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
+    if (h_expert_token_counts[static_cast<std::size_t>(active_slot)] >=
+        static_cast<int32_t>(kMinGroupedCutlassRows)) {
+      cutlass_slots.push_back(active_slot);
+    } else {
+      fallback_slots.push_back(active_slot);
+    }
+  }
 
   auto copy_to_ws = [&](const auto& vec) {
       using T = typename std::decay<decltype(vec)>::type::value_type;
       std::size_t bytes = vec.size() * sizeof(T);
       T* d_ptr = reinterpret_cast<T*>(alloc_ws(bytes));
-      cudaMemcpyAsync(d_ptr, vec.data(), bytes, cudaMemcpyHostToDevice, 0);
+      if (bytes != 0) {
+        cudaMemcpyAsync(d_ptr, vec.data(), bytes, cudaMemcpyHostToDevice, 0);
+      }
       return d_ptr;
   };
 
-  auto d_up_A_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_A_ptr));
-  auto d_up_A_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_A_scale));
-  auto d_up_A_global = reinterpret_cast<const float**>(copy_to_ws(h_up_A_global));
-  auto d_up_B_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_B_ptr));
-  auto d_up_B_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_up_B_scale));
-  auto d_up_B_global = reinterpret_cast<const float**>(copy_to_ws(h_up_B_global));
-  auto d_up_D_ptr = reinterpret_cast<float**>(copy_to_ws(h_up_D_ptr));
-  auto d_expert_token_counts = reinterpret_cast<const int32_t*>(copy_to_ws(h_expert_token_counts));
+  auto run_grouped_slots = [&](const auto& a_ptrs,
+                               const auto& a_scales,
+                               const auto& a_globals,
+                               const auto& b_ptrs,
+                               const auto& b_scales,
+                               const auto& b_globals,
+                               const auto& d_ptrs,
+                               int k,
+                               int n) {
+    if (cutlass_slots.empty()) {
+      return true;
+    }
 
-  GroupedMoeWorkspace cutlass_ws;
-  ws_offset = (ws_offset + 127) & ~127;
-  cutlass_ws.data = ws_base + ws_offset;
-  cutlass_ws.nbytes = GroupedMoeWorkspaceBytes(max_experts);
+    auto subset = [&](const auto& values) {
+      using T = typename std::decay<decltype(values)>::type::value_type;
+      std::vector<T> filtered;
+      filtered.reserve(cutlass_slots.size());
+      for (int slot : cutlass_slots) {
+        filtered.push_back(values[static_cast<std::size_t>(slot)]);
+      }
+      return filtered;
+    };
 
-  if (!RunGroupedFp4Gemm(
-        d_up_A_ptr, d_up_A_scale, d_up_A_global,
-        d_up_B_ptr, d_up_B_scale, d_up_B_global,
-        d_up_D_ptr, d_expert_token_counts,
-        params.hidden_size, params.routed_expert_intermediate_size, max_experts,
-        cutlass_ws, nullptr)) {
-      return false;
+    ws_offset = 0;
+    const auto d_a_ptrs =
+        reinterpret_cast<const std::uint8_t**>(copy_to_ws(subset(a_ptrs)));
+    const auto d_a_scales =
+        reinterpret_cast<const std::uint8_t**>(copy_to_ws(subset(a_scales)));
+    const auto d_a_globals =
+        reinterpret_cast<const float**>(copy_to_ws(subset(a_globals)));
+    const auto d_b_ptrs =
+        reinterpret_cast<const std::uint8_t**>(copy_to_ws(subset(b_ptrs)));
+    const auto d_b_scales =
+        reinterpret_cast<const std::uint8_t**>(copy_to_ws(subset(b_scales)));
+    const auto d_b_globals =
+        reinterpret_cast<const float**>(copy_to_ws(subset(b_globals)));
+    const auto d_d_ptrs =
+        reinterpret_cast<float**>(copy_to_ws(subset(d_ptrs)));
+    const auto d_token_counts =
+        reinterpret_cast<const int32_t*>(copy_to_ws(subset(h_expert_token_counts)));
+
+    ws_offset = (ws_offset + 127) & ~127;
+    GroupedMoeWorkspace cutlass_ws{
+        ws_base + ws_offset,
+        GroupedMoeWorkspaceBytes(static_cast<int>(cutlass_slots.size()))};
+    return RunGroupedFp4Gemm(
+        d_a_ptrs,
+        d_a_scales,
+        d_a_globals,
+        d_b_ptrs,
+        d_b_scales,
+        d_b_globals,
+        d_d_ptrs,
+        d_token_counts,
+        k,
+        n,
+        static_cast<int>(cutlass_slots.size()),
+        cutlass_ws,
+        nullptr);
+  };
+
+  auto run_fallback_slots = [&](std::size_t input_cols,
+                                std::size_t output_cols,
+                                float* source_base,
+                                const auto& output_ptrs,
+                                const auto& weights,
+                                const auto descriptors) {
+    for (int active_slot : fallback_slots) {
+      const int expert_id_int = active_expert_ids_host[static_cast<std::size_t>(active_slot)];
+      const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
+      const int expert_offset_int = expert_offsets_host[expert_id];
+      const int next_expert_offset_int = expert_offsets_host[expert_id + 1];
+      const std::size_t expert_offset = static_cast<std::size_t>(expert_offset_int);
+      const std::size_t expert_token_count =
+          static_cast<std::size_t>(next_expert_offset_int - expert_offset_int);
+      auto source_view = DeviceTensorFp32::CreateView(
+          {expert_token_count, input_cols},
+          source_base + (expert_offset * input_cols));
+      auto output_view = DeviceTensorFp32::CreateView(
+          {expert_token_count, output_cols},
+          output_ptrs[static_cast<std::size_t>(active_slot)]);
+      const auto weight_view = MakeNvfp4PackedMatrixDeviceView(weights[expert_id]);
+      const auto plan = BuildRuntimeNvfp4GemmPlan(
+          *descriptors[expert_id],
+          weight_view,
+          expert_token_count,
+          params.heuristic_cache);
+      if (!source_view ||
+          !output_view ||
+          !weight_view.valid() ||
+          !plan.has_value() ||
+          !RunNvfp4RowMajorFp32SourceToDevice(
+              *params.cublas_handle,
+              *plan,
+              *source_view,
+              weight_view,
+              output_view.get(),
+              pack_options,
+              false)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // The current SM120 grouped FP4 kernel is numerically unstable below the
+  // 128-row tile height covered by the existing CUTLASS smoke tests.
+  if (!run_grouped_slots(
+          h_up_A_ptr,
+          h_up_A_scale,
+          h_up_A_global,
+          h_up_B_ptr,
+          h_up_B_scale,
+          h_up_B_global,
+          h_up_D_ptr,
+          static_cast<int>(params.hidden_size),
+          static_cast<int>(params.routed_expert_intermediate_size)) ||
+      !run_fallback_slots(
+          params.hidden_size,
+          params.routed_expert_intermediate_size,
+          params.gather_scratch,
+          h_up_D_ptr,
+          routed_up_host,
+          params.routed_up_descriptors)) {
+    return false;
   }
 
   // Phase 2: Relu, Pack, and Down Proj setup
+  ws_offset = 0;
   for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
     const int expert_id_int = active_expert_ids_host[active_slot];
     const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
@@ -392,37 +516,38 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
         return false;
     }
 
-    h_down_A_ptr[expert_id] = packed_data;
-    h_down_A_scale[expert_id] = matmul_scales;
-    h_down_A_global[expert_id] = tensor_scale;
+    h_down_A_ptr[active_slot] = packed_data;
+    h_down_A_scale[active_slot] = matmul_scales;
+    h_down_A_global[active_slot] = tensor_scale;
 
-    h_down_B_ptr[expert_id] = routed_down_host[expert_id].packed_data;
-    h_down_B_scale[expert_id] = routed_down_host[expert_id].matmul_block_scales_data;
-    h_down_B_global[expert_id] = routed_down_host[expert_id].tensor_scale_data;
+    h_down_B_ptr[active_slot] = routed_down_host[expert_id].packed_data;
+    if (h_down_B_ptr[active_slot] == nullptr) {
+      return false;
+    }
+    h_down_B_scale[active_slot] = routed_down_host[expert_id].matmul_block_scales_data;
+    h_down_B_global[active_slot] = routed_down_host[expert_id].tensor_scale_data;
 
-    h_down_D_ptr[expert_id] = params.gather_scratch + (expert_offset * params.hidden_size);
+    h_down_D_ptr[active_slot] = params.gather_scratch + (expert_offset * params.hidden_size);
   }
 
-  // Reuse the ws_base for down proj pointers
-  ws_offset = 0;
-  auto d_down_A_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_A_ptr));
-  auto d_down_A_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_A_scale));
-  auto d_down_A_global = reinterpret_cast<const float**>(copy_to_ws(h_down_A_global));
-  auto d_down_B_ptr = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_B_ptr));
-  auto d_down_B_scale = reinterpret_cast<const std::uint8_t**>(copy_to_ws(h_down_B_scale));
-  auto d_down_B_global = reinterpret_cast<const float**>(copy_to_ws(h_down_B_global));
-  auto d_down_D_ptr = reinterpret_cast<float**>(copy_to_ws(h_down_D_ptr));
-
-  // Reuse the CUTLASS workspace (up-proj GEMM is complete on the same stream)
-  cutlass_ws.data = ws_base + ((ws_offset + 127) & ~127);
-
-  if (!RunGroupedFp4Gemm(
-        d_down_A_ptr, d_down_A_scale, d_down_A_global,
-        d_down_B_ptr, d_down_B_scale, d_down_B_global,
-        d_down_D_ptr, d_expert_token_counts,
-        params.routed_expert_intermediate_size, params.hidden_size, max_experts,
-        cutlass_ws, nullptr)) {
-      return false;
+  if (!run_grouped_slots(
+          h_down_A_ptr,
+          h_down_A_scale,
+          h_down_A_global,
+          h_down_B_ptr,
+          h_down_B_scale,
+          h_down_B_global,
+          h_down_D_ptr,
+          static_cast<int>(params.routed_expert_intermediate_size),
+          static_cast<int>(params.hidden_size)) ||
+      !run_fallback_slots(
+          params.routed_expert_intermediate_size,
+          params.hidden_size,
+          params.expert_up_scratch,
+          h_down_D_ptr,
+          routed_down_host,
+          params.routed_down_descriptors)) {
+    return false;
   }
 
   // Phase 3: ScatterAdd
