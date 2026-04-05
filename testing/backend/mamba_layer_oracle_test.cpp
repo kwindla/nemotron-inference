@@ -543,6 +543,7 @@ std::optional<MambaReplayResult> run_mamba_replay(
   auto y_output = DeviceTensorBf16::Create({input_rows, layer_config.intermediate_size});
   auto grouped_output = DeviceTensorBf16::Create({input_rows, layer_config.intermediate_size});
   const std::vector<__nv_bfloat16> projected_bf16 = to_bf16(trace.in_proj_output);
+  const bool use_token_loop = env_var_enabled("NEMOTRON_MAMBA_USE_TOKEN_LOOP");
   if (!manual_request || !manual_request->valid() ||
       !projected || !projected->valid() ||
       !conv_output || !conv_output->valid() ||
@@ -568,22 +569,41 @@ std::optional<MambaReplayResult> run_mamba_replay(
           *conv1d_bias,
           manual_request->mamba_conv_state(),
           conv_output.get()) ||
-      !nemotron::MambaSsmUpdateBf16(
-          *projected,
-          *conv_output,
-          layer_config.intermediate_size,
-          conv_dim,
-          layer_config.num_heads,
-          layer_config.head_dim,
-          layer_config.state_size,
-          layer_config.n_groups,
-          layer_config.time_step_min,
-          layer_config.ssm_state_offset_elems,
-          *a_log,
-          *d,
-          *dt_bias,
-          manual_request->mamba_state(),
-          y_output.get()) ||
+      !(use_token_loop
+            ? nemotron::MambaSsmUpdateBf16(
+                  *projected,
+                  *conv_output,
+                  layer_config.intermediate_size,
+                  conv_dim,
+                  layer_config.num_heads,
+                  layer_config.head_dim,
+                  layer_config.state_size,
+                  layer_config.n_groups,
+                  layer_config.time_step_min,
+                  layer_config.ssm_state_offset_elems,
+                  *a_log,
+                  *d,
+                  *dt_bias,
+                  manual_request->mamba_state(),
+                  y_output.get())
+            : (manual_request->EnsureMambaChunkScanWorkspace(input_rows, 128) &&
+               nemotron::MambaChunkedScanPrefillBf16(
+                   *projected,
+                   *conv_output,
+                   layer_config.intermediate_size,
+                   conv_dim,
+                   layer_config.num_heads,
+                   layer_config.head_dim,
+                   layer_config.state_size,
+                   layer_config.n_groups,
+                   128,
+                   layer_config.ssm_state_offset_elems,
+                   *a_log,
+                   *d,
+                   *dt_bias,
+                   manual_request->mamba_state(),
+                   y_output.get(),
+                   manual_request->mamba_chunk_scan_workspace()))) ||
       !nemotron::GroupedRmsNormGatedBf16(
           *y_output,
           *projected,

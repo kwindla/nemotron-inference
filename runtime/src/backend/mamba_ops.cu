@@ -11,6 +11,16 @@ namespace {
 constexpr int kThreadsPerBlock = 256;
 constexpr int kDecodeConvThreads = 128;
 constexpr int kDecodeSsmThreads = 64;
+constexpr int kMambaChunkSize = 128;
+constexpr int kMambaFixedHeads = 128;
+constexpr int kMambaFixedHeadDim = 64;
+constexpr int kMambaFixedStateSize = 128;
+constexpr int kMambaFixedGroups = 8;
+constexpr int kMambaFixedIntermediate = kMambaFixedHeads * kMambaFixedHeadDim;
+constexpr int kChunkCumsumTileHeads = 8;
+constexpr int kChunkStateNTile = 64;
+constexpr int kChunkScanQTile = 64;
+constexpr int kStatePassingTile = 512;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -56,6 +66,290 @@ __device__ __forceinline__ void StoreMambaValue(
     std::size_t index,
     float value) {
   output[index] = __float2bfloat16(value);
+}
+
+__device__ __forceinline__ std::size_t ChunkHeadOffset(
+    std::size_t chunk,
+    std::size_t head,
+    std::size_t chunk_size) {
+  return ((chunk * kMambaFixedHeads) + head) * chunk_size;
+}
+
+__device__ __forceinline__ int ChunkLengthDevice(
+    std::size_t token_count,
+    std::size_t chunk,
+    std::size_t chunk_size) {
+  const std::size_t start = chunk * chunk_size;
+  if (start >= token_count) {
+    return 0;
+  }
+  const std::size_t remaining = token_count - start;
+  return static_cast<int>(remaining < chunk_size ? remaining : chunk_size);
+}
+
+template <int Q, int TileHeads>
+__global__ __launch_bounds__(128) void ChunkCumsumKernel(
+    const __nv_bfloat16* projected,
+    std::size_t token_count,
+    std::size_t projection_size,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    const float* a_log,
+    const float* dt_bias,
+    float* dt_chunk,
+    float* dA_cumsum) {
+  extern __shared__ float shared_dt[];
+
+  const int chunk = blockIdx.x;
+  const int head_base = blockIdx.y * TileHeads;
+  const int tid = static_cast<int>(threadIdx.y * blockDim.x + threadIdx.x);
+  const int threads = static_cast<int>(blockDim.x * blockDim.y);
+
+  for (int linear = tid; linear < TileHeads * Q; linear += threads) {
+    const int head_local = linear / Q;
+    const int q = linear % Q;
+    const int head = head_base + head_local;
+    float dt = 0.0f;
+    if (head < kMambaFixedHeads) {
+      const std::size_t token = static_cast<std::size_t>(chunk) * Q + q;
+      if (token < token_count) {
+        const std::size_t dt_index =
+            token * projection_size + intermediate_size + conv_dim + head;
+        dt = SoftplusDevice(__bfloat162float(projected[dt_index]) + dt_bias[head]);
+      }
+    }
+    shared_dt[linear] = dt;
+  }
+  __syncthreads();
+
+  if (tid >= TileHeads) {
+    return;
+  }
+
+  const int head = head_base + tid;
+  if (head >= kMambaFixedHeads) {
+    return;
+  }
+
+  const float a = -expf(a_log[head]);
+  const std::size_t base = ChunkHeadOffset(chunk, head, Q);
+  float cumsum = 0.0f;
+  const int row_offset = tid * Q;
+  for (int q = 0; q < Q; ++q) {
+    const float dt = shared_dt[row_offset + q];
+    cumsum += dt * a;
+    dt_chunk[base + q] = dt;
+    dA_cumsum[base + q] = cumsum;
+  }
+}
+
+template <int Q, int P, int N, int G, int NTile>
+__global__ __launch_bounds__(128) void ChunkStateKernel(
+    const __nv_bfloat16* conv_output,
+    std::size_t token_count,
+    std::size_t conv_dim,
+    std::size_t intermediate_size,
+    const float* dt_chunk,
+    const float* dA_cumsum,
+    float* state_scratch) {
+  __shared__ float shared_scale[Q];
+
+  const int blocks_per_head = N / NTile;
+  const int head = blockIdx.x / blocks_per_head;
+  const int n_tile = (blockIdx.x % blocks_per_head) * NTile;
+  const int chunk = blockIdx.y;
+  const int tid =
+      static_cast<int>((threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x);
+  const int threads = static_cast<int>(blockDim.x * blockDim.y * blockDim.z);
+  const int chunk_length = ChunkLengthDevice(token_count, chunk, Q);
+  const int group = head / (kMambaFixedHeads / G);
+  const std::size_t dt_base = ChunkHeadOffset(chunk, head, Q);
+  const float lambda_last = chunk_length > 0 ? dA_cumsum[dt_base + chunk_length - 1] : 0.0f;
+
+  for (int q = tid; q < Q; q += threads) {
+    float scale = 0.0f;
+    if (q < chunk_length) {
+      scale = expf(lambda_last - dA_cumsum[dt_base + q]) * dt_chunk[dt_base + q];
+    }
+    shared_scale[q] = scale;
+  }
+  __syncthreads();
+
+  for (int linear = tid; linear < P * NTile; linear += threads) {
+    const int p = linear / NTile;
+    const int n = n_tile + (linear % NTile);
+    float accum = 0.0f;
+    for (int q = 0; q < chunk_length; ++q) {
+      const std::size_t token = static_cast<std::size_t>(chunk) * Q + q;
+      const float x = __bfloat162float(conv_output[token * conv_dim + head * P + p]);
+      const float b =
+          __bfloat162float(conv_output[token * conv_dim + intermediate_size + group * N + n]);
+      accum += shared_scale[q] * b * x;
+    }
+    state_scratch[(((static_cast<std::size_t>(chunk) * kMambaFixedHeads + head) * P + p) * N) + n] =
+        accum;
+  }
+}
+
+template <int Q, int H, int P, int N, int Tile>
+__global__ __launch_bounds__(128) void StatePassingKernel(
+    std::size_t token_count,
+    std::size_t chunk_count,
+    const float* dA_cumsum,
+    float* state_scratch,
+    float* ssm_state) {
+  constexpr int kThreads = 128;
+  constexpr int kValuesPerThread = Tile / kThreads;
+  static_assert(Tile % kThreads == 0, "State passing tile must map evenly onto the block.");
+
+  const int slices_per_head = (P * N) / Tile;
+  const int head = blockIdx.x / slices_per_head;
+  const int slice = blockIdx.x % slices_per_head;
+  const int tid = static_cast<int>(threadIdx.y * blockDim.x + threadIdx.x);
+  const std::size_t head_state_base = static_cast<std::size_t>(head) * P * N;
+  const std::size_t slice_base = static_cast<std::size_t>(slice) * Tile;
+
+  float current[kValuesPerThread];
+#pragma unroll
+  for (int i = 0; i < kValuesPerThread; ++i) {
+    const std::size_t offset = slice_base + tid + i * kThreads;
+    current[i] = ssm_state[head_state_base + offset];
+  }
+
+  for (std::size_t chunk = 0; chunk < chunk_count; ++chunk) {
+    const int chunk_length = ChunkLengthDevice(token_count, chunk, Q);
+    const float decay =
+        chunk_length > 0 ? expf(dA_cumsum[ChunkHeadOffset(chunk, head, Q) + chunk_length - 1])
+                         : 1.0f;
+    const std::size_t scratch_base =
+        ((chunk * H + head) * P * N) + slice_base;
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+      const std::size_t offset = tid + i * kThreads;
+      const float delta = state_scratch[scratch_base + offset];
+      state_scratch[scratch_base + offset] = current[i];
+      current[i] = decay * current[i] + delta;
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < kValuesPerThread; ++i) {
+    const std::size_t offset = slice_base + tid + i * kThreads;
+    ssm_state[head_state_base + offset] = current[i];
+  }
+}
+
+template <int Q, int G, int N, int TileQ>
+__global__ __launch_bounds__(128) void BmmChunkKernel(
+    const __nv_bfloat16* conv_output,
+    std::size_t token_count,
+    std::size_t conv_dim,
+    std::size_t intermediate_size,
+    float* cb_chunk) {
+  const int tiles_per_group = (Q / TileQ) * (Q / TileQ);
+  const int group = blockIdx.x / tiles_per_group;
+  const int local_tile = blockIdx.x % tiles_per_group;
+  const int qi_start = (local_tile / (Q / TileQ)) * TileQ;
+  const int qj_start = (local_tile % (Q / TileQ)) * TileQ;
+  const int chunk = blockIdx.y;
+  const int tid =
+      static_cast<int>((threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x);
+  const int threads = static_cast<int>(blockDim.x * blockDim.y * blockDim.z);
+  const int chunk_length = ChunkLengthDevice(token_count, chunk, Q);
+
+  for (int linear = tid; linear < TileQ * TileQ; linear += threads) {
+    const int qi = qi_start + (linear / TileQ);
+    const int qj = qj_start + (linear % TileQ);
+    float accum = 0.0f;
+    if (qi < chunk_length && qj < chunk_length) {
+      const std::size_t token_i = static_cast<std::size_t>(chunk) * Q + qi;
+      const std::size_t token_j = static_cast<std::size_t>(chunk) * Q + qj;
+      const std::size_t c_base =
+          token_i * conv_dim + intermediate_size + G * N + group * N;
+      const std::size_t b_base = token_j * conv_dim + intermediate_size + group * N;
+      for (int n = 0; n < N; ++n) {
+        accum += __bfloat162float(conv_output[c_base + n]) *
+                 __bfloat162float(conv_output[b_base + n]);
+      }
+    }
+    cb_chunk[(((static_cast<std::size_t>(chunk) * G + group) * Q + qi) * Q) + qj] = accum;
+  }
+}
+
+template <int Q, int H, int P, int N, int G, int TileQ>
+__global__ __launch_bounds__(128) void ChunkScanKernel(
+    const __nv_bfloat16* conv_output,
+    std::size_t token_count,
+    std::size_t conv_dim,
+    std::size_t intermediate_size,
+    const float* d_values,
+    const float* dt_chunk,
+    const float* dA_cumsum,
+    const float* boundary_state,
+    const float* cb_chunk,
+    __nv_bfloat16* y_output) {
+  extern __shared__ unsigned char shared_bytes[];
+  __nv_bfloat16* shared_x = reinterpret_cast<__nv_bfloat16*>(shared_bytes);
+  float* shared_dt = reinterpret_cast<float*>(shared_x + (Q * P));
+  float* shared_dA = shared_dt + Q;
+
+  const int head = blockIdx.x / (Q / TileQ);
+  const int q_tile = blockIdx.x % (Q / TileQ);
+  const int q_start = q_tile * TileQ;
+  const int chunk = blockIdx.y;
+  const int group = head / (H / G);
+  const int tid = static_cast<int>(threadIdx.y * blockDim.x + threadIdx.x);
+  const int threads = static_cast<int>(blockDim.x * blockDim.y);
+  const int chunk_length = ChunkLengthDevice(token_count, chunk, Q);
+  const std::size_t chunk_head_base = ChunkHeadOffset(chunk, head, Q);
+
+  for (int linear = tid; linear < Q * P; linear += threads) {
+    const int q = linear / P;
+    const int p = linear % P;
+    __nv_bfloat16 value = __float2bfloat16(0.0f);
+    if (q < chunk_length) {
+      const std::size_t token = static_cast<std::size_t>(chunk) * Q + q;
+      value = conv_output[token * conv_dim + head * P + p];
+    }
+    shared_x[linear] = value;
+  }
+  for (int q = tid; q < Q; q += threads) {
+    const float dA = dA_cumsum[chunk_head_base + q];
+    shared_dA[q] = dA;
+    shared_dt[q] = q < chunk_length ? expf(-dA) * dt_chunk[chunk_head_base + q] : 0.0f;
+  }
+  __syncthreads();
+
+  for (int linear = tid; linear < TileQ * P; linear += threads) {
+    const int qi_local = linear / P;
+    const int p = linear % P;
+    const int qi = q_start + qi_local;
+    if (qi >= chunk_length) {
+      continue;
+    }
+
+    const std::size_t token = static_cast<std::size_t>(chunk) * Q + qi;
+    const float scale_i = expf(shared_dA[qi]);
+    const std::size_t c_base =
+        token * conv_dim + intermediate_size + G * N + group * N;
+    const std::size_t boundary_base =
+        (((static_cast<std::size_t>(chunk) * H + head) * P + p) * N);
+    float accum = 0.0f;
+    for (int n = 0; n < N; ++n) {
+      accum += __bfloat162float(conv_output[c_base + n]) * boundary_state[boundary_base + n];
+    }
+    accum *= scale_i;
+
+    const std::size_t cb_row_base =
+        (((static_cast<std::size_t>(chunk) * G + group) * Q + qi) * Q);
+    for (int qj = 0; qj <= qi; ++qj) {
+      accum += scale_i * shared_dt[qj] * cb_chunk[cb_row_base + qj] *
+               __bfloat162float(shared_x[qj * P + p]);
+    }
+
+    accum += d_values[head] * __bfloat162float(shared_x[qi * P + p]);
+    y_output[token * intermediate_size + head * P + p] = __float2bfloat16(accum);
+  }
 }
 
 template <int kWidth, typename ProjectedT, typename ConvStateT, typename OutputT>
@@ -909,6 +1203,197 @@ bool MambaSsmUpdateBf16(
       dt_bias.data(),
       ssm_state->data() + ssm_state_offset_elems,
       y_output->data());
+  return CheckCuda(cudaGetLastError());
+}
+
+bool MambaChunkedScanPrefillBf16(
+    const DeviceTensorBf16& projected,
+    const DeviceTensorBf16& conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    std::size_t chunk_size,
+    std::size_t ssm_state_offset_elems,
+    const DeviceTensorFp32& a_log,
+    const DeviceTensorFp32& d,
+    const DeviceTensorFp32& dt_bias,
+    DeviceTensorFp32* ssm_state,
+    DeviceTensorBf16* y_output,
+    MambaChunkScanWorkspace* workspace,
+    cudaStream_t stream) {
+  if (!projected.valid() ||
+      !conv_output.valid() ||
+      !a_log.valid() ||
+      !d.valid() ||
+      !dt_bias.valid() ||
+      ssm_state == nullptr ||
+      !ssm_state->valid() ||
+      y_output == nullptr ||
+      !y_output->valid() ||
+      workspace == nullptr ||
+      workspace->dt_chunk == nullptr ||
+      workspace->dA_cumsum == nullptr ||
+      workspace->state_scratch == nullptr ||
+      workspace->cb_chunk == nullptr ||
+      !workspace->dt_chunk->valid() ||
+      !workspace->dA_cumsum->valid() ||
+      !workspace->state_scratch->valid() ||
+      !workspace->cb_chunk->valid() ||
+      projected.shape().size() != 2 ||
+      conv_output.shape().size() != 2 ||
+      y_output->shape().size() != 2 ||
+      projected.shape()[0] == 0 ||
+      projected.shape()[0] != conv_output.shape()[0] ||
+      projected.shape()[0] != y_output->shape()[0] ||
+      projected.shape()[1] != intermediate_size + conv_dim + num_heads ||
+      conv_output.shape()[1] != conv_dim ||
+      y_output->shape()[1] != intermediate_size ||
+      intermediate_size != kMambaFixedIntermediate ||
+      num_heads != kMambaFixedHeads ||
+      head_dim != kMambaFixedHeadDim ||
+      state_size != kMambaFixedStateSize ||
+      n_groups != kMambaFixedGroups ||
+      chunk_size != kMambaChunkSize ||
+      conv_dim != (kMambaFixedIntermediate + 2 * kMambaFixedGroups * kMambaFixedStateSize) ||
+      a_log.numel() != num_heads ||
+      d.numel() != num_heads ||
+      dt_bias.numel() != num_heads ||
+      ssm_state_offset_elems + (intermediate_size * state_size) > ssm_state->numel() ||
+      workspace->chunk_size != chunk_size ||
+      workspace->capacity_tokens < projected.shape()[0]) {
+    return false;
+  }
+
+  const std::size_t token_count = projected.shape()[0];
+  const std::size_t chunk_count = (token_count + chunk_size - 1) / chunk_size;
+  const std::size_t dt_required = chunk_count * num_heads * chunk_size;
+  const std::size_t state_required = chunk_count * num_heads * head_dim * state_size;
+  const std::size_t cb_required = chunk_count * n_groups * chunk_size * chunk_size;
+  if (workspace->dt_chunk->numel() < dt_required ||
+      workspace->dA_cumsum->numel() < dt_required ||
+      workspace->state_scratch->numel() < state_required ||
+      workspace->cb_chunk->numel() < cb_required) {
+    return false;
+  }
+
+  const dim3 chunk_cumsum_grid(
+      static_cast<unsigned int>(chunk_count),
+      static_cast<unsigned int>(kMambaFixedHeads / kChunkCumsumTileHeads),
+      1);
+  const dim3 chunk_cumsum_block(32, 4, 1);
+  ChunkCumsumKernel<kMambaChunkSize, kChunkCumsumTileHeads>
+      <<<chunk_cumsum_grid,
+         chunk_cumsum_block,
+         sizeof(float) * kChunkCumsumTileHeads * kMambaChunkSize,
+         stream>>>(
+          projected.data(),
+          token_count,
+          projected.shape()[1],
+          intermediate_size,
+          conv_dim,
+          a_log.data(),
+          dt_bias.data(),
+          workspace->dt_chunk->data(),
+          workspace->dA_cumsum->data());
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const dim3 chunk_state_grid(
+      static_cast<unsigned int>(kMambaFixedHeads * (kMambaFixedStateSize / kChunkStateNTile)),
+      static_cast<unsigned int>(chunk_count),
+      1);
+  const dim3 chunk_state_block(32, 2, 2);
+  ChunkStateKernel<
+      kMambaChunkSize,
+      kMambaFixedHeadDim,
+      kMambaFixedStateSize,
+      kMambaFixedGroups,
+      kChunkStateNTile>
+      <<<chunk_state_grid, chunk_state_block, sizeof(float) * kMambaChunkSize, stream>>>(
+          conv_output.data(),
+          token_count,
+          conv_dim,
+          intermediate_size,
+          workspace->dt_chunk->data(),
+          workspace->dA_cumsum->data(),
+          workspace->state_scratch->data());
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const dim3 state_passing_grid(
+      static_cast<unsigned int>(
+          kMambaFixedHeads * ((kMambaFixedHeadDim * kMambaFixedStateSize) / kStatePassingTile)),
+      1,
+      1);
+  const dim3 state_passing_block(32, 4, 1);
+  StatePassingKernel<
+      kMambaChunkSize,
+      kMambaFixedHeads,
+      kMambaFixedHeadDim,
+      kMambaFixedStateSize,
+      kStatePassingTile>
+      <<<state_passing_grid, state_passing_block, 0, stream>>>(
+          token_count,
+          chunk_count,
+          workspace->dA_cumsum->data(),
+          workspace->state_scratch->data(),
+          ssm_state->data() + ssm_state_offset_elems);
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const dim3 bmm_chunk_grid(
+      static_cast<unsigned int>(
+          kMambaFixedGroups * (kMambaChunkSize / kChunkScanQTile) * (kMambaChunkSize / kChunkScanQTile)),
+      static_cast<unsigned int>(chunk_count),
+      1);
+  const dim3 bmm_chunk_block(32, 2, 2);
+  BmmChunkKernel<
+      kMambaChunkSize,
+      kMambaFixedGroups,
+      kMambaFixedStateSize,
+      kChunkScanQTile>
+      <<<bmm_chunk_grid, bmm_chunk_block, 0, stream>>>(
+          conv_output.data(),
+          token_count,
+          conv_dim,
+          intermediate_size,
+          workspace->cb_chunk->data());
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const dim3 chunk_scan_grid(
+      static_cast<unsigned int>(kMambaFixedHeads * (kMambaChunkSize / kChunkScanQTile)),
+      static_cast<unsigned int>(chunk_count),
+      1);
+  const dim3 chunk_scan_block(32, 4, 1);
+  const std::size_t chunk_scan_shared =
+      (sizeof(__nv_bfloat16) * kMambaChunkSize * kMambaFixedHeadDim) +
+      (sizeof(float) * kMambaChunkSize * 2);
+  ChunkScanKernel<
+      kMambaChunkSize,
+      kMambaFixedHeads,
+      kMambaFixedHeadDim,
+      kMambaFixedStateSize,
+      kMambaFixedGroups,
+      kChunkScanQTile>
+      <<<chunk_scan_grid, chunk_scan_block, chunk_scan_shared, stream>>>(
+          conv_output.data(),
+          token_count,
+          conv_dim,
+          intermediate_size,
+          d.data(),
+          workspace->dt_chunk->data(),
+          workspace->dA_cumsum->data(),
+          workspace->state_scratch->data(),
+          workspace->cb_chunk->data(),
+          y_output->data());
   return CheckCuda(cudaGetLastError());
 }
 

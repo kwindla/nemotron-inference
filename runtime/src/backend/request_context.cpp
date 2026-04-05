@@ -7,6 +7,7 @@
 #include <limits>
 #include <utility>
 
+#include "nemotron/mamba_ops.h"
 #include "nemotron/runtime_stats.h"
 
 namespace nemotron {
@@ -346,6 +347,7 @@ RequestExecutionContext::RequestExecutionContext(
       mamba_projected_decode_(std::move(mamba_projected_decode)),
       mamba_scan_output_decode_(std::move(mamba_scan_output_decode)),
       mamba_projected_output_decode_(std::move(mamba_projected_output_decode)),
+      mamba_chunk_scan_workspace_(std::make_unique<MambaChunkScanWorkspace>()),
       attention_normed_decode_(std::move(attention_normed_decode)),
       attention_q_decode_(std::move(attention_q_decode)),
       attention_k_decode_(std::move(attention_k_decode)),
@@ -374,6 +376,9 @@ RequestExecutionContext::~RequestExecutionContext() = default;
 
 bool RequestExecutionContext::valid() const {
   if (!forward_graph_state_) {
+    return false;
+  }
+  if (!mamba_chunk_scan_workspace_) {
     return false;
   }
   if (!hidden_ || !hidden_->valid() ||
@@ -570,6 +575,52 @@ DeviceTensorFp32* RequestExecutionContext::mamba_projected_output_decode() {
 
 const DeviceTensorFp32* RequestExecutionContext::mamba_projected_output_decode() const {
   return mamba_projected_output_decode_.get();
+}
+
+MambaChunkScanWorkspace* RequestExecutionContext::mamba_chunk_scan_workspace() {
+  return mamba_chunk_scan_workspace_.get();
+}
+
+const MambaChunkScanWorkspace* RequestExecutionContext::mamba_chunk_scan_workspace() const {
+  return mamba_chunk_scan_workspace_.get();
+}
+
+bool RequestExecutionContext::EnsureMambaChunkScanWorkspace(
+    std::size_t token_count,
+    std::size_t chunk_size) {
+  if (!mamba_chunk_scan_workspace_ || chunk_size == 0 || token_count == 0) {
+    return false;
+  }
+
+  MambaChunkScanWorkspace& workspace = *mamba_chunk_scan_workspace_;
+  if (workspace.capacity_tokens >= token_count && workspace.chunk_size == chunk_size &&
+      workspace.dt_chunk && workspace.dA_cumsum && workspace.state_scratch &&
+      workspace.cb_chunk &&
+      workspace.dt_chunk->valid() && workspace.dA_cumsum->valid() &&
+      workspace.state_scratch->valid() && workspace.cb_chunk->valid()) {
+    return true;
+  }
+
+  const std::size_t chunk_count = (token_count + chunk_size - 1) / chunk_size;
+  if (chunk_count == 0) {
+    return false;
+  }
+
+  auto dt_chunk = DeviceTensorFp32::Create({chunk_count, 128, chunk_size});
+  auto dA_cumsum = DeviceTensorFp32::Create({chunk_count, 128, chunk_size});
+  auto state_scratch = DeviceTensorFp32::Create({chunk_count, 128, 64, 128});
+  auto cb_chunk = DeviceTensorFp32::Create({chunk_count, 8, chunk_size, chunk_size});
+  if (!dt_chunk || !dA_cumsum || !state_scratch || !cb_chunk) {
+    return false;
+  }
+
+  workspace.dt_chunk = std::move(dt_chunk);
+  workspace.dA_cumsum = std::move(dA_cumsum);
+  workspace.state_scratch = std::move(state_scratch);
+  workspace.cb_chunk = std::move(cb_chunk);
+  workspace.capacity_tokens = token_count;
+  workspace.chunk_size = chunk_size;
+  return true;
 }
 
 DeviceTensorFp32* RequestExecutionContext::expert_intermediate_scratch() {

@@ -1,12 +1,22 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 
 #include <cuda_runtime.h>
 
 #include "nemotron/device_tensor.h"
 
 namespace nemotron {
+
+struct MambaChunkScanWorkspace {
+  std::unique_ptr<DeviceTensorFp32> dt_chunk;
+  std::unique_ptr<DeviceTensorFp32> dA_cumsum;
+  std::unique_ptr<DeviceTensorFp32> state_scratch;
+  std::unique_ptr<DeviceTensorFp32> cb_chunk;
+  std::size_t capacity_tokens = 0;
+  std::size_t chunk_size = 0;
+};
 
 bool MambaCausalConv1dUpdateDecodeFp32(
     const DeviceTensorFp32& projected,
@@ -90,6 +100,25 @@ bool MambaSsmUpdateBf16(
     const DeviceTensorFp32& dt_bias,
     DeviceTensorFp32* ssm_state,
     DeviceTensorBf16* y_output,
+    cudaStream_t stream = nullptr);
+
+bool MambaChunkedScanPrefillBf16(
+    const DeviceTensorBf16& projected,
+    const DeviceTensorBf16& conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    std::size_t chunk_size,
+    std::size_t ssm_state_offset_elems,
+    const DeviceTensorFp32& a_log,
+    const DeviceTensorFp32& d,
+    const DeviceTensorFp32& dt_bias,
+    DeviceTensorFp32* ssm_state,
+    DeviceTensorBf16* y_output,
+    MambaChunkScanWorkspace* workspace,
     cudaStream_t stream = nullptr);
 
 bool MambaSelectiveStateUpdateDecodeFp32(

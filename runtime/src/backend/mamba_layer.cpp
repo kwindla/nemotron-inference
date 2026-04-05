@@ -67,6 +67,11 @@ bool OptimizedMambaDecodeKernelsEnabled() {
   return kEnabled;
 }
 
+bool MambaUseTokenLoopPrefill() {
+  static const bool kEnabled = std::getenv("NEMOTRON_MAMBA_USE_TOKEN_LOOP") != nullptr;
+  return kEnabled;
+}
+
 bool MambaSubLayerProfileEnabled() {
   static const bool kEnabled = []() {
     const char* value = std::getenv("NEMOTRON_FORWARD_PROFILE");
@@ -92,6 +97,7 @@ enum class MambaSubLayerStage : std::size_t {
 
 constexpr std::size_t kMambaSubLayerStageCount =
     static_cast<std::size_t>(MambaSubLayerStage::kCount);
+constexpr std::size_t kMambaChunkScanSize = 128;
 
 const char* MambaSubLayerStageName(MambaSubLayerStage stage) {
   switch (stage) {
@@ -1154,13 +1160,36 @@ bool MambaLayerSlice::Run(
             })) {
       return false;
     }
+    if (!MambaUseTokenLoopPrefill() &&
+        !request_context.EnsureMambaChunkScanWorkspace(token_count, kMambaChunkScanSize)) {
+      return false;
+    }
     bool ssm_ok = false;
     if (conv1d_ok &&
         !measure_stage(
             MambaSubLayerStage::kSsmUpdate,
             &ssm_ok,
             [&]() {
-              return MambaSsmUpdateBf16(
+              if (MambaUseTokenLoopPrefill()) {
+                return MambaSsmUpdateBf16(
+                    *projected,
+                    *conv_output,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.num_heads,
+                    impl_->config.head_dim,
+                    impl_->config.state_size,
+                    impl_->config.n_groups,
+                    impl_->config.time_step_min,
+                    impl_->config.ssm_state_offset_elems,
+                    *impl_->A_log,
+                    *impl_->D,
+                    *impl_->dt_bias,
+                    request_context.mamba_state(),
+                    y_output.get(),
+                    stream);
+              }
+              return MambaChunkedScanPrefillBf16(
                   *projected,
                   *conv_output,
                   impl_->config.intermediate_size,
@@ -1169,13 +1198,14 @@ bool MambaLayerSlice::Run(
                   impl_->config.head_dim,
                   impl_->config.state_size,
                   impl_->config.n_groups,
-                  impl_->config.time_step_min,
+                  kMambaChunkScanSize,
                   impl_->config.ssm_state_offset_elems,
                   *impl_->A_log,
                   *impl_->D,
                   *impl_->dt_bias,
                   request_context.mamba_state(),
                   y_output.get(),
+                  request_context.mamba_chunk_scan_workspace(),
                   stream);
             })) {
       return false;
@@ -1545,13 +1575,36 @@ bool MambaLayerSlice::Run(
             })) {
       return false;
     }
+    if (!MambaUseTokenLoopPrefill() &&
+        !request_context.EnsureMambaChunkScanWorkspace(token_count, kMambaChunkScanSize)) {
+      return false;
+    }
     bool ssm_ok = false;
     if (conv1d_ok &&
         !measure_stage(
             MambaSubLayerStage::kSsmUpdate,
             &ssm_ok,
             [&]() {
-              return MambaSsmUpdateBf16(
+              if (MambaUseTokenLoopPrefill()) {
+                return MambaSsmUpdateBf16(
+                    *projected,
+                    *conv_output,
+                    impl_->config.intermediate_size,
+                    conv_dim,
+                    impl_->config.num_heads,
+                    impl_->config.head_dim,
+                    impl_->config.state_size,
+                    impl_->config.n_groups,
+                    impl_->config.time_step_min,
+                    impl_->config.ssm_state_offset_elems,
+                    *impl_->A_log,
+                    *impl_->D,
+                    *impl_->dt_bias,
+                    request_context.mamba_state(),
+                    y_output.get(),
+                    stream);
+              }
+              return MambaChunkedScanPrefillBf16(
                   *projected,
                   *conv_output,
                   impl_->config.intermediate_size,
@@ -1560,13 +1613,14 @@ bool MambaLayerSlice::Run(
                   impl_->config.head_dim,
                   impl_->config.state_size,
                   impl_->config.n_groups,
-                  impl_->config.time_step_min,
+                  kMambaChunkScanSize,
                   impl_->config.ssm_state_offset_elems,
                   *impl_->A_log,
                   *impl_->D,
                   *impl_->dt_bias,
                   request_context.mamba_state(),
                   y_output.get(),
+                  request_context.mamba_chunk_scan_workspace(),
                   stream);
             })) {
       return false;

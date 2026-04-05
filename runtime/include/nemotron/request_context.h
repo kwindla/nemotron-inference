@@ -14,6 +14,8 @@
 
 namespace nemotron {
 
+struct MambaChunkScanWorkspace;
+
 struct RequestExecutionConfig {
   std::size_t hidden_size = 0;
   std::size_t max_tokens = 0;
@@ -74,6 +76,9 @@ class RequestExecutionContext {
   const DeviceTensorFp32* mamba_scan_output_decode() const;
   DeviceTensorFp32* mamba_projected_output_decode();
   const DeviceTensorFp32* mamba_projected_output_decode() const;
+  MambaChunkScanWorkspace* mamba_chunk_scan_workspace();
+  const MambaChunkScanWorkspace* mamba_chunk_scan_workspace() const;
+  bool EnsureMambaChunkScanWorkspace(std::size_t token_count, std::size_t chunk_size);
   DeviceTensorBf16* key_cache();
   const DeviceTensorBf16* key_cache() const;
   DeviceTensorFp8E4M3* key_cache_fp8();
@@ -205,6 +210,7 @@ class RequestExecutionContext {
   std::unique_ptr<DeviceTensorFp32> mamba_projected_decode_;
   std::unique_ptr<DeviceTensorFp32> mamba_scan_output_decode_;
   std::unique_ptr<DeviceTensorFp32> mamba_projected_output_decode_;
+  std::unique_ptr<MambaChunkScanWorkspace> mamba_chunk_scan_workspace_;
   std::unique_ptr<DeviceTensorFp32> attention_normed_decode_;
   std::unique_ptr<DeviceTensorFp32> attention_q_decode_;
   std::unique_ptr<DeviceTensorFp32> attention_k_decode_;
