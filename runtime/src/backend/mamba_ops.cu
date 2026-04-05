@@ -414,23 +414,15 @@ __global__ __launch_bounds__(128) void BmmChunkKernel(
   }
 }
 
-// ChunkScanKernel: y[qi, p] = boundary + intra_chunk + D*X, using WMMA tensor cores.
+// ChunkScanKernel: y[qi, p] = boundary + intra_chunk + D*X
+// Fused single-accumulator WMMA following TRT-LLM's architecture:
+//   Each warp maintains its accumulator registers across both contributions.
+//   Phase 1 loads (scaled_C, bf16_state) into shared, WMMAs into acc.
+//   Phase 2 reloads shared with (scaled_CB), WMMAs into the SAME acc using s_x.
+//   No intermediate store between phases — accumulators persist in registers.
+//   Pre-scales C by exp(dA[qi]) to avoid mid-loop accumulator element access.
 //
-// Phase 1 (boundary): scaled_C[TileQ, N] @ bf16_state[N, P] -> [TileQ, P]
-//   where scaled_C[qi, n] = bf16(C[qi, n] * exp(dA[qi]))
-// Phase 2 (intra-chunk): scaled_CB[TileQ, Q] @ X[Q, P] -> [TileQ, P]
-//   where scaled_CB[qi, qj] = bf16(exp(dA[qi]-dA[qj]) * dt[qj] * CB[qi, qj]) with causal mask
-// Final: y = phase1 + phase2 + D*X
-//
-// Dynamic shared memory layout (~65 KiB, set via cudaFuncSetAttribute):
-//   s_x:         [Q, P]       BF16  persistent          16 KiB
-//   s_dA:        [Q]          FP32  persistent           512 B
-//   s_dt:        [Q]          FP32  persistent           512 B
-//   s_result1:   [TileQ, P]   FP32  Phase 1 output      16 KiB
-//   s_work:      [TileQ, N]   BF16  Phase 1: scaled_C   16 KiB
-//                              or [TileQ, Q] Phase 2: scaled_CB (same size when N==Q)
-//   s_work2:     [N, P]       BF16  Phase 1: bf16_state  16 KiB
-//                              or [TileQ, P] FP32 Phase 2: result2  (smaller, fits)
+// One CTA per (head, q_tile, chunk). 128 threads = 4 warps, 16 output tiles.
 template <int Q, int H, int P, int N, int G, int TileQ>
 __global__ void ChunkScanKernel(
     const __nv_bfloat16* conv_output,
@@ -447,18 +439,26 @@ __global__ void ChunkScanKernel(
   constexpr int WM = 16, WN = 16, WK = 16;
   constexpr int TM = TileQ / WM;
   constexpr int TN_P = P / WN;
-  constexpr int TK_N = N / WK;
-  constexpr int TK_Q = Q / WK;
+  constexpr int TK = N / WK;  // N == Q, same tile count for both phases
   constexpr int OUTPUT_TILES = TM * TN_P;
+  constexpr int TILES_PER_WARP = OUTPUT_TILES / 4;  // 4 warps, 4 tiles each
   static_assert(N == Q, "ChunkScanKernel requires N == Q for shared memory reuse");
+  static_assert(OUTPUT_TILES % 4 == 0, "Output tiles must divide evenly among 4 warps");
 
+  // Dynamic shared memory layout (~49 KiB):
+  //   s_x:    [Q, P]      BF16  persistent                16 KiB
+  //   s_dA:   [Q]          FP32  persistent                 512 B
+  //   s_dt:   [Q]          FP32  persistent                 512 B
+  //   s_a:    [TileQ, N]   BF16  Phase 1: scaled_C          16 KiB
+  //                               Phase 2: scaled_CB (reloaded)
+  //   s_b:    [N, P]       BF16  Phase 1: bf16_state        16 KiB
+  //                               After Phase 2: reused as s_result FP32
   extern __shared__ unsigned char shared_bytes[];
-  auto* s_x = reinterpret_cast<__nv_bfloat16*>(shared_bytes);                      // [Q, P]
-  auto* s_dA = reinterpret_cast<float*>(s_x + Q * P);                              // [Q]
-  auto* s_dt = s_dA + Q;                                                            // [Q]
-  auto* s_result1 = s_dt + Q;                                                       // [TileQ, P] FP32
-  auto* s_work = reinterpret_cast<__nv_bfloat16*>(s_result1 + TileQ * P);          // [TileQ, N] BF16
-  auto* s_work2 = s_work + TileQ * N;                                               // [N, P] BF16
+  auto* s_x = reinterpret_cast<__nv_bfloat16*>(shared_bytes);
+  auto* s_dA = reinterpret_cast<float*>(s_x + Q * P);
+  auto* s_dt = s_dA + Q;
+  auto* s_a = reinterpret_cast<__nv_bfloat16*>(s_dt + Q);
+  auto* s_b = s_a + TileQ * N;
 
   const int head = blockIdx.x / (Q / TileQ);
   const int q_tile = blockIdx.x % (Q / TileQ);
@@ -471,7 +471,6 @@ __global__ void ChunkScanKernel(
   const std::size_t chunk_head_base = ChunkHeadOffset(chunk, head, Q);
   const float d_val = d_values[head];
   const int warp_id = tid / 32;
-  const int num_warps = threads / 32;
 
   // === Load persistent data ===
   for (int q = tid; q < Q; q += threads) {
@@ -480,15 +479,12 @@ __global__ void ChunkScanKernel(
   }
   for (int linear = tid; linear < Q * P; linear += threads) {
     const int q = linear / P;
-    const int p = linear % P;
     s_x[linear] = (q < chunk_length)
-        ? conv_output[static_cast<std::size_t>(chunk * Q + q) * conv_dim + head * P + p]
+        ? conv_output[static_cast<std::size_t>(chunk * Q + q) * conv_dim + head * P + (linear % P)]
         : __float2bfloat16(0.0f);
   }
-  __syncthreads();
 
-  // === Phase 1: boundary contribution ===
-  // scaled_C[qi, n] = bf16(C[qi, n] * exp(dA[qi])) -> s_work[TileQ, N]
+  // === Load Phase 1 data: scaled_C and bf16_state ===
   for (int linear = tid; linear < TileQ * N; linear += threads) {
     const int qi_local = linear / N;
     const int n = linear % N;
@@ -500,39 +496,40 @@ __global__ void ChunkScanKernel(
           conv_output[token * conv_dim + intermediate_size + G * N + group * N + n]);
       val = __float2bfloat16(c * expf(s_dA[qi]));
     }
-    s_work[qi_local * N + n] = val;
+    s_a[qi_local * N + n] = val;
   }
-  // bf16_state[n, p] = bf16(boundary_state[head, p, n]) -> s_work2[N, P]
   for (int linear = tid; linear < N * P; linear += threads) {
     const int n = linear / P;
     const int p = linear % P;
     const std::size_t idx =
         ((static_cast<std::size_t>(chunk) * H + head) * P + p) * N + n;
-    s_work2[n * P + p] = __float2bfloat16(boundary_state[idx]);
+    s_b[n * P + p] = __float2bfloat16(boundary_state[idx]);
   }
   __syncthreads();
 
-  // WMMA: result1[TileQ, P] = scaled_C[TileQ, N] @ bf16_state[N, P]
-  for (int tile_idx = warp_id; tile_idx < OUTPUT_TILES; tile_idx += num_warps) {
-    const int tm = tile_idx / TN_P;
-    const int tn = tile_idx % TN_P;
-    wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc;
-    wmma::fill_fragment(acc, 0.0f);
-    for (int tk = 0; tk < TK_N; ++tk) {
+  // === Initialize per-warp accumulators ===
+  wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc[TILES_PER_WARP];
+  for (int t = 0; t < TILES_PER_WARP; ++t) {
+    wmma::fill_fragment(acc[t], 0.0f);
+  }
+
+  // === Phase 1 WMMA: acc += scaled_C[TileQ, N] @ bf16_state[N, P] ===
+  for (int tk = 0; tk < TK; ++tk) {
+    for (int t = 0; t < TILES_PER_WARP; ++t) {
+      const int tile_idx = warp_id + t * 4;
+      const int tm = tile_idx / TN_P;
+      const int tn = tile_idx % TN_P;
       wmma::fragment<wmma::matrix_a, WM, WN, WK, __nv_bfloat16, wmma::row_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &s_work[tm * WM * N + tk * WK], N);
+      wmma::load_matrix_sync(a_frag, &s_a[tm * WM * N + tk * WK], N);
       wmma::fragment<wmma::matrix_b, WM, WN, WK, __nv_bfloat16, wmma::row_major> b_frag;
-      wmma::load_matrix_sync(b_frag, &s_work2[tk * WK * P + tn * WN], P);
-      wmma::mma_sync(acc, a_frag, b_frag, acc);
+      wmma::load_matrix_sync(b_frag, &s_b[tk * WK * P + tn * WN], P);
+      wmma::mma_sync(acc[t], a_frag, b_frag, acc[t]);
     }
-    wmma::store_matrix_sync(&s_result1[tm * WM * P + tn * WN], acc, P,
-                            wmma::mem_row_major);
   }
+  // Accumulators persist in registers across this sync
   __syncthreads();
 
-  // === Phase 2: intra-chunk contribution ===
-  // scaled_CB[qi, qj] = bf16(exp(dA[qi]-dA[qj]) * dt[qj] * CB[qi,qj]) with causal mask
-  // Reuse s_work[TileQ, Q] (same size as TileQ*N since N==Q)
+  // === Load Phase 2 data: scaled_CB (reuse s_a) ===
   for (int linear = tid; linear < TileQ * Q; linear += threads) {
     const int qi_local = linear / Q;
     const int qj = linear % Q;
@@ -544,38 +541,43 @@ __global__ void ChunkScanKernel(
           ((static_cast<std::size_t>(chunk) * G + group) * Q + qi) * Q + qj;
       val = __float2bfloat16(scale * cb_chunk[cb_idx]);
     }
-    s_work[qi_local * Q + qj] = val;
+    s_a[qi_local * Q + qj] = val;
   }
-  // Reuse s_work2 for result2[TileQ, P] FP32 (TileQ*P*4 = 16K <= N*P*2 = 16K)
-  auto* s_result2 = reinterpret_cast<float*>(s_work2);
   __syncthreads();
 
-  // WMMA: result2[TileQ, P] = scaled_CB[TileQ, Q] @ X[Q, P]
-  for (int tile_idx = warp_id; tile_idx < OUTPUT_TILES; tile_idx += num_warps) {
-    const int tm = tile_idx / TN_P;
-    const int tn = tile_idx % TN_P;
-    wmma::fragment<wmma::accumulator, WM, WN, WK, float> acc;
-    wmma::fill_fragment(acc, 0.0f);
-    for (int tk = 0; tk < TK_Q; ++tk) {
+  // === Phase 2 WMMA: acc += scaled_CB[TileQ, Q] @ X[Q, P] (same accumulators) ===
+  for (int tk = 0; tk < TK; ++tk) {
+    for (int t = 0; t < TILES_PER_WARP; ++t) {
+      const int tile_idx = warp_id + t * 4;
+      const int tm = tile_idx / TN_P;
+      const int tn = tile_idx % TN_P;
       wmma::fragment<wmma::matrix_a, WM, WN, WK, __nv_bfloat16, wmma::row_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &s_work[tm * WM * Q + tk * WK], Q);
+      wmma::load_matrix_sync(a_frag, &s_a[tm * WM * Q + tk * WK], Q);
       wmma::fragment<wmma::matrix_b, WM, WN, WK, __nv_bfloat16, wmma::row_major> b_frag;
       wmma::load_matrix_sync(b_frag, &s_x[tk * WK * P + tn * WN], P);
-      wmma::mma_sync(acc, a_frag, b_frag, acc);
+      wmma::mma_sync(acc[t], a_frag, b_frag, acc[t]);
     }
-    wmma::store_matrix_sync(&s_result2[tm * WM * P + tn * WN], acc, P,
+  }
+
+  // === Store accumulators + D*X → output ===
+  // Reuse s_b as FP32 result buffer (N*P*2 bytes >= TileQ*P*4 bytes since N*2 >= TileQ*4 when N>=2*TileQ... no)
+  // Actually N*P*sizeof(bf16) = 128*64*2 = 16384, TileQ*P*sizeof(float) = 64*64*4 = 16384. Exact fit.
+  auto* s_result = reinterpret_cast<float*>(s_b);
+  for (int t = 0; t < TILES_PER_WARP; ++t) {
+    const int tile_idx = warp_id + t * 4;
+    const int tm = tile_idx / TN_P;
+    const int tn = tile_idx % TN_P;
+    wmma::store_matrix_sync(&s_result[tm * WM * P + tn * WN], acc[t], P,
                             wmma::mem_row_major);
   }
   __syncthreads();
 
-  // === Final: y = result1 + result2 + D*X ===
   for (int linear = tid; linear < TileQ * P; linear += threads) {
     const int qi_local = linear / P;
     const int p = linear % P;
     const int qi = q_start + qi_local;
     if (qi >= chunk_length) continue;
-    const float val = s_result1[linear] + s_result2[linear]
-                    + d_val * __bfloat162float(s_x[qi * P + p]);
+    const float val = s_result[linear] + d_val * __bfloat162float(s_x[qi * P + p]);
     const std::size_t token = static_cast<std::size_t>(chunk) * Q + qi;
     y_output[token * intermediate_size + head * P + p] = __float2bfloat16(val);
   }
@@ -1648,15 +1650,13 @@ bool MambaChunkedScanPrefillBf16(
       1);
   const dim3 chunk_scan_block(32, 4, 1);
   // Dynamic shared memory for WMMA ChunkScan:
-  //   s_x[Q*P] BF16 + s_dA[Q] FP32 + s_dt[Q] FP32 + s_result1[TileQ*P] FP32
-  //   + s_work[TileQ*N] BF16 + s_work2[N*P] BF16
+  //   s_x[Q*P] BF16 + s_dA[Q] FP32 + s_dt[Q] FP32 + s_a[TileQ*N] BF16 + s_b[N*P] BF16
   constexpr std::size_t kChunkScanShared =
       (sizeof(__nv_bfloat16) * kMambaChunkSize * kMambaFixedHeadDim) +  // s_x
       (sizeof(float) * kMambaChunkSize) +                               // s_dA
       (sizeof(float) * kMambaChunkSize) +                               // s_dt
-      (sizeof(float) * kChunkScanQTile * kMambaFixedHeadDim) +          // s_result1
-      (sizeof(__nv_bfloat16) * kChunkScanQTile * kMambaFixedStateSize) + // s_work
-      (sizeof(__nv_bfloat16) * kMambaFixedStateSize * kMambaFixedHeadDim); // s_work2
+      (sizeof(__nv_bfloat16) * kChunkScanQTile * kMambaFixedStateSize) + // s_a
+      (sizeof(__nv_bfloat16) * kMambaFixedStateSize * kMambaFixedHeadDim); // s_b
   {
     using KernelT = void(*)(const __nv_bfloat16*, std::size_t, std::size_t, std::size_t,
         const float*, const float*, const float*, const float*, const float*, __nv_bfloat16*);
