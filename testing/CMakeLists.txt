@@ -571,6 +571,17 @@ target_compile_definitions(
 nemotron_add_test(mamba_layer_oracle_test)
 
 add_executable(
+  chunked_scan_kernel_verify_test
+  backend/chunked_scan_kernel_verify_test.cpp
+)
+target_link_libraries(
+  chunked_scan_kernel_verify_test
+  PRIVATE
+    nemotron_runtime_backend)
+target_compile_features(chunked_scan_kernel_verify_test PRIVATE cxx_std_17)
+nemotron_add_test(chunked_scan_kernel_verify_test)
+
+add_executable(
   mamba_layer18_runtime_input_oracle_test
   backend/mamba_layer_oracle_test.cpp
 )

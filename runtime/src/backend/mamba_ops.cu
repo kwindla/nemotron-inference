@@ -254,7 +254,9 @@ __global__ __launch_bounds__(128) void ChunkStateKernel(
       const float x = __bfloat162float(conv_output[token * conv_dim + head * P + p]);
       const float b =
           __bfloat162float(conv_output[token * conv_dim + intermediate_size + group * N + n]);
-      accum += shared_scale[q] * b * x;
+      // Match vLLM: scale * B cast to BF16 before dot with X (BF16 tensor-core contract)
+      const float scaled_b = __bfloat162float(__float2bfloat16(shared_scale[q] * b));
+      accum += scaled_b * x;
     }
     state_scratch[(((static_cast<std::size_t>(chunk) * kMambaFixedHeads + head) * P + p) * N) + n] =
         accum;
@@ -403,18 +405,23 @@ __global__ __launch_bounds__(128) void ChunkScanKernel(
         token * conv_dim + intermediate_size + G * N + group * N;
     const std::size_t boundary_base =
         (((static_cast<std::size_t>(chunk) * H + head) * P + p) * N);
+    // Match vLLM: cast boundary_state to BF16 before dot with C (BF16 tensor-core contract)
     float accum = 0.0f;
     for (int n = 0; n < N; ++n) {
-      accum += __bfloat162float(conv_output[c_base + n]) * boundary_state[boundary_base + n];
+      const float c_val = __bfloat162float(conv_output[c_base + n]);
+      const float state_bf16 = __bfloat162float(__float2bfloat16(boundary_state[boundary_base + n]));
+      accum += c_val * state_bf16;
     }
     accum *= scale_i;
 
+    // Match vLLM: scale * CB cast to BF16 before dot with X (BF16 tensor-core contract)
     const std::size_t cb_row_base =
         (((static_cast<std::size_t>(chunk) * G + group) * Q + qi) * Q);
     for (int qj = 0; qj <= qi; ++qj) {
       const float intra_chunk_scale = expf(shared_dA[qi] - shared_dA[qj]) * shared_dt[qj];
-      accum += intra_chunk_scale * cb_chunk[cb_row_base + qj] *
-               __bfloat162float(shared_x[qj * P + p]);
+      const float scaled_cb = __bfloat162float(
+          __float2bfloat16(intra_chunk_scale * cb_chunk[cb_row_base + qj]));
+      accum += scaled_cb * __bfloat162float(shared_x[qj * P + p]);
     }
 
     accum += d_values[head] * __bfloat162float(shared_x[qi * P + p]);
