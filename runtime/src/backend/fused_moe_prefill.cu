@@ -11,6 +11,7 @@
 
 #include "nemotron/gemm_execution.h"
 #include "nemotron/fused_moe_grouped.h"
+#include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/gemm_planner.h"
 #include "nemotron/nvfp4_gemm_runner.h"
 #include "nemotron/nvfp4_packing.h"
@@ -344,17 +345,17 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   auto d_up_D_ptr = reinterpret_cast<float**>(copy_to_ws(h_up_D_ptr));
   auto d_expert_token_counts = reinterpret_cast<const int32_t*>(copy_to_ws(h_expert_token_counts));
 
-  Nvfp4GroupedMoEWorkspace cutlass_ws;
+  GroupedMoeWorkspace cutlass_ws;
   ws_offset = (ws_offset + 127) & ~127;
   cutlass_ws.data = ws_base + ws_offset;
-  cutlass_ws.nbytes = GetNvfp4GroupedMoEWorkspaceSize(max_experts);
+  cutlass_ws.nbytes = GroupedMoeWorkspaceBytes(max_experts);
 
-  if (!RunNvfp4GroupedMoEFp32AccumToDevice(
+  if (!RunGroupedFp4Gemm(
         d_up_A_ptr, d_up_A_scale, d_up_A_global,
         d_up_B_ptr, d_up_B_scale, d_up_B_global,
         d_up_D_ptr, d_expert_token_counts,
         params.hidden_size, params.routed_expert_intermediate_size, max_experts,
-        cutlass_ws, 0)) {
+        cutlass_ws, nullptr)) {
       return false;
   }
 
@@ -412,12 +413,15 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   auto d_down_B_global = reinterpret_cast<const float**>(copy_to_ws(h_down_B_global));
   auto d_down_D_ptr = reinterpret_cast<float**>(copy_to_ws(h_down_D_ptr));
 
-  if (!RunNvfp4GroupedMoEFp32AccumToDevice(
+  // Reuse the CUTLASS workspace (up-proj GEMM is complete on the same stream)
+  cutlass_ws.data = ws_base + ((ws_offset + 127) & ~127);
+
+  if (!RunGroupedFp4Gemm(
         d_down_A_ptr, d_down_A_scale, d_down_A_global,
         d_down_B_ptr, d_down_B_scale, d_down_B_global,
         d_down_D_ptr, d_expert_token_counts,
         params.routed_expert_intermediate_size, params.hidden_size, max_experts,
-        cutlass_ws, 0)) {
+        cutlass_ws, nullptr)) {
       return false;
   }
 
