@@ -83,6 +83,57 @@ Plan-aligned rerun on the current working tree from
   but the hot-prefix tail prefill itself is still far above baseline at
   `1155.880 ms`
 
+Re-profile update on the clean checkpoint `22b0463`:
+
+- `nsys` traces were captured for:
+  - `artifacts/profiles/ttft_prefill_20260406/nsys_cold_prefill_prefix128.nsys-rep`
+  - `artifacts/profiles/ttft_prefill_20260406/nsys_cached_committed_head_prefix128_tail4.nsys-rep`
+- the cold `prefix128` trace shows the custom MoE prefill kernel still
+  dominating the end-to-end wall time:
+  - `FusedMoePrefillKernel`: `5602.587 ms` total over `115` launches
+    (`48.718 ms` average), which is about `1120 ms` per measured benchmark
+    iteration and therefore nearly the whole cold TTFT
+  - the next largest GPU bucket is `MambaSsdPrefillFixedKernel<128>` at only
+    `45.257 ms` total
+- the cached `prefix128_tail4` trace tells the same story:
+  - `FusedMoePrefillKernel`: `16790.389 ms` total over `345` launches
+    (`48.668 ms` average)
+  - the hot-prefix tail prefill itself was `1126.400 ms`, again pointing at the
+    expert path rather than restore or decode
+- `ncu` on the first `FusedMoePrefillKernel` launch from cold `prefix128`
+  (`artifacts/profiles/ttft_prefill_20260406/ncu_cold_prefill_prefix128_fused_moe.csv`)
+  shows a serialized kernel rather than a bandwidth-limited kernel:
+  - block size `256`, grid size `128`
+  - `54` registers per thread
+  - `26880` bytes shared memory per block
+  - occupancy limited to `3` blocks/SM by shared memory and `4` by registers
+  - DRAM throughput only `2.18%` of peak
+  - scheduler eligibility only about `0.09` warps per cycle active
+- that profile is consistent with the code structure in
+  `runtime/src/backend/fused_moe_prefill.cu`, where input quantization and both
+  activation-plus-requantization stages are still serialized on `tid == 0`
+- immediate next optimization step: keep the current contract and kernel shape,
+  but parallelize the thread-0 quantize / `Relu2` / requantize sections before
+  attempting a larger grouped-math redesign
+
+First Priority-1 recovery step on top of `22b0463`:
+
+- changed `fused_decode::QuantizeDequantizeNvfp4Row` to a block-parallel row
+  implementation instead of a single-thread walk
+- changed `FusedMoePrefillKernel` so the initial selected-expert copy and both
+  `Relu2` stages are block-parallel instead of `tid == 0`
+- correctness stayed green on:
+  - `fused_moe_prefill_test`
+  - `multi_turn_prefix_reuse_test`
+- focused TTFT rerun on `prefix128` / `tail4` improved, but only modestly:
+  - `cold_prefill_prefix128`: `1153.988 ms` -> `1114.050 ms` (`1.036x`, `3.46%`)
+  - `cached_committed_head_prefix128_tail4`: `1143.402 ms` -> `1099.152 ms`
+    (`1.040x`, `3.87%`)
+- conclusion: the thread-0 sections were real, but they were not the dominant
+  source of the regression. The next step should stop polishing around these
+  scalar loops and move to the larger structural gap versus vLLM / TRT-LLM:
+  grouped routed-expert math with token-by-expert scheduling and weight reuse
+
 Reference-scope note:
 
 - vLLM comparison in this plan uses the CUDA FP4 fused-MoE stack plus the

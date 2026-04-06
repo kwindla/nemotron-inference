@@ -64,16 +64,14 @@ __global__ void FusedMoePrefillKernel(FusedMoePrefillParams params) {
       params.shared_output != nullptr ? params.shared_output + hidden_offset : nullptr;
   const std::size_t selection_offset = token_index * params.top_k;
 
-  if (tid == 0) {
-    for (std::size_t slot = 0; slot < params.top_k; ++slot) {
-      selected_indices[slot] = params.selected_indices[selection_offset + slot];
-      selected_weights[slot] = params.selected_weights[selection_offset + slot];
-    }
-    fused_decode::QuantizeDequantizeNvfp4Row(
-        normalized_row,
-        quantized_input,
-        params.hidden_size);
+  for (std::size_t slot = tid; slot < params.top_k; slot += blockDim.x) {
+    selected_indices[slot] = params.selected_indices[selection_offset + slot];
+    selected_weights[slot] = params.selected_weights[selection_offset + slot];
   }
+  fused_decode::QuantizeDequantizeNvfp4Row(
+      normalized_row,
+      quantized_input,
+      params.hidden_size);
   __syncthreads();
 
   for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {
@@ -106,15 +104,16 @@ __global__ void FusedMoePrefillKernel(FusedMoePrefillParams params) {
     }
     __syncthreads();
 
-    if (tid == 0) {
-      for (std::size_t row = 0; row < params.routed_expert_intermediate_size; ++row) {
-        expert_buffer[row] = fused_decode::Relu2(expert_buffer[row]);
-      }
-      fused_decode::QuantizeDequantizeNvfp4Row(
-          expert_buffer,
-          expert_buffer,
-          params.routed_expert_intermediate_size);
+    for (std::size_t row = tid;
+         row < params.routed_expert_intermediate_size;
+         row += blockDim.x) {
+      expert_buffer[row] = fused_decode::Relu2(expert_buffer[row]);
     }
+    __syncthreads();
+    fused_decode::QuantizeDequantizeNvfp4Row(
+        expert_buffer,
+        expert_buffer,
+        params.routed_expert_intermediate_size);
     __syncthreads();
 
     for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {
@@ -146,15 +145,16 @@ __global__ void FusedMoePrefillKernel(FusedMoePrefillParams params) {
   }
   __syncthreads();
 
-  if (tid == 0) {
-    for (std::size_t row = 0; row < params.shared_expert_intermediate_size; ++row) {
-      expert_buffer[row] = fused_decode::Relu2(expert_buffer[row]);
-    }
-    fused_decode::QuantizeDequantizeNvfp4Row(
-        expert_buffer,
-        expert_buffer,
-        params.shared_expert_intermediate_size);
+  for (std::size_t row = tid;
+       row < params.shared_expert_intermediate_size;
+       row += blockDim.x) {
+    expert_buffer[row] = fused_decode::Relu2(expert_buffer[row]);
   }
+  __syncthreads();
+  fused_decode::QuantizeDequantizeNvfp4Row(
+      expert_buffer,
+      expert_buffer,
+      params.shared_expert_intermediate_size);
   __syncthreads();
 
   for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {

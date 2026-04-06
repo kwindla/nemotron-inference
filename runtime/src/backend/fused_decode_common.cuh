@@ -95,6 +95,21 @@ __device__ inline float QuantizeDequantizeNvfp4Scalar(float value, float scale) 
   return DecodeFp4(EncodeFp4(value / scale)) * scale;
 }
 
+__device__ inline float BlockReduceMax(float value) {
+  __shared__ float shared_max[kThreadsPerBlock];
+  const unsigned int tid = threadIdx.x;
+  shared_max[tid] = value;
+  __syncthreads();
+
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + stride]);
+    }
+    __syncthreads();
+  }
+  return shared_max[0];
+}
+
 __device__ inline void QuantizeDequantizeNvfp4Row(
     const float* input,
     float* output,
@@ -103,10 +118,12 @@ __device__ inline void QuantizeDequantizeNvfp4Row(
     return;
   }
 
-  float global_max_abs = 0.0f;
-  for (std::size_t col = 0; col < cols; ++col) {
-    global_max_abs = fmaxf(global_max_abs, fabsf(input[col]));
+  const std::size_t tid = static_cast<std::size_t>(threadIdx.x);
+  float local_max_abs = 0.0f;
+  for (std::size_t col = tid; col < cols; col += blockDim.x) {
+    local_max_abs = fmaxf(local_max_abs, fabsf(input[col]));
   }
+  const float global_max_abs = BlockReduceMax(local_max_abs);
 
   float tensor_scale = 1.0f;
   if (global_max_abs > (kNvfp4Fp4MaxFinite * kNvfp4Fp8E4M3MaxFinite)) {
@@ -114,7 +131,7 @@ __device__ inline void QuantizeDequantizeNvfp4Row(
         global_max_abs / (kNvfp4Fp4MaxFinite * kNvfp4Fp8E4M3MaxFinite));
   }
 
-  for (std::size_t block = 0; block < cols / kNvfp4BlockWidth; ++block) {
+  for (std::size_t block = tid; block < cols / kNvfp4BlockWidth; block += blockDim.x) {
     const std::size_t block_offset = block * kNvfp4BlockWidth;
     float block_max_abs = 0.0f;
     for (std::size_t i = 0; i < kNvfp4BlockWidth; ++i) {
