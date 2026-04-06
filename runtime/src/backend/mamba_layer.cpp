@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,6 +32,40 @@ bool starts_with(const std::string& value, const std::string& prefix) {
 constexpr std::size_t kMambaMultiTokenMaxChunkTokens = 8192;
 
 thread_local MambaLayerExecutionCounters g_mamba_layer_execution_counters;
+
+enum class MambaScratchRole : std::uint8_t {
+  kNormalizedBf16,
+  kNormalizedFp32,
+  kProjected,
+  kScanOutput,
+  kProjectedOutput,
+  kConvOutput,
+};
+
+struct CachedMambaScratchKey {
+  int device = -1;
+  MambaScratchRole role = MambaScratchRole::kNormalizedFp32;
+  std::size_t cols = 0;
+
+  bool operator==(const CachedMambaScratchKey& other) const {
+    return device == other.device &&
+           role == other.role &&
+           cols == other.cols;
+  }
+};
+
+struct CachedMambaScratchKeyHash {
+  std::size_t operator()(const CachedMambaScratchKey& key) const {
+    std::size_t hash = 0;
+    const auto mix = [&](std::size_t value) {
+      hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+    };
+    mix(static_cast<std::size_t>(key.device));
+    mix(static_cast<std::size_t>(key.role));
+    mix(key.cols);
+    return hash;
+  }
+};
 
 void RecordMambaNativeMultiTokenExecution(std::size_t token_count) {
   if (token_count <= 1) {
@@ -151,6 +186,70 @@ std::optional<ScaledFp8LinearConfig> BuildScaledFp8LinearConfig(
   config.weight_scale = *weight_scale_value;
   config.input_scale = *input_scale_value;
   return config;
+}
+
+DeviceTensorFp32* GetCachedMambaFp32Scratch(
+    MambaScratchRole role,
+    std::size_t rows,
+    std::size_t cols) {
+  int current_device = -1;
+  if (cudaGetDevice(&current_device) != cudaSuccess) {
+    return nullptr;
+  }
+
+  thread_local std::unordered_map<
+      CachedMambaScratchKey,
+      std::unique_ptr<DeviceTensorFp32>,
+      CachedMambaScratchKeyHash>
+      cache;
+
+  const CachedMambaScratchKey key{current_device, role, cols};
+  auto it = cache.find(key);
+  if (it == cache.end() ||
+      it->second == nullptr ||
+      !it->second->valid() ||
+      it->second->shape().size() != 2 ||
+      it->second->shape()[1] != cols ||
+      it->second->shape()[0] < rows) {
+    auto scratch = DeviceTensorFp32::Create({rows, cols});
+    if (!scratch || !scratch->valid()) {
+      return nullptr;
+    }
+    it = cache.insert_or_assign(key, std::move(scratch)).first;
+  }
+  return it->second.get();
+}
+
+DeviceTensorBf16* GetCachedMambaBf16Scratch(
+    MambaScratchRole role,
+    std::size_t rows,
+    std::size_t cols) {
+  int current_device = -1;
+  if (cudaGetDevice(&current_device) != cudaSuccess) {
+    return nullptr;
+  }
+
+  thread_local std::unordered_map<
+      CachedMambaScratchKey,
+      std::unique_ptr<DeviceTensorBf16>,
+      CachedMambaScratchKeyHash>
+      cache;
+
+  const CachedMambaScratchKey key{current_device, role, cols};
+  auto it = cache.find(key);
+  if (it == cache.end() ||
+      it->second == nullptr ||
+      !it->second->valid() ||
+      it->second->shape().size() != 2 ||
+      it->second->shape()[1] != cols ||
+      it->second->shape()[0] < rows) {
+    auto scratch = DeviceTensorBf16::Create({rows, cols});
+    if (!scratch || !scratch->valid()) {
+      return nullptr;
+    }
+    it = cache.insert_or_assign(key, std::move(scratch)).first;
+  }
+  return it->second.get();
 }
 
 }  // namespace
@@ -641,6 +740,78 @@ bool MambaLayerSlice::Run(
     projected = impl_->projected_scratch.get();
     scan_output = impl_->scan_output_scratch.get();
     projected_output = impl_->projected_output_scratch.get();
+  } else {
+    auto* normalized_bf16_backing = GetCachedMambaBf16Scratch(
+        MambaScratchRole::kNormalizedBf16,
+        token_count,
+        impl_->config.hidden_size);
+    auto* normalized_backing = GetCachedMambaFp32Scratch(
+        MambaScratchRole::kNormalizedFp32,
+        token_count,
+        impl_->config.hidden_size);
+    auto* projected_backing = GetCachedMambaFp32Scratch(
+        MambaScratchRole::kProjected,
+        token_count,
+        projection_size);
+    auto* scan_output_backing = GetCachedMambaFp32Scratch(
+        MambaScratchRole::kScanOutput,
+        token_count,
+        impl_->config.intermediate_size);
+    auto* projected_output_backing = GetCachedMambaFp32Scratch(
+        MambaScratchRole::kProjectedOutput,
+        token_count,
+        impl_->config.hidden_size);
+
+    if (normalized_bf16_backing != nullptr) {
+      if (normalized_bf16_backing->shape()[0] == token_count) {
+        normalized_bf16 = normalized_bf16_backing;
+      } else {
+        normalized_bf16_owned = DeviceTensorBf16::CreateView(
+            {token_count, impl_->config.hidden_size},
+            normalized_bf16_backing->data());
+        normalized_bf16 = normalized_bf16_owned.get();
+      }
+    }
+    if (normalized_backing != nullptr) {
+      if (normalized_backing->shape()[0] == token_count) {
+        normalized = normalized_backing;
+      } else {
+        normalized_owned = DeviceTensorFp32::CreateView(
+            {token_count, impl_->config.hidden_size},
+            normalized_backing->data());
+        normalized = normalized_owned.get();
+      }
+    }
+    if (projected_backing != nullptr) {
+      if (projected_backing->shape()[0] == token_count) {
+        projected = projected_backing;
+      } else {
+        projected_owned = DeviceTensorFp32::CreateView(
+            {token_count, projection_size},
+            projected_backing->data());
+        projected = projected_owned.get();
+      }
+    }
+    if (scan_output_backing != nullptr) {
+      if (scan_output_backing->shape()[0] == token_count) {
+        scan_output = scan_output_backing;
+      } else {
+        scan_output_owned = DeviceTensorFp32::CreateView(
+            {token_count, impl_->config.intermediate_size},
+            scan_output_backing->data());
+        scan_output = scan_output_owned.get();
+      }
+    }
+    if (projected_output_backing != nullptr) {
+      if (projected_output_backing->shape()[0] == token_count) {
+        projected_output = projected_output_backing;
+      } else {
+        projected_output_owned = DeviceTensorFp32::CreateView(
+            {token_count, impl_->config.hidden_size},
+            projected_output_backing->data());
+        projected_output = projected_output_owned.get();
+      }
+    }
   }
   if (projected_output == nullptr || normalized_bf16 == nullptr) {
     if (normalized_bf16 == nullptr) {
@@ -737,8 +908,23 @@ bool MambaLayerSlice::Run(
       }
     }
 
-    auto conv_output = DeviceTensorFp32::Create({token_count, conv_dim});
-    if (!conv_output || !conv_output->valid()) {
+    auto* conv_output_backing = GetCachedMambaFp32Scratch(
+        MambaScratchRole::kConvOutput,
+        token_count,
+        conv_dim);
+    std::unique_ptr<DeviceTensorFp32> conv_output_owned;
+    DeviceTensorFp32* conv_output = nullptr;
+    if (conv_output_backing != nullptr) {
+      if (conv_output_backing->shape()[0] == token_count) {
+        conv_output = conv_output_backing;
+      } else {
+        conv_output_owned = DeviceTensorFp32::CreateView(
+            {token_count, conv_dim},
+            conv_output_backing->data());
+        conv_output = conv_output_owned.get();
+      }
+    }
+    if (conv_output == nullptr || !conv_output->valid()) {
       return false;
     }
 
@@ -752,7 +938,7 @@ bool MambaLayerSlice::Run(
     conv_params.initial_conv_state = state_view.conv_state;
     conv_params.conv1d_weight = impl_->conv1d_weight_device->data();
     conv_params.conv1d_bias = impl_->conv1d_bias_device->data();
-    if (!RunMambaConvPrefill(conv_params, *projected, conv_output.get())) {
+    if (!RunMambaConvPrefill(conv_params, *projected, conv_output)) {
       return false;
     }
 
