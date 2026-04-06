@@ -205,6 +205,30 @@ __global__ void PermutedExpertRowCoopKernel(
   }
 }
 
+__global__ void GatherPermutedRowsKernel(
+    const float* input,
+    const int* permuted_token_indices,
+    float* output,
+    std::size_t output_rows,
+    std::size_t input_rows,
+    std::size_t cols) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t count = output_rows * cols;
+  if (index >= count) {
+    return;
+  }
+
+  const std::size_t row = index / cols;
+  const std::size_t col = index % cols;
+  const int input_row = permuted_token_indices[row];
+  if (input_row < 0 || static_cast<std::size_t>(input_row) >= input_rows) {
+    output[index] = 0.0f;
+    return;
+  }
+  output[index] = input[static_cast<std::size_t>(input_row) * cols + col];
+}
+
 template <typename T>
 class DeviceArray {
  public:
@@ -295,6 +319,45 @@ class ScopedCudaEventTimer {
 bool HasCudaDevice() {
   int device_count = 0;
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
+
+template <typename T>
+bool CopyDeviceBufferToHost(const T* device_data, std::size_t count, std::vector<T>* host_values) {
+  if (device_data == nullptr || host_values == nullptr) {
+    return false;
+  }
+  host_values->assign(count, T{});
+  return cudaMemcpy(
+             host_values->data(),
+             device_data,
+             count * sizeof(T),
+             cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+bool LaunchGatherPermutedRows(
+    const float* input,
+    const int* permuted_token_indices,
+    std::size_t output_rows,
+    std::size_t input_rows,
+    std::size_t cols,
+    float* output) {
+  if (input == nullptr ||
+      permuted_token_indices == nullptr ||
+      output == nullptr ||
+      output_rows == 0 ||
+      cols == 0) {
+    return false;
+  }
+  const dim3 block(256);
+  const dim3 grid(static_cast<unsigned int>(((output_rows * cols) + block.x - 1u) / block.x));
+  GatherPermutedRowsKernel<<<grid, block>>>(
+      input,
+      permuted_token_indices,
+      output,
+      output_rows,
+      input_rows,
+      cols);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 std::vector<float> MakePatternedValues(
@@ -465,9 +528,23 @@ std::optional<BenchmarkResult> RunCase(
     std::vector<float>* output_host = nullptr) {
   const std::size_t selection_count = benchmark_case.prefix_tokens * kTopK;
   const auto expert_offsets = BuildExpertOffsets(selection_count);
+  const auto selected_indices_host = BuildSelectedIndicesForOffsets(expert_offsets);
+  const std::vector<float> selected_weights_host(selection_count, 1.0f);
   const std::size_t active_experts = CountActiveExperts(expert_offsets);
-  auto expert_offsets_device = DeviceArray<int>::CopyFromHost(expert_offsets);
-  if (expert_offsets_device == nullptr) {
+  auto selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
+  auto selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);
+  auto routing = DeviceExpertRouting::Create(kRoutedExperts, selection_count);
+  if (selected_indices_device == nullptr ||
+      selected_weights_device == nullptr ||
+      routing == nullptr ||
+      !routing->valid() ||
+      !RunDeviceExpertRouting(
+          selected_indices_device->data(),
+          selected_weights_device->data(),
+          benchmark_case.prefix_tokens,
+          kTopK,
+          routing.get()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
 
@@ -481,14 +558,26 @@ std::optional<BenchmarkResult> RunCase(
     return std::nullopt;
   }
 
-  auto input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
+  auto input = DeviceTensorFp32::Create({benchmark_case.prefix_tokens, kHiddenSize});
+  auto compact_input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
   auto output = DeviceTensorFp32::Create({selection_count, kRoutedIntermediateSize});
-  if (input == nullptr || output == nullptr) {
+  if (input == nullptr || compact_input == nullptr || output == nullptr) {
     return std::nullopt;
   }
 
-  const auto input_host = MakePatternedValues(selection_count, kHiddenSize, 23, 0.03125f);
+  const auto input_host =
+      MakePatternedValues(benchmark_case.prefix_tokens, kHiddenSize, 23, 0.03125f);
   if (!input->CopyFromHost(input_host.data(), input_host.size())) {
+    return std::nullopt;
+  }
+  if (!LaunchGatherPermutedRows(
+          input->data(),
+          routing->sorted_token_indices(),
+          selection_count,
+          benchmark_case.prefix_tokens,
+          kHiddenSize,
+          compact_input->data()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
 
@@ -499,8 +588,8 @@ std::optional<BenchmarkResult> RunCase(
 
   auto run_once = [&]() {
     return RunGroupedNvfp4ExpertMatVec(
-        input->data(),
-        expert_offsets_device->data(),
+        compact_input->data(),
+        routing->expert_offsets(),
         kRoutedExperts,
         routed_up_views_device->data(),
         kRoutedIntermediateSize,
@@ -579,7 +668,25 @@ std::optional<BenchmarkResult> RunRaggedRowCoopCase(
     std::vector<float>* output_host = nullptr) {
   const std::size_t selection_count = benchmark_case.prefix_tokens * kTopK;
   const auto expert_offsets = BuildExpertOffsets(selection_count);
+  const auto selected_indices_host = BuildSelectedIndicesForOffsets(expert_offsets);
+  const std::vector<float> selected_weights_host(selection_count, 1.0f);
   const std::size_t active_experts = CountActiveExperts(expert_offsets);
+  auto selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
+  auto selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);
+  auto routing = DeviceExpertRouting::Create(kRoutedExperts, selection_count);
+  if (selected_indices_device == nullptr ||
+      selected_weights_device == nullptr ||
+      routing == nullptr ||
+      !routing->valid() ||
+      !RunDeviceExpertRouting(
+          selected_indices_device->data(),
+          selected_weights_device->data(),
+          benchmark_case.prefix_tokens,
+          kTopK,
+          routing.get()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
+    return std::nullopt;
+  }
 
   std::vector<int> cta_expert_ids;
   std::vector<int> cta_row_starts;
@@ -611,13 +718,25 @@ std::optional<BenchmarkResult> RunRaggedRowCoopCase(
     return std::nullopt;
   }
 
-  const auto input_host = MakePatternedValues(selection_count, kHiddenSize, 23, 0.03125f);
-  auto input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
+  const auto input_host =
+      MakePatternedValues(benchmark_case.prefix_tokens, kHiddenSize, 23, 0.03125f);
+  auto input = DeviceTensorFp32::Create({benchmark_case.prefix_tokens, kHiddenSize});
+  auto compact_input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
   auto output = DeviceTensorFp32::Create({selection_count, kRoutedIntermediateSize});
-  if (input == nullptr || output == nullptr) {
+  if (input == nullptr || compact_input == nullptr || output == nullptr) {
     return std::nullopt;
   }
   if (!input->CopyFromHost(input_host.data(), input_host.size())) {
+    return std::nullopt;
+  }
+  if (!LaunchGatherPermutedRows(
+          input->data(),
+          routing->sorted_token_indices(),
+          selection_count,
+          benchmark_case.prefix_tokens,
+          kHiddenSize,
+          compact_input->data()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
 
@@ -630,7 +749,7 @@ std::optional<BenchmarkResult> RunRaggedRowCoopCase(
   const dim3 grid(static_cast<unsigned int>(cta_expert_ids.size()));
   auto run_once = [&]() {
     PermutedExpertRowCoopKernel<<<grid, block>>>(
-        input->data(),
+        compact_input->data(),
         expert_offsets_device->data(),
         cta_expert_ids_device->data(),
         cta_row_starts_device->data(),
@@ -737,6 +856,14 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
       cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
+  std::vector<int> total_padded_rows_host;
+  if (!CopyDeviceBufferToHost(launch_plan->total_padded_rows(), 1, &total_padded_rows_host) ||
+      total_padded_rows_host.size() != 1 ||
+      total_padded_rows_host[0] <= 0) {
+    return std::nullopt;
+  }
+  const std::size_t padded_selection_count =
+      static_cast<std::size_t>(total_padded_rows_host[0]);
 
   const auto routed_up = BuildUploadedRoutedUpViews();
   if (!routed_up.has_value()) {
@@ -748,13 +875,25 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
     return std::nullopt;
   }
 
-  const auto input_host = MakePatternedValues(selection_count, kHiddenSize, 23, 0.03125f);
-  auto input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
-  auto output = DeviceTensorFp32::Create({selection_count, kRoutedIntermediateSize});
-  if (input == nullptr || output == nullptr) {
+  const auto input_host =
+      MakePatternedValues(benchmark_case.prefix_tokens, kHiddenSize, 23, 0.03125f);
+  auto input = DeviceTensorFp32::Create({benchmark_case.prefix_tokens, kHiddenSize});
+  auto permuted_input = DeviceTensorFp32::Create({padded_selection_count, kHiddenSize});
+  auto output = DeviceTensorFp32::Create({padded_selection_count, kRoutedIntermediateSize});
+  if (input == nullptr || permuted_input == nullptr || output == nullptr) {
     return std::nullopt;
   }
   if (!input->CopyFromHost(input_host.data(), input_host.size())) {
+    return std::nullopt;
+  }
+  if (!LaunchGatherPermutedRows(
+          input->data(),
+          launch_plan->permuted_token_indices(),
+          padded_selection_count,
+          benchmark_case.prefix_tokens,
+          kHiddenSize,
+          permuted_input->data()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
 
@@ -765,7 +904,7 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
 
   auto run_once = [&]() {
     return RunLaunchPlannedNvfp4ExpertMatVec(
-        input->data(),
+        permuted_input->data(),
         launch_plan.get(),
         selection_count,
         routed_up_views_device->data(),
@@ -820,8 +959,7 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
   result.case_name = benchmark_case.name;
   result.prefix_tokens = benchmark_case.prefix_tokens;
   result.selection_count = selection_count;
-  result.padded_selection_count = static_cast<std::size_t>(
-      selection_count == 0 ? 0 : selection_count);
+  result.padded_selection_count = padded_selection_count;
   result.active_experts = active_experts;
   result.cold_ms = *cold_ms;
   result.hot_mean_ms = hot_mean_ms;
@@ -832,9 +970,27 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
   result.hot_weight_gib_per_s =
       hot_mean_ms > 0.0 ? weight_bytes / (hot_mean_ms / 1000.0) / (1024.0 * 1024.0 * 1024.0) : 0.0;
   if (output_host != nullptr) {
-    output_host->resize(selection_count * kRoutedIntermediateSize);
-    if (!output->CopyToHost(output_host->data(), output_host->size())) {
+    std::vector<float> padded_output_host(padded_selection_count * kRoutedIntermediateSize, 0.0f);
+    std::vector<int> sorted_to_permuted_host;
+    if (!output->CopyToHost(padded_output_host.data(), padded_output_host.size()) ||
+        !CopyDeviceBufferToHost(
+            launch_plan->sorted_to_permuted_indices(),
+            selection_count,
+            &sorted_to_permuted_host)) {
       return std::nullopt;
+    }
+    output_host->assign(selection_count * kRoutedIntermediateSize, 0.0f);
+    for (std::size_t sorted_index = 0; sorted_index < selection_count; ++sorted_index) {
+      const int padded_index = sorted_to_permuted_host[sorted_index];
+      if (padded_index < 0) {
+        return std::nullopt;
+      }
+      const float* src =
+          padded_output_host.data() +
+          static_cast<std::size_t>(padded_index) * kRoutedIntermediateSize;
+      float* dst =
+          output_host->data() + sorted_index * kRoutedIntermediateSize;
+      std::copy(src, src + kRoutedIntermediateSize, dst);
     }
   }
   return result;

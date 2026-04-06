@@ -2052,3 +2052,32 @@ Interpretation:
   plane or the compact-vs-padded layout boundary
 - the remaining recovery work must target the routed and shared expert
   math cores themselves
+
+## Routed-Up Microbench Realignment
+
+After switching `RunLaunchPlannedNvfp4ExpertMatVec(...)` to the padded
+runtime contract, the standalone routed-up benchmark needed one more fix:
+
+- it now starts from `token_count x hidden`
+- baseline and ragged variants explicitly gather compact expert-major rows via
+  routing before timing the math kernel
+- the launch-plan variant explicitly gathers padded routed rows via
+  `permuted_token_indices`
+- output comparison now remaps padded output back through
+  `sorted_to_permuted`
+
+Focused `prefix128` result after that realignment:
+
+- `baseline`: `10.235 ms`
+- `ragged_row_coop`: `9.554 ms`
+- `launch_plan_upper_bound`: `9.794 ms`
+
+Interpretation:
+
+- the benchmark now matches the runtime contract again
+- the padded launch-plan math kernel remains slightly slower than the
+  benchmark-only ragged row-coop variant
+- that is consistent with the near-flat TTFT result from the active runtime
+  path
+- the next useful change must improve the math core itself, not just the
+  surrounding layout contract
