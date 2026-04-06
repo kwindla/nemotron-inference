@@ -109,6 +109,25 @@ bool ExpectEqualVector(
   return true;
 }
 
+bool ExpectVectorPrefix(
+    const std::vector<int>& actual,
+    const std::vector<int>& expected_prefix,
+    const std::string& label) {
+  if (actual.size() < expected_prefix.size()) {
+    std::cerr << "FAIL: " << label << " prefix size mismatch\n";
+    return false;
+  }
+  for (std::size_t i = 0; i < expected_prefix.size(); ++i) {
+    if (actual[i] != expected_prefix[i]) {
+      std::cerr << "FAIL: " << label << " mismatch at " << i
+                << ": actual=" << actual[i]
+                << " expected=" << expected_prefix[i] << "\n";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool RunLaunchPlanCase(
     std::size_t n_experts,
     std::size_t token_count,
@@ -146,7 +165,7 @@ bool RunLaunchPlanCase(
               routing.get()),
           "RunDeviceExpertRouting should succeed") ||
       !Expect(
-          BuildDeviceMoeLaunchPlan(*routing, launch_plan.get()),
+          BuildDeviceMoeLaunchPlan(*routing, selection_count, launch_plan.get()),
           "BuildDeviceMoeLaunchPlan should succeed") ||
       !Expect(
           cudaDeviceSynchronize() == cudaSuccess,
@@ -186,15 +205,6 @@ bool RunLaunchPlanCase(
     return false;
   }
 
-  std::vector<int> expected_expert_ids_padded(launch_plan->cta_capacity(), -1);
-  std::vector<int> expected_row_starts_padded(launch_plan->cta_capacity(), 0);
-  std::vector<int> expected_valid_rows_padded(launch_plan->cta_capacity(), 0);
-  for (std::size_t i = 0; i < expected_expert_ids.size(); ++i) {
-    expected_expert_ids_padded[i] = expected_expert_ids[i];
-    expected_row_starts_padded[i] = expected_row_starts[i];
-    expected_valid_rows_padded[i] = expected_valid_rows[i];
-  }
-
   return Expect(
              cta_count.size() == 1 &&
                  cta_count[0] == static_cast<int>(expected_expert_ids.size()),
@@ -204,17 +214,17 @@ bool RunLaunchPlanCase(
                  total_padded_rows[0] ==
                      static_cast<int>(expected_expert_ids.size() * nemotron::kMoeLaunchPlanTokenTile),
              "total_padded_rows should match expected") &&
-         ExpectEqualVector(
+         ExpectVectorPrefix(
              cta_expert_ids,
-             expected_expert_ids_padded,
+             expected_expert_ids,
              "cta_expert_ids") &&
-         ExpectEqualVector(
+         ExpectVectorPrefix(
              cta_row_starts,
-             expected_row_starts_padded,
+             expected_row_starts,
              "cta_row_starts") &&
-         ExpectEqualVector(
+         ExpectVectorPrefix(
              cta_valid_rows,
-             expected_valid_rows_padded,
+             expected_valid_rows,
              "cta_valid_rows");
 }
 

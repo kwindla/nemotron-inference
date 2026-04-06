@@ -44,6 +44,7 @@ bool RunGroupedNvfp4ExpertMatVec(
 bool RunLaunchPlannedNvfp4ExpertMatVec(
     const float* input,
     const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     float* output);

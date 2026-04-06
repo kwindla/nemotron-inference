@@ -78,7 +78,7 @@ __global__ void BuildLaunchPlanKernel(
     const int* expert_offsets,
     const int* active_expert_count,
     const int* active_expert_ids,
-    int cta_capacity,
+    int current_cta_capacity,
     int* cta_count,
     int* total_padded_rows,
     int* cta_expert_ids,
@@ -100,8 +100,8 @@ __global__ void BuildLaunchPlanKernel(
     const int end = expert_offsets[expert_index + 1];
     for (int row_start = begin; row_start < end;
          row_start += static_cast<int>(kMoeLaunchPlanTokenTile)) {
-      if (write_index >= cta_capacity) {
-        *cta_count = cta_capacity + 1;
+      if (write_index >= current_cta_capacity) {
+        *cta_count = current_cta_capacity + 1;
         *total_padded_rows = padded_rows;
         return;
       }
@@ -115,12 +115,6 @@ __global__ void BuildLaunchPlanKernel(
       ++write_index;
       padded_rows += static_cast<int>(kMoeLaunchPlanTokenTile);
     }
-  }
-
-  for (int index = write_index; index < cta_capacity; ++index) {
-    cta_expert_ids[index] = -1;
-    cta_row_starts[index] = 0;
-    cta_valid_rows[index] = 0;
   }
   *cta_count = write_index;
   *total_padded_rows = padded_rows;
@@ -266,12 +260,15 @@ int* DeviceMoeLaunchPlan::cta_valid_rows() const {
 
 bool BuildDeviceMoeLaunchPlan(
     const DeviceExpertRouting& routing,
+    std::size_t active_selection_count,
     DeviceMoeLaunchPlan* plan) {
   if (!routing.valid() ||
       plan == nullptr ||
       !plan->valid() ||
+      active_selection_count == 0 ||
       plan->n_experts() != routing.n_experts() ||
-      plan->selection_count() < routing.selection_count() ||
+      active_selection_count > routing.selection_count() ||
+      plan->selection_count() < active_selection_count ||
       plan->cta_count() == nullptr ||
       plan->total_padded_rows() == nullptr ||
       plan->cta_expert_ids() == nullptr ||
@@ -283,11 +280,20 @@ bool BuildDeviceMoeLaunchPlan(
     return false;
   }
 
+  const auto current_cta_capacity =
+      DeviceMoeLaunchPlan::CtaCapacity(plan->n_experts(), active_selection_count);
+  if (!current_cta_capacity.has_value() ||
+      *current_cta_capacity == 0 ||
+      *current_cta_capacity > plan->cta_capacity() ||
+      *current_cta_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+
   BuildLaunchPlanKernel<<<1, 1>>>(
       routing.expert_offsets(),
       routing.active_expert_count(),
       routing.active_expert_ids(),
-      static_cast<int>(plan->cta_capacity()),
+      static_cast<int>(*current_cta_capacity),
       plan->cta_count(),
       plan->total_padded_rows(),
       plan->cta_expert_ids(),

@@ -733,7 +733,7 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
           benchmark_case.prefix_tokens,
           kTopK,
           routing.get()) ||
-      !BuildDeviceMoeLaunchPlan(*routing, launch_plan.get()) ||
+      !BuildDeviceMoeLaunchPlan(*routing, selection_count, launch_plan.get()) ||
       cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
@@ -767,6 +767,7 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
     return RunLaunchPlannedNvfp4ExpertMatVec(
         input->data(),
         launch_plan.get(),
+        selection_count,
         routed_up_views_device->data(),
         kRoutedIntermediateSize,
         output->data());

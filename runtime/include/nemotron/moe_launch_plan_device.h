@@ -50,6 +50,7 @@ class DeviceMoeLaunchPlan {
 
 bool BuildDeviceMoeLaunchPlan(
     const DeviceExpertRouting& routing,
+    std::size_t active_selection_count,
     DeviceMoeLaunchPlan* plan);
 
 }  // namespace nemotron

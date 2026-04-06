@@ -502,14 +502,22 @@ bool LaunchContiguousMatVec(
 bool LaunchPlannedMatVec(
     const float* input,
     const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     float* output) {
   if (launch_plan == nullptr ||
       !launch_plan->valid() ||
-      launch_plan->cta_capacity() == 0 ||
+      active_selection_count == 0 ||
       weights == nullptr ||
       output_rows_per_expert == 0) {
+    return false;
+  }
+  const auto current_cta_capacity =
+      DeviceMoeLaunchPlan::CtaCapacity(launch_plan->n_experts(), active_selection_count);
+  if (!current_cta_capacity.has_value() ||
+      *current_cta_capacity == 0 ||
+      *current_cta_capacity > launch_plan->cta_capacity()) {
     return false;
   }
   const std::size_t output_row_tile_count =
@@ -520,7 +528,7 @@ bool LaunchPlannedMatVec(
   }
   const dim3 block(kPlannedThreadsPerBlock);
   const dim3 grid(
-      static_cast<unsigned int>(launch_plan->cta_capacity()),
+      static_cast<unsigned int>(*current_cta_capacity),
       static_cast<unsigned int>(output_row_tile_count));
   Nvfp4LaunchPlannedExpertMatVecRowsKernel<<<grid, block>>>(
       input,
@@ -602,12 +610,14 @@ bool RunGroupedNvfp4ExpertMatVec(
 bool RunLaunchPlannedNvfp4ExpertMatVec(
     const float* input,
     const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     float* output) {
   if (input == nullptr ||
       launch_plan == nullptr ||
       !launch_plan->valid() ||
+      active_selection_count == 0 ||
       weights == nullptr ||
       output_rows_per_expert == 0 ||
       output == nullptr) {
@@ -616,6 +626,7 @@ bool RunLaunchPlannedNvfp4ExpertMatVec(
   return LaunchPlannedMatVec(
       input,
       launch_plan,
+      active_selection_count,
       weights,
       output_rows_per_expert,
       output);
@@ -685,7 +696,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
           params.token_count,
           params.top_k,
           params.routing) ||
-      !BuildDeviceMoeLaunchPlan(*params.routing, params.launch_plan) ||
+      !BuildDeviceMoeLaunchPlan(*params.routing, selection_count, params.launch_plan) ||
       !LaunchZeroBuffer(params.output, token_hidden_count) ||
       !LaunchZeroBuffer(params.routed_output, token_hidden_count) ||
       !LaunchZeroBuffer(params.shared_output, token_hidden_count) ||
@@ -706,6 +717,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   if (!RunLaunchPlannedNvfp4ExpertMatVec(
           params.routed_gather_scratch,
           params.launch_plan,
+          selection_count,
           params.routed_up_device,
           params.routed_expert_intermediate_size,
           params.routed_up_scratch)) {
@@ -723,6 +735,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   if (!RunLaunchPlannedNvfp4ExpertMatVec(
           params.routed_up_scratch,
           params.launch_plan,
+          selection_count,
           params.routed_down_device,
           params.hidden_size,
           params.routed_gather_scratch)) {

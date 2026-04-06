@@ -1881,3 +1881,120 @@ Current best explanation:
 - so the next profiling target should be broader request-sized overhead:
   snapshot size, KV reservation, request views, or another max-context-scaled
   component outside the MoE window logic
+
+## Short-Tail Static-Compare Profile
+
+Focused `nsys` comparison artifacts:
+
+- `artifacts/profiles/ttft_prefill_20260406_static_compare/nsys_cached_committed_head_prefix128_tail4_capacity133_window133.nsys-rep`
+- `artifacts/profiles/ttft_prefill_20260406_static_compare/nsys_cached_committed_head_prefix128_tail4_capacity4096_window133.nsys-rep`
+
+Compared setups:
+
+- small request-sized workspace:
+  - `resolved_runtime_moe_prefill_capacity_tokens=133`
+  - `resolved_runtime_moe_prefill_window_tokens=133`
+- large static workspace with explicit small active window:
+  - `resolved_runtime_moe_prefill_capacity_tokens=4096`
+  - `resolved_runtime_moe_prefill_window_tokens=133`
+
+The `nsys` diff showed that the regression was not a broad request-sized tax.
+Almost all of the extra time was in the new launch-plan path itself:
+
+- `Nvfp4LaunchPlannedExpertMatVecRowsKernel`: `+166.781 ms` total over the
+  5-iteration trace
+- `BuildLaunchPlanKernel`: `+5.803 ms` total over the 5-iteration trace
+- everything else was noise by comparison
+
+Important API implication:
+
+- `cudaFree`, `cudaStreamSynchronize`, and `cudaMalloc` also increased, but
+  those deltas are downstream symptoms of slower kernels on the same stream,
+  not the root cause
+
+Root cause in our implementation:
+
+- the runtime launch-plan buffers were statically allocated at max workspace
+  capacity, which is correct
+- but `LaunchPlannedMatVec()` was launching `grid.x = launch_plan->cta_capacity()`
+  instead of an upper bound derived from the **current** active selection count
+- `BuildLaunchPlanKernel` was also filling sentinel entries up to that same max
+  capacity
+
+For the failing case, that meant:
+
+- actual resumed tail prefill work: `selection_count = 4 * 6 = 24`
+- small request-sized workspace upper bound: `CtaCapacity(128, 798) = 211`
+- large static workspace upper bound: `CtaCapacity(128, 24576) = 3184`
+- ideal current-batch upper bound for the actual tail work:
+  `CtaCapacity(128, 24) = 24`
+
+So even the good small-workspace case was still overlaunching, but the full
+static workspace case was overlaunching much more severely.
+
+## TRT-LLM Comparison: The Missing Piece
+
+TRT-LLM does two separate things here:
+
+1. it statically allocates buffers large enough for the configured maximum
+2. it computes the host launch upper bound from the **current batch token
+   count**, not from the maximum buffer capacity
+
+Relevant reference points:
+
+- `runner.h:getMaxNumCtasInBatchDim(...)`
+- `routingRenormalize/launchBlockKernel.cu`
+
+What TRT-LLM does:
+
+- host computes `maxNumCtasInBatchDim` from `numTokens`, `topK`,
+  `numExperts`, and `tileTokensDim`
+- routing writes exact device metadata:
+  - `ctaIdxXyToBatchIdx`
+  - `ctaIdxXyToMnLimit`
+  - `numNonExitingCtas`
+- grouped kernels launch against the current-batch upper bound and let the
+  device metadata stop non-participating CTAs
+
+What we were missing:
+
+- we copied the "device exact CTA metadata" half
+- but we were still using max workspace capacity for the host-side upper bound
+
+## Dynamic Upper-Bound Fix
+
+The runtime now keeps the static launch-plan buffers but uses the **current**
+active selection count for both launch-plan build and launch:
+
+- `BuildDeviceMoeLaunchPlan(..., active_selection_count, ...)`
+- `RunLaunchPlannedNvfp4ExpertMatVec(..., active_selection_count, ...)`
+
+That removes both sources of max-capacity tax:
+
+- `BuildLaunchPlanKernel` no longer clears the whole max-capacity tail
+- `LaunchPlannedMatVec()` no longer launches `grid.x = max_buffer_ctas`
+
+Focused validation remains green:
+
+- `moe_launch_plan_device_test`
+- `fused_moe_prefill_test`
+- `multi_turn_prefix_reuse_test`
+
+Focused benchmark after the fix, artifact:
+
+- `artifacts/benchmarks/ttft_20260406_launch_plan_dynamic_upper_bound_capacity4096_window133_prefix128_pair.stdout.txt`
+
+Key result:
+
+- with `resolved_runtime_moe_prefill_capacity_tokens=4096` and
+  `resolved_runtime_moe_prefill_window_tokens=133`,
+  `cached_committed_head_prefix128_tail4` improved from `68.912 ms` to
+  `46.835 ms`
+
+Interpretation:
+
+- the remaining short-tail regression was not an unavoidable consequence of
+  static preallocation
+- it was a missing TRT-LLM-style dynamic CTA upper bound in our launch-plan
+  integration
+- static buffers plus current-batch launch bounds is the correct architecture
