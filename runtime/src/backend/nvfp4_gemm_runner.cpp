@@ -173,6 +173,31 @@ struct CachedNvfp4MatmulKeyHash {
   }
 };
 
+struct CachedNvfp4ActivationPackKey {
+  int device = -1;
+  std::size_t cols = 0;
+  Nvfp4ScaleLayout scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
+
+  bool operator==(const CachedNvfp4ActivationPackKey& other) const {
+    return device == other.device &&
+           cols == other.cols &&
+           scale_layout == other.scale_layout;
+  }
+};
+
+struct CachedNvfp4ActivationPackKeyHash {
+  std::size_t operator()(const CachedNvfp4ActivationPackKey& key) const {
+    std::size_t hash = 0;
+    const auto mix = [&](std::size_t value) {
+      hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+    };
+    mix(static_cast<std::size_t>(key.device));
+    mix(key.cols);
+    mix(static_cast<std::size_t>(key.scale_layout));
+    return hash;
+  }
+};
+
 struct CachedNvfp4MatmulResources {
   cublasLtMatmulDesc_t op_desc = nullptr;
   cublasLtMatrixLayout_t a_desc = nullptr;
@@ -456,6 +481,33 @@ CachedNvfp4MatmulResources* GetCachedNvfp4MatmulResources(
   auto* resources_ptr = resources.get();
   cache.emplace(key, std::move(resources));
   return resources_ptr;
+}
+
+DeviceNvfp4Matrix* GetCachedNvfp4ActivationPack(
+    std::size_t rows,
+    std::size_t cols,
+    Nvfp4ScaleLayout scale_layout) {
+  int current_device = -1;
+  if (!CheckCuda(cudaGetDevice(&current_device))) {
+    return nullptr;
+  }
+
+  thread_local std::unordered_map<
+      CachedNvfp4ActivationPackKey,
+      std::unique_ptr<DeviceNvfp4Matrix>,
+      CachedNvfp4ActivationPackKeyHash>
+      cache;
+
+  const CachedNvfp4ActivationPackKey key{current_device, cols, scale_layout};
+  auto it = cache.find(key);
+  if (it == cache.end() || it->second == nullptr || !it->second->valid() || it->second->rows() < rows) {
+    auto packed = DeviceNvfp4Matrix::Create(rows, cols, scale_layout);
+    if (!packed || !packed->valid()) {
+      return nullptr;
+    }
+    it = cache.insert_or_assign(key, std::move(packed)).first;
+  }
+  return it->second.get();
 }
 
 struct PreparedNvfp4MatmulCall {
@@ -764,25 +816,26 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
   if (!weights.valid()) {
     return std::nullopt;
   }
-  auto packed = PackDeviceRowMajorFp32ToNvfp4(activations, pack_options);
-  if (!packed || !packed->valid()) {
+  if (!activations.valid() || activations.shape().size() != 2) {
+    return std::nullopt;
+  }
+  const std::size_t rows = activations.shape()[0];
+  const std::size_t cols = activations.shape()[1];
+  const Nvfp4ScaleLayout scale_layout =
+      ResolveActivationNvfp4ScaleLayout(rows, pack_options.execution_scale_layout);
+  auto* packed = GetCachedNvfp4ActivationPack(rows, cols, scale_layout);
+  if (packed == nullptr || !packed->PackInto(activations, pack_options)) {
     return std::nullopt;
   }
   const auto stats = RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
-      MakeNvfp4PackedMatrixDeviceView(*packed),
+      MakeNvfp4PackedMatrixDeviceView(*packed, rows),
       packed->device_tensor_scale_ptr(),
       weights,
       weights.tensor_scale_data,
       output);
   if (!stats.has_value()) {
-    return std::nullopt;
-  }
-
-  // The packed activation buffer is owned by this helper. Keep it alive until
-  // the queued matmul completes so cuBLASLt does not read freed device memory.
-  if (!CheckCuda(cudaStreamSynchronize(nullptr))) {
     return std::nullopt;
   }
   return stats;
