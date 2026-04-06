@@ -2284,3 +2284,68 @@ Practical conclusion:
 - the next material step should increase work per CTA, using the existing
   launch-plan contract as input to a more tile- / GEMM-like routed-up math
   core rather than another tiny row kernel
+
+## Wider-CTA Routed-Up Checkpoint
+
+The next benchmark-only question was whether simply increasing work per CTA
+already moves us toward the TRT-LLM grouped-GEMM shape, even before changing
+the math family itself.
+
+New routed-up benchmark variants:
+
+- `ragged_row_coop_tile8`
+  - exact host-built CTA list
+  - `8` output rows / CTA
+  - `256` threads / CTA
+- `launch_plan_flattened_tile8`
+  - same `8` output rows / CTA
+  - same static launch-plan contract
+  - still launches against the upper-bound CTA capacity
+
+Measured routed-up microbench results:
+
+- `prefix128`
+  - `ragged_row_coop`: `1.890 ms`
+  - `ragged_row_coop_tile8`: `1.531 ms`
+  - `launch_plan_upper_bound` with retained runtime tile8 path: `2.522 ms`
+  - `launch_plan_flattened_tile8`: `2.524 ms`
+- `prefix4096`
+  - `ragged_row_coop`: `52.899 ms`
+  - `ragged_row_coop_tile8`: `35.651 ms`
+  - `launch_plan_upper_bound` with retained runtime tile8 path: `81.299 ms`
+  - `launch_plan_flattened_tile8`: `81.274 ms`
+
+Focused runtime TTFT after promoting `8` output rows / CTA to the active
+launch-planned routed kernel:
+
+- `cold_prefill_prefix128`: `193.538 ms -> 190.134 ms`
+- `cached_committed_head_prefix128_tail4` hot-prefix TTFT:
+  `30.366 ms -> 30.547 ms`
+- `cached_global_root_prefix128_tail4` hot-prefix TTFT:
+  `30.445 ms -> 30.358 ms`
+
+Interpretation:
+
+- increasing work per CTA is absolutely the right direction
+- the exact-CTA tile8 ragged kernel is much faster than the tile4 ragged kernel
+- but the upper-bound launch-plan path still captures only a small fraction of
+  that benefit
+
+This clarifies the architecture gap relative to TRT-LLM:
+
+- TRT routing produces exact CTA metadata such as `numNonExitingCtas` and CTA
+  maps that grouped Gemm1 / Gemm2 consume directly
+- our active runtime still relies on an upper-bound CTA launch and early exits
+- for `prefix128`, that overlaunch factor is still large
+- for `prefix4096`, where overlaunch is small, the remaining gap indicates we
+  also need a richer exact task map, not just a larger output tile
+
+Practical conclusion:
+
+- the next useful runtime contract extension is an exact routed task map that
+  is closer to TRT-LLM's CTA map shape
+- specifically, the launch plan should be able to materialize one task record
+  per real `(expert, row_tile, output_row_tile)` block, not just per routed-row
+  tile
+- that still keeps the runtime device-only and statically allocated, but gives
+  the math kernel the exact grouped-task list it needs

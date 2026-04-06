@@ -11,7 +11,7 @@ namespace nemotron {
 namespace {
 
 constexpr int kGroupedTokenTile = 8;
-constexpr int kPlannedOutputTile = 4;
+constexpr int kPlannedOutputTile = 8;
 constexpr int kPlannedPairsPerStep = 32;
 constexpr int kPlannedThreadsPerBlock = kPlannedOutputTile * 32;
 
