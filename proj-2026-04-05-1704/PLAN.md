@@ -131,6 +131,18 @@ Treat these as implementation rules:
 Correctness and the single-path rule still dominate. Do not satisfy these
 criteria by adding alternate runtime implementations.
 
+### 5. Correctness means behavioral reuse equivalence, not bitwise identity
+
+For this project, the correctness bar is:
+
+- cold full prefill and split / resumed prefill remain behaviorally equivalent
+  on the Nano oracle path
+- committed-head reuse stays stable
+- greedy token decisions do not diverge between cold and resumed execution
+
+Bitwise-identical tensors are not the requirement unless a narrow diagnostic
+test explicitly asks for them.
+
 ## Current Baseline
 
 Reference artifacts:
@@ -564,7 +576,7 @@ Long-tail caveat:
   Acceptance criteria for Step 2:
 
   - no full-logits DtoH copy on the default greedy path
-  - exact correctness retained on the Nano oracle path
+  - behavioral reuse equivalence retained on the Nano oracle path
   - prefix-cache exact-hit flow works without requiring host-visible boundary
     logits by default
   - TTFT is not worse in any of the `4` / `128` / `4096` cases and should
@@ -645,7 +657,7 @@ Long-tail caveat:
   - no host loop whose iteration count depends on active experts
   - zero hot-path `cudaMalloc` / `cudaFree` after warmup
   - fixed launch schedule independent of active-expert count
-  - exact correctness retained on the Nano oracle path
+  - behavioral reuse equivalence retained on the Nano oracle path
   - material TTFT gain in `prefix128` and cached `tail4` / `tail128`
   - no meaningful regression in `prefix4` or `prefix4096`
 

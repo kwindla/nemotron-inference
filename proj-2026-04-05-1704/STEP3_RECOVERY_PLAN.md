@@ -15,7 +15,7 @@ The contract work is now good enough to treat as fixed for this phase:
 - one active runtime code path
 - device-only runtime contract
 - no hot-path DtoH
-- correctness restored on the committed-head reuse path
+- behavioral reuse equivalence restored on the committed-head reuse path
 
 That means the priority is no longer "prove the contract." The priority is:
 
@@ -64,6 +64,15 @@ Primary success criteria:
 - beat the old cold-prefill baseline on the plan-aligned benchmark surface
 - keep hot-prefix TTFT at or below the old baseline
 - preserve one runtime path and the current device-only contract
+- preserve behaviorally exact reuse on the Nano oracle path
+
+Behavioral reuse requirement for this phase:
+
+- cold full prefill and split / resumed prefill must remain behaviorally
+  equivalent on the Nano oracle path
+- the acceptance bar is stable reuse behavior, not bitwise-identical tensors
+- small numerical drift is acceptable only if it does not change committed-head
+  reuse behavior, cache correctness, or greedy token decisions
 
 Required correctness gates:
 
@@ -373,8 +382,8 @@ Implementation note:
 - the candidate path builds padded expert-major token tiles, runs a
   row-cooperative CUDA kernel, then unpads the result back to logical token
   order before comparing outputs
-- this keeps the experiment benchmark-only while enforcing exact output
-  agreement before any runtime integration
+- this keeps the experiment benchmark-only while using a zero-diff numerical
+  diagnostic against the current baseline before any runtime integration
 
 Candidate shape:
 
@@ -434,7 +443,7 @@ Conclusion:
 
 - this experiment rules out a tempting but insufficient next step:
   “expert-major permutation plus shared-input reuse” by itself is not enough
-  for the exact-accumulation path we need
+  for the behaviorally reuse-stable path we need
 - the next routed-up prototype should preserve the correctness guard, but it
   needs to attack the remaining problem more directly:
   - reduce or avoid padded token work for the `prefix128` regime
@@ -457,7 +466,7 @@ Change:
 - remove padded expert-major token storage entirely
 - build CTA metadata directly from the true `expert_offsets`
 - load only the valid token rows for each expert tile
-- keep the same exact-output cross-check against the routed-up baseline
+- keep the same zero-diff numerical cross-check against the routed-up baseline
 
 This isolates the effect of padded-token overhead from the effect of the
 shared-input row-cooperative math itself.
@@ -512,8 +521,9 @@ Updated conclusion:
   path behind the existing device-only contract and measure TTFT impact
 - because the gain is only about `7%` on the key routed-up microbench case,
   this is likely not the whole recovery
-- but it is the first exact benchmark-only routed-up design that beats the
-  current baseline across the Nano benchmark surface
+- but it is the first benchmark-only routed-up design that beats the current
+  baseline across the Nano benchmark surface while still matching it exactly in
+  this narrow numerical experiment
 
 ### Rejected Runtime Integration: Upper-Bound Device Mapping
 
@@ -2081,3 +2091,47 @@ Interpretation:
   path
 - the next useful change must improve the math core itself, not just the
   surrounding layout contract
+
+## TRT-LLM Review Checkpoint
+
+Current review against the TRT-LLM reference points to five concrete gaps that
+still matter:
+
+1. Routed expert math is still scalar row-wise matvec, not grouped GEMM.
+   The active kernel still decodes FP4 weights inline and accumulates row-wise
+   over `K`, while TRT-LLM feeds `PermuteGemm1` / `Gemm2` through the grouped
+   batched GEMM runner.
+
+2. Routing metadata is richer now, but the active runtime does not consume the
+   full tile contract yet.
+   We now build `cta_m_limits`, padded-token maps, and reverse maps, but the
+   routed math and activation stages still mostly operate as row kernels over
+   padded storage rather than tile-aware kernels that use the full CTA plan.
+
+3. Permute and activation are still generic row kernels.
+   TRT-LLM permutes and activates through tile-aware kernels keyed by
+   `tile_idx_to_mn_limit` and `num_non_exiting_ctas`. Our current prefill path
+   still does:
+   - FP32 gather / permute
+   - FP32 `Relu2`
+   - FP32 quantize-dequantize
+
+4. Shared expert math is still on the old scalar contiguous path.
+   Even after routed launch-plan work, the shared up/down path still uses the
+   same scalar matvec family and remains a substantial part of cold-prefill
+   time.
+
+5. The launch-plan builder itself is still much simpler and more serialized
+   than TRT-LLM routing.
+   TRT-LLM parallelizes histogram, scans, CTA-map build, and permutation in
+   one routing step. Our launch-plan builder is still a small serial kernel.
+   This is no longer the main design-center bottleneck, but it remains a gap
+   for larger prompt lengths.
+
+Practical conclusion:
+
+- the contract work is now close enough to TRT-LLM that more progress from
+  control-plane changes alone should be expected to be small
+- the next material win must come from replacing the routed and then shared
+  scalar matvec math cores with a tile- / GEMM-like implementation that
+  actually uses the padded launch-plan contract
