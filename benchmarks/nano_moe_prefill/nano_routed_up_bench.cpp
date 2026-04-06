@@ -127,7 +127,7 @@ __global__ void PermutedExpertRowCoopKernel(
   const std::size_t pairs_per_row = weight.input_cols / 2;
   const std::size_t blocks_per_row =
       weight.input_cols / kNvfp4BlockWidth;
-  double accum[kPermutedTokenTile] = {0.0};
+  float accum[kPermutedTokenTile] = {0.0f};
 
   for (std::size_t pair_base = 0; pair_base < pairs_per_row;
        pair_base += kPermutedPairsPerStep) {
@@ -172,12 +172,8 @@ __global__ void PermutedExpertRowCoopKernel(
         const float w1 = DecodeFp4Nibble((packed >> 4) & 0x0Fu) * block_scale;
         for (int token_index = 0; token_index < clamped_valid_rows; ++token_index) {
           const int value_index = static_cast<int>(lane) * 2;
-          accum[token_index] +=
-              static_cast<double>(input_tile[token_index][value_index]) *
-              static_cast<double>(w0);
-          accum[token_index] +=
-              static_cast<double>(input_tile[token_index][value_index + 1]) *
-              static_cast<double>(w1);
+          accum[token_index] += input_tile[token_index][value_index] * w0;
+          accum[token_index] += input_tile[token_index][value_index + 1] * w1;
         }
       }
     }
@@ -200,10 +196,114 @@ __global__ void PermutedExpertRowCoopKernel(
     for (int token_index = 0; token_index < clamped_valid_rows; ++token_index) {
       const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
       output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row)] =
-          static_cast<float>(accum[token_index]);
+          accum[token_index];
     }
   }
 }
+
+__global__ void LaunchPlannedFp32AccumKernel(
+    const float* input,
+    const int* cta_count,
+    const int* cta_expert_ids,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
+    int output_row_tile_count,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  __shared__ float input_tile[kPermutedTokenTile][kPermutedPairsPerStep * 2];
+
+  const int task_index = static_cast<int>(blockIdx.x);
+  const int warp_index = static_cast<int>(threadIdx.x) / 32;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int exact_cta_count = cta_count[0];
+  const int exact_task_count = exact_cta_count * output_row_tile_count;
+  if (task_index >= exact_task_count) {
+    return;
+  }
+
+  const int cta_index = task_index / output_row_tile_count;
+  const int output_row_tile = task_index % output_row_tile_count;
+  const int output_row = output_row_tile * kPermutedOutputTile + warp_index;
+  const int expert_index = cta_expert_ids[cta_index];
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
+  if (expert_index < 0 ||
+      warp_index >= kPermutedOutputTile ||
+      static_cast<std::size_t>(output_row) >= output_rows_per_expert ||
+      valid_rows <= 0) {
+    return;
+  }
+
+  const auto weight = weights[static_cast<std::size_t>(expert_index)];
+  const std::size_t pairs_per_row = weight.input_cols / 2;
+  const std::size_t blocks_per_row = weight.input_cols / kNvfp4BlockWidth;
+  const std::size_t packed_row_offset =
+      static_cast<std::size_t>(output_row) * pairs_per_row;
+  const std::size_t scale_row_offset =
+      static_cast<std::size_t>(output_row) * blocks_per_row;
+  const float tensor_scale = *weight.tensor_scale_data;
+  float accum[kPermutedTokenTile] = {0.0f};
+
+  for (std::size_t pair_base = 0; pair_base < pairs_per_row;
+       pair_base += kPermutedPairsPerStep) {
+    const std::size_t remaining_pairs = pairs_per_row - pair_base;
+    const int pairs_this_step = static_cast<int>(
+        remaining_pairs < static_cast<std::size_t>(kPermutedPairsPerStep)
+            ? remaining_pairs
+            : static_cast<std::size_t>(kPermutedPairsPerStep));
+    const int values_this_step = valid_rows * pairs_this_step * 2;
+    for (int linear_index = static_cast<int>(threadIdx.x);
+         linear_index < values_this_step;
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int token_index = linear_index / (pairs_this_step * 2);
+      const int within_token = linear_index % (pairs_this_step * 2);
+      const int pair_offset = within_token / 2;
+      const int value_offset = within_token % 2;
+      const std::size_t input_row =
+          static_cast<std::size_t>(row_start + token_index);
+      const std::size_t col =
+          (pair_base + static_cast<std::size_t>(pair_offset)) * 2u +
+          static_cast<std::size_t>(value_offset);
+      input_tile[token_index][within_token] =
+          input[input_row * weight.input_cols + col];
+    }
+    __syncthreads();
+
+    const std::size_t pair_index = pair_base + static_cast<std::size_t>(lane);
+    if (lane < pairs_this_step) {
+      const std::size_t block = pair_index / 8u;
+      const float block_scale =
+          DecodeFp8Byte(weight.block_scales_data[scale_row_offset + block]) *
+          tensor_scale;
+      const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+      const float w0 = DecodeFp4Nibble(packed & 0x0Fu) * block_scale;
+      const float w1 = DecodeFp4Nibble((packed >> 4) & 0x0Fu) * block_scale;
+      for (int token_index = 0; token_index < valid_rows; ++token_index) {
+        const int value_index = lane * 2;
+        accum[token_index] += input_tile[token_index][value_index] * w0;
+        accum[token_index] += input_tile[token_index][value_index + 1] * w1;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int token_index = 0; token_index < valid_rows; ++token_index) {
+    for (int stride = 16; stride > 0; stride >>= 1) {
+      accum[token_index] += __shfl_down_sync(0xffffffffu, accum[token_index], stride);
+    }
+  }
+
+  if (lane == 0) {
+    for (int token_index = 0; token_index < valid_rows; ++token_index) {
+      const std::size_t input_row =
+          static_cast<std::size_t>(row_start + token_index);
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row)] =
+          accum[token_index];
+    }
+  }
+}
+
 
 __global__ void GatherPermutedRowsKernel(
     const float* input,
@@ -856,14 +956,6 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
       cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
-  std::vector<int> total_padded_rows_host;
-  if (!CopyDeviceBufferToHost(launch_plan->total_padded_rows(), 1, &total_padded_rows_host) ||
-      total_padded_rows_host.size() != 1 ||
-      total_padded_rows_host[0] <= 0) {
-    return std::nullopt;
-  }
-  const std::size_t padded_selection_count =
-      static_cast<std::size_t>(total_padded_rows_host[0]);
 
   const auto routed_up = BuildUploadedRoutedUpViews();
   if (!routed_up.has_value()) {
@@ -878,9 +970,9 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
   const auto input_host =
       MakePatternedValues(benchmark_case.prefix_tokens, kHiddenSize, 23, 0.03125f);
   auto input = DeviceTensorFp32::Create({benchmark_case.prefix_tokens, kHiddenSize});
-  auto permuted_input = DeviceTensorFp32::Create({padded_selection_count, kHiddenSize});
-  auto output = DeviceTensorFp32::Create({padded_selection_count, kRoutedIntermediateSize});
-  if (input == nullptr || permuted_input == nullptr || output == nullptr) {
+  auto compact_input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
+  auto output = DeviceTensorFp32::Create({selection_count, kRoutedIntermediateSize});
+  if (input == nullptr || compact_input == nullptr || output == nullptr) {
     return std::nullopt;
   }
   if (!input->CopyFromHost(input_host.data(), input_host.size())) {
@@ -888,11 +980,11 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
   }
   if (!LaunchGatherPermutedRows(
           input->data(),
-          launch_plan->permuted_token_indices(),
-          padded_selection_count,
+          routing->sorted_token_indices(),
+          selection_count,
           benchmark_case.prefix_tokens,
           kHiddenSize,
-          permuted_input->data()) ||
+          compact_input->data()) ||
       cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
@@ -904,7 +996,7 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
 
   auto run_once = [&]() {
     return RunLaunchPlannedNvfp4ExpertMatVec(
-        permuted_input->data(),
+        compact_input->data(),
         launch_plan.get(),
         selection_count,
         routed_up_views_device->data(),
@@ -959,7 +1051,7 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
   result.case_name = benchmark_case.name;
   result.prefix_tokens = benchmark_case.prefix_tokens;
   result.selection_count = selection_count;
-  result.padded_selection_count = padded_selection_count;
+  result.padded_selection_count = selection_count;
   result.active_experts = active_experts;
   result.cold_ms = *cold_ms;
   result.hot_mean_ms = hot_mean_ms;
@@ -970,27 +1062,168 @@ std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
   result.hot_weight_gib_per_s =
       hot_mean_ms > 0.0 ? weight_bytes / (hot_mean_ms / 1000.0) / (1024.0 * 1024.0 * 1024.0) : 0.0;
   if (output_host != nullptr) {
-    std::vector<float> padded_output_host(padded_selection_count * kRoutedIntermediateSize, 0.0f);
-    std::vector<int> sorted_to_permuted_host;
-    if (!output->CopyToHost(padded_output_host.data(), padded_output_host.size()) ||
-        !CopyDeviceBufferToHost(
-            launch_plan->sorted_to_permuted_indices(),
-            selection_count,
-            &sorted_to_permuted_host)) {
+    output_host->resize(selection_count * kRoutedIntermediateSize);
+    if (!output->CopyToHost(output_host->data(), output_host->size())) {
       return std::nullopt;
     }
-    output_host->assign(selection_count * kRoutedIntermediateSize, 0.0f);
-    for (std::size_t sorted_index = 0; sorted_index < selection_count; ++sorted_index) {
-      const int padded_index = sorted_to_permuted_host[sorted_index];
-      if (padded_index < 0) {
-        return std::nullopt;
-      }
-      const float* src =
-          padded_output_host.data() +
-          static_cast<std::size_t>(padded_index) * kRoutedIntermediateSize;
-      float* dst =
-          output_host->data() + sorted_index * kRoutedIntermediateSize;
-      std::copy(src, src + kRoutedIntermediateSize, dst);
+  }
+  return result;
+}
+
+std::optional<BenchmarkResult> RunLaunchPlanFp32AccumCase(
+    const BenchmarkCase& benchmark_case,
+    const BenchmarkOptions& options,
+    std::vector<float>* output_host = nullptr) {
+  const std::size_t selection_count = benchmark_case.prefix_tokens * kTopK;
+  const auto expert_offsets = BuildExpertOffsets(selection_count);
+  const std::size_t active_experts = CountActiveExperts(expert_offsets);
+  const auto selected_indices_host = BuildSelectedIndicesForOffsets(expert_offsets);
+  const std::vector<float> selected_weights_host(selection_count, 1.0f);
+
+  auto selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
+  auto selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);
+  auto routing = DeviceExpertRouting::Create(kRoutedExperts, selection_count);
+  auto launch_plan = DeviceMoeLaunchPlan::Create(kRoutedExperts, selection_count);
+  if (selected_indices_device == nullptr ||
+      selected_weights_device == nullptr ||
+      routing == nullptr ||
+      !routing->valid() ||
+      launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      !RunDeviceExpertRouting(
+          selected_indices_device->data(),
+          selected_weights_device->data(),
+          benchmark_case.prefix_tokens,
+          kTopK,
+          routing.get()) ||
+      !BuildDeviceMoeLaunchPlan(*routing, selection_count, launch_plan.get()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
+    return std::nullopt;
+  }
+
+  const auto routed_up = BuildUploadedRoutedUpViews();
+  if (!routed_up.has_value()) {
+    return std::nullopt;
+  }
+  auto routed_up_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up->views);
+  if (routed_up_views_device == nullptr) {
+    return std::nullopt;
+  }
+
+  const auto input_host =
+      MakePatternedValues(benchmark_case.prefix_tokens, kHiddenSize, 23, 0.03125f);
+  auto input = DeviceTensorFp32::Create({benchmark_case.prefix_tokens, kHiddenSize});
+  auto compact_input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
+  auto output = DeviceTensorFp32::Create({selection_count, kRoutedIntermediateSize});
+  if (input == nullptr || compact_input == nullptr || output == nullptr) {
+    return std::nullopt;
+  }
+  if (!input->CopyFromHost(input_host.data(), input_host.size())) {
+    return std::nullopt;
+  }
+  if (!LaunchGatherPermutedRows(
+          input->data(),
+          routing->sorted_token_indices(),
+          selection_count,
+          benchmark_case.prefix_tokens,
+          kHiddenSize,
+          compact_input->data()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
+    return std::nullopt;
+  }
+
+  const auto current_cta_capacity =
+      DeviceMoeLaunchPlan::CtaCapacity(kRoutedExperts, selection_count);
+  if (!current_cta_capacity.has_value() || *current_cta_capacity == 0) {
+    return std::nullopt;
+  }
+  const std::size_t output_row_tile_count =
+      (kRoutedIntermediateSize + static_cast<std::size_t>(kPermutedOutputTile) - 1u) /
+      static_cast<std::size_t>(kPermutedOutputTile);
+
+  ScopedCudaEventTimer timer;
+  if (!timer.valid()) {
+    return std::nullopt;
+  }
+
+  const dim3 block(kPermutedThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>(*current_cta_capacity * output_row_tile_count));
+  auto run_once = [&]() {
+    LaunchPlannedFp32AccumKernel<<<grid, block>>>(
+        compact_input->data(),
+        launch_plan->cta_count(),
+        launch_plan->cta_expert_ids(),
+        launch_plan->cta_row_starts(),
+        launch_plan->cta_valid_rows(),
+        static_cast<int>(output_row_tile_count),
+        routed_up_views_device->data(),
+        kRoutedIntermediateSize,
+        output->data());
+    return cudaGetLastError() == cudaSuccess;
+  };
+
+  for (std::size_t iteration = 0; iteration < options.warmup_iterations; ++iteration) {
+    const auto elapsed = timer.Measure(run_once);
+    if (!elapsed.has_value()) {
+      return std::nullopt;
+    }
+  }
+
+  const auto cold_ms = timer.Measure(run_once);
+  if (!cold_ms.has_value()) {
+    return std::nullopt;
+  }
+
+  double hot_sum_ms = 0.0;
+  double hot_min_ms = 0.0;
+  double hot_max_ms = 0.0;
+  for (std::size_t iteration = 0; iteration < options.hot_iterations; ++iteration) {
+    const auto hot_elapsed = timer.Measure(run_once);
+    if (!hot_elapsed.has_value()) {
+      return std::nullopt;
+    }
+    const double elapsed_ms = *hot_elapsed;
+    hot_sum_ms += elapsed_ms;
+    if (iteration == 0 || elapsed_ms < hot_min_ms) {
+      hot_min_ms = elapsed_ms;
+    }
+    if (iteration == 0 || elapsed_ms > hot_max_ms) {
+      hot_max_ms = elapsed_ms;
+    }
+  }
+
+  const double hot_mean_ms =
+      hot_sum_ms / static_cast<double>(std::max<std::size_t>(1, options.hot_iterations));
+  const double logical_flops =
+      2.0 * static_cast<double>(selection_count) *
+      static_cast<double>(kHiddenSize) *
+      static_cast<double>(kRoutedIntermediateSize);
+  const double weight_bytes =
+      static_cast<double>(active_experts) *
+      static_cast<double>(kHiddenSize) *
+      static_cast<double>(kRoutedIntermediateSize) *
+      kNvfp4BytesPerWeight;
+
+  BenchmarkResult result;
+  result.variant_name = "launch_plan_flattened";
+  result.case_name = benchmark_case.name;
+  result.prefix_tokens = benchmark_case.prefix_tokens;
+  result.selection_count = selection_count;
+  result.padded_selection_count = selection_count;
+  result.active_experts = active_experts;
+  result.cold_ms = *cold_ms;
+  result.hot_mean_ms = hot_mean_ms;
+  result.hot_min_ms = hot_min_ms;
+  result.hot_max_ms = hot_max_ms;
+  result.hot_tflops =
+      hot_mean_ms > 0.0 ? logical_flops / (hot_mean_ms / 1000.0) / 1.0e12 : 0.0;
+  result.hot_weight_gib_per_s =
+      hot_mean_ms > 0.0 ? weight_bytes / (hot_mean_ms / 1000.0) / (1024.0 * 1024.0 * 1024.0) : 0.0;
+  if (output_host != nullptr) {
+    output_host->resize(selection_count * kRoutedIntermediateSize);
+    if (!output->CopyToHost(output_host->data(), output_host->size())) {
+      return std::nullopt;
     }
   }
   return result;
@@ -1083,6 +1316,18 @@ int main(int argc, char** argv) {
     }
     PopulateDiffSummary(baseline_output_host, launch_plan_output_host, &*launch_plan_result);
     PrintResult(*launch_plan_result);
+
+    std::vector<float> fp32_accum_output_host;
+    auto fp32_accum_result =
+        RunLaunchPlanFp32AccumCase(benchmark_case, options, &fp32_accum_output_host);
+    if (!fp32_accum_result.has_value()) {
+      std::cerr << "nano_routed_up_bench: launch-plan fp32-accum case failed: "
+                << benchmark_case.name << "\n";
+      return 1;
+    }
+    PopulateDiffSummary(baseline_output_host, fp32_accum_output_host, &*fp32_accum_result);
+    PrintResult(*fp32_accum_result);
+
   }
 
   if (!ran_any) {

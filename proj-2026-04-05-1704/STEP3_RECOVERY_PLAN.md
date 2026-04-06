@@ -2135,3 +2135,152 @@ Practical conclusion:
 - the next material win must come from replacing the routed and then shared
   scalar matvec math cores with a tile- / GEMM-like implementation that
   actually uses the padded launch-plan contract
+
+## FP32 Accumulation Checkpoint
+
+The next benchmark-only question was whether our custom NVFP4 math core was
+paying an avoidable cost by widening accumulation all the way to `double`
+instead of staying closer to TRT-LLM's Blackwell-style low-precision MMA +
+FP32-accumulator model.
+
+TRT-LLM reference points:
+
+- grouped GEMM options default the accumulator dtype to `Fp32`
+- Blackwell MoE GEMM options allow low-precision MMA input types including
+  `E2m1` / `E4m3`
+- this reinforces that our scalar FP4 decode + `double` reduction path is not
+  representative of the intended arithmetic model
+
+First focused benchmark-only experiment:
+
+- keep the active padded launch-plan contract and overlaunch shape unchanged
+- replace only the routed-up accumulator type with `float`
+- leave the rest of the kernel structure unchanged
+
+Measured routed-up microbench results after that change:
+
+- `prefix4`
+  - `baseline`: `0.543 ms`
+  - `launch_plan_fp32_accum`: `0.154 ms`
+- `prefix128`
+  - `baseline`: `11.129 ms` before the runtime change
+  - benchmark-only `launch_plan_fp32_accum`: `2.785 ms`
+- `prefix4096`
+  - `baseline`: `320.731 ms`
+  - `launch_plan_fp32_accum`: `98.112 ms`
+
+The narrow benchmark diff guard did not show any observed numerical drift on
+these cases, which is consistent with the project requirement now being
+behavioral reuse equivalence rather than bitwise identity.
+
+Active runtime change:
+
+- all three custom NVFP4 matvec kernels in
+  `runtime/src/backend/fused_moe_prefill.cu` now accumulate in `float`
+  instead of `double`:
+  - grouped routed expert matvec
+  - launch-planned routed expert matvec
+  - contiguous shared expert matvec
+
+Focused correctness after landing the runtime change:
+
+- `fused_moe_prefill_test`: pass
+- `expert_routing_device_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+
+Focused plan-aligned TTFT rerun under the full-static `tail4` matrix:
+
+- command:
+  - `NEMOTRON_FORWARD_MANIFEST=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json ./build-sm120-relwithdebinfo/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench --prefix-length 4 --prefix-length 128 --prefix-length 4096 --tail-token-count 4 --warmup 0 --iterations 5`
+- measured cold medians:
+  - `cold_prefill_prefix4`: `30.770 ms`
+  - `cold_prefill_prefix128`: `197.220 ms`
+  - `cold_prefill_prefix4096`: `6350.265 ms`
+- measured cached committed-head hot-prefix medians:
+  - `prefix4_tail4`: `28.996 ms`
+  - `prefix128_tail4`: `31.415 ms`
+  - `prefix4096_tail4`: `73.509 ms`
+
+Comparison against the committed working baseline in `PLAN.md`:
+
+- cached `tail4` now beats the old baseline at all three prefix lengths
+- cold `prefix4` also beats the old baseline
+- cold `prefix128` improves dramatically versus the recent regression state,
+  but is still above the old `142.156 ms` baseline
+- cold `prefix4096` remains far slower than baseline, so long-prefill recovery
+  is still unresolved
+
+Interpretation:
+
+- widening custom NVFP4 accumulation to `double` was a major self-inflicted
+  performance loss
+- switching to FP32 accumulation is safe enough for the current behavioral
+  reuse requirement on the focused oracle path
+- the short / medium routed and shared expert paths recovered strongly from
+  this change
+- the next profiling step should re-check `cold_prefill_prefix128` to see how
+  much MoE gap remains, and separately confirm whether long-prefill work has
+  now shifted decisively toward Mamba / non-MoE costs at `prefix4096`
+
+## Launch-Pattern Checkpoint
+
+After the FP32-accum change, the next focused question was whether the active
+launch-planned routed kernel was still leaving performance on the table simply
+because of launch ordering and CTA metadata use.
+
+Focused routed-up microbench on `prefix128`:
+
+- retained runtime-like `launch_plan_upper_bound`: `2.776 ms`
+- benchmark-local row-tile-major reordering: `2.635 ms`
+- exact ragged benchmark CTA list: `1.889 ms`
+
+That small row-tile-major win was real enough to land in the active runtime
+path:
+
+- `Nvfp4LaunchPlannedExpertMatVecRowsKernel` now launches with `grid.x =
+  output_row_tile_count`, `grid.y = current_cta_capacity`, so consecutive CTAs
+  stay on the same routed-row tile while sweeping output-row tiles
+
+Focused TTFT rerun after that runtime launch-order change:
+
+- `cold_prefill_prefix128`: `197.220 ms -> 193.538 ms`
+- `cached_committed_head_prefix128_tail4` hot-prefix TTFT:
+  `31.415 ms -> 30.366 ms`
+- `cached_global_root_prefix128_tail4` hot-prefix TTFT:
+  `31.580 ms -> 30.445 ms`
+
+The more important result came from `ncu` on the routed-up microbench:
+
+- exact ragged kernel:
+  - grid size: `59392`
+  - duration: `2.377 ms`
+  - eligible warps / scheduler: `1.93`
+- launch-planned kernel after flattening the launch order:
+  - grid size: `96512`
+  - duration: `3.441 ms`
+  - eligible warps / scheduler: `1.07`
+
+The exact CTA count for this case is only `128` routed-row tiles, but the
+active launch-planned path still launches against the static upper bound
+`current_cta_capacity = 208`. That multiplies by `464` output-row tiles to
+produce `96512` launched CTAs instead of the `59392` real CTAs in the exact
+ragged benchmark. The remaining routed-up gap is therefore not mainly
+`blockIdx` ordering anymore; it is capacity-based CTA overlaunch.
+
+TRT-LLM comparison:
+
+- TRT routing writes exact CTA metadata such as `numNonExitingCtas`,
+  `ctaIdxXyToBatchIdx`, and `ctaIdxXyToMnLimit`
+- grouped Gemm1 / Gemm2 consume that exact metadata directly
+- this lets TRT amortize the control-plane work inside a much stronger
+  grouped-GEMM math core, instead of paying row-kernel overhead per tiny CTA
+
+Practical conclusion:
+
+- the current row-kernel path can still win from cleaner launch patterns, but
+  the remaining gap is fundamentally tied to using a small-work-per-CTA custom
+  routed kernel with an upper-bound launch count
+- another round of control-plane polish is unlikely to recover the full gap
+- the next material step should increase work per CTA, using the existing
+  launch-plan contract as input to a more tile- / GEMM-like routed-up math
+  core rather than another tiny row kernel
