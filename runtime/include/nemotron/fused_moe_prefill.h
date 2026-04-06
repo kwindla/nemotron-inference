@@ -25,8 +25,8 @@ struct FusedMoePrefillParams {
   const float* normalized = nullptr;
   DeviceExpertRouting* routing = nullptr;
   DeviceMoeLaunchPlan* launch_plan = nullptr;
-  float* routed_gather_scratch = nullptr;  // selection_count x hidden_size
-  float* routed_up_scratch = nullptr;      // selection_count x routed_expert_intermediate_size
+  float* routed_gather_scratch = nullptr;  // padded_row_capacity x hidden_size
+  float* routed_up_scratch = nullptr;      // padded_row_capacity x routed_expert_intermediate_size
   float* shared_up_scratch = nullptr;      // token_count x shared_expert_intermediate_size
   float* output = nullptr;  // Receives routed + shared expert contributions.
   float* routed_output = nullptr;  // Optional.

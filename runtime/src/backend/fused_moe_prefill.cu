@@ -52,18 +52,23 @@ __global__ void ZeroBufferKernel(float* data, std::size_t count) {
 __global__ void GatherRowsKernel(
     const float* input,
     const int* row_indices,
+    const int* active_output_rows,
     float* output,
-    std::size_t output_rows,
+    std::size_t output_row_capacity,
     std::size_t input_rows,
     std::size_t cols) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t count = output_rows * cols;
+  const std::size_t count = output_row_capacity * cols;
   if (index >= count) {
     return;
   }
 
   const std::size_t row = index / cols;
+  if (active_output_rows != nullptr &&
+      row >= static_cast<std::size_t>(active_output_rows[0])) {
+    return;
+  }
   const std::size_t col = index % cols;
   const int input_row = row_indices[row];
   if (input_row < 0 || static_cast<std::size_t>(input_row) >= input_rows) {
@@ -75,10 +80,15 @@ __global__ void GatherRowsKernel(
 
 __global__ void QuantizeDequantizeRowsKernel(
     float* data,
-    std::size_t row_count,
+    const int* active_row_count,
+    std::size_t row_capacity,
     std::size_t cols) {
   const std::size_t row = static_cast<std::size_t>(blockIdx.x);
-  if (row >= row_count) {
+  if (row >= row_capacity) {
+    return;
+  }
+  if (active_row_count != nullptr &&
+      row >= static_cast<std::size_t>(active_row_count[0])) {
     return;
   }
   fused_decode::QuantizeDequantizeNvfp4Row(
@@ -91,6 +101,25 @@ __global__ void Relu2Kernel(float* data, std::size_t count) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count) {
+    return;
+  }
+  data[index] = fused_decode::Relu2(data[index]);
+}
+
+__global__ void Relu2RowsKernel(
+    float* data,
+    const int* active_row_count,
+    std::size_t row_capacity,
+    std::size_t cols) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t count = row_capacity * cols;
+  if (index >= count) {
+    return;
+  }
+  const std::size_t row = index / cols;
+  if (active_row_count != nullptr &&
+      row >= static_cast<std::size_t>(active_row_count[0])) {
     return;
   }
   data[index] = fused_decode::Relu2(data[index]);
@@ -180,7 +209,6 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
     const float* input,
     const int* cta_count,
     const int* cta_expert_ids,
-    const int* cta_row_starts,
     const int* cta_valid_rows,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
@@ -198,8 +226,9 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
   const int output_row_tile = static_cast<int>(blockIdx.y);
   const int output_row = output_row_tile * kPlannedOutputTile + warp_index;
   const int expert_index = cta_expert_ids[cta_index];
-  const int row_start = cta_row_starts[cta_index];
   const int valid_rows = cta_valid_rows[cta_index];
+  const int padded_row_base =
+      cta_index * static_cast<int>(kMoeLaunchPlanTokenTile);
   if (expert_index < 0 ||
       warp_index >= kPlannedOutputTile ||
       static_cast<std::size_t>(output_row) >= output_rows_per_expert ||
@@ -231,7 +260,8 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
       const int within_token = linear_index % (pairs_this_step * 2);
       const int pair_offset = within_token / 2;
       const int value_offset = within_token % 2;
-      const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
+      const std::size_t input_row =
+          static_cast<std::size_t>(padded_row_base + token_index);
       const std::size_t col =
           (pair_base + static_cast<std::size_t>(pair_offset)) * 2u +
           static_cast<std::size_t>(value_offset);
@@ -270,7 +300,8 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
 
   if (lane == 0) {
     for (int token_index = 0; token_index < valid_rows; ++token_index) {
-      const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
+      const std::size_t input_row =
+          static_cast<std::size_t>(padded_row_base + token_index);
       output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row)] =
           static_cast<float>(accum[token_index]);
     }
@@ -362,6 +393,7 @@ __global__ void Nvfp4MatVecRowsKernel(
 __global__ void ReduceSelectionOutputsKernel(
     const float* grouped_output,
     const int* selection_to_sorted,
+    const int* sorted_to_permuted,
     const float* selected_weights,
     std::size_t token_count,
     std::size_t top_k,
@@ -384,8 +416,12 @@ __global__ void ReduceSelectionOutputsKernel(
     if (sorted_index < 0) {
       continue;
     }
+    const int padded_index = sorted_to_permuted[sorted_index];
+    if (padded_index < 0) {
+      continue;
+    }
     const std::size_t grouped_offset =
-        static_cast<std::size_t>(sorted_index) * hidden_size + hidden_index;
+        static_cast<std::size_t>(padded_index) * hidden_size + hidden_index;
     accum += static_cast<double>(selected_weights[selection_index]) *
              static_cast<double>(grouped_output[grouped_offset]);
   }
@@ -426,27 +462,37 @@ bool LaunchZeroBuffer(float* data, std::size_t count) {
 bool LaunchGatherRows(
     const float* input,
     const int* row_indices,
-    std::size_t output_rows,
+    const int* active_output_rows,
+    std::size_t output_row_capacity,
     std::size_t input_rows,
     std::size_t cols,
     float* output) {
-  const std::size_t count = output_rows * cols;
+  const std::size_t count = output_row_capacity * cols;
   const dim3 block(fused_decode::kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
   GatherRowsKernel<<<grid, block>>>(
       input,
       row_indices,
+      active_output_rows,
       output,
-      output_rows,
+      output_row_capacity,
       input_rows,
       cols);
   return CheckCuda(cudaGetLastError());
 }
 
-bool LaunchQuantizeDequantizeRows(float* data, std::size_t row_count, std::size_t cols) {
+bool LaunchQuantizeDequantizeRows(
+    float* data,
+    const int* active_row_count,
+    std::size_t row_capacity,
+    std::size_t cols) {
   const dim3 block(fused_decode::kThreadsPerBlock);
-  const dim3 grid(static_cast<unsigned int>(row_count));
-  QuantizeDequantizeRowsKernel<<<grid, block>>>(data, row_count, cols);
+  const dim3 grid(static_cast<unsigned int>(row_capacity));
+  QuantizeDequantizeRowsKernel<<<grid, block>>>(
+      data,
+      active_row_count,
+      row_capacity,
+      cols);
   return CheckCuda(cudaGetLastError());
 }
 
@@ -454,6 +500,21 @@ bool LaunchRelu2(float* data, std::size_t count) {
   const dim3 block(fused_decode::kThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
   Relu2Kernel<<<grid, block>>>(data, count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchRelu2Rows(
+    float* data,
+    const int* active_row_count,
+    std::size_t row_capacity,
+    std::size_t cols) {
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>(((row_capacity * cols) + block.x - 1u) / block.x));
+  Relu2RowsKernel<<<grid, block>>>(
+      data,
+      active_row_count,
+      row_capacity,
+      cols);
   return CheckCuda(cudaGetLastError());
 }
 
@@ -534,7 +595,6 @@ bool LaunchPlannedMatVec(
       input,
       launch_plan->cta_count(),
       launch_plan->cta_expert_ids(),
-      launch_plan->cta_row_starts(),
       launch_plan->cta_valid_rows(),
       weights,
       output_rows_per_expert,
@@ -545,6 +605,7 @@ bool LaunchPlannedMatVec(
 bool LaunchReduceSelectionOutputs(
     const float* grouped_output,
     const int* selection_to_sorted,
+    const int* sorted_to_permuted,
     const float* selected_weights,
     std::size_t token_count,
     std::size_t top_k,
@@ -557,6 +618,7 @@ bool LaunchReduceSelectionOutputs(
   ReduceSelectionOutputsKernel<<<grid, block>>>(
       grouped_output,
       selection_to_sorted,
+      sorted_to_permuted,
       selected_weights,
       token_count,
       top_k,
@@ -685,10 +747,13 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   }
 
   const std::size_t token_hidden_count = params.token_count * params.hidden_size;
-  const std::size_t selection_intermediate_count =
-      selection_count * params.routed_expert_intermediate_size;
   const std::size_t shared_intermediate_count =
       params.token_count * params.shared_expert_intermediate_size;
+  const auto padded_selection_capacity =
+      DeviceMoeLaunchPlan::PaddedRowCapacity(params.n_routed_experts, selection_count);
+  if (!padded_selection_capacity.has_value()) {
+    return false;
+  }
 
   if (!RunDeviceExpertRouting(
           params.selected_indices,
@@ -702,14 +767,16 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       !LaunchZeroBuffer(params.shared_output, token_hidden_count) ||
       !LaunchGatherRows(
           params.normalized,
-          params.routing->sorted_token_indices(),
-          selection_count,
+          params.launch_plan->permuted_token_indices(),
+          params.launch_plan->total_padded_rows(),
+          *padded_selection_capacity,
           params.token_count,
           params.hidden_size,
           params.routed_gather_scratch) ||
       !LaunchQuantizeDequantizeRows(
           params.routed_gather_scratch,
-          selection_count,
+          params.launch_plan->total_padded_rows(),
+          *padded_selection_capacity,
           params.hidden_size)) {
     return false;
   }
@@ -724,10 +791,15 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  if (!LaunchRelu2(params.routed_up_scratch, selection_intermediate_count) ||
+  if (!LaunchRelu2Rows(
+          params.routed_up_scratch,
+          params.launch_plan->total_padded_rows(),
+          *padded_selection_capacity,
+          params.routed_expert_intermediate_size) ||
       !LaunchQuantizeDequantizeRows(
           params.routed_up_scratch,
-          selection_count,
+          params.launch_plan->total_padded_rows(),
+          *padded_selection_capacity,
           params.routed_expert_intermediate_size)) {
     return false;
   }
@@ -745,6 +817,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   if (!LaunchReduceSelectionOutputs(
           params.routed_gather_scratch,
           params.routing->selection_to_sorted(),
+          params.launch_plan->sorted_to_permuted_indices(),
           params.selected_weights,
           params.token_count,
           params.top_k,
@@ -761,6 +834,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
           cudaMemcpyDeviceToDevice)) ||
       !LaunchQuantizeDequantizeRows(
           params.routed_gather_scratch,
+          nullptr,
           params.token_count,
           params.hidden_size) ||
       !LaunchContiguousMatVec(
@@ -771,6 +845,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       !LaunchRelu2(params.shared_up_scratch, shared_intermediate_count) ||
       !LaunchQuantizeDequantizeRows(
           params.shared_up_scratch,
+          nullptr,
           params.token_count,
           params.shared_expert_intermediate_size) ||
       !LaunchContiguousMatVec(

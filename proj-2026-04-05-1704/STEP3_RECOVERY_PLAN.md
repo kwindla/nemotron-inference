@@ -1998,3 +1998,57 @@ Interpretation:
 - it was a missing TRT-LLM-style dynamic CTA upper bound in our launch-plan
   integration
 - static buffers plus current-batch launch bounds is the correct architecture
+
+## Padded Routed-Row Checkpoint
+
+The next TRT-LLM-aligned step is now landed in the active runtime contract:
+
+- `DeviceMoeLaunchPlan` now carries padded routed-row metadata in addition to
+  exact CTA metadata:
+  - `permuted_token_indices`
+  - `sorted_to_permuted_indices`
+  - `cta_m_limits`
+- request-scoped MoE workspace scratch for routed prefill is now sized to
+  `PaddedRowCapacity(num_experts, selection_capacity)`, not just raw
+  `selection_capacity`
+- `RunFusedMoePrefill()` now uses that padded routed-row layout end to end for
+  the routed path:
+  - padded gather / permute from `normalized`
+  - routed-up on padded rows
+  - activation / requant on padded rows
+  - routed-down on padded rows
+  - finalize via `selection_to_sorted -> sorted_to_permuted`
+
+Focused correctness after switching the active path:
+
+- `moe_launch_plan_device_test`: pass
+- `fused_moe_prefill_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+
+Focused design-center TTFT rerun, command:
+
+- `NEMOTRON_FORWARD_MANIFEST=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json ./build-sm120-relwithdebinfo/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench --prefix-length 128 --tail-token-count 4 --warmup 0 --iterations 5`
+
+Measured result on the padded routed-row path:
+
+- `cold_prefill_prefix128`: `654.286 ms`
+- `cached_committed_head_prefix128_tail4` hot-prefix: `46.454 ms`
+- `cached_global_root_prefix128_tail4` hot-prefix: `46.440 ms`
+
+Comparison against the pre-padded-layout design-center baseline
+(`artifacts/benchmarks/ttft_20260406_post_dynamic_bounds_prefix128_tail4.stdout.txt`):
+
+- `cold_prefill_prefix128`: `651.942 ms` -> `654.286 ms`
+  (`0.36%` slower)
+- `cached_committed_head_prefix128_tail4`: `46.381 ms` -> `46.454 ms`
+  (`0.16%` slower)
+
+Interpretation:
+
+- the padded routed-row layout is architecturally correct and now validated on
+  the active runtime path
+- but it is essentially TTFT-neutral on the design-center case
+- this is strong evidence that the remaining gap is not the routed control
+  plane or the compact-vs-padded layout boundary
+- the remaining recovery work must target the routed and shared expert
+  math cores themselves

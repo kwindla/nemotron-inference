@@ -99,6 +99,12 @@ std::optional<std::size_t> DeviceMoeLaunchPlanBytes(
   return DeviceMoeLaunchPlan::Bytes(n_experts, selection_count);
 }
 
+std::optional<std::size_t> PaddedSelectionCapacity(
+    std::size_t n_experts,
+    std::size_t selection_count) {
+  return DeviceMoeLaunchPlan::PaddedRowCapacity(n_experts, selection_count);
+}
+
 bool HandlesSatisfyLayerInvariant(
     const AttentionKvCacheConfig& config,
     const std::vector<KvPageHandle>& pages,
@@ -177,7 +183,14 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
   }
 
   const auto selection_capacity = CheckedMul(token_capacity, config.top_k);
+  const auto padded_selection_capacity =
+      selection_capacity.has_value()
+          ? PaddedSelectionCapacity(config.num_experts, *selection_capacity)
+          : std::nullopt;
   if (!selection_capacity.has_value()) {
+    return std::nullopt;
+  }
+  if (!padded_selection_capacity.has_value()) {
     return std::nullopt;
   }
   const Nvfp4ScaleLayout pack_scale_layout = MoePrefillPackScaleLayout();
@@ -205,9 +218,10 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(DeviceExpertRoutingBytes(config.num_experts, *selection_capacity)) &&
                  add_bytes(DeviceMoeLaunchPlanBytes(config.num_experts, *selection_capacity)) &&
                  add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
-                 add_bytes(MatrixBytes(*selection_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(
+                     MatrixBytes(*padded_selection_capacity, config.hidden_size, sizeof(float))) &&
                  add_bytes(MatrixBytes(
-                     *selection_capacity,
+                     *padded_selection_capacity,
                      config.routed_expert_intermediate_size,
                      sizeof(float))) &&
                  add_bytes(MatrixBytes(
@@ -215,11 +229,11 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                      config.shared_expert_intermediate_size,
                      sizeof(float))) &&
                  add_bytes(Nvfp4MatrixBytes(
-                     *selection_capacity,
+                     *padded_selection_capacity,
                      config.hidden_size,
                      pack_scale_layout)) &&
                  add_bytes(Nvfp4MatrixBytes(
-                     *selection_capacity,
+                     *padded_selection_capacity,
                      config.routed_expert_intermediate_size,
                      pack_scale_layout)) &&
                  add_bytes(Nvfp4MatrixBytes(
@@ -238,6 +252,11 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   }
 
   const std::size_t selection_capacity = token_capacity * config.top_k;
+  const auto padded_selection_capacity =
+      PaddedSelectionCapacity(config.num_experts, selection_capacity);
+  if (!padded_selection_capacity.has_value()) {
+    return nullptr;
+  }
   const Nvfp4ScaleLayout pack_scale_layout = MoePrefillPackScaleLayout();
   auto workspace = std::make_unique<MoePrefillWorkspace>();
   workspace->config = config;
@@ -256,15 +275,19 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   workspace->fused_prefill_routed_output_scratch =
       DeviceTensorFp32::Create({token_capacity, config.hidden_size});
   workspace->fused_prefill_gather_scratch =
-      DeviceTensorFp32::Create({selection_capacity, config.hidden_size});
+      DeviceTensorFp32::Create({*padded_selection_capacity, config.hidden_size});
   workspace->fused_prefill_expert_up_scratch =
-      DeviceTensorFp32::Create({selection_capacity, config.routed_expert_intermediate_size});
+      DeviceTensorFp32::Create(
+          {*padded_selection_capacity, config.routed_expert_intermediate_size});
   workspace->fused_prefill_shared_up_scratch =
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
   workspace->fused_prefill_gather_pack =
-      DeviceNvfp4Matrix::Create(selection_capacity, config.hidden_size, pack_scale_layout);
+      DeviceNvfp4Matrix::Create(
+          *padded_selection_capacity,
+          config.hidden_size,
+          pack_scale_layout);
   workspace->fused_prefill_expert_up_pack = DeviceNvfp4Matrix::Create(
-      selection_capacity,
+      *padded_selection_capacity,
       config.routed_expert_intermediate_size,
       pack_scale_layout);
   workspace->fused_prefill_shared_up_pack = DeviceNvfp4Matrix::Create(
@@ -285,6 +308,11 @@ bool MoePrefillWorkspace::valid() const {
   }
 
   const std::size_t selection_capacity = token_capacity_value * config.top_k;
+  const auto padded_selection_capacity =
+      PaddedSelectionCapacity(config.num_experts, selection_capacity);
+  if (!padded_selection_capacity.has_value()) {
+    return false;
+  }
   return TensorMatchesShape(normalized_bf16.get(), token_capacity_value, config.hidden_size) &&
          TensorMatchesShape(input_fp32.get(), token_capacity_value, config.hidden_size) &&
          TensorMatchesShape(normalized.get(), token_capacity_value, config.hidden_size) &&
@@ -307,11 +335,11 @@ bool MoePrefillWorkspace::valid() const {
              config.hidden_size) &&
          TensorMatchesShape(
              fused_prefill_gather_scratch.get(),
-             selection_capacity,
+             *padded_selection_capacity,
              config.hidden_size) &&
          TensorMatchesShape(
              fused_prefill_expert_up_scratch.get(),
-             selection_capacity,
+             *padded_selection_capacity,
              config.routed_expert_intermediate_size) &&
          TensorMatchesShape(
              fused_prefill_shared_up_scratch.get(),
@@ -319,11 +347,11 @@ bool MoePrefillWorkspace::valid() const {
              config.shared_expert_intermediate_size) &&
          fused_prefill_gather_pack != nullptr &&
          fused_prefill_gather_pack->valid() &&
-         fused_prefill_gather_pack->rows() >= selection_capacity &&
+         fused_prefill_gather_pack->rows() >= *padded_selection_capacity &&
          fused_prefill_gather_pack->cols() == config.hidden_size &&
          fused_prefill_expert_up_pack != nullptr &&
          fused_prefill_expert_up_pack->valid() &&
-         fused_prefill_expert_up_pack->rows() >= selection_capacity &&
+         fused_prefill_expert_up_pack->rows() >= *padded_selection_capacity &&
          fused_prefill_expert_up_pack->cols() == config.routed_expert_intermediate_size &&
          fused_prefill_shared_up_pack != nullptr &&
          fused_prefill_shared_up_pack->valid() &&

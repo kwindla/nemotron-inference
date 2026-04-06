@@ -14,11 +14,24 @@ struct DeviceMoeLaunchPlan::Impl {
   int* cta_expert_ids = nullptr;
   int* cta_row_starts = nullptr;
   int* cta_valid_rows = nullptr;
+  int* cta_m_limits = nullptr;
+  int* permuted_token_indices = nullptr;
+  int* sorted_to_permuted_indices = nullptr;
   std::size_t n_experts = 0;
   std::size_t selection_count = 0;
   std::size_t cta_capacity = 0;
+  std::size_t padded_row_capacity = 0;
 
   ~Impl() {
+    if (sorted_to_permuted_indices != nullptr) {
+      cudaFree(sorted_to_permuted_indices);
+    }
+    if (permuted_token_indices != nullptr) {
+      cudaFree(permuted_token_indices);
+    }
+    if (cta_m_limits != nullptr) {
+      cudaFree(cta_m_limits);
+    }
     if (cta_valid_rows != nullptr) {
       cudaFree(cta_valid_rows);
     }
@@ -76,18 +89,30 @@ std::optional<std::size_t> CheckedAdd(std::size_t lhs, std::size_t rhs) {
 
 __global__ void BuildLaunchPlanKernel(
     const int* expert_offsets,
+    const int* sorted_token_indices,
     const int* active_expert_count,
     const int* active_expert_ids,
     int current_cta_capacity,
+    int current_padded_row_capacity,
     int* cta_count,
     int* total_padded_rows,
     int* cta_expert_ids,
     int* cta_row_starts,
-    int* cta_valid_rows) {
+    int* cta_valid_rows,
+    int* cta_m_limits,
+    int* permuted_token_indices,
+    int* sorted_to_permuted_indices,
+    int active_selection_count) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
 
+  for (int sorted_index = 0; sorted_index < active_selection_count; ++sorted_index) {
+    sorted_to_permuted_indices[sorted_index] = -1;
+  }
+  for (int padded_index = 0; padded_index < current_padded_row_capacity; ++padded_index) {
+    permuted_token_indices[padded_index] = -1;
+  }
   const int active_count = *active_expert_count;
   int write_index = 0;
   int padded_rows = 0;
@@ -106,12 +131,29 @@ __global__ void BuildLaunchPlanKernel(
         return;
       }
       const int remaining_rows = end - row_start;
-      cta_expert_ids[write_index] = expert_index;
-      cta_row_starts[write_index] = row_start;
-      cta_valid_rows[write_index] =
+      const int valid_rows =
           remaining_rows < static_cast<int>(kMoeLaunchPlanTokenTile)
               ? remaining_rows
               : static_cast<int>(kMoeLaunchPlanTokenTile);
+      cta_expert_ids[write_index] = expert_index;
+      cta_row_starts[write_index] = row_start;
+      cta_valid_rows[write_index] = valid_rows;
+      cta_m_limits[write_index] =
+          static_cast<int>(write_index * static_cast<int>(kMoeLaunchPlanTokenTile)) + valid_rows;
+      const int padded_base =
+          static_cast<int>(write_index * static_cast<int>(kMoeLaunchPlanTokenTile));
+      if ((padded_base + static_cast<int>(kMoeLaunchPlanTokenTile)) > current_padded_row_capacity) {
+        *cta_count = current_cta_capacity + 1;
+        *total_padded_rows = padded_rows;
+        return;
+      }
+      for (int token_offset = 0; token_offset < static_cast<int>(kMoeLaunchPlanTokenTile); ++token_offset) {
+        if (token_offset < valid_rows) {
+          const int sorted_index = row_start + token_offset;
+          permuted_token_indices[padded_base + token_offset] = sorted_token_indices[sorted_index];
+          sorted_to_permuted_indices[sorted_index] = padded_base + token_offset;
+        }
+      }
       ++write_index;
       padded_rows += static_cast<int>(kMoeLaunchPlanTokenTile);
     }
@@ -139,7 +181,11 @@ std::optional<std::size_t> DeviceMoeLaunchPlan::Bytes(
     std::size_t n_experts,
     std::size_t selection_count) {
   const auto cta_capacity = CtaCapacity(n_experts, selection_count);
+  const auto padded_row_capacity = PaddedRowCapacity(n_experts, selection_count);
   if (!cta_capacity.has_value()) {
+    return std::nullopt;
+  }
+  if (!padded_row_capacity.has_value()) {
     return std::nullopt;
   }
 
@@ -160,20 +206,37 @@ std::optional<std::size_t> DeviceMoeLaunchPlan::Bytes(
                  add_bytes(sizeof(int)) &&
                  add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
                  add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
-                 add_bytes(CheckedMul(*cta_capacity, sizeof(int)))
+                 add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
+                 add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
+                 add_bytes(CheckedMul(*padded_row_capacity, sizeof(int)))
+                 &&
+                 add_bytes(CheckedMul(selection_count, sizeof(int)))
              ? std::optional<std::size_t>(total)
              : std::nullopt;
+}
+
+std::optional<std::size_t> DeviceMoeLaunchPlan::PaddedRowCapacity(
+    std::size_t n_experts,
+    std::size_t selection_count) {
+  const auto cta_capacity = CtaCapacity(n_experts, selection_count);
+  if (!cta_capacity.has_value()) {
+    return std::nullopt;
+  }
+  return CheckedMul(*cta_capacity, kMoeLaunchPlanTokenTile);
 }
 
 std::unique_ptr<DeviceMoeLaunchPlan> DeviceMoeLaunchPlan::Create(
     std::size_t n_experts,
     std::size_t selection_count) {
   const auto cta_capacity = CtaCapacity(n_experts, selection_count);
+  const auto padded_row_capacity = PaddedRowCapacity(n_experts, selection_count);
   if (!HasCudaDevice() ||
       !cta_capacity.has_value() ||
+      !padded_row_capacity.has_value() ||
       n_experts > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
       selection_count > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-      *cta_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      *cta_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      *padded_row_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return nullptr;
   }
 
@@ -181,6 +244,7 @@ std::unique_ptr<DeviceMoeLaunchPlan> DeviceMoeLaunchPlan::Create(
   impl->n_experts = n_experts;
   impl->selection_count = selection_count;
   impl->cta_capacity = *cta_capacity;
+  impl->padded_row_capacity = *padded_row_capacity;
 
   if (!AllocateDeviceBuffer(
           reinterpret_cast<void**>(&impl->cta_count),
@@ -196,7 +260,16 @@ std::unique_ptr<DeviceMoeLaunchPlan> DeviceMoeLaunchPlan::Create(
           *cta_capacity * sizeof(int)) ||
       !AllocateDeviceBuffer(
           reinterpret_cast<void**>(&impl->cta_valid_rows),
-          *cta_capacity * sizeof(int))) {
+          *cta_capacity * sizeof(int)) ||
+      !AllocateDeviceBuffer(
+          reinterpret_cast<void**>(&impl->cta_m_limits),
+          *cta_capacity * sizeof(int)) ||
+      !AllocateDeviceBuffer(
+          reinterpret_cast<void**>(&impl->permuted_token_indices),
+          *padded_row_capacity * sizeof(int)) ||
+      !AllocateDeviceBuffer(
+          reinterpret_cast<void**>(&impl->sorted_to_permuted_indices),
+          selection_count * sizeof(int))) {
     return nullptr;
   }
 
@@ -221,9 +294,13 @@ bool DeviceMoeLaunchPlan::valid() const {
          impl_->cta_expert_ids != nullptr &&
          impl_->cta_row_starts != nullptr &&
          impl_->cta_valid_rows != nullptr &&
+         impl_->cta_m_limits != nullptr &&
+         impl_->permuted_token_indices != nullptr &&
+         impl_->sorted_to_permuted_indices != nullptr &&
          impl_->n_experts > 0 &&
          impl_->selection_count > 0 &&
-         impl_->cta_capacity > 0;
+         impl_->cta_capacity > 0 &&
+         impl_->padded_row_capacity > 0;
 }
 
 std::size_t DeviceMoeLaunchPlan::n_experts() const {
@@ -236,6 +313,10 @@ std::size_t DeviceMoeLaunchPlan::selection_count() const {
 
 std::size_t DeviceMoeLaunchPlan::cta_capacity() const {
   return impl_ != nullptr ? impl_->cta_capacity : 0;
+}
+
+std::size_t DeviceMoeLaunchPlan::padded_row_capacity() const {
+  return impl_ != nullptr ? impl_->padded_row_capacity : 0;
 }
 
 int* DeviceMoeLaunchPlan::cta_count() const {
@@ -258,6 +339,18 @@ int* DeviceMoeLaunchPlan::cta_valid_rows() const {
   return impl_ != nullptr ? impl_->cta_valid_rows : nullptr;
 }
 
+int* DeviceMoeLaunchPlan::cta_m_limits() const {
+  return impl_ != nullptr ? impl_->cta_m_limits : nullptr;
+}
+
+int* DeviceMoeLaunchPlan::permuted_token_indices() const {
+  return impl_ != nullptr ? impl_->permuted_token_indices : nullptr;
+}
+
+int* DeviceMoeLaunchPlan::sorted_to_permuted_indices() const {
+  return impl_ != nullptr ? impl_->sorted_to_permuted_indices : nullptr;
+}
+
 bool BuildDeviceMoeLaunchPlan(
     const DeviceExpertRouting& routing,
     std::size_t active_selection_count,
@@ -274,7 +367,11 @@ bool BuildDeviceMoeLaunchPlan(
       plan->cta_expert_ids() == nullptr ||
       plan->cta_row_starts() == nullptr ||
       plan->cta_valid_rows() == nullptr ||
+      plan->cta_m_limits() == nullptr ||
+      plan->permuted_token_indices() == nullptr ||
+      plan->sorted_to_permuted_indices() == nullptr ||
       routing.expert_offsets() == nullptr ||
+      routing.sorted_token_indices() == nullptr ||
       routing.active_expert_count() == nullptr ||
       routing.active_expert_ids() == nullptr) {
     return false;
@@ -282,23 +379,34 @@ bool BuildDeviceMoeLaunchPlan(
 
   const auto current_cta_capacity =
       DeviceMoeLaunchPlan::CtaCapacity(plan->n_experts(), active_selection_count);
+  const auto current_padded_row_capacity =
+      DeviceMoeLaunchPlan::PaddedRowCapacity(plan->n_experts(), active_selection_count);
   if (!current_cta_capacity.has_value() ||
+      !current_padded_row_capacity.has_value() ||
       *current_cta_capacity == 0 ||
       *current_cta_capacity > plan->cta_capacity() ||
+      *current_padded_row_capacity == 0 ||
+      *current_padded_row_capacity > plan->padded_row_capacity() ||
       *current_cta_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return false;
   }
 
   BuildLaunchPlanKernel<<<1, 1>>>(
       routing.expert_offsets(),
+      routing.sorted_token_indices(),
       routing.active_expert_count(),
       routing.active_expert_ids(),
       static_cast<int>(*current_cta_capacity),
+      static_cast<int>(*current_padded_row_capacity),
       plan->cta_count(),
       plan->total_padded_rows(),
       plan->cta_expert_ids(),
       plan->cta_row_starts(),
-      plan->cta_valid_rows());
+      plan->cta_valid_rows(),
+      plan->cta_m_limits(),
+      plan->permuted_token_indices(),
+      plan->sorted_to_permuted_indices(),
+      static_cast<int>(active_selection_count));
   return CheckCuda(cudaGetLastError());
 }
 

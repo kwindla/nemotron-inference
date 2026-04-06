@@ -1206,6 +1206,8 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   DeviceTensorFp32* expert_up_scratch = ResolveFusedPrefillExpertUpScratch();
   DeviceTensorFp32* shared_up_scratch = ResolveFusedPrefillSharedUpScratch();
   const std::size_t selection_count = token_count * config.top_k;
+  const auto padded_selection_count =
+      DeviceMoeLaunchPlan::PaddedRowCapacity(config.n_routed_experts, selection_count);
   const auto routed_output_shape =
       routed_output_scratch != nullptr ? routed_output_scratch->shape() : std::vector<std::size_t>{};
   const auto gather_shape =
@@ -1217,6 +1219,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   if (routing == nullptr ||
       launch_plan == nullptr ||
       !launch_plan->valid() ||
+      !padded_selection_count.has_value() ||
       launch_plan->selection_count() < selection_count ||
       !routing->valid() ||
       routing->selection_count() < selection_count ||
@@ -1228,12 +1231,12 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       gather_scratch == nullptr ||
       !gather_scratch->valid() ||
       gather_shape.size() != 2 ||
-      gather_shape[0] < selection_count ||
+      gather_shape[0] < *padded_selection_count ||
       gather_shape[1] != config.hidden_size ||
       expert_up_scratch == nullptr ||
       !expert_up_scratch->valid() ||
       expert_up_shape.size() != 2 ||
-      expert_up_shape[0] < selection_count ||
+      expert_up_shape[0] < *padded_selection_count ||
       expert_up_shape[1] != config.routed_expert_intermediate_size ||
       shared_up_scratch == nullptr ||
       !shared_up_scratch->valid() ||
@@ -2059,6 +2062,11 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   }
 
   const std::size_t max_selection_count = config.max_token_count * config.top_k;
+  const auto max_padded_selection_count =
+      DeviceMoeLaunchPlan::PaddedRowCapacity(config.n_routed_experts, max_selection_count);
+  if (!max_padded_selection_count.has_value()) {
+    return debug_fail("fused prefill padded selection capacity computation failed");
+  }
   std::unique_ptr<DeviceTensorInt32> device_topk_ids;
   std::unique_ptr<DeviceTensorFp32> device_topk_weights;
   std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
@@ -2089,15 +2097,18 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     fused_prefill_routed_output_scratch =
         DeviceTensorFp32::Create({config.max_token_count, config.hidden_size});
     fused_prefill_gather_scratch =
-        DeviceTensorFp32::Create({max_selection_count, config.hidden_size});
+        DeviceTensorFp32::Create({*max_padded_selection_count, config.hidden_size});
     fused_prefill_expert_up_scratch = DeviceTensorFp32::Create(
-        {max_selection_count, config.routed_expert_intermediate_size});
+        {*max_padded_selection_count, config.routed_expert_intermediate_size});
     fused_prefill_shared_up_scratch = DeviceTensorFp32::Create(
         {config.max_token_count, config.shared_expert_intermediate_size});
     fused_prefill_gather_pack =
-        DeviceNvfp4Matrix::Create(max_selection_count, config.hidden_size, pack_scale_layout);
+        DeviceNvfp4Matrix::Create(
+            *max_padded_selection_count,
+            config.hidden_size,
+            pack_scale_layout);
     fused_prefill_expert_up_pack = DeviceNvfp4Matrix::Create(
-        max_selection_count,
+        *max_padded_selection_count,
         config.routed_expert_intermediate_size,
         pack_scale_layout);
     fused_prefill_shared_up_pack = DeviceNvfp4Matrix::Create(

@@ -136,7 +136,10 @@ bool RunLaunchPlanCase(
     const std::vector<float>& selected_weights_host,
     const std::vector<int>& expected_expert_ids,
     const std::vector<int>& expected_row_starts,
-    const std::vector<int>& expected_valid_rows) {
+    const std::vector<int>& expected_valid_rows,
+    const std::vector<int>& expected_m_limits,
+    const std::vector<int>& expected_permuted_token_indices,
+    const std::vector<int>& expected_sorted_to_permuted_indices) {
   const std::size_t selection_count = token_count * top_k;
   auto selected_indices_device = DeviceBuffer<int>::Create(selection_count);
   auto selected_weights_device = DeviceBuffer<float>::Create(selection_count);
@@ -178,6 +181,9 @@ bool RunLaunchPlanCase(
   std::vector<int> cta_expert_ids;
   std::vector<int> cta_row_starts;
   std::vector<int> cta_valid_rows;
+  std::vector<int> cta_m_limits;
+  std::vector<int> permuted_token_indices;
+  std::vector<int> sorted_to_permuted_indices;
   if (!Expect(
           CopyDeviceValues(launch_plan->cta_count(), 1, &cta_count),
           "cta_count should download") ||
@@ -201,7 +207,25 @@ bool RunLaunchPlanCase(
               launch_plan->cta_valid_rows(),
               launch_plan->cta_capacity(),
               &cta_valid_rows),
-          "cta_valid_rows should download")) {
+          "cta_valid_rows should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->cta_m_limits(),
+              launch_plan->cta_capacity(),
+              &cta_m_limits),
+          "cta_m_limits should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->permuted_token_indices(),
+              launch_plan->cta_capacity() * nemotron::kMoeLaunchPlanTokenTile,
+              &permuted_token_indices),
+          "permuted_token_indices should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->sorted_to_permuted_indices(),
+              selection_count,
+              &sorted_to_permuted_indices),
+          "sorted_to_permuted_indices should download")) {
     return false;
   }
 
@@ -225,7 +249,19 @@ bool RunLaunchPlanCase(
          ExpectVectorPrefix(
              cta_valid_rows,
              expected_valid_rows,
-             "cta_valid_rows");
+             "cta_valid_rows") &&
+         ExpectVectorPrefix(
+             cta_m_limits,
+             expected_m_limits,
+             "cta_m_limits") &&
+         ExpectVectorPrefix(
+             permuted_token_indices,
+             expected_permuted_token_indices,
+             "permuted_token_indices") &&
+         ExpectVectorPrefix(
+             sorted_to_permuted_indices,
+             expected_sorted_to_permuted_indices,
+             "sorted_to_permuted_indices");
 }
 
 bool RunLaunchPlanValidationCase() {
@@ -258,6 +294,15 @@ int main() {
   const std::vector<int> small_expected_expert_ids = {1, 3, 4};
   const std::vector<int> small_expected_row_starts = {0, 3, 6};
   const std::vector<int> small_expected_valid_rows = {3, 3, 2};
+  const std::vector<int> small_expected_m_limits = {3, 11, 18};
+  const std::vector<int> small_expected_permuted_token_indices = {
+      0, 1, 3, -1, -1, -1, -1, -1,
+      0, 1, 2, -1, -1, -1, -1, -1,
+      2, 3, -1, -1, -1, -1, -1, -1,
+  };
+  const std::vector<int> small_expected_sorted_to_permuted_indices = {
+      0, 1, 2, 8, 9, 10, 16, 17,
+  };
 
   std::vector<int> multi_tile_selected_indices;
   std::vector<float> multi_tile_selected_weights;
@@ -276,6 +321,19 @@ int main() {
   const std::vector<int> multi_tile_expected_expert_ids = {0, 0, 1, 2, 2};
   const std::vector<int> multi_tile_expected_row_starts = {0, 8, 9, 10, 18};
   const std::vector<int> multi_tile_expected_valid_rows = {8, 1, 1, 8, 2};
+  const std::vector<int> multi_tile_expected_m_limits = {8, 9, 17, 32, 34};
+  const std::vector<int> multi_tile_expected_permuted_token_indices = {
+      0, 0, 0, 0, 1, 1, 1, 1,
+      2, -1, -1, -1, -1, -1, -1, -1,
+      4, -1, -1, -1, -1, -1, -1, -1,
+      2, 2, 2, 3, 3, 3, 3, 4,
+      4, 4, -1, -1, -1, -1, -1, -1,
+  };
+  const std::vector<int> multi_tile_expected_sorted_to_permuted_indices = {
+      0, 1, 2, 3, 4, 5, 6, 7,
+      8, 16, 24, 25, 26, 27, 28, 29,
+      30, 31, 32, 33,
+  };
 
   if (!RunLaunchPlanValidationCase() ||
       !RunLaunchPlanCase(
@@ -286,7 +344,10 @@ int main() {
           small_selected_weights,
           small_expected_expert_ids,
           small_expected_row_starts,
-          small_expected_valid_rows) ||
+          small_expected_valid_rows,
+          small_expected_m_limits,
+          small_expected_permuted_token_indices,
+          small_expected_sorted_to_permuted_indices) ||
       !RunLaunchPlanCase(
           4,
           5,
@@ -295,7 +356,10 @@ int main() {
           multi_tile_selected_weights,
           multi_tile_expected_expert_ids,
           multi_tile_expected_row_starts,
-          multi_tile_expected_valid_rows)) {
+          multi_tile_expected_valid_rows,
+          multi_tile_expected_m_limits,
+          multi_tile_expected_permuted_token_indices,
+          multi_tile_expected_sorted_to_permuted_indices)) {
     return 1;
   }
 

@@ -15,6 +15,9 @@ class DeviceMoeLaunchPlan {
   static std::optional<std::size_t> CtaCapacity(
       std::size_t n_experts,
       std::size_t selection_count);
+  static std::optional<std::size_t> PaddedRowCapacity(
+      std::size_t n_experts,
+      std::size_t selection_count);
   static std::optional<std::size_t> Bytes(
       std::size_t n_experts,
       std::size_t selection_count);
@@ -33,12 +36,16 @@ class DeviceMoeLaunchPlan {
   std::size_t n_experts() const;
   std::size_t selection_count() const;
   std::size_t cta_capacity() const;
+  std::size_t padded_row_capacity() const;
 
   int* cta_count() const;
   int* total_padded_rows() const;
   int* cta_expert_ids() const;
   int* cta_row_starts() const;
   int* cta_valid_rows() const;
+  int* cta_m_limits() const;
+  int* permuted_token_indices() const;
+  int* sorted_to_permuted_indices() const;
 
  private:
   struct Impl;

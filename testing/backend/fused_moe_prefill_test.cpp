@@ -752,11 +752,14 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       DeviceMoeLaunchPlan::Create(
           test_case.n_routed_experts,
           test_case.token_count * test_case.top_k);
+  const auto padded_selection_count = DeviceMoeLaunchPlan::PaddedRowCapacity(
+      test_case.n_routed_experts,
+      test_case.token_count * test_case.top_k);
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
-          {test_case.token_count * test_case.top_k, test_case.hidden_size});
+          {padded_selection_count.value_or(0), test_case.hidden_size});
   auto routed_up_scratch = DeviceTensorFp32::Create(
-      {test_case.token_count * test_case.top_k,
+      {padded_selection_count.value_or(0),
        test_case.routed_expert_intermediate_size});
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
@@ -772,6 +775,7 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               routing->valid() &&
               launch_plan != nullptr &&
               launch_plan->valid() &&
+              padded_selection_count.has_value() &&
               routed_gather_scratch != nullptr &&
               routed_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
@@ -954,11 +958,14 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
       DeviceMoeLaunchPlan::Create(
           test_case.n_routed_experts,
           test_case.token_count * test_case.top_k);
+  const auto padded_selection_count = DeviceMoeLaunchPlan::PaddedRowCapacity(
+      test_case.n_routed_experts,
+      test_case.token_count * test_case.top_k);
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
-          {test_case.token_count * test_case.top_k, test_case.hidden_size});
+          {padded_selection_count.value_or(0), test_case.hidden_size});
   auto routed_up_scratch = DeviceTensorFp32::Create(
-      {test_case.token_count * test_case.top_k,
+      {padded_selection_count.value_or(0),
        test_case.routed_expert_intermediate_size});
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
@@ -974,6 +981,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               routing->valid() &&
               launch_plan != nullptr &&
               launch_plan->valid() &&
+              padded_selection_count.has_value() &&
               routed_gather_scratch != nullptr &&
               routed_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
