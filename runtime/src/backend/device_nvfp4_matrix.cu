@@ -365,7 +365,7 @@ bool DeviceNvfp4Matrix::PackInto(
   const std::size_t cols = source.shape()[1];
   const Nvfp4ScaleLayout scale_layout =
       ResolveActivationNvfp4ScaleLayout(rows, options.execution_scale_layout);
-  if (rows != impl_->rows ||
+  if (rows > impl_->rows ||
       cols != impl_->cols ||
       scale_layout != impl_->scale_layout) {
     return false;

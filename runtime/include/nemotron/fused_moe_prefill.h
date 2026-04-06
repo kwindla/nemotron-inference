@@ -7,6 +7,7 @@
 namespace nemotron {
 
 class CublasLtHandle;
+class DeviceNvfp4Matrix;
 class GemmHeuristicCache;
 struct GemmDescriptor;
 
@@ -26,6 +27,8 @@ struct FusedMoePrefillParams {
   const GemmDescriptor* const* routed_down_descriptors = nullptr;
   FusedNvfp4WeightView shared_up;
   FusedNvfp4WeightView shared_down;
+  // Host-side arrays indexed by expert id. The views themselves point at
+  // resident device weights.
   const FusedNvfp4WeightView* routed_up = nullptr;
   const FusedNvfp4WeightView* routed_down = nullptr;
   const float* input = nullptr;
@@ -35,11 +38,12 @@ struct FusedMoePrefillParams {
   float* gather_scratch = nullptr;
   float* expert_up_scratch = nullptr;
   float* shared_up_scratch = nullptr;
+  DeviceNvfp4Matrix* gather_pack = nullptr;
+  DeviceNvfp4Matrix* expert_up_pack = nullptr;
+  DeviceNvfp4Matrix* shared_up_pack = nullptr;
   const int* expert_offsets = nullptr;
   const int* sorted_token_indices = nullptr;
   const float* sorted_token_weights = nullptr;
-  const int* active_expert_count = nullptr;
-  const int* active_expert_ids = nullptr;
 };
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params);

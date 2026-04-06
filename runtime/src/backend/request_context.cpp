@@ -34,6 +34,31 @@ std::optional<std::size_t> MatrixBytes(
   return CheckedMul(*numel, element_bytes);
 }
 
+std::optional<std::size_t> Nvfp4MatrixBytes(
+    std::size_t rows,
+    std::size_t cols,
+    Nvfp4ScaleLayout scale_layout) {
+  std::size_t total = 0;
+  const auto add_bytes = [&](std::size_t bytes) -> bool {
+    const auto next_total = CheckedAdd(total, bytes);
+    if (!next_total.has_value()) {
+      return false;
+    }
+    total = *next_total;
+    return true;
+  };
+  return add_bytes(PackedFp4Bytes(rows, cols)) &&
+                 add_bytes(RowMajorNvfp4ScaleBytes(rows, cols)) &&
+                 add_bytes(ExecutionNvfp4ScaleBytes(rows, cols, scale_layout)) &&
+                 add_bytes(sizeof(float))
+             ? std::optional<std::size_t>(total)
+             : std::nullopt;
+}
+
+Nvfp4ScaleLayout MoePrefillPackScaleLayout() {
+  return Nvfp4ScaleLayout::kSwizzled128x4;
+}
+
 bool WorkspaceConfigSupported(const MoePrefillWorkspaceConfig& config) {
   return config.hidden_size != 0 &&
          config.num_experts != 0 &&
@@ -63,9 +88,7 @@ std::optional<std::size_t> DeviceExpertRoutingBytes(
   return add_bytes(n_experts, sizeof(int)) &&
                  add_bytes(n_experts + 1, sizeof(int)) &&
                  add_bytes(selection_count, sizeof(int)) &&
-                 add_bytes(selection_count, sizeof(float)) &&
-                 add_bytes(1, sizeof(int)) &&
-                 add_bytes(n_experts, sizeof(int))
+                 add_bytes(selection_count, sizeof(float))
              ? std::optional<std::size_t>(total)
              : std::nullopt;
 }
@@ -151,6 +174,7 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
   if (!selection_capacity.has_value()) {
     return std::nullopt;
   }
+  const Nvfp4ScaleLayout pack_scale_layout = MoePrefillPackScaleLayout();
 
   std::size_t total = 0;
   const auto add_bytes = [&](std::optional<std::size_t> bytes) -> bool {
@@ -182,7 +206,19 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(
                      token_capacity,
                      config.shared_expert_intermediate_size,
-                     sizeof(float)))
+                     sizeof(float))) &&
+                 add_bytes(Nvfp4MatrixBytes(
+                     *selection_capacity,
+                     config.hidden_size,
+                     pack_scale_layout)) &&
+                 add_bytes(Nvfp4MatrixBytes(
+                     *selection_capacity,
+                     config.routed_expert_intermediate_size,
+                     pack_scale_layout)) &&
+                 add_bytes(Nvfp4MatrixBytes(
+                     token_capacity,
+                     config.shared_expert_intermediate_size,
+                     pack_scale_layout))
              ? std::optional<std::size_t>(total)
              : std::nullopt;
 }
@@ -195,6 +231,7 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   }
 
   const std::size_t selection_capacity = token_capacity * config.top_k;
+  const Nvfp4ScaleLayout pack_scale_layout = MoePrefillPackScaleLayout();
   auto workspace = std::make_unique<MoePrefillWorkspace>();
   workspace->config = config;
   workspace->token_capacity_value = token_capacity;
@@ -215,6 +252,16 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       DeviceTensorFp32::Create({selection_capacity, config.routed_expert_intermediate_size});
   workspace->fused_prefill_shared_up_scratch =
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
+  workspace->fused_prefill_gather_pack =
+      DeviceNvfp4Matrix::Create(selection_capacity, config.hidden_size, pack_scale_layout);
+  workspace->fused_prefill_expert_up_pack = DeviceNvfp4Matrix::Create(
+      selection_capacity,
+      config.routed_expert_intermediate_size,
+      pack_scale_layout);
+  workspace->fused_prefill_shared_up_pack = DeviceNvfp4Matrix::Create(
+      token_capacity,
+      config.shared_expert_intermediate_size,
+      pack_scale_layout);
   if (!workspace->valid()) {
     return nullptr;
   }
@@ -255,7 +302,19 @@ bool MoePrefillWorkspace::valid() const {
          TensorMatchesShape(
              fused_prefill_shared_up_scratch.get(),
              token_capacity_value,
-             config.shared_expert_intermediate_size);
+             config.shared_expert_intermediate_size) &&
+         fused_prefill_gather_pack != nullptr &&
+         fused_prefill_gather_pack->valid() &&
+         fused_prefill_gather_pack->rows() >= selection_capacity &&
+         fused_prefill_gather_pack->cols() == config.hidden_size &&
+         fused_prefill_expert_up_pack != nullptr &&
+         fused_prefill_expert_up_pack->valid() &&
+         fused_prefill_expert_up_pack->rows() >= selection_capacity &&
+         fused_prefill_expert_up_pack->cols() == config.routed_expert_intermediate_size &&
+         fused_prefill_shared_up_pack != nullptr &&
+         fused_prefill_shared_up_pack->valid() &&
+         fused_prefill_shared_up_pack->rows() >= token_capacity_value &&
+         fused_prefill_shared_up_pack->cols() == config.shared_expert_intermediate_size;
 }
 
 std::size_t MoePrefillWorkspace::token_capacity() const {

@@ -109,6 +109,7 @@ std::optional<CublasLtGemmPlan> BuildRuntimeNvfp4GemmPlan(
 }  // namespace
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
+  const std::size_t selection_count = params.token_count * params.top_k;
   if (params.cublas_handle == nullptr ||
       !params.cublas_handle->valid() ||
       params.token_count == 0 ||
@@ -135,11 +136,21 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       params.gather_scratch == nullptr ||
       params.expert_up_scratch == nullptr ||
       params.shared_up_scratch == nullptr ||
+      params.gather_pack == nullptr ||
+      params.expert_up_pack == nullptr ||
+      params.shared_up_pack == nullptr ||
+      !params.gather_pack->valid() ||
+      !params.expert_up_pack->valid() ||
+      !params.shared_up_pack->valid() ||
+      params.gather_pack->rows() < selection_count ||
+      params.gather_pack->cols() != params.hidden_size ||
+      params.expert_up_pack->rows() < selection_count ||
+      params.expert_up_pack->cols() != params.routed_expert_intermediate_size ||
+      params.shared_up_pack->rows() < params.token_count ||
+      params.shared_up_pack->cols() != params.shared_expert_intermediate_size ||
       params.expert_offsets == nullptr ||
       params.sorted_token_indices == nullptr ||
-      params.sorted_token_weights == nullptr ||
-      params.active_expert_count == nullptr ||
-      params.active_expert_ids == nullptr) {
+      params.sorted_token_weights == nullptr) {
     return false;
   }
 
@@ -159,17 +170,6 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  int active_expert_count = 0;
-  if (!CheckCuda(cudaMemcpy(
-          &active_expert_count,
-          params.active_expert_count,
-          sizeof(active_expert_count),
-          cudaMemcpyDeviceToHost)) ||
-      active_expert_count < 0 ||
-      static_cast<std::size_t>(active_expert_count) > params.n_routed_experts) {
-    return false;
-  }
-
   std::vector<int> expert_offsets_host;
   if (!CopyDeviceBufferToHost(
           params.expert_offsets,
@@ -179,59 +179,38 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  const std::size_t selection_count = params.token_count * params.top_k;
   if (expert_offsets_host.front() != 0 ||
       expert_offsets_host.back() < 0 ||
       static_cast<std::size_t>(expert_offsets_host.back()) > selection_count) {
     return false;
   }
+
+  std::vector<int> active_expert_ids_host;
+  active_expert_ids_host.reserve(params.n_routed_experts);
   for (std::size_t expert_index = 0; expert_index < params.n_routed_experts; ++expert_index) {
     if (expert_offsets_host[expert_index] > expert_offsets_host[expert_index + 1]) {
       return false;
     }
-  }
-
-  std::vector<int> active_expert_ids_host;
-  if (active_expert_count > 0 &&
-      (!CopyDeviceBufferToHost(
-           params.active_expert_ids,
-           static_cast<std::size_t>(active_expert_count),
-           &active_expert_ids_host) ||
-       active_expert_ids_host.size() != static_cast<std::size_t>(active_expert_count))) {
-    return false;
-  }
-
-  // routed_up / routed_down are device arrays of FusedNvfp4WeightView.
-  // Copy them to host so we can read per-expert views for GEMM plan building.
-  std::vector<FusedNvfp4WeightView> routed_up_host;
-  std::vector<FusedNvfp4WeightView> routed_down_host;
-  if (!CopyDeviceBufferToHost(
-          params.routed_up,
-          params.n_routed_experts,
-          &routed_up_host) ||
-      !CopyDeviceBufferToHost(
-          params.routed_down,
-          params.n_routed_experts,
-          &routed_down_host)) {
-    return false;
+    if (expert_offsets_host[expert_index] != expert_offsets_host[expert_index + 1]) {
+      active_expert_ids_host.push_back(static_cast<int>(expert_index));
+    }
   }
 
   const Nvfp4PackOptions pack_options = RuntimeMoeNvfp4PackOptions();
-  for (int active_slot = 0; active_slot < active_expert_count; ++active_slot) {
-    const int expert_id_int = active_expert_ids_host[active_slot];
+  for (int expert_id_int : active_expert_ids_host) {
     if (expert_id_int < 0) {
       return false;
     }
     const std::size_t expert_id = static_cast<std::size_t>(expert_id_int);
     if (expert_id >= params.n_routed_experts ||
-        !ValidFusedNvfp4WeightView(routed_up_host[expert_id]) ||
-        !ValidFusedNvfp4WeightView(routed_down_host[expert_id]) ||
+        !ValidFusedNvfp4WeightView(params.routed_up[expert_id]) ||
+        !ValidFusedNvfp4WeightView(params.routed_down[expert_id]) ||
         !DescriptorMatchesWeightView(
             params.routed_up_descriptors[expert_id],
-            routed_up_host[expert_id]) ||
+            params.routed_up[expert_id]) ||
         !DescriptorMatchesWeightView(
             params.routed_down_descriptors[expert_id],
-            routed_down_host[expert_id])) {
+            params.routed_down[expert_id])) {
       return false;
     }
 
@@ -260,9 +239,9 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     }
 
     const Nvfp4PackedMatrixDeviceView up_weight_view =
-        MakeNvfp4PackedMatrixDeviceView(routed_up_host[expert_id]);
+        MakeNvfp4PackedMatrixDeviceView(params.routed_up[expert_id]);
     const Nvfp4PackedMatrixDeviceView down_weight_view =
-        MakeNvfp4PackedMatrixDeviceView(routed_down_host[expert_id]);
+        MakeNvfp4PackedMatrixDeviceView(params.routed_down[expert_id]);
     const auto routed_up_plan = BuildRuntimeNvfp4GemmPlan(
         *params.routed_up_descriptors[expert_id],
         up_weight_view,
@@ -281,22 +260,26 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
              *normalized,
              params.sorted_token_indices + expert_offset,
              gather_view.get()) ||
-        !RunNvfp4RowMajorFp32SourceToDevice(
+        !params.gather_pack->PackInto(*gather_view, pack_options) ||
+        !RunNvfp4RowMajorFp32AccumToDevice(
              *params.cublas_handle,
              *routed_up_plan,
-             *gather_view,
+             MakeNvfp4PackedMatrixDeviceView(*params.gather_pack, expert_token_count),
+             params.gather_pack->device_tensor_scale_ptr(),
              up_weight_view,
-             expert_up_view.get(),
-             pack_options)
+             up_weight_view.tensor_scale_data,
+             expert_up_view.get())
              .has_value() ||
         !Relu2InPlaceFp32(expert_up_view.get()) ||
-        !RunNvfp4RowMajorFp32SourceToDevice(
+        !params.expert_up_pack->PackInto(*expert_up_view, pack_options) ||
+        !RunNvfp4RowMajorFp32AccumToDevice(
              *params.cublas_handle,
              *routed_down_plan,
-             *expert_up_view,
+             MakeNvfp4PackedMatrixDeviceView(*params.expert_up_pack, expert_token_count),
+             params.expert_up_pack->device_tensor_scale_ptr(),
              down_weight_view,
-             gather_view.get(),
-             pack_options)
+             down_weight_view.tensor_scale_data,
+             gather_view.get())
              .has_value() ||
         !ScatterAddWeightedRowsFp32(
              *gather_view,
@@ -325,22 +308,26 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       !shared_down_weight_view.valid() ||
       !shared_up_plan.has_value() ||
       !shared_down_plan.has_value() ||
-      !RunNvfp4RowMajorFp32SourceToDevice(
+      !params.gather_pack->PackInto(*normalized, pack_options) ||
+      !RunNvfp4RowMajorFp32AccumToDevice(
            *params.cublas_handle,
            *shared_up_plan,
-           *normalized,
+           MakeNvfp4PackedMatrixDeviceView(*params.gather_pack, params.token_count),
+           params.gather_pack->device_tensor_scale_ptr(),
            shared_up_weight_view,
-           shared_up.get(),
-           pack_options)
+           shared_up_weight_view.tensor_scale_data,
+           shared_up.get())
            .has_value() ||
       !Relu2InPlaceFp32(shared_up.get()) ||
-      !RunNvfp4RowMajorFp32SourceToDevice(
+      !params.shared_up_pack->PackInto(*shared_up, pack_options) ||
+      !RunNvfp4RowMajorFp32AccumToDevice(
            *params.cublas_handle,
            *shared_down_plan,
-           *shared_up,
+           MakeNvfp4PackedMatrixDeviceView(*params.shared_up_pack, params.token_count),
+           params.shared_up_pack->device_tensor_scale_ptr(),
            shared_down_weight_view,
-           output.get(),
-           pack_options)
+           shared_down_weight_view.tensor_scale_data,
+           output.get())
            .has_value() ||
       // The caller already updated the BF16 residual buffer at the layer entry.
       // This path must return only the MoE delta, not input + delta.

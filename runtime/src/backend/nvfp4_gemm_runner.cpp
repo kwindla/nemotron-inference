@@ -522,13 +522,6 @@ std::optional<PreparedNvfp4MatmulCall> PrepareNvfp4MatmulCall(
     return std::nullopt;
   }
 
-  // Cached resources include a mutable op descriptor and reusable device alpha
-  // buffer. Wait for prior launches that may still be consuming them before we
-  // retarget scale pointers or rewrite alpha for the next matmul.
-  if (!CheckCuda(cudaStreamSynchronize(nullptr))) {
-    return std::nullopt;
-  }
-
   if (!check_cublas(
           cublasLtMatmulDescSetAttribute(
               resources->op_desc,
@@ -635,14 +628,23 @@ Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Wei
 }
 
 Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Matrix& matrix) {
+  return MakeNvfp4PackedMatrixDeviceView(matrix, matrix.rows());
+}
+
+Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(
+    const DeviceNvfp4Matrix& matrix,
+    std::size_t rows) {
+  if (rows == 0 || rows > matrix.rows()) {
+    return {};
+  }
   return Nvfp4PackedMatrixDeviceView{
       matrix.packed_data(),
-      matrix.packed_nbytes(),
+      PackedFp4Bytes(rows, matrix.cols()),
       matrix.matmul_block_scales_data(),
-      matrix.matmul_block_scales_nbytes(),
+      ExecutionNvfp4ScaleBytes(rows, matrix.cols(), matrix.scale_layout()),
       matrix.device_tensor_scale_ptr(),
       matrix.tensor_scale_nbytes(),
-      matrix.rows(),
+      rows,
       matrix.cols(),
   };
 }

@@ -28,6 +28,9 @@ struct Nvfp4PackedMatrixDeviceView {
 
 Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Weight& matrix);
 Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(const DeviceNvfp4Matrix& matrix);
+Nvfp4PackedMatrixDeviceView MakeNvfp4PackedMatrixDeviceView(
+    const DeviceNvfp4Matrix& matrix,
+    std::size_t rows);
 
 struct Nvfp4RowMajorDeviceStats {
   std::size_t rows = 0;

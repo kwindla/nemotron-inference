@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 
+#include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/expert_routing_device.h"
 #include "nemotron/paged_kv_cache.h"
@@ -56,6 +57,9 @@ struct MoePrefillWorkspace {
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
+  std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_gather_pack;
+  std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_expert_up_pack;
+  std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_shared_up_pack;
 };
 
 class RequestExecutionContext {
