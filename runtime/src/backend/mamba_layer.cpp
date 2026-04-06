@@ -789,8 +789,7 @@ bool MambaLayerSlice::Run(
       }
     }
 
-    return run_output_projection() &&
-           cudaStreamSynchronize(nullptr) == cudaSuccess;
+    return run_output_projection();
   };
 
   if (token_count > 1 || trace != nullptr) {
@@ -819,8 +818,7 @@ bool MambaLayerSlice::Run(
   if (!RunFusedMambaDecode(fused_params, *projected, scan_output)) {
     return false;
   }
-  return run_output_projection() &&
-         cudaStreamSynchronize(nullptr) == cudaSuccess;
+  return run_output_projection();
 }
 
 bool MambaLayerSlice::Run(
@@ -848,7 +846,7 @@ bool MambaLayerSlice::Run(
           output_bf16.get(),
           trace) &&
       CastTensorBf16ToFp32(*output_bf16, output);
-  return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
+  return ok;
 }
 
 }  // namespace nemotron

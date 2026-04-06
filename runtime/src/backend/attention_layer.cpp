@@ -798,7 +798,7 @@ bool AttentionLayerSlice::Run(
     }
     return false;
   }
-  return cudaStreamSynchronize(nullptr) == cudaSuccess;
+  return true;
 }
 
 bool AttentionLayerSlice::Run(
@@ -830,7 +830,7 @@ bool AttentionLayerSlice::Run(
           residual_bf16.get(),
           output_bf16.get()) &&
       CastTensorBf16ToFp32(*output_bf16, output);
-  return ok && cudaStreamSynchronize(nullptr) == cudaSuccess;
+  return ok;
 }
 
 }  // namespace nemotron

@@ -423,8 +423,7 @@ bool UploadedLinearOp::Run(
         output_bf16 != nullptr &&
         CastTensorFp32ToBf16(activations, activations_bf16.get()) &&
         Run(handle, heuristic_cache, *activations_bf16, output_bf16.get()) &&
-        CastTensorBf16ToFp32(*output_bf16, output) &&
-        cudaStreamSynchronize(nullptr) == cudaSuccess;
+        CastTensorBf16ToFp32(*output_bf16, output);
     if (!bridge_ok && debug) {
       std::cerr << "linear_op: FP32 bridge via BF16 dense weight failed for "
                 << impl_->descriptor.tensor_name << "\n";
