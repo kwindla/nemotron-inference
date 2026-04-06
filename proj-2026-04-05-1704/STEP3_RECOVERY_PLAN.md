@@ -357,6 +357,52 @@ Immediate interpretation:
 
 This is the current baseline to beat for the routed-up replacement.
 
+## Routed-Up Standalone `ncu` Baseline
+
+Artifact:
+
+- `artifacts/profiles/nano_routed_up_20260406/ncu_routed_up_prefix128.csv`
+
+Profile target:
+
+- `nano_routed_up_bench --case prefix128`
+- kernel:
+  `Nvfp4GroupedExpertMatVecRowsKernel(const float*, const int*, unsigned long, const FusedNvfp4WeightView*, unsigned long, float*)`
+
+Key metrics:
+
+- block size `128`
+- grid size `14848`
+- registers per thread `48`
+- static shared memory per block `6144` bytes
+- theoretical occupancy `83.33%`
+- achieved occupancy `80.51%`
+- achieved active warps per SM `38.64`
+- eligible warps per scheduler `0.15`
+- issued warps per scheduler `0.11`
+- `No Eligible = 88.94%`
+- memory throughput about `23.24 GB/s`
+- DRAM throughput `1.32%` of peak
+
+Interpretation:
+
+- the current routed-up kernel is not primarily occupancy-limited
+- it is also still nowhere near a bandwidth limit
+- the dominant problem is issue starvation in a scalar dependency-heavy kernel
+  with very few eligible warps per cycle despite high achieved occupancy
+
+This matters because it changes the next optimization rule:
+
+- do not chase occupancy for its own sake
+- do not assume a larger shared-memory tile automatically helps
+- the next routed-up experiment needs a different math mechanism or much higher
+  instruction-level parallelism, not just a different launch geometry
+
+One attempted expert-major tile rewrite was tried and then reverted before
+landing because it regressed the routed-up microbench and temporarily broke the
+synthetic contract test. The result reinforces the point above: changing the
+block shape alone is not enough if the arithmetic core stays scalar.
+
 ### Benchmark Contract
 
 Fast iteration benchmarks:
