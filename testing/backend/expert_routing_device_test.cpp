@@ -542,6 +542,7 @@ void BuildCpuReference(
     std::vector<int>* expert_offsets,
     std::vector<int>* sorted_token_indices,
     std::vector<float>* sorted_token_weights,
+    std::vector<int>* selection_to_sorted,
     std::vector<int>* active_expert_ids) {
   const std::size_t selection_count = token_count * top_k;
   std::vector<int> expert_counts(n_experts, 0);
@@ -557,6 +558,7 @@ void BuildCpuReference(
 
   sorted_token_indices->assign(selection_count, 0);
   sorted_token_weights->assign(selection_count, 0.0f);
+  selection_to_sorted->assign(selection_count, -1);
   std::vector<int> write_offsets = *expert_offsets;
   for (std::size_t token_index = 0; token_index < token_count; ++token_index) {
     for (std::size_t slot = 0; slot < top_k; ++slot) {
@@ -567,6 +569,7 @@ void BuildCpuReference(
           static_cast<int>(token_index);
       (*sorted_token_weights)[static_cast<std::size_t>(write_index)] =
           selected_weights[selection_index];
+      (*selection_to_sorted)[selection_index] = write_index;
     }
   }
 
@@ -631,6 +634,7 @@ bool RunParityCase(
     std::vector<int> actual_expert_offsets;
     std::vector<int> actual_sorted_token_indices;
     std::vector<float> actual_sorted_token_weights;
+    std::vector<int> actual_selection_to_sorted;
     std::vector<int> actual_active_expert_count;
     std::vector<int> actual_active_expert_ids;
     if (!Expect(
@@ -653,6 +657,12 @@ bool RunParityCase(
             "sorted token weights download should succeed") ||
         !Expect(
             CopyDeviceValues(
+                routing->selection_to_sorted(),
+                selection_count,
+                &actual_selection_to_sorted),
+            "selection_to_sorted download should succeed") ||
+        !Expect(
+            CopyDeviceValues(
                 routing->active_expert_count(),
                 1,
                 &actual_active_expert_count),
@@ -669,6 +679,7 @@ bool RunParityCase(
     std::vector<int> expected_expert_offsets;
     std::vector<int> expected_sorted_token_indices;
     std::vector<float> expected_sorted_token_weights;
+    std::vector<int> expected_selection_to_sorted;
     std::vector<int> expected_active_expert_ids;
     BuildCpuReference(
         n_experts,
@@ -679,6 +690,7 @@ bool RunParityCase(
         &expected_expert_offsets,
         &expected_sorted_token_indices,
         &expected_sorted_token_weights,
+        &expected_selection_to_sorted,
         &expected_active_expert_ids);
 
     if (!ExpectEqualVector(
@@ -693,6 +705,10 @@ bool RunParityCase(
             MaxAbsDiff(actual_sorted_token_weights, expected_sorted_token_weights) ==
                 0.0f,
             "sorted_token_weights should match exactly") ||
+        !ExpectEqualVector(
+            actual_selection_to_sorted,
+            expected_selection_to_sorted,
+            "selection_to_sorted") ||
         !Expect(
             actual_active_expert_count.size() == 1,
             "active expert count should be scalar") ||

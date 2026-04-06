@@ -1,4 +1,5 @@
 #include "nemotron/device_tensor.h"
+#include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_prefill.h"
 #include "nemotron/monolithic_expert_weights.h"
 #include "nemotron/nvfp4_packing.h"
@@ -22,6 +23,7 @@ namespace {
 
 using nemotron::DeviceTensorFp32;
 using nemotron::DeviceTensorInt32;
+using nemotron::DeviceExpertRouting;
 using nemotron::FusedMoePrefillParams;
 using nemotron::FusedNvfp4WeightView;
 using nemotron::HostNvfp4Matrix;
@@ -114,6 +116,45 @@ std::optional<std::vector<float>> QuantizeDequantizeRow(
   }
   return DequantizeNvfp4Matrix(*packed);
 }
+
+template <typename T>
+class DeviceArray {
+ public:
+  static std::unique_ptr<DeviceArray> CopyFromHost(const std::vector<T>& values) {
+    if (values.empty()) {
+      return nullptr;
+    }
+    T* data = nullptr;
+    const std::size_t bytes = values.size() * sizeof(T);
+    if (cudaMalloc(reinterpret_cast<void**>(&data), bytes) != cudaSuccess) {
+      return nullptr;
+    }
+    if (cudaMemcpy(data, values.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+      cudaFree(data);
+      return nullptr;
+    }
+    return std::unique_ptr<DeviceArray>(new DeviceArray(data, values.size()));
+  }
+
+  ~DeviceArray() {
+    if (data_ != nullptr) {
+      cudaFree(data_);
+    }
+  }
+
+  DeviceArray(const DeviceArray&) = delete;
+  DeviceArray& operator=(const DeviceArray&) = delete;
+
+  const T* data() const {
+    return data_;
+  }
+
+ private:
+  DeviceArray(T* data, std::size_t size) : data_(data), size_(size) {}
+
+  T* data_ = nullptr;
+  std::size_t size_ = 0;
+};
 
 struct UploadedWeights {
   std::unique_ptr<MonolithicNvfp4ExpertWeights> storage;
@@ -375,6 +416,10 @@ bool TestFusedMoePrefillRejectsMissingSelectionContract() {
   auto output = DeviceTensorFp32::Create({1, kHiddenSize});
   auto topk_ids = DeviceTensorInt32::Create({1, 1});
   auto topk_weights = DeviceTensorFp32::Create({1, 1});
+  auto routing = DeviceExpertRouting::Create(1, 1);
+  auto routed_gather_scratch = DeviceTensorFp32::Create({1, kHiddenSize});
+  auto routed_up_scratch = DeviceTensorFp32::Create({1, kIntermediateSize});
+  auto shared_up_scratch = DeviceTensorFp32::Create({1, kIntermediateSize});
   const std::vector<float> input_host = MakePatternedValues(1, kHiddenSize, 17, 0.03125f);
   const std::vector<float> normalized_host = MakePatternedValues(1, kHiddenSize, 19, 0.0234375f);
   const std::vector<int> topk_ids_host = {0};
@@ -390,7 +435,12 @@ bool TestFusedMoePrefillRejectsMissingSelectionContract() {
               normalized != nullptr &&
               output != nullptr &&
               topk_ids != nullptr &&
-              topk_weights != nullptr,
+              topk_weights != nullptr &&
+              routing != nullptr &&
+              routing->valid() &&
+              routed_gather_scratch != nullptr &&
+              routed_up_scratch != nullptr &&
+              shared_up_scratch != nullptr,
           "test tensors should allocate") ||
       !Expect(input->CopyFromHost(input_host.data(), input_host.size()),
               "input should upload") ||
@@ -400,6 +450,16 @@ bool TestFusedMoePrefillRejectsMissingSelectionContract() {
               "topk ids should upload") ||
       !Expect(topk_weights->CopyFromHost(topk_weights_host.data(), topk_weights_host.size()),
               "topk weights should upload")) {
+    return false;
+  }
+  auto routed_up_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up->views);
+  auto routed_down_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down->views);
+  if (!Expect(
+          routed_up_views_device != nullptr &&
+              routed_down_views_device != nullptr,
+          "device weight-view tables should upload")) {
     return false;
   }
 
@@ -412,11 +472,15 @@ bool TestFusedMoePrefillRejectsMissingSelectionContract() {
   params.top_k = 1;
   params.shared_up = shared_up->views.front();
   params.shared_down = shared_down->views.front();
-  params.routed_up = routed_up->views.data();
-  params.routed_down = routed_down->views.data();
+  params.routed_up_device = routed_up_views_device->data();
+  params.routed_down_device = routed_down_views_device->data();
   params.selected_weights = topk_weights->data();
   params.input = input->data();
   params.normalized = normalized->data();
+  params.routing = routing.get();
+  params.routed_gather_scratch = routed_gather_scratch->data();
+  params.routed_up_scratch = routed_up_scratch->data();
+  params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   if (!Expect(
           !RunFusedMoePrefill(params),
@@ -462,6 +526,16 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
           "reference weights should upload")) {
     return false;
   }
+  auto routed_up_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up->views);
+  auto routed_down_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down->views);
+  if (!Expect(
+          routed_up_views_device != nullptr &&
+              routed_down_views_device != nullptr,
+          "device weight-view tables should upload")) {
+    return false;
+  }
 
   auto input =
       DeviceTensorFp32::Create({test_case.token_count, test_case.hidden_size});
@@ -477,6 +551,18 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       DeviceTensorInt32::Create({test_case.token_count, test_case.top_k});
   auto topk_weights =
       DeviceTensorFp32::Create({test_case.token_count, test_case.top_k});
+  auto routing =
+      DeviceExpertRouting::Create(
+          test_case.n_routed_experts,
+          test_case.token_count * test_case.top_k);
+  auto routed_gather_scratch =
+      DeviceTensorFp32::Create(
+          {test_case.token_count * test_case.top_k, test_case.hidden_size});
+  auto routed_up_scratch = DeviceTensorFp32::Create(
+      {test_case.token_count * test_case.top_k,
+       test_case.routed_expert_intermediate_size});
+  auto shared_up_scratch = DeviceTensorFp32::Create(
+      {test_case.token_count, test_case.shared_expert_intermediate_size});
   if (!Expect(
           input != nullptr &&
               normalized != nullptr &&
@@ -484,7 +570,12 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               routed_output != nullptr &&
               shared_output != nullptr &&
               topk_ids != nullptr &&
-              topk_weights != nullptr,
+              topk_weights != nullptr &&
+              routing != nullptr &&
+              routing->valid() &&
+              routed_gather_scratch != nullptr &&
+              routed_up_scratch != nullptr &&
+              shared_up_scratch != nullptr,
           "prefill tensors should allocate") ||
       !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
               "input should upload") ||
@@ -514,12 +605,16 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.top_k = test_case.top_k;
   params.shared_up = shared_up->views.front();
   params.shared_down = shared_down->views.front();
-  params.routed_up = routed_up->views.data();
-  params.routed_down = routed_down->views.data();
+  params.routed_up_device = routed_up_views_device->data();
+  params.routed_down_device = routed_down_views_device->data();
   params.selected_indices = topk_ids->data();
   params.selected_weights = topk_weights->data();
   params.input = input->data();
   params.normalized = normalized->data();
+  params.routing = routing.get();
+  params.routed_gather_scratch = routed_gather_scratch->data();
+  params.routed_up_scratch = routed_up_scratch->data();
+  params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();
   params.shared_output = shared_output->data();

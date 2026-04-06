@@ -10,8 +10,7 @@
 namespace nemotron {
 namespace {
 
-constexpr int kMaxSelectedExperts = 32;
-constexpr int kMaxRoutedExperts = 1024;
+constexpr int kGroupedTokenTile = 8;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -20,13 +19,12 @@ bool CheckCuda(cudaError_t status) {
 bool ValidFusedNvfp4WeightView(const FusedNvfp4WeightView& weight) {
   return weight.packed_data != nullptr &&
          weight.block_scales_data != nullptr &&
-         weight.matmul_block_scales_data != nullptr &&
          weight.tensor_scale_data != nullptr &&
          weight.output_rows > 0 &&
          weight.input_cols > 0;
 }
 
-__device__ fused_decode::Nvfp4WeightView MakeDeviceWeightView(
+__host__ __device__ fused_decode::Nvfp4WeightView MakeDeviceWeightView(
     const FusedNvfp4WeightView& weight) {
   return fused_decode::Nvfp4WeightView{
       weight.packed_data,
@@ -37,139 +35,408 @@ __device__ fused_decode::Nvfp4WeightView MakeDeviceWeightView(
   };
 }
 
-__global__ void FusedMoePrefillKernel(FusedMoePrefillParams params) {
-  extern __shared__ float shared_storage[];
-  __shared__ int selected_indices[kMaxSelectedExperts];
-  __shared__ float selected_weights[kMaxSelectedExperts];
+__global__ void ZeroBufferKernel(float* data, std::size_t count) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  data[index] = 0.0f;
+}
 
-  const std::size_t expert_buffer_size =
-      params.routed_expert_intermediate_size > params.shared_expert_intermediate_size
-          ? params.routed_expert_intermediate_size
-          : params.shared_expert_intermediate_size;
-  float* expert_buffer = shared_storage;
-  float* quantized_input = expert_buffer + expert_buffer_size;
-
-  const std::size_t token_index = static_cast<std::size_t>(blockIdx.x);
-  if (token_index >= params.token_count) {
+__global__ void GatherRowsKernel(
+    const float* input,
+    const int* row_indices,
+    float* output,
+    std::size_t output_rows,
+    std::size_t input_rows,
+    std::size_t cols) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t count = output_rows * cols;
+  if (index >= count) {
     return;
   }
 
-  const std::size_t tid = static_cast<std::size_t>(threadIdx.x);
-  const std::size_t hidden_offset = token_index * params.hidden_size;
-  const float* normalized_row = params.normalized + hidden_offset;
-  float* output_row = params.output + hidden_offset;
-  float* routed_output_row =
-      params.routed_output != nullptr ? params.routed_output + hidden_offset : nullptr;
-  float* shared_output_row =
-      params.shared_output != nullptr ? params.shared_output + hidden_offset : nullptr;
-  const std::size_t selection_offset = token_index * params.top_k;
+  const std::size_t row = index / cols;
+  const std::size_t col = index % cols;
+  const int input_row = row_indices[row];
+  if (input_row < 0 || static_cast<std::size_t>(input_row) >= input_rows) {
+    output[index] = 0.0f;
+    return;
+  }
+  output[index] = input[static_cast<std::size_t>(input_row) * cols + col];
+}
 
-  for (std::size_t slot = tid; slot < params.top_k; slot += blockDim.x) {
-    selected_indices[slot] = params.selected_indices[selection_offset + slot];
-    selected_weights[slot] = params.selected_weights[selection_offset + slot];
+__global__ void QuantizeDequantizeRowsKernel(
+    float* data,
+    std::size_t row_count,
+    std::size_t cols) {
+  const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+  if (row >= row_count) {
+    return;
   }
   fused_decode::QuantizeDequantizeNvfp4Row(
-      normalized_row,
-      quantized_input,
-      params.hidden_size);
-  __syncthreads();
+      data + row * cols,
+      data + row * cols,
+      cols);
+}
 
-  for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {
-    output_row[column] = 0.0f;
-    if (routed_output_row != nullptr) {
-      routed_output_row[column] = 0.0f;
-    }
-    if (shared_output_row != nullptr) {
-      shared_output_row[column] = 0.0f;
-    }
+__global__ void Relu2Kernel(float* data, std::size_t count) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
   }
-  __syncthreads();
+  data[index] = fused_decode::Relu2(data[index]);
+}
 
-  for (std::size_t slot = 0; slot < params.top_k; ++slot) {
-    const int expert_index = selected_indices[slot];
-    if (expert_index < 0 ||
-        static_cast<std::size_t>(expert_index) >= params.n_routed_experts) {
-      continue;
+__global__ void Nvfp4GroupedExpertMatVecRowsKernel(
+    const float* input,
+    const int* expert_offsets,
+    std::size_t n_experts,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  __shared__ double partial_sums[kGroupedTokenTile * fused_decode::kThreadsPerBlock];
+
+  const std::size_t expert_index = static_cast<std::size_t>(blockIdx.x) / output_rows_per_expert;
+  const std::size_t output_row = static_cast<std::size_t>(blockIdx.x) % output_rows_per_expert;
+  if (expert_index >= n_experts) {
+    return;
+  }
+
+  const int begin_row = expert_offsets[expert_index];
+  const int end_row = expert_offsets[expert_index + 1];
+  if (begin_row >= end_row) {
+    return;
+  }
+
+  const fused_decode::Nvfp4WeightView weight =
+      MakeDeviceWeightView(weights[expert_index]);
+  const std::size_t pairs_per_row = weight.input_cols / 2;
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset = output_row * (weight.input_cols / 2);
+  const std::size_t scale_row_offset = output_row * blocks_per_row;
+  const float tensor_scale = *weight.tensor_scale_data;
+
+  for (int tile_begin = begin_row; tile_begin < end_row; tile_begin += kGroupedTokenTile) {
+    const int remaining_rows = end_row - tile_begin;
+    const int valid_rows =
+        remaining_rows < kGroupedTokenTile ? remaining_rows : kGroupedTokenTile;
+    double accum[kGroupedTokenTile] = {0.0};
+
+    for (std::size_t pair_index = static_cast<std::size_t>(threadIdx.x);
+         pair_index < pairs_per_row;
+         pair_index += blockDim.x) {
+      const std::size_t block = pair_index / 8u;
+      const std::size_t pair_in_block = pair_index % 8u;
+      const std::size_t col = block * fused_decode::kNvfp4BlockWidth + pair_in_block * 2u;
+      const float block_scale =
+          fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) * tensor_scale;
+      const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+      const float w0 = fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
+      const float w1 = fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
+      for (int tile_row = 0; tile_row < valid_rows; ++tile_row) {
+        const float* input_row =
+            input + static_cast<std::size_t>(tile_begin + tile_row) * weight.input_cols;
+        accum[tile_row] += static_cast<double>(input_row[col]) * static_cast<double>(w0);
+        accum[tile_row] += static_cast<double>(input_row[col + 1]) * static_cast<double>(w1);
+      }
     }
 
-    const fused_decode::Nvfp4WeightView up_view =
-        MakeDeviceWeightView(params.routed_up[expert_index]);
-    const fused_decode::Nvfp4WeightView down_view =
-        MakeDeviceWeightView(params.routed_down[expert_index]);
-
-    for (std::size_t row = tid;
-         row < params.routed_expert_intermediate_size;
-         row += blockDim.x) {
-      expert_buffer[row] = fused_decode::Nvfp4RowMajorDot(quantized_input, up_view, row);
+    for (int tile_row = 0; tile_row < kGroupedTokenTile; ++tile_row) {
+      partial_sums[tile_row * blockDim.x + threadIdx.x] =
+          tile_row < valid_rows ? accum[tile_row] : 0.0;
     }
     __syncthreads();
 
-    for (std::size_t row = tid;
-         row < params.routed_expert_intermediate_size;
-         row += blockDim.x) {
-      expert_buffer[row] = fused_decode::Relu2(expert_buffer[row]);
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        for (int tile_row = 0; tile_row < valid_rows; ++tile_row) {
+          partial_sums[tile_row * blockDim.x + threadIdx.x] +=
+              partial_sums[tile_row * blockDim.x + threadIdx.x + stride];
+        }
+      }
+      __syncthreads();
     }
-    __syncthreads();
-    fused_decode::QuantizeDequantizeNvfp4Row(
-        expert_buffer,
-        expert_buffer,
-        params.routed_expert_intermediate_size);
-    __syncthreads();
 
-    for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {
-      const float contribution =
-          fused_decode::Nvfp4RowMajorDot(expert_buffer, down_view, column);
-      const float weighted_contribution =
-          __fmul_rn(selected_weights[slot], contribution);
-      output_row[column] = __fadd_rn(output_row[column], weighted_contribution);
-      if (routed_output_row != nullptr) {
-        routed_output_row[column] = __fadd_rn(
-            routed_output_row[column],
-            weighted_contribution);
+    if (threadIdx.x == 0) {
+      for (int tile_row = 0; tile_row < valid_rows; ++tile_row) {
+        output[static_cast<std::size_t>(tile_begin + tile_row) * output_rows_per_expert +
+               output_row] = static_cast<float>(partial_sums[tile_row * blockDim.x]);
       }
     }
     __syncthreads();
   }
+}
 
-  const fused_decode::Nvfp4WeightView shared_up_view =
-      MakeDeviceWeightView(params.shared_up);
-  const fused_decode::Nvfp4WeightView shared_down_view =
-      MakeDeviceWeightView(params.shared_down);
-  for (std::size_t row = tid;
-       row < params.shared_expert_intermediate_size;
-       row += blockDim.x) {
-    expert_buffer[row] = fused_decode::Nvfp4RowMajorDot(
-        quantized_input,
-        shared_up_view,
-        row);
+template <bool kGroupedRows>
+__global__ void Nvfp4MatVecRowsKernel(
+    const float* input,
+    std::size_t input_row_count,
+    const int* expert_offsets,
+    int expert_index,
+    fused_decode::Nvfp4WeightView weight,
+    float* output) {
+  __shared__ double partial_sums[kGroupedTokenTile * fused_decode::kThreadsPerBlock];
+
+  const std::size_t output_row = static_cast<std::size_t>(blockIdx.x);
+  if (output_row >= weight.output_rows) {
+    return;
   }
-  __syncthreads();
 
-  for (std::size_t row = tid;
-       row < params.shared_expert_intermediate_size;
-       row += blockDim.x) {
-    expert_buffer[row] = fused_decode::Relu2(expert_buffer[row]);
+  int begin_row = 0;
+  int end_row = static_cast<int>(input_row_count);
+  if constexpr (kGroupedRows) {
+    begin_row = expert_offsets[expert_index];
+    end_row = expert_offsets[expert_index + 1];
   }
-  __syncthreads();
-  fused_decode::QuantizeDequantizeNvfp4Row(
-      expert_buffer,
-      expert_buffer,
-      params.shared_expert_intermediate_size);
-  __syncthreads();
+  if (begin_row >= end_row) {
+    return;
+  }
 
-  for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {
-    const float contribution =
-        fused_decode::Nvfp4RowMajorDot(expert_buffer, shared_down_view, column);
-    output_row[column] = __fadd_rn(output_row[column], contribution);
-    if (shared_output_row != nullptr) {
-      shared_output_row[column] = contribution;
+  const std::size_t pairs_per_row = weight.input_cols / 2;
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset = output_row * (weight.input_cols / 2);
+  const std::size_t scale_row_offset = output_row * blocks_per_row;
+  const float tensor_scale = *weight.tensor_scale_data;
+
+  for (int tile_begin = begin_row; tile_begin < end_row; tile_begin += kGroupedTokenTile) {
+    const int remaining_rows = end_row - tile_begin;
+    const int valid_rows =
+        remaining_rows < kGroupedTokenTile ? remaining_rows : kGroupedTokenTile;
+    double accum[kGroupedTokenTile] = {0.0};
+
+    for (std::size_t pair_index = static_cast<std::size_t>(threadIdx.x);
+         pair_index < pairs_per_row;
+         pair_index += blockDim.x) {
+      const std::size_t block = pair_index / 8u;
+      const std::size_t pair_in_block = pair_index % 8u;
+      const std::size_t col = block * fused_decode::kNvfp4BlockWidth + pair_in_block * 2u;
+      const float block_scale =
+          fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) * tensor_scale;
+      const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+      const float w0 = fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
+      const float w1 = fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
+      for (int tile_row = 0; tile_row < valid_rows; ++tile_row) {
+        const float* input_row =
+            input + static_cast<std::size_t>(tile_begin + tile_row) * weight.input_cols;
+        accum[tile_row] += static_cast<double>(input_row[col]) * static_cast<double>(w0);
+        accum[tile_row] += static_cast<double>(input_row[col + 1]) * static_cast<double>(w1);
+      }
     }
+
+    for (int tile_row = 0; tile_row < kGroupedTokenTile; ++tile_row) {
+      partial_sums[tile_row * blockDim.x + threadIdx.x] =
+          tile_row < valid_rows ? accum[tile_row] : 0.0;
+    }
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        for (int tile_row = 0; tile_row < valid_rows; ++tile_row) {
+          partial_sums[tile_row * blockDim.x + threadIdx.x] +=
+              partial_sums[tile_row * blockDim.x + threadIdx.x + stride];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      for (int tile_row = 0; tile_row < valid_rows; ++tile_row) {
+        output[static_cast<std::size_t>(tile_begin + tile_row) * weight.output_rows + output_row] =
+            static_cast<float>(partial_sums[tile_row * blockDim.x]);
+      }
+    }
+    __syncthreads();
   }
+}
+
+__global__ void ReduceSelectionOutputsKernel(
+    const float* grouped_output,
+    const int* selection_to_sorted,
+    const float* selected_weights,
+    std::size_t token_count,
+    std::size_t top_k,
+    std::size_t hidden_size,
+    float* output,
+    float* routed_output) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t count = token_count * hidden_size;
+  if (index >= count) {
+    return;
+  }
+
+  const std::size_t token_index = index / hidden_size;
+  const std::size_t hidden_index = index % hidden_size;
+  double accum = 0.0;
+  for (std::size_t slot = 0; slot < top_k; ++slot) {
+    const std::size_t selection_index = token_index * top_k + slot;
+    const int sorted_index = selection_to_sorted[selection_index];
+    if (sorted_index < 0) {
+      continue;
+    }
+    const std::size_t grouped_offset =
+        static_cast<std::size_t>(sorted_index) * hidden_size + hidden_index;
+    accum += static_cast<double>(selected_weights[selection_index]) *
+             static_cast<double>(grouped_output[grouped_offset]);
+  }
+  const float reduced = static_cast<float>(accum);
+  output[index] = reduced;
+  if (routed_output != nullptr) {
+    routed_output[index] = reduced;
+  }
+}
+
+__global__ void AccumulateSharedOutputKernel(
+    const float* shared_output,
+    std::size_t count,
+    float* output,
+    float* shared_output_copy) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const float value = shared_output[index];
+  output[index] += value;
+  if (shared_output_copy != nullptr) {
+    shared_output_copy[index] = value;
+  }
+}
+
+bool LaunchZeroBuffer(float* data, std::size_t count) {
+  if (data == nullptr || count == 0) {
+    return true;
+  }
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
+  ZeroBufferKernel<<<grid, block>>>(data, count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchGatherRows(
+    const float* input,
+    const int* row_indices,
+    std::size_t output_rows,
+    std::size_t input_rows,
+    std::size_t cols,
+    float* output) {
+  const std::size_t count = output_rows * cols;
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
+  GatherRowsKernel<<<grid, block>>>(
+      input,
+      row_indices,
+      output,
+      output_rows,
+      input_rows,
+      cols);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchQuantizeDequantizeRows(float* data, std::size_t row_count, std::size_t cols) {
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>(row_count));
+  QuantizeDequantizeRowsKernel<<<grid, block>>>(data, row_count, cols);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchRelu2(float* data, std::size_t count) {
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
+  Relu2Kernel<<<grid, block>>>(data, count);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchGroupedMatVec(
+    const float* input,
+    const int* expert_offsets,
+    std::size_t n_experts,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  if (weights == nullptr || n_experts == 0 || output_rows_per_expert == 0) {
+    return false;
+  }
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>(n_experts * output_rows_per_expert));
+  Nvfp4GroupedExpertMatVecRowsKernel<<<grid, block>>>(
+      input,
+      expert_offsets,
+      n_experts,
+      weights,
+      output_rows_per_expert,
+      output);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchContiguousMatVec(
+    const float* input,
+    std::size_t input_row_count,
+    const FusedNvfp4WeightView& weight,
+    float* output) {
+  if (!ValidFusedNvfp4WeightView(weight)) {
+    return false;
+  }
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>(weight.output_rows));
+  Nvfp4MatVecRowsKernel<false><<<grid, block>>>(
+      input,
+      input_row_count,
+      nullptr,
+      0,
+      MakeDeviceWeightView(weight),
+      output);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchReduceSelectionOutputs(
+    const float* grouped_output,
+    const int* selection_to_sorted,
+    const float* selected_weights,
+    std::size_t token_count,
+    std::size_t top_k,
+    std::size_t hidden_size,
+    float* output,
+    float* routed_output) {
+  const std::size_t count = token_count * hidden_size;
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
+  ReduceSelectionOutputsKernel<<<grid, block>>>(
+      grouped_output,
+      selection_to_sorted,
+      selected_weights,
+      token_count,
+      top_k,
+      hidden_size,
+      output,
+      routed_output);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchAccumulateSharedOutput(
+    const float* shared_output,
+    std::size_t count,
+    float* output,
+    float* shared_output_copy) {
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
+  AccumulateSharedOutputKernel<<<grid, block>>>(
+      shared_output,
+      count,
+      output,
+      shared_output_copy);
+  return CheckCuda(cudaGetLastError());
 }
 
 }  // namespace
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
+  const std::size_t selection_count = params.token_count * params.top_k;
+
   if (params.token_count == 0 ||
       params.hidden_size == 0 ||
       params.hidden_size % fused_decode::kNvfp4BlockWidth != 0 ||
@@ -178,19 +445,27 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       params.shared_expert_intermediate_size == 0 ||
       params.shared_expert_intermediate_size % fused_decode::kNvfp4BlockWidth != 0 ||
       params.n_routed_experts == 0 ||
-      params.n_routed_experts > kMaxRoutedExperts ||
       params.top_k == 0 ||
       params.top_k > params.n_routed_experts ||
-      params.top_k > kMaxSelectedExperts ||
       !ValidFusedNvfp4WeightView(params.shared_up) ||
       !ValidFusedNvfp4WeightView(params.shared_down) ||
-      params.routed_up == nullptr ||
-      params.routed_down == nullptr ||
+      params.routed_up_device == nullptr ||
+      params.routed_down_device == nullptr ||
       params.selected_indices == nullptr ||
       params.selected_weights == nullptr ||
       params.input == nullptr ||
       params.normalized == nullptr ||
+      params.routing == nullptr ||
+      params.routed_gather_scratch == nullptr ||
+      params.routed_up_scratch == nullptr ||
+      params.shared_up_scratch == nullptr ||
       params.output == nullptr) {
+    return false;
+  }
+
+  if (!params.routing->valid() ||
+      params.routing->n_experts() != params.n_routed_experts ||
+      params.routing->selection_count() < selection_count) {
     return false;
   }
 
@@ -207,14 +482,108 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  const dim3 block(fused_decode::kThreadsPerBlock);
-  const dim3 grid(static_cast<unsigned int>(params.token_count));
-  const std::size_t shared_bytes =
-      (std::max(params.routed_expert_intermediate_size,
-                params.shared_expert_intermediate_size) +
-       params.hidden_size) *
-      sizeof(float);
-  FusedMoePrefillKernel<<<grid, block, shared_bytes>>>(params);
+  const std::size_t token_hidden_count = params.token_count * params.hidden_size;
+  const std::size_t selection_intermediate_count =
+      selection_count * params.routed_expert_intermediate_size;
+  const std::size_t shared_intermediate_count =
+      params.token_count * params.shared_expert_intermediate_size;
+
+  if (!RunDeviceExpertRouting(
+          params.selected_indices,
+          params.selected_weights,
+          params.token_count,
+          params.top_k,
+          params.routing) ||
+      !LaunchZeroBuffer(params.output, token_hidden_count) ||
+      !LaunchZeroBuffer(params.routed_output, token_hidden_count) ||
+      !LaunchZeroBuffer(params.shared_output, token_hidden_count) ||
+      !LaunchGatherRows(
+          params.normalized,
+          params.routing->sorted_token_indices(),
+          selection_count,
+          params.token_count,
+          params.hidden_size,
+          params.routed_gather_scratch) ||
+      !LaunchQuantizeDequantizeRows(
+          params.routed_gather_scratch,
+          selection_count,
+          params.hidden_size)) {
+    return false;
+  }
+
+  const int* expert_offsets = params.routing->expert_offsets();
+  if (!LaunchGroupedMatVec(
+          params.routed_gather_scratch,
+          expert_offsets,
+          params.n_routed_experts,
+          params.routed_up_device,
+          params.routed_expert_intermediate_size,
+          params.routed_up_scratch)) {
+    return false;
+  }
+
+  if (!LaunchRelu2(params.routed_up_scratch, selection_intermediate_count) ||
+      !LaunchQuantizeDequantizeRows(
+          params.routed_up_scratch,
+          selection_count,
+          params.routed_expert_intermediate_size)) {
+    return false;
+  }
+
+  if (!LaunchGroupedMatVec(
+          params.routed_up_scratch,
+          expert_offsets,
+          params.n_routed_experts,
+          params.routed_down_device,
+          params.hidden_size,
+          params.routed_gather_scratch)) {
+    return false;
+  }
+
+  if (!LaunchReduceSelectionOutputs(
+          params.routed_gather_scratch,
+          params.routing->selection_to_sorted(),
+          params.selected_weights,
+          params.token_count,
+          params.top_k,
+          params.hidden_size,
+          params.output,
+          params.routed_output)) {
+    return false;
+  }
+
+  if (!CheckCuda(cudaMemcpyAsync(
+          params.routed_gather_scratch,
+          params.normalized,
+          token_hidden_count * sizeof(float),
+          cudaMemcpyDeviceToDevice)) ||
+      !LaunchQuantizeDequantizeRows(
+          params.routed_gather_scratch,
+          params.token_count,
+          params.hidden_size) ||
+      !LaunchContiguousMatVec(
+          params.routed_gather_scratch,
+          params.token_count,
+          params.shared_up,
+          params.shared_up_scratch) ||
+      !LaunchRelu2(params.shared_up_scratch, shared_intermediate_count) ||
+      !LaunchQuantizeDequantizeRows(
+          params.shared_up_scratch,
+          params.token_count,
+          params.shared_expert_intermediate_size) ||
+      !LaunchContiguousMatVec(
+          params.shared_up_scratch,
+          params.token_count,
+          params.shared_down,
+          params.routed_gather_scratch) ||
+      !LaunchAccumulateSharedOutput(
+          params.routed_gather_scratch,
+          token_hidden_count,
+          params.output,
+          params.shared_output)) {
+    return false;
+  }
+
   return CheckCuda(cudaGetLastError());
 }
 

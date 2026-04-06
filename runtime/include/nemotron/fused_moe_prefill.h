@@ -2,6 +2,7 @@
 
 #include <cstddef>
 
+#include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_decode.h"
 
 namespace nemotron {
@@ -15,12 +16,16 @@ struct FusedMoePrefillParams {
   std::size_t top_k = 0;
   FusedNvfp4WeightView shared_up;
   FusedNvfp4WeightView shared_down;
-  const FusedNvfp4WeightView* routed_up = nullptr;
-  const FusedNvfp4WeightView* routed_down = nullptr;
+  const FusedNvfp4WeightView* routed_up_device = nullptr;
+  const FusedNvfp4WeightView* routed_down_device = nullptr;
   const int* selected_indices = nullptr;
   const float* selected_weights = nullptr;
   const float* input = nullptr;  // Reserved for future fused epilog variants.
   const float* normalized = nullptr;
+  DeviceExpertRouting* routing = nullptr;
+  float* routed_gather_scratch = nullptr;  // selection_count x hidden_size
+  float* routed_up_scratch = nullptr;      // selection_count x routed_expert_intermediate_size
+  float* shared_up_scratch = nullptr;      // token_count x shared_expert_intermediate_size
   float* output = nullptr;  // Receives routed + shared expert contributions.
   float* routed_output = nullptr;  // Optional.
   float* shared_output = nullptr;  // Optional.

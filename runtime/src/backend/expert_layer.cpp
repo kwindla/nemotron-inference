@@ -836,6 +836,8 @@ struct ExpertLayerSlice::Impl {
   bool monolithic_resident = false;
   bool fused_direct_moe_supported = false;
   PreparedResidentMoeWeights direct_moe_weights;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> direct_moe_routed_up_views_device;
+  std::unique_ptr<DeviceArray<FusedNvfp4WeightView>> direct_moe_routed_down_views_device;
   DirectMoeExecutionState direct_moe_execution_state;
 
   static bool BuildResidentRoutedWeightViews(
@@ -1185,11 +1187,55 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     return false;
   }
 
+  DeviceExpertRouting* routing = ResolveFusedPrefillRouting();
+  DeviceTensorFp32* routed_output_scratch = ResolveFusedPrefillRoutedOutputScratch();
+  DeviceTensorFp32* gather_scratch = ResolveFusedPrefillGatherScratch();
+  DeviceTensorFp32* expert_up_scratch = ResolveFusedPrefillExpertUpScratch();
+  DeviceTensorFp32* shared_up_scratch = ResolveFusedPrefillSharedUpScratch();
+  const std::size_t selection_count = token_count * config.top_k;
+  const auto routed_output_shape =
+      routed_output_scratch != nullptr ? routed_output_scratch->shape() : std::vector<std::size_t>{};
+  const auto gather_shape =
+      gather_scratch != nullptr ? gather_scratch->shape() : std::vector<std::size_t>{};
+  const auto expert_up_shape =
+      expert_up_scratch != nullptr ? expert_up_scratch->shape() : std::vector<std::size_t>{};
+  const auto shared_up_shape =
+      shared_up_scratch != nullptr ? shared_up_scratch->shape() : std::vector<std::size_t>{};
+  if (routing == nullptr ||
+      !routing->valid() ||
+      routing->selection_count() < selection_count ||
+      routed_output_scratch == nullptr ||
+      !routed_output_scratch->valid() ||
+      routed_output_shape.size() != 2 ||
+      routed_output_shape[0] < token_count ||
+      routed_output_shape[1] != config.hidden_size ||
+      gather_scratch == nullptr ||
+      !gather_scratch->valid() ||
+      gather_shape.size() != 2 ||
+      gather_shape[0] < selection_count ||
+      gather_shape[1] != config.hidden_size ||
+      expert_up_scratch == nullptr ||
+      !expert_up_scratch->valid() ||
+      expert_up_shape.size() != 2 ||
+      expert_up_shape[0] < selection_count ||
+      expert_up_shape[1] != config.routed_expert_intermediate_size ||
+      shared_up_scratch == nullptr ||
+      !shared_up_scratch->valid() ||
+      shared_up_shape.size() != 2 ||
+      shared_up_shape[0] < token_count ||
+      shared_up_shape[1] != config.shared_expert_intermediate_size) {
+    return false;
+  }
+
   if (!direct_moe_weights.prepared ||
       !HasValidPreparedMoeWeightView(direct_moe_weights.shared_up) ||
       !HasValidPreparedMoeWeightView(direct_moe_weights.shared_down) ||
       direct_moe_weights.routed_up_views.size() != config.n_routed_experts ||
-      direct_moe_weights.routed_down_views.size() != config.n_routed_experts) {
+      direct_moe_weights.routed_down_views.size() != config.n_routed_experts ||
+      direct_moe_routed_up_views_device == nullptr ||
+      direct_moe_routed_up_views_device->size() != config.n_routed_experts ||
+      direct_moe_routed_down_views_device == nullptr ||
+      direct_moe_routed_down_views_device->size() != config.n_routed_experts) {
     return false;
   }
 
@@ -1209,13 +1255,18 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.top_k = config.top_k;
   params.shared_up = direct_moe_weights.shared_up;
   params.shared_down = direct_moe_weights.shared_down;
-  params.routed_up = direct_moe_weights.routed_up_views.data();
-  params.routed_down = direct_moe_weights.routed_down_views.data();
+  params.routed_up_device = direct_moe_routed_up_views_device->data();
+  params.routed_down_device = direct_moe_routed_down_views_device->data();
   params.selected_indices = topk_ids;
   params.selected_weights = topk_weights;
   params.input = input.data();
   params.normalized = normalized.data();
+  params.routing = routing;
+  params.routed_gather_scratch = gather_scratch->data();
+  params.routed_up_scratch = expert_up_scratch->data();
+  params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
+  params.routed_output = routed_output_scratch->data();
 
   if (RunFusedMoePrefill(params)) {
     return true;
@@ -2112,10 +2163,16 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     shared_down_view = MakeFusedNvfp4WeightView(*impl->shared_down_nvfp4_device);
   }
   if (fused_direct_moe_supported) {
+    auto resident_routed_up_views_device =
+        DeviceArray<FusedNvfp4WeightView>::CopyFromHost(resident_routed_up_views);
+    auto resident_routed_down_views_device =
+        DeviceArray<FusedNvfp4WeightView>::CopyFromHost(resident_routed_down_views);
     if (!HasValidPreparedMoeWeightView(shared_up_view) ||
         !HasValidPreparedMoeWeightView(shared_down_view) ||
         resident_routed_up_views.size() != config.n_routed_experts ||
-        resident_routed_down_views.size() != config.n_routed_experts) {
+        resident_routed_down_views.size() != config.n_routed_experts ||
+        resident_routed_up_views_device == nullptr ||
+        resident_routed_down_views_device == nullptr) {
       return debug_fail("resident direct MoE weight preparation failed");
     }
     for (std::size_t expert_index = 0; expert_index < config.n_routed_experts; ++expert_index) {
@@ -2129,6 +2186,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     impl->direct_moe_weights.shared_down = shared_down_view;
     impl->direct_moe_weights.routed_up_views = resident_routed_up_views;
     impl->direct_moe_weights.routed_down_views = resident_routed_down_views;
+    impl->direct_moe_routed_up_views_device = std::move(resident_routed_up_views_device);
+    impl->direct_moe_routed_down_views_device = std::move(resident_routed_down_views_device);
   }
   if (debug) {
     const std::uint64_t resident_total_expert_bytes =

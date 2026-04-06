@@ -13,6 +13,7 @@ struct DeviceExpertRouting::Impl {
   int* expert_offsets = nullptr;
   int* sorted_token_indices = nullptr;
   float* sorted_token_weights = nullptr;
+  int* selection_to_sorted = nullptr;
   int* active_expert_count = nullptr;
   int* active_expert_ids = nullptr;
   std::size_t n_experts = 0;
@@ -36,6 +37,9 @@ struct DeviceExpertRouting::Impl {
     }
     if (sorted_token_weights != nullptr) {
       cudaFree(sorted_token_weights);
+    }
+    if (selection_to_sorted != nullptr) {
+      cudaFree(selection_to_sorted);
     }
   }
 };
@@ -138,7 +142,8 @@ __global__ void ExpertScatterKernel(
     int n_experts,
     const int* expert_offsets,
     int* sorted_token_indices,
-    float* sorted_token_weights) {
+    float* sorted_token_weights,
+    int* selection_to_sorted) {
   const int expert_index =
       static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (expert_index >= n_experts) {
@@ -155,6 +160,7 @@ __global__ void ExpertScatterKernel(
     sorted_token_indices[write_index] =
         static_cast<int>(selection_index / static_cast<std::size_t>(top_k));
     sorted_token_weights[write_index] = selected_weights[selection_index];
+    selection_to_sorted[selection_index] = write_index;
     ++write_index;
   }
 }
@@ -213,6 +219,9 @@ std::unique_ptr<DeviceExpertRouting> DeviceExpertRouting::Create(
           reinterpret_cast<void**>(&impl->sorted_token_weights),
           selection_count * sizeof(float)) ||
       !AllocateDeviceBuffer(
+          reinterpret_cast<void**>(&impl->selection_to_sorted),
+          selection_count * sizeof(int)) ||
+      !AllocateDeviceBuffer(
           reinterpret_cast<void**>(&impl->active_expert_count),
           sizeof(int)) ||
       !AllocateDeviceBuffer(
@@ -241,6 +250,7 @@ bool DeviceExpertRouting::valid() const {
          impl_->expert_offsets != nullptr &&
          impl_->sorted_token_indices != nullptr &&
          impl_->sorted_token_weights != nullptr &&
+         impl_->selection_to_sorted != nullptr &&
          impl_->active_expert_count != nullptr &&
          impl_->active_expert_ids != nullptr &&
          impl_->n_experts > 0 &&
@@ -265,6 +275,10 @@ int* DeviceExpertRouting::sorted_token_indices() const {
 
 float* DeviceExpertRouting::sorted_token_weights() const {
   return impl_ != nullptr ? impl_->sorted_token_weights : nullptr;
+}
+
+int* DeviceExpertRouting::selection_to_sorted() const {
+  return impl_ != nullptr ? impl_->selection_to_sorted : nullptr;
 }
 
 int* DeviceExpertRouting::active_expert_count() const {
@@ -310,7 +324,11 @@ bool RunDeviceExpertRouting(
   if (!CheckCuda(cudaMemset(
           routing->impl_->expert_counts,
           0,
-          routing->n_experts() * sizeof(int)))) {
+          routing->n_experts() * sizeof(int))) ||
+      !CheckCuda(cudaMemset(
+          routing->impl_->selection_to_sorted,
+          0xff,
+          selection_count * sizeof(int)))) {
     return false;
   }
 
@@ -339,7 +357,8 @@ bool RunDeviceExpertRouting(
       n_experts,
       routing->impl_->expert_offsets,
       routing->impl_->sorted_token_indices,
-      routing->impl_->sorted_token_weights);
+      routing->impl_->sorted_token_weights,
+      routing->impl_->selection_to_sorted);
   if (!CheckCuda(cudaGetLastError())) {
     return false;
   }
