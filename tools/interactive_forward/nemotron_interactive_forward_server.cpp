@@ -33,9 +33,8 @@ constexpr std::size_t GiB(std::size_t value) {
 
 struct Options {
   std::filesystem::path manifest_path;
-  std::size_t default_max_new_tokens = 256;
+  std::size_t default_max_new_tokens = 2048;
   std::size_t target_context_tokens = 8192;
-  std::size_t graph_bytes = GiB(4);
 };
 
 struct TurnCommand {
@@ -134,10 +133,6 @@ bool ParseArgs(int argc, char** argv, Options* options) {
           !ParseNonNegativeSizeT(argv[++i], &options->target_context_tokens)) {
         return false;
       }
-    } else if (arg == "--graph-bytes") {
-      if (i + 1 >= argc || !ParseNonNegativeSizeT(argv[++i], &options->graph_bytes)) {
-        return false;
-      }
     } else {
       return false;
     }
@@ -205,6 +200,8 @@ void WriteRuntimeStatsJson(
   output << "\"scaled_fp8_reference_fallbacks\":" << stats.scaled_fp8_reference_fallbacks << ",";
   output << "\"attention_decode_plan_creates\":" << stats.attention_decode_plan_creates << ",";
   output << "\"attention_decode_plan_hits\":" << stats.attention_decode_plan_hits << ",";
+  output << "\"expert_selection_metadata_downloads\":"
+         << stats.expert_selection_metadata_downloads << ",";
   output << "\"flashinfer_routed_expert_uses\":" << stats.flashinfer_routed_expert_uses << ",";
   output << "\"flashinfer_routed_expert_fallbacks\":" << stats.flashinfer_routed_expert_fallbacks
          << ",";
@@ -212,6 +209,8 @@ void WriteRuntimeStatsJson(
          << stats.grouped_routed_expert_fastpath_uses << ",";
   output << "\"grouped_routed_expert_fastpath_fallbacks\":"
          << stats.grouped_routed_expert_fastpath_fallbacks << ",";
+  output << "\"grouped_routed_expert_prereq_fallbacks\":"
+         << stats.grouped_routed_expert_prereq_fallbacks << ",";
   output << "\"forward_graph_captures\":" << stats.forward_graph_captures << ",";
   output << "\"forward_graph_replays\":" << stats.forward_graph_replays << ",";
   output << "\"moe_graph_captures\":" << stats.moe_graph_captures << ",";
@@ -321,7 +320,7 @@ nemotron::RuntimeBootstrapOptions MakeBootstrapOptions(const Options& options) {
   bootstrap.service_target.total_memory_bytes = GiB(128);
   bootstrap.service_target.weights_bytes = GiB(100);
   bootstrap.service_target.workspace_bytes = GiB(8);
-  bootstrap.service_target.graph_bytes = options.graph_bytes;
+  bootstrap.service_target.graph_bytes = 0;
   bootstrap.service_target.safety_headroom_bytes = GiB(4);
   bootstrap.service_target.target_active_requests = 1;
   bootstrap.service_target.target_context_tokens = options.target_context_tokens;
@@ -363,6 +362,7 @@ ReadyState InitializeServer(const Options& options, ServerState* state) {
   config->max_tokens = options.target_context_tokens;
 
   setenv("NEMOTRON_PREFIX_CACHE", "0", 1);
+  setenv("NEMOTRON_DISABLE_CUDA_GRAPH_FORWARD", "1", 1);
 
   const auto environment_start = std::chrono::steady_clock::now();
   auto environment = nemotron::RuntimeEnvironment::BuildFromManifestFile(
@@ -554,7 +554,6 @@ void EmitReadyJson(const ReadyState& ready, const ServerState& state) {
     std::cout << "\"prefix_cache_supported\":false,";
     std::cout << "\"target_context_tokens\":" << state.options.target_context_tokens << ",";
     std::cout << "\"default_max_new_tokens\":" << state.options.default_max_new_tokens << ",";
-    std::cout << "\"graph_bytes\":" << state.options.graph_bytes << ",";
     std::cout << "\"environment_build_ms\":" << std::fixed << std::setprecision(6)
               << ready.environment_build_ms << ",";
     std::cout << "\"model_build_ms\":" << std::fixed << std::setprecision(6)
@@ -632,7 +631,7 @@ int main(int argc, char** argv) {
   if (!ParseArgs(argc, argv, &options)) {
     EmitErrorJson(
         "usage: nemotron_interactive_forward_server --manifest <path> "
-        "[--max-new-tokens N] [--target-context-tokens N] [--graph-bytes BYTES]");
+        "[--max-new-tokens N] [--target-context-tokens N]");
     return 2;
   }
 

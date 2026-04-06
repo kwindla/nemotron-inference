@@ -69,6 +69,11 @@ bool ExpertSubLayerProfileEnabled() {
   return kEnabled;
 }
 
+bool GroupedRoutedDiagnosticsEnabled() {
+  static const bool kEnabled = std::getenv("NEMOTRON_GROUPED_ROUTED_DEBUG") != nullptr;
+  return kEnabled;
+}
+
 void LogSubLayerProfileCudaFailure(const char* caller, cudaError_t error) {
   std::cerr << caller << ": " << cudaGetErrorString(error) << "\n";
 }
@@ -3514,17 +3519,30 @@ bool RunExpertLayerImpl(
   auto& selected_indices_host = *selection_scratch.indices_host;
   auto& selected_weights_host = *selection_scratch.weights_host;
   bool selection_metadata_downloaded = false;
+  const bool grouped_routed_diagnostics = GroupedRoutedDiagnosticsEnabled();
   const auto ensure_selection_metadata_host =
       [&]() -> bool {
     if (selection_metadata_downloaded) {
       return true;
     }
-    if (!selection_scratch.indices_device->CopyToHost(
-            selected_indices_host.data(),
-            selection_count) ||
-        !selection_scratch.weights_device->CopyToHost(
+    const bool indices_ok = selection_scratch.indices_device->CopyToHost(
+        selected_indices_host.data(),
+        selection_count);
+    const bool weights_ok =
+        indices_ok &&
+        selection_scratch.weights_device->CopyToHost(
             selected_weights_host.data(),
-            selection_count)) {
+            selection_count);
+    if (!indices_ok || !weights_ok) {
+      if (grouped_routed_diagnostics) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " grouped routed diag selection_metadata_download_failed"
+                  << " indices_ok=" << (indices_ok ? 1 : 0)
+                  << " weights_ok=" << (weights_ok ? 1 : 0)
+                  << " selection_count=" << selection_count
+                  << " token_count=" << token_count
+                  << "\n";
+      }
       return false;
     }
     selection_metadata_downloaded = true;
@@ -4009,11 +4027,20 @@ bool RunExpertLayerImpl(
           const std::int32_t* selected_indices_device,
           const float* selected_weights_device,
           std::size_t batch_count) -> GroupedRoutedResult {
+    const bool grouped_diag_for_layer =
+        grouped_routed_diagnostics && impl.config.layer_index == 1;
     const auto grouped_fatal =
         [&](const std::string& reason) -> GroupedRoutedResult {
       std::cerr << "expert_layer: layer " << impl.config.layer_index
                 << " grouped routed fastpath unsupported: "
-                << reason << "\n";
+                << reason
+                << " token_index=" << token_index
+                << " batch_count=" << batch_count
+                << " token_count=" << token_count
+                << " trace_present=" << (trace != nullptr ? 1 : 0)
+                << " selection_metadata_downloaded="
+                << (selection_metadata_downloaded ? 1 : 0)
+                << "\n";
       return GroupedRoutedResult::kFatal;
     };
     const auto buffer_capacity =
@@ -4113,6 +4140,14 @@ bool RunExpertLayerImpl(
     };
 
     if (trace != nullptr && token_count == 1) {
+      if (grouped_diag_for_layer) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " grouped routed diag result=fallback"
+                  << " reason=trace_single_token"
+                  << " token_index=" << token_index
+                  << " batch_count=" << batch_count
+                  << "\n";
+      }
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPrereqFallback();
       return GroupedRoutedResult::kFallback;
@@ -4124,6 +4159,14 @@ bool RunExpertLayerImpl(
           " expected=custom_fused");
     }
     if (!impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
+      if (grouped_diag_for_layer) {
+        std::cerr << "expert_layer: layer " << impl.config.layer_index
+                  << " grouped routed diag result=fallback"
+                  << " reason=disabled"
+                  << " token_index=" << token_index
+                  << " batch_count=" << batch_count
+                  << "\n";
+      }
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPrereqFallback();
       return GroupedRoutedResult::kFallback;
@@ -5500,6 +5543,16 @@ bool RunExpertLayerImpl(
       }
     }
 
+    if (grouped_diag_for_layer) {
+      std::cerr << "expert_layer: layer " << impl.config.layer_index
+                << " grouped routed diag result=used"
+                << " token_index=" << token_index
+                << " batch_count=" << batch_count
+                << " token_count=" << token_count
+                << " selection_metadata_downloaded="
+                << (selection_metadata_downloaded ? 1 : 0)
+                << "\n";
+    }
     RecordGroupedRoutedExpertFastpathUse();
     return GroupedRoutedResult::kUsed;
   };

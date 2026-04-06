@@ -71,6 +71,8 @@ Interactive forward tool:
 - the first direct-path interactive helper now lives under [tools/interactive_forward](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward)
 - design note: [INTERACTIVE_FORWARD_DESIGN.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md)
 - it keeps the model warm in a C++ server process, but rerenders and re-prefills the full prompt each turn
+- it preserves the model's visible thinking output and stores assistant history back into the tokenizer's intended `reasoning_content` / final-answer contract
+- it captures server stderr separately in `artifacts/interactive_forward/server-stderr.log` so backend warnings do not corrupt the chat transcript
 - it intentionally does not expose prefix-cache reuse or `CreateFromCache(...)` yet
 - use it as a forward-path exerciser and latency probe for the working direct `Create(...)` path
 
@@ -79,16 +81,18 @@ Build and run it:
 ```bash
 cmake -S . -B build
 cmake --build build --target nemotron_interactive_forward_server -j
-uv run --script tools/interactive_forward/nemotron_interactive_forward.py --graph-bytes 0
-uv run --script tools/interactive_forward/nemotron_interactive_forward.py --graph-bytes 0 --once "Hello"
+uv run --script tools/interactive_forward/nemotron_interactive_forward.py
+uv run --script tools/interactive_forward/nemotron_interactive_forward.py --once "Hello"
 ```
 
 Current interactive-tool limitations:
 
+- forward graph capture is force-disabled in this helper via `NEMOTRON_DISABLE_CUDA_GRAPH_FORWARD=1`
 - no prefix-cache restore/commit between turns
 - no cache-backed model creation
 - no automatic context truncation
 - prefill still materializes a `[prompt_tokens, vocab_size]` logits tensor because that is the current `RunPrefill(...)` API contract
+- defaults are intentionally conservative for interactive use: `--target-context-tokens 8192`, `--max-new-tokens 2048`
 
 If `/usr/local/cuda/compat` or `/usr/local/cuda-13.2/compat` exists, `ctest` now prepends it automatically for the runtime test binaries. The benchmark wrapper scripts below do the same. Direct binary launches still need an equivalent `LD_LIBRARY_PATH` if the compat stack is required.
 
@@ -164,6 +168,7 @@ Current runtime config support includes:
 - `NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_FAMILY=attention|expert|other|all` to scope that experiment to one dense family during 16-token decode validation
 - `NEMOTRON_EXPERIMENTAL_DENSE_DEVICE_PLAN_SURFACE_TENSORS=<comma-separated substrings>` to scope the dense-native experiment to specific tensor-name classes such as `gate.weight`, `fc1_latent_proj.weight`, or `fc2_latent_proj.weight`
 - `NEMOTRON_GROUPED_NVFP4_DEBUG=1` to print grouped routed-expert cuBLASLt failure stage / status on the decode path
+- `NEMOTRON_GROUPED_ROUTED_DEBUG=1` to print layer-1 grouped-routed metadata-download / fastpath diagnostics to stderr when debugging interactive or decode-path serving issues
 - `NEMOTRON_ROUTED_MOE_BACKEND=auto|custom|flashinfer` to select the routed MoE serving backend (`auto` uses FlashInfer if a compatible plugin is present, otherwise the accepted custom fused backend)
 - `NEMOTRON_ROUTED_MOE_BACKEND_STRICT=1` to fail instead of falling back when `flashinfer` is requested but unavailable
 - `NEMOTRON_FLASHINFER_MOE_LIBRARY=/path/to/libnemotron_flashinfer_moe.so` to override the routed FlashInfer plugin lookup path

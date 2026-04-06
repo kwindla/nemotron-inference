@@ -17,16 +17,25 @@ This first Nemotron version uses:
 - full prompt rerender each turn
 - full prompt prefill each turn
 - greedy decode only
+- visible reasoning / thinking output preserved
 - line-oriented stdin/stdout IPC
+- separate server stderr capture in `artifacts/interactive_forward/server-stderr.log`
 
 This version does **not** use:
 
 - `CreateFromCache(...)`
+- forward graph capture / replay
 - prefix-cache restore/commit across turns
 - request-context snapshot/restore
 - sampling
 
 Those paths are left out on purpose because the direct parity path is now the working baseline, while the cache-backed model-build path is still unqualified.
+
+The helper also force-disables forward CUDA graph capture with
+`NEMOTRON_DISABLE_CUDA_GRAPH_FORWARD=1`. This is intentional: leaving the
+request-context default graph toggle enabled allowed an early decode capture
+attempt to touch grouped-routed host validation paths and emit misleading
+warnings, even though the real non-graph decode path was healthy.
 
 ## Why Prefix Cache Is Not Exposed Yet
 
@@ -67,12 +76,17 @@ Responses are one JSON line each. `TURN` responses include:
 - aggregate throughput
 - runtime execution stats snapshot
 
+The Python helper additionally writes `turn_begin` / `turn_end` JSON markers to
+the shared stderr log so backend diagnostics can be correlated with exact user
+turns without polluting stdout.
+
 ## Important Limitations
 
 1. Prompt logits are still materialized as `[prompt_tokens, vocab_size]` because that is the current `RunPrefill(...)` API contract.
 2. Large prompts therefore allocate a large logits tensor, even though the tool only copies the last prefill row back to host.
 3. No automatic context truncation is implemented in the Python CLI yet.
 4. `/cache` is intentionally unsupported.
+5. Defaults are `--target-context-tokens 8192` and `--max-new-tokens 2048`, which are aimed at realistic interactive inspection rather than tiny smoke tests.
 
 ## Intended Use
 
@@ -80,5 +94,5 @@ Use this tool to:
 
 - smoke-test interactive chat turns against the direct path
 - inspect prefill and decode latency by turn
-- exercise graph-on / graph-off runtime configurations
+- exercise the current non-graph direct runtime path
 - validate future forward-path changes without rebuilding bespoke test harnesses

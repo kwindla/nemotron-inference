@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -25,6 +25,10 @@ DEFAULT_BUILD_DIR = "build"
 DEFAULT_MANIFEST = (
     REPO_ROOT / "artifacts" / "manifests" / "forward_runtime_manifest_unverified.json"
 )
+DEFAULT_SERVER_STDERR_LOG = (
+    REPO_ROOT / "artifacts" / "interactive_forward" / "server-stderr.log"
+)
+IM_END_TOKEN = "<|im_end|>"
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,13 +52,19 @@ def parse_args() -> argparse.Namespace:
         help="Explicit path to nemotron_interactive_forward_server.",
     )
     parser.add_argument(
+        "--server-stderr-log",
+        type=Path,
+        default=DEFAULT_SERVER_STDERR_LOG,
+        help="Path to capture helper-server stderr separately from the chat transcript.",
+    )
+    parser.add_argument(
         "--tokenizer",
         help="Tokenizer name or path. Defaults to the manifest model_id.",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=256,
+        default=2048,
         help="Maximum generated tokens per turn.",
     )
     parser.add_argument(
@@ -62,12 +72,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8192,
         help="Request-context token capacity for the helper.",
-    )
-    parser.add_argument(
-        "--graph-bytes",
-        type=int,
-        default=4 * 1024 * 1024 * 1024,
-        help="Graph memory budget passed into RuntimeBootstrapOptions.",
     )
     parser.add_argument(
         "--system",
@@ -193,6 +197,42 @@ def format_tokens_per_second(value: float) -> str:
     return f"{value:.3f} tok/s"
 
 
+def strip_trailing_control_tokens(text: str) -> str:
+    cleaned = text
+    while True:
+        candidate = cleaned.rstrip()
+        if not candidate.endswith(IM_END_TOKEN):
+            return candidate
+        cleaned = candidate[: -len(IM_END_TOKEN)]
+
+
+def parse_assistant_generation(raw_text: str) -> tuple[str, str, str | None]:
+    cleaned = strip_trailing_control_tokens(raw_text).strip()
+    reasoning_content: str | None = None
+    assistant_content = cleaned
+
+    if "</think>" in cleaned:
+        reasoning_part, assistant_part = cleaned.rsplit("</think>", 1)
+        if "<think>" in reasoning_part:
+            reasoning_part = reasoning_part.split("<think>", 1)[1]
+        reasoning_part = reasoning_part.strip()
+        assistant_part = assistant_part.strip()
+        reasoning_content = reasoning_part if reasoning_part else None
+        assistant_content = assistant_part
+    elif cleaned.startswith("<think>"):
+        reasoning_part = cleaned.split("<think>", 1)[1].strip()
+        reasoning_content = reasoning_part if reasoning_part else None
+        assistant_content = ""
+
+    display_text = assistant_content
+    if reasoning_content is not None:
+        display_text = f"<think>\n{reasoning_content}\n</think>"
+        if assistant_content:
+            display_text += f"\n\n{assistant_content}"
+
+    return display_text, assistant_content, reasoning_content
+
+
 def print_help() -> None:
     print("Commands:")
     print("  /help          Show this help")
@@ -248,6 +288,10 @@ def print_turn_summary(
         f"scaled_fp8_native={runtime_stats.get('scaled_fp8_native_success', 0)} "
         f"scaled_fp8_fallback={runtime_stats.get('scaled_fp8_reference_fallbacks', 0)} "
         f"attn_decode_plan_hits={runtime_stats.get('attention_decode_plan_hits', 0)} "
+        f"grouped_routed_uses={runtime_stats.get('grouped_routed_expert_fastpath_uses', 0)} "
+        f"grouped_routed_fallbacks={runtime_stats.get('grouped_routed_expert_fastpath_fallbacks', 0)} "
+        f"grouped_routed_prereq_fallbacks={runtime_stats.get('grouped_routed_expert_prereq_fallbacks', 0)} "
+        f"selection_downloads={runtime_stats.get('expert_selection_metadata_downloads', 0)} "
         f"forward_graph_replays={runtime_stats.get('forward_graph_replays', 0)}"
     )
     print()
@@ -261,13 +305,16 @@ class InteractiveSession:
         eos_token_ids: list[int],
         args: argparse.Namespace,
         ready_payload: dict[str, Any],
+        server_stderr_handle: TextIO | None,
     ) -> None:
         self.process = process
         self.tokenizer = tokenizer
         self.eos_token_ids = eos_token_ids
         self.args = args
         self.ready_payload = ready_payload
-        self.messages: list[dict[str, str]] = []
+        self.server_stderr_handle = server_stderr_handle
+        self.turn_index = 0
+        self.messages: list[dict[str, Any]] = []
         if args.system:
             self.messages.append({"role": "system", "content": args.system})
 
@@ -275,9 +322,18 @@ class InteractiveSession:
         self.messages = []
         if self.args.system:
             self.messages.append({"role": "system", "content": self.args.system})
+        self.turn_index = 0
         send_command(self.process, "RESET")
 
+    def write_server_stderr_marker(self, phase: str, **fields: Any) -> None:
+        if self.server_stderr_handle is None:
+            return
+        payload = {"helper_marker": phase, "turn_index": self.turn_index, **fields}
+        self.server_stderr_handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        self.server_stderr_handle.flush()
+
     def run_turn(self, user_text: str) -> None:
+        self.turn_index += 1
         pending_messages = self.messages + [{"role": "user", "content": user_text}]
         tokenize_start = time.perf_counter()
         prompt_token_ids = render_chat_token_ids(
@@ -293,24 +349,46 @@ class InteractiveSession:
             )
         eos_csv = ",".join(str(token_id) for token_id in self.eos_token_ids)
         prompt_csv = ",".join(str(token_id) for token_id in prompt_token_ids)
+        self.write_server_stderr_marker(
+            "turn_begin",
+            prompt_tokens=len(prompt_token_ids),
+            history_messages=len(self.messages),
+            user_text=user_text,
+        )
         response = send_command(
             self.process,
             f"TURN\t{self.args.max_new_tokens}\t{eos_csv}\t{prompt_csv}",
         )
         detokenize_start = time.perf_counter()
         generated_token_ids = [int(token_id) for token_id in response["generated_token_ids"]]
-        generated_text = self.tokenizer.decode(
+        raw_generated_text = self.tokenizer.decode(
             generated_token_ids,
             skip_special_tokens=False,
         )
+        generated_text, assistant_content, reasoning_content = parse_assistant_generation(
+            raw_generated_text
+        )
         detokenize_end = time.perf_counter()
-        self.messages = pending_messages + [{"role": "assistant", "content": generated_text}]
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_content,
+        }
+        if reasoning_content is not None:
+            assistant_message["reasoning_content"] = reasoning_content
+        self.messages = pending_messages + [assistant_message]
         print_turn_summary(
             response,
             tokenize_ms=(tokenize_end - tokenize_start) * 1000.0,
             detokenize_ms=(detokenize_end - detokenize_start) * 1000.0,
             generated_text=generated_text,
             args=self.args,
+        )
+        self.write_server_stderr_marker(
+            "turn_end",
+            generated_tokens=len(generated_token_ids),
+            hit_eos=bool(response.get("hit_eos")),
+            hit_capacity_limit=bool(response.get("hit_capacity_limit")),
+            total_ms=float(response.get("total_ms", 0.0)),
         )
 
     def repl(self) -> None:
@@ -357,49 +435,61 @@ def main() -> int:
     server_binary = resolve_server_binary(args)
     if not server_binary.exists():
         raise RuntimeError(f"server binary not found: {server_binary}")
+    server_stderr_log = args.server_stderr_log.resolve()
+    server_stderr_log.parent.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_tokenizer(str(tokenizer_name))
     eos_token_ids = resolve_eos_token_ids(args, tokenizer)
 
-    process = subprocess.Popen(
-        [
-            str(server_binary),
-            "--manifest",
-            str(args.manifest.resolve()),
-            "--max-new-tokens",
-            str(args.max_new_tokens),
-            "--target-context-tokens",
-            str(args.target_context_tokens),
-            "--graph-bytes",
-            str(args.graph_bytes),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=None,
-        text=True,
-        bufsize=1,
-    )
+    server_stderr_handle = server_stderr_log.open("w", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            [
+                str(server_binary),
+                "--manifest",
+                str(args.manifest.resolve()),
+                "--max-new-tokens",
+                str(args.max_new_tokens),
+                "--target-context-tokens",
+                str(args.target_context_tokens),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=server_stderr_handle,
+            text=True,
+            bufsize=1,
+        )
 
-    if process.stdout is None:
-        raise RuntimeError("interactive helper stdout pipe was not created")
-    ready_line = process.stdout.readline()
-    if ready_line == "":
-        raise RuntimeError("interactive helper exited before signaling readiness")
-    ready_payload = json.loads(ready_line)
-    if not ready_payload.get("ok", False):
-        raise RuntimeError(ready_payload.get("error", "interactive helper failed during startup"))
+        if process.stdout is None:
+            raise RuntimeError("interactive helper stdout pipe was not created")
+        ready_line = process.stdout.readline()
+        if ready_line == "":
+            raise RuntimeError("interactive helper exited before signaling readiness")
+        ready_payload = json.loads(ready_line)
+        if not ready_payload.get("ok", False):
+            raise RuntimeError(ready_payload.get("error", "interactive helper failed during startup"))
+    except Exception:
+        server_stderr_handle.close()
+        raise
 
     print(
         "helper: "
         f"model_id={ready_payload['model_id']} "
         f"target_context_tokens={ready_payload['target_context_tokens']} "
-        f"graph_bytes={ready_payload['graph_bytes']} "
         f"env_build={format_ms(float(ready_payload['environment_build_ms']))} "
         f"model_build={format_ms(float(ready_payload['model_build_ms']))}"
     )
-    print("helper: direct Create(...) path only; prefix-cache reuse is unsupported")
+    print("helper: direct Create(...) path only; graph capture and prefix-cache reuse are unsupported")
+    print(f"helper: server stderr log={server_stderr_log}")
 
-    session = InteractiveSession(process, tokenizer, eos_token_ids, args, ready_payload)
+    session = InteractiveSession(
+        process,
+        tokenizer,
+        eos_token_ids,
+        args,
+        ready_payload,
+        server_stderr_handle,
+    )
     try:
         if args.once is not None:
             session.run_turn(args.once)
@@ -407,6 +497,7 @@ def main() -> int:
             session.repl()
     finally:
         session.close()
+        server_stderr_handle.close()
     return 0
 
 
