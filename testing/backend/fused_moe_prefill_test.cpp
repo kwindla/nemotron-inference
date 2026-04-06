@@ -277,7 +277,6 @@ bool BuildReferenceOutputs(
       0.0f);
 
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
-    const float* input_row = test_case.input.data() + token_index * test_case.hidden_size;
     const float* normalized_row =
         test_case.normalized.data() + token_index * test_case.hidden_size;
     std::vector<float> normalized_vec(
@@ -293,7 +292,6 @@ bool BuildReferenceOutputs(
         expected_routed_output->data() + token_index * test_case.hidden_size;
     float* shared_output_row =
         expected_shared_output->data() + token_index * test_case.hidden_size;
-    std::copy(input_row, input_row + test_case.hidden_size, output_row);
 
     for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
       const std::size_t selection_index = token_index * test_case.top_k + slot;
@@ -588,11 +586,11 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   std::vector<float> recomposed_output(actual_routed_output.size(), 0.0f);
   for (std::size_t index = 0; index < recomposed_output.size(); ++index) {
     recomposed_output[index] =
-        test_case.input[index] + actual_routed_output[index] + actual_shared_output[index];
+        actual_routed_output[index] + actual_shared_output[index];
   }
   return Expect(
       MaxAbsDiff(actual_output, recomposed_output) <= kMaxAbsDiffTolerance,
-      "prefill output should equal input + routed + shared contributions");
+      "prefill output should equal routed + shared contributions");
 }
 
 }  // namespace

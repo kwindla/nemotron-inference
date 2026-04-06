@@ -152,6 +152,17 @@ std::vector<float> slice_row(
       values.begin() + static_cast<std::ptrdiff_t>(row_offset + row_width));
 }
 
+const nemotron::CapturedLayerOutput* find_captured_layer(
+    const nemotron::SingleTokenForwardTrace& trace,
+    std::size_t layer_index) {
+  for (const auto& captured : trace.captured_layers) {
+    if (captured.layer_index == layer_index) {
+      return &captured;
+    }
+  }
+  return nullptr;
+}
+
 std::vector<float> copy_tensor_to_host(const DeviceTensorFp32& tensor) {
   std::vector<float> host(tensor.numel(), 0.0f);
   if (!tensor.CopyToHost(host.data(), host.size())) {
@@ -448,6 +459,88 @@ bool expect_rows_match(
       cold_in_restored_top5 && restored_in_cold_top5,
       label + " argmax token should match or both appear in each other's top-5; max_abs_diff=" +
           std::to_string(diff));
+}
+
+void log_prefill_decode_boundary_localization(
+    const SingleTokenForwardModel& model,
+    const std::vector<std::int32_t>& prefix_tokens,
+    std::int32_t appended_token_id) {
+  std::vector<std::int32_t> committed_tokens = prefix_tokens;
+  committed_tokens.push_back(appended_token_id);
+  std::vector<std::size_t> capture_layer_indices;
+  capture_layer_indices.reserve(model.plan().layers.size());
+  for (const auto& layer : model.plan().layers) {
+    capture_layer_indices.push_back(layer.layer_index);
+  }
+
+  auto full_context = model.CreateRequestContext();
+  auto decode_context = model.CreateRequestContext();
+  auto full_logits = DeviceTensorFp32::Create({committed_tokens.size(), model.config().vocab_size});
+  auto prefix_logits = DeviceTensorFp32::Create({prefix_tokens.size(), model.config().vocab_size});
+  auto decode_logits = DeviceTensorFp32::Create({1, model.config().vocab_size});
+  nemotron::SingleTokenForwardTrace full_trace;
+  nemotron::SingleTokenForwardTrace decode_trace;
+  if (full_context == nullptr ||
+      !full_context->valid() ||
+      decode_context == nullptr ||
+      !decode_context->valid() ||
+      full_logits == nullptr ||
+      !full_logits->valid() ||
+      prefix_logits == nullptr ||
+      !prefix_logits->valid() ||
+      decode_logits == nullptr ||
+      !decode_logits->valid()) {
+    std::cerr << "multi_turn_prefix_reuse_test: prefill/decode localization setup failed\n";
+    return;
+  }
+
+  if (!model.RunPrefill(
+          committed_tokens.data(),
+          committed_tokens.size(),
+          *full_context,
+          full_logits.get(),
+          capture_layer_indices,
+          &full_trace) ||
+      !model.RunPrefill(
+          prefix_tokens.data(),
+          prefix_tokens.size(),
+          *decode_context,
+          prefix_logits.get()) ||
+      !model.ContinueSingleToken(
+          appended_token_id,
+          *decode_context,
+          decode_logits.get(),
+          capture_layer_indices,
+          &decode_trace)) {
+    std::cerr << "multi_turn_prefix_reuse_test: prefill/decode localization execution failed\n";
+    return;
+  }
+
+  for (const auto& layer : model.plan().layers) {
+    const auto* full_layer = find_captured_layer(full_trace, layer.layer_index);
+    const auto* decode_layer = find_captured_layer(decode_trace, layer.layer_index);
+    if (full_layer == nullptr || decode_layer == nullptr) {
+      continue;
+    }
+    const std::vector<float> full_row = slice_row(
+        full_layer->hidden,
+        committed_tokens.size() - 1,
+        model.config().hidden_size);
+    const std::vector<float> decode_row = slice_row(
+        decode_layer->hidden,
+        0,
+        model.config().hidden_size);
+    const float diff = max_abs_diff(full_row, decode_row);
+    if (!(diff <= 0.0f)) {
+      std::cerr << "multi_turn_prefix_reuse_test: first prefill/decode layer divergence"
+                << " layer=" << layer.layer_index
+                << " kind=" << static_cast<int>(layer.kind)
+                << " max_abs_diff=" << diff << "\n";
+      return;
+    }
+  }
+
+  std::cerr << "multi_turn_prefix_reuse_test: no per-layer hidden divergence found before boundary mismatch\n";
 }
 
 struct GreedyContinuationResult {
@@ -802,13 +895,48 @@ bool run_multi_turn_prefix_reuse_test() {
   }
 
   auto cold_committed_context = model->CreateRequestContext();
+  auto cold_committed_prefill_context = model->CreateRequestContext();
+  auto cold_committed_prefill_logits = DeviceTensorFp32::Create({committed_tokens.size(), config.vocab_size});
   nemotron::GreedyDecodeConfig followup_decode_config;
   followup_decode_config.max_new_tokens = followup_decode_token_count;
   followup_decode_config.eos_token_ids = eos_token_ids;
   nemotron::GreedyDecodeResult cold_committed_decode;
+  std::vector<float> cold_committed_boundary;
   if (!expect(
           cold_committed_context != nullptr && cold_committed_context->valid(),
           "cold committed-head request context should be creatable") ||
+      !expect(
+          cold_committed_prefill_context != nullptr && cold_committed_prefill_context->valid(),
+          "cold committed-head prefill context should be creatable") ||
+      !expect(
+          cold_committed_prefill_logits != nullptr && cold_committed_prefill_logits->valid(),
+          "cold committed-head prefill logits should allocate") ||
+      !expect(
+          model->RunPrefill(
+              committed_tokens.data(),
+              committed_tokens.size(),
+              *cold_committed_prefill_context,
+              cold_committed_prefill_logits.get()),
+          "cold committed-head prefill should succeed")) {
+    return false;
+  }
+  cold_committed_boundary = slice_row(
+      copy_tensor_to_host(*cold_committed_prefill_logits),
+      committed_tokens.size() - 1,
+      config.vocab_size);
+  const auto cold_committed_boundary_argmax = argmax_token_id(cold_committed_boundary);
+  const auto cached_committed_boundary_argmax = argmax_token_id(*cached_committed_boundary_logits);
+  const bool cold_committed_boundary_match = expect_rows_match(
+      cold_committed_boundary,
+      *cached_committed_boundary_logits,
+      "cold committed-head boundary vs cached boundary");
+  if (cold_committed_boundary_argmax != cached_committed_boundary_argmax) {
+    log_prefill_decode_boundary_localization(
+        *model,
+        prompt,
+        restored_prompt_decode->generated_token_ids.front());
+  }
+  if (!cold_committed_boundary_match ||
       !expect(
           model->RunGreedyDecode(
               committed_tokens.data(),

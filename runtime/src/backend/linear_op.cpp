@@ -438,6 +438,123 @@ GemmKernelFamily UploadedLinearOp::kernel_family() const {
   return impl_ ? impl_->descriptor.kernel_family : GemmKernelFamily::kDenseRowMajor;
 }
 
+bool RunLinearBf16WithFp32Fallback(
+    const UploadedLinearOp& op,
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output) {
+  if (op.Run(handle, heuristic_cache, activations, output)) {
+    return true;
+  }
+  auto fp32_input = DeviceTensorFp32::Create(activations.shape());
+  auto fp32_output = DeviceTensorFp32::Create(output != nullptr ? output->shape() : std::vector<std::size_t>{});
+  return fp32_input != nullptr &&
+         fp32_output != nullptr &&
+         CastTensorBf16ToFp32(activations, fp32_input.get()) &&
+         op.Run(handle, heuristic_cache, *fp32_input, fp32_output.get()) &&
+         CastTensorFp32ToBf16(*fp32_output, output) &&
+         cudaStreamSynchronize(nullptr) == cudaSuccess;
+}
+
+bool RunStableRowBf16Linear(
+    const UploadedLinearOp& op,
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output,
+    std::size_t stable_row_count) {
+  if (!activations.valid() ||
+      output == nullptr ||
+      !output->valid() ||
+      activations.shape().size() != 2 ||
+      output->shape().size() != 2 ||
+      activations.shape().front() != output->shape().front() ||
+      activations.shape().back() != op.input_cols() ||
+      output->shape().back() != op.output_rows() ||
+      stable_row_count == 0) {
+    return false;
+  }
+
+  const std::size_t rows = activations.shape().front();
+  const std::size_t input_width = activations.shape().back();
+  const std::size_t output_width = output->shape().back();
+  if (rows == 0) {
+    return true;
+  }
+
+  std::unique_ptr<DeviceTensorBf16> padded_input;
+  std::unique_ptr<DeviceTensorBf16> padded_output;
+  if (stable_row_count > 1) {
+    padded_input = DeviceTensorBf16::Create({stable_row_count, input_width});
+    padded_output = DeviceTensorBf16::Create({stable_row_count, output_width});
+    if (padded_input == nullptr ||
+        !padded_input->valid() ||
+        padded_output == nullptr ||
+        !padded_output->valid()) {
+      return false;
+    }
+  }
+
+  for (std::size_t row_start = 0; row_start < rows; row_start += stable_row_count) {
+    const std::size_t chunk_rows = std::min(stable_row_count, rows - row_start);
+    auto input_chunk = DeviceTensorBf16::CreateView(
+        {chunk_rows, input_width},
+        activations.data() + (row_start * input_width));
+    auto output_chunk = DeviceTensorBf16::CreateView(
+        {chunk_rows, output_width},
+        output->data() + (row_start * output_width));
+    if (input_chunk == nullptr ||
+        output_chunk == nullptr ||
+        !input_chunk->valid() ||
+        !output_chunk->valid()) {
+      return false;
+    }
+
+    if (chunk_rows == stable_row_count) {
+      if (!RunLinearBf16WithFp32Fallback(
+              op,
+              handle,
+              heuristic_cache,
+              *input_chunk,
+              output_chunk.get())) {
+        return false;
+      }
+      continue;
+    }
+
+    if (!padded_input->FillZero() || !padded_output->FillZero()) {
+      return false;
+    }
+    const std::size_t input_copy_elems = chunk_rows * input_width;
+    const std::size_t output_copy_elems = chunk_rows * output_width;
+    if (cudaMemcpy(
+            padded_input->data(),
+            input_chunk->data(),
+            input_copy_elems * sizeof(__nv_bfloat16),
+            cudaMemcpyDeviceToDevice) != cudaSuccess) {
+      return false;
+    }
+    if (!RunLinearBf16WithFp32Fallback(
+            op,
+            handle,
+            heuristic_cache,
+            *padded_input,
+            padded_output.get())) {
+      return false;
+    }
+    if (cudaMemcpy(
+            output_chunk->data(),
+            padded_output->data(),
+            output_copy_elems * sizeof(__nv_bfloat16),
+            cudaMemcpyDeviceToDevice) != cudaSuccess) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool UploadedLinearOp::Run(
     CublasLtHandle& handle,
     GemmHeuristicCache* heuristic_cache,

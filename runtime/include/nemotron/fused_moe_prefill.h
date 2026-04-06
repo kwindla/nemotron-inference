@@ -19,9 +19,9 @@ struct FusedMoePrefillParams {
   const FusedNvfp4WeightView* routed_down = nullptr;
   const int* selected_indices = nullptr;
   const float* selected_weights = nullptr;
-  const float* input = nullptr;
+  const float* input = nullptr;  // Reserved for future fused epilog variants.
   const float* normalized = nullptr;
-  float* output = nullptr;
+  float* output = nullptr;  // Receives routed + shared expert contributions.
   float* routed_output = nullptr;  // Optional.
   float* shared_output = nullptr;  // Optional.
 };

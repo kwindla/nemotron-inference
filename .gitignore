@@ -13,3 +13,5 @@ claude-todo.md
 proj-*/codex-jobs/*.log
 vllm-env/
 third_party/TensorRT-LLM/
+*.sqlite
+*.nsys-rep

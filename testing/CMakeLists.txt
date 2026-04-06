@@ -583,6 +583,19 @@ target_compile_definitions(
 nemotron_add_test(multi_turn_prefix_reuse_test)
 
 add_executable(
+  split_prefill_localization_test
+  api/split_prefill_localization_test.cpp
+)
+
+target_link_libraries(split_prefill_localization_test PRIVATE nemotron_runtime_api)
+target_compile_features(split_prefill_localization_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  split_prefill_localization_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+add_executable(
   nano_loader_budget_test
   api/nano_loader_budget_test.cpp
 )

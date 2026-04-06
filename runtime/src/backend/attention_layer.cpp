@@ -144,6 +144,7 @@ bool IsNanoDecodeShape(
 }
 
 constexpr std::size_t kNanoMultiTokenMaxQueryTokens = 1024;
+constexpr std::size_t kNanoStablePrefillProjectionRows = 32;
 
 bool IsNanoMultiTokenShape(
     const AttentionLayerConfig& layer_config,
@@ -155,6 +156,20 @@ bool IsNanoMultiTokenShape(
          layer_config.query_head_count == 32 &&
          token_count >= 2 &&
          token_count <= kNanoMultiTokenMaxQueryTokens &&
+         cache_config.dtype == KvCacheDataType::kBf16 &&
+         cache_config.kv_head_count == 2 &&
+         cache_config.head_dim == 128 &&
+         cache_config.tokens_per_page == 16;
+}
+
+bool UsesStableNanoPrefillProjection(
+    const AttentionLayerConfig& layer_config,
+    const AttentionKvCacheConfig& cache_config,
+    std::size_t token_count) {
+  return token_count > 1 &&
+         layer_config.query_head_count == 32 &&
+         layer_config.kv_head_count == 2 &&
+         layer_config.head_dim == 128 &&
          cache_config.dtype == KvCacheDataType::kBf16 &&
          cache_config.kv_head_count == 2 &&
          cache_config.head_dim == 128 &&
@@ -448,6 +463,12 @@ bool AttentionLayerSlice::Run(
     return false;
   }
 
+  const bool use_stable_nano_prefill_projection =
+      UsesStableNanoPrefillProjection(
+          impl_->config,
+          request_context.config().attention_kv_cache,
+          token_count);
+
   if (token_count > kNanoMultiTokenMaxQueryTokens &&
       impl_->config.query_head_count == 32 &&
       impl_->config.kv_head_count == 2 &&
@@ -495,6 +516,8 @@ bool AttentionLayerSlice::Run(
     RecordAttentionNativeMultiTokenExecution(token_count);
   }
 
+  const std::size_t query_width = impl_->config.query_head_count * impl_->config.head_dim;
+  const std::size_t kv_width = impl_->config.kv_head_count * impl_->config.head_dim;
   std::unique_ptr<DeviceTensorBf16> normed_owned;
   std::unique_ptr<DeviceTensorBf16> q_owned;
   std::unique_ptr<DeviceTensorBf16> k_owned;
@@ -519,12 +542,13 @@ bool AttentionLayerSlice::Run(
     query_bf16 = impl_->query_bf16_scratch.get();
     output_bf16 = impl_->attn_output_bf16_scratch.get();
   } else {
-    normed_owned = DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
-    q_owned = DeviceTensorBf16::Create({token_count, impl_->config.query_head_count * impl_->config.head_dim});
-    k_owned = DeviceTensorBf16::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
-    v_owned = DeviceTensorBf16::Create({token_count, impl_->config.kv_head_count * impl_->config.head_dim});
+    normed_owned =
+        DeviceTensorBf16::Create({token_count, impl_->config.hidden_size});
+    q_owned = DeviceTensorBf16::Create({token_count, query_width});
+    k_owned = DeviceTensorBf16::Create({token_count, kv_width});
+    v_owned = DeviceTensorBf16::Create({token_count, kv_width});
     attn_output_owned = DeviceTensorBf16::Create(
-        {token_count, impl_->config.query_head_count * impl_->config.head_dim});
+        {token_count, query_width});
     query_bf16_owned =
         DeviceTensorBf16::Create({1, impl_->config.query_head_count, token_count, impl_->config.head_dim});
     output_layout_owned =
@@ -554,17 +578,21 @@ bool AttentionLayerSlice::Run(
   const auto run_linear_bf16 = [&](const UploadedLinearOp& op,
                                    const DeviceTensorBf16& bf16_input,
                                    DeviceTensorBf16* bf16_output) -> bool {
-    if (op.Run(cublas_handle, heuristic_cache, bf16_input, bf16_output)) {
-      return true;
+    if (use_stable_nano_prefill_projection) {
+      return RunStableRowBf16Linear(
+          op,
+          cublas_handle,
+          heuristic_cache,
+          bf16_input,
+          bf16_output,
+          kNanoStablePrefillProjectionRows);
     }
-    auto fp32_input = DeviceTensorFp32::Create(bf16_input.shape());
-    auto fp32_output = DeviceTensorFp32::Create(bf16_output->shape());
-    return fp32_input != nullptr &&
-           fp32_output != nullptr &&
-           CastTensorBf16ToFp32(bf16_input, fp32_input.get()) &&
-           op.Run(cublas_handle, heuristic_cache, *fp32_input, fp32_output.get()) &&
-           CastTensorFp32ToBf16(*fp32_output, bf16_output) &&
-           cudaStreamSynchronize(nullptr) == cudaSuccess;
+    return RunLinearBf16WithFp32Fallback(
+        op,
+        cublas_handle,
+        heuristic_cache,
+        bf16_input,
+        bf16_output);
   };
 
   const bool norm_ok =

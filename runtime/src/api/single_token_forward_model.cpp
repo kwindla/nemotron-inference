@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -488,6 +489,8 @@ void AppendCapturedLayers(
       CapturedLayerOutput appended;
       appended.layer_index = step_layer.layer_index;
       appended.hidden = step_layer.hidden;
+      appended.hidden_delta_bf16_bits = step_layer.hidden_delta_bf16_bits;
+      appended.residual_accum_bf16_bits = step_layer.residual_accum_bf16_bits;
       output_layers->push_back(std::move(appended));
       continue;
     }
@@ -495,6 +498,14 @@ void AppendCapturedLayers(
         existing->hidden.end(),
         step_layer.hidden.begin(),
         step_layer.hidden.end());
+    existing->hidden_delta_bf16_bits.insert(
+        existing->hidden_delta_bf16_bits.end(),
+        step_layer.hidden_delta_bf16_bits.begin(),
+        step_layer.hidden_delta_bf16_bits.end());
+    existing->residual_accum_bf16_bits.insert(
+        existing->residual_accum_bf16_bits.end(),
+        step_layer.residual_accum_bf16_bits.begin(),
+        step_layer.residual_accum_bf16_bits.end());
   }
 }
 
@@ -569,6 +580,19 @@ std::vector<float> CopyTensorToHost(const DeviceTensorBf16& tensor) {
     host[i] = __bfloat162float(host_bf16[i]);
   }
   return host;
+}
+
+std::vector<std::uint16_t> CopyTensorBf16BitsToHost(const DeviceTensorBf16& tensor) {
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return {};
+  }
+
+  std::vector<std::uint16_t> host_bits(host_bf16.size(), 0);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    std::memcpy(&host_bits[i], &host_bf16[i], sizeof(host_bits[i]));
+  }
+  return host_bits;
 }
 
 std::vector<float> CopyCombinedTensorToHost(
@@ -1870,7 +1894,11 @@ bool SingleTokenForwardModel::RunTokens(
       CapturedLayerOutput captured;
       captured.layer_index = layer.plan.layer_index;
       captured.hidden = CopyCombinedTensorToHost(*current, *residual_tensor);
-      if (captured.hidden.empty()) {
+      captured.hidden_delta_bf16_bits = CopyTensorBf16BitsToHost(*current);
+      captured.residual_accum_bf16_bits = CopyTensorBf16BitsToHost(*residual_tensor);
+      if (captured.hidden.empty() ||
+          captured.hidden_delta_bf16_bits.empty() ||
+          captured.residual_accum_bf16_bits.empty()) {
         std::cerr << "single_token_forward_model: failed to capture layer " << layer.plan.layer_index << "\n";
         return false;
       }

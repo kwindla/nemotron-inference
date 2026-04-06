@@ -55,6 +55,21 @@ class UploadedLinearOp {
   std::unique_ptr<Impl> impl_;
 };
 
+bool RunLinearBf16WithFp32Fallback(
+    const UploadedLinearOp& op,
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output);
+
+bool RunStableRowBf16Linear(
+    const UploadedLinearOp& op,
+    CublasLtHandle& handle,
+    GemmHeuristicCache* heuristic_cache,
+    const DeviceTensorBf16& activations,
+    DeviceTensorBf16* output,
+    std::size_t stable_row_count);
+
 std::optional<std::vector<float>> ReadVectorWeightToHostFp32(
     const KernelTensorDescriptor& descriptor);
 std::unique_ptr<DeviceTensorFp32> UploadVectorWeightToDeviceFp32(

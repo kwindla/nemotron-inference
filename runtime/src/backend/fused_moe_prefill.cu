@@ -56,7 +56,6 @@ __global__ void FusedMoePrefillKernel(FusedMoePrefillParams params) {
 
   const std::size_t tid = static_cast<std::size_t>(threadIdx.x);
   const std::size_t hidden_offset = token_index * params.hidden_size;
-  const float* input_row = params.input + hidden_offset;
   const float* normalized_row = params.normalized + hidden_offset;
   float* output_row = params.output + hidden_offset;
   float* routed_output_row =
@@ -78,7 +77,7 @@ __global__ void FusedMoePrefillKernel(FusedMoePrefillParams params) {
   __syncthreads();
 
   for (std::size_t column = tid; column < params.hidden_size; column += blockDim.x) {
-    output_row[column] = input_row[column];
+    output_row[column] = 0.0f;
     if (routed_output_row != nullptr) {
       routed_output_row[column] = 0.0f;
     }

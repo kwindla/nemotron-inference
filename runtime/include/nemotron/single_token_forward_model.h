@@ -75,6 +75,8 @@ struct SingleTokenForwardPlan {
 struct CapturedLayerOutput {
   std::size_t layer_index = 0;
   std::vector<float> hidden;
+  std::vector<std::uint16_t> hidden_delta_bf16_bits;
+  std::vector<std::uint16_t> residual_accum_bf16_bits;
 };
 
 struct SingleTokenForwardTrace {
