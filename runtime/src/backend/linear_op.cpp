@@ -23,6 +23,7 @@ namespace nemotron {
 
 struct UploadedLinearOp::Impl {
   GemmDescriptor descriptor;
+  std::optional<float> fixed_activation_tensor_scale;
   std::unique_ptr<DeviceDenseWeightFp32> dense_weight_fp32;
   std::unique_ptr<DeviceDenseWeightBf16> dense_weight_bf16;
   std::unique_ptr<DeviceNvfp4Weight> nvfp4_weight;
@@ -110,7 +111,8 @@ void LogGemmExecuteFailure(
 Nvfp4PackOptions RuntimeNvfp4PackOptions(
     bool debug,
     const GemmDescriptor& descriptor,
-    std::size_t rows) {
+    std::size_t rows,
+    std::optional<float> fixed_activation_tensor_scale = std::nullopt) {
   Nvfp4PackOptions options;
   // The row-major cuBLASLt NVFP4 fastpath is numerically stable with the
   // 128x4 activation scale-factor layout, but the 8x4 variant still diverges
@@ -118,13 +120,18 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(
   // support available in the packer utilities, but force the runtime bridge to
   // use the validated 128x4 layout until the 8x4 execute contract is fixed.
   options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
+  options.fixed_tensor_scale = fixed_activation_tensor_scale;
   if (debug) {
     std::cerr << "linear_op: NVFP4 activation pack options for "
               << descriptor.tensor_name
               << " M=" << rows
               << " scale_layout=" << ToString(*options.execution_scale_layout)
-              << " tensor_scale=dynamic"
-              << "\n";
+              << " tensor_scale="
+              << (fixed_activation_tensor_scale.has_value() ? "fixed" : "dynamic");
+    if (fixed_activation_tensor_scale.has_value()) {
+      std::cerr << ":" << *fixed_activation_tensor_scale;
+    }
+    std::cerr << "\n";
   }
   return options;
 }
@@ -303,9 +310,16 @@ float DecodeFp8(std::uint8_t raw_byte) {
 }  // namespace
 
 std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor& descriptor) {
+  return Create(descriptor, std::nullopt);
+}
+
+std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(
+    const GemmDescriptor& descriptor,
+    std::optional<float> fixed_activation_tensor_scale) {
   const bool debug = std::getenv("NEMOTRON_FORWARD_DEBUG") != nullptr;
   auto impl = std::make_unique<Impl>();
   impl->descriptor = descriptor;
+  impl->fixed_activation_tensor_scale = fixed_activation_tensor_scale;
   switch (descriptor.kernel_family) {
     case GemmKernelFamily::kDenseRowMajor:
       if (IsBf16Storage(descriptor.storage_dtype)) {
@@ -347,7 +361,12 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(const GemmDescriptor&
           descriptor.input_cols,
           ResolveActivationNvfp4ScaleLayout(
               1,
-              RuntimeNvfp4PackOptions(debug, descriptor, 1).execution_scale_layout));
+              RuntimeNvfp4PackOptions(
+                  debug,
+                  descriptor,
+                  1,
+                  impl->fixed_activation_tensor_scale)
+                  .execution_scale_layout));
       if (!impl->activation_pack || !impl->activation_pack->valid()) {
         if (debug) {
           std::cerr << "linear_op_create: NVFP4 activation pack allocation failed for "
@@ -483,7 +502,11 @@ bool UploadedLinearOp::Run(
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       {
         const Nvfp4PackOptions pack_options =
-            RuntimeNvfp4PackOptions(debug, impl_->descriptor, rows);
+            RuntimeNvfp4PackOptions(
+                debug,
+                impl_->descriptor,
+                rows,
+                impl_->fixed_activation_tensor_scale);
         const std::optional<Nvfp4ScaleLayout> activation_scale_layout =
             pack_options.execution_scale_layout;
         const char* plan_source = "runtime";

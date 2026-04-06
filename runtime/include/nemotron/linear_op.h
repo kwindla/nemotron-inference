@@ -19,6 +19,9 @@ namespace nemotron {
 class UploadedLinearOp {
  public:
   static std::unique_ptr<UploadedLinearOp> Create(const GemmDescriptor& descriptor);
+  static std::unique_ptr<UploadedLinearOp> Create(
+      const GemmDescriptor& descriptor,
+      std::optional<float> fixed_activation_tensor_scale);
 
   UploadedLinearOp(UploadedLinearOp&&) noexcept;
   UploadedLinearOp& operator=(UploadedLinearOp&&) noexcept;

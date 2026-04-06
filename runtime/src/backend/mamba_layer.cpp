@@ -430,6 +430,13 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
   Impl::ProjectionFamily in_proj_family = Impl::ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> in_proj_dense;
   std::unique_ptr<ScaledFp8LinearOp> in_proj_scaled_fp8;
+  std::optional<float> in_proj_fixed_activation_tensor_scale;
+  if (bindings.in_proj_input_scale != nullptr) {
+    in_proj_fixed_activation_tensor_scale = ReadScalarTensorToHostFp32(*bindings.in_proj_input_scale);
+    if (!in_proj_fixed_activation_tensor_scale.has_value()) {
+      return debug_fail("in_proj input_scale read failed");
+    }
+  }
   if (bindings.in_proj_kernel_weight != nullptr &&
       bindings.in_proj_weight_scale != nullptr &&
       bindings.in_proj_input_scale != nullptr) {
@@ -446,7 +453,9 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     }
   }
   if (in_proj_family == Impl::ProjectionFamily::kNone) {
-    in_proj_dense = UploadedLinearOp::Create(*bindings.in_proj_gemm_weight);
+    in_proj_dense = UploadedLinearOp::Create(
+        *bindings.in_proj_gemm_weight,
+        in_proj_fixed_activation_tensor_scale);
     if (!in_proj_dense || !in_proj_dense->valid()) {
       return debug_fail("in_proj dense creation failed");
     }
@@ -456,6 +465,13 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
   Impl::ProjectionFamily out_proj_family = Impl::ProjectionFamily::kNone;
   std::unique_ptr<UploadedLinearOp> out_proj_dense;
   std::unique_ptr<ScaledFp8LinearOp> out_proj_scaled_fp8;
+  std::optional<float> out_proj_fixed_activation_tensor_scale;
+  if (bindings.out_proj_input_scale != nullptr) {
+    out_proj_fixed_activation_tensor_scale = ReadScalarTensorToHostFp32(*bindings.out_proj_input_scale);
+    if (!out_proj_fixed_activation_tensor_scale.has_value()) {
+      return debug_fail("out_proj input_scale read failed");
+    }
+  }
   if (bindings.out_proj_kernel_weight != nullptr &&
       bindings.out_proj_weight_scale != nullptr &&
       bindings.out_proj_input_scale != nullptr) {
@@ -472,7 +488,9 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::Create(
     }
   }
   if (out_proj_family == Impl::ProjectionFamily::kNone) {
-    out_proj_dense = UploadedLinearOp::Create(*bindings.out_proj_gemm_weight);
+    out_proj_dense = UploadedLinearOp::Create(
+        *bindings.out_proj_gemm_weight,
+        out_proj_fixed_activation_tensor_scale);
     if (!out_proj_dense || !out_proj_dense->valid()) {
       return debug_fail("out_proj dense creation failed");
     }
