@@ -1,6 +1,8 @@
 #include "nemotron/fused_moe_prefill.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <limits>
@@ -10,10 +12,15 @@
 namespace nemotron {
 namespace {
 
+namespace wmma = nvcuda::wmma;
+
 constexpr int kGroupedTokenTile = 8;
 constexpr int kPlannedOutputTile = 32;
-constexpr int kPlannedPairsPerStep = 32;
-constexpr int kPlannedThreadsPerBlock = kGroupedTokenTile * kPlannedOutputTile;
+constexpr int kPlannedThreadsPerBlock = 64;
+constexpr int kPlannedWmmaTileM = 16;
+constexpr int kPlannedWmmaTileN = 16;
+constexpr int kPlannedWmmaTileK = 16;
+constexpr int kPlannedWmmaWarpsPerBlock = 2;
 
 static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
 
@@ -214,8 +221,9 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     float* output) {
-  __shared__ float input_tile[kGroupedTokenTile][kPlannedPairsPerStep * 2];
-  __shared__ float weight_tile[kPlannedOutputTile][kPlannedPairsPerStep * 2];
+  __shared__ __nv_bfloat16 a_tile[kPlannedOutputTile][kPlannedWmmaTileK];
+  __shared__ __nv_bfloat16 b_tile[kPlannedWmmaTileK][kPlannedWmmaTileM];
+  __shared__ float c_tile[kPlannedOutputTile][kPlannedWmmaTileM];
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -224,20 +232,19 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
   }
 
   const int tid = static_cast<int>(threadIdx.x);
-  const int token_index = tid / kPlannedOutputTile;
-  const int output_lane = tid % kPlannedOutputTile;
+  const int warp_id = tid / 32;
   const int output_row_base = static_cast<int>(blockIdx.x) * kPlannedOutputTile;
   const int expert_index = cta_expert_ids[cta_index];
   const int row_start = cta_row_starts[cta_index];
   const int valid_rows = cta_valid_rows[cta_index];
   if (expert_index < 0 ||
       static_cast<std::size_t>(output_row_base) >= output_rows_per_expert ||
-      valid_rows <= 0) {
+      valid_rows <= 0 ||
+      warp_id >= kPlannedWmmaWarpsPerBlock) {
     return;
   }
 
-  const fused_decode::Nvfp4WeightView weight =
-      MakeDeviceWeightView(weights[expert_index]);
+  const FusedNvfp4WeightView weight = weights[expert_index];
   const std::size_t pairs_per_row = weight.input_cols / 2;
   const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
   const int output_rows_this_tile = static_cast<int>(
@@ -246,67 +253,98 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
           ? (output_rows_per_expert - static_cast<std::size_t>(output_row_base))
           : static_cast<std::size_t>(kPlannedOutputTile));
   const float tensor_scale = *weight.tensor_scale_data;
-  float accum = 0.0f;
 
-  for (std::size_t pair_base = 0; pair_base < pairs_per_row;
-       pair_base += static_cast<std::size_t>(kPlannedPairsPerStep)) {
-    const std::size_t remaining_pairs = pairs_per_row - pair_base;
-    const int pairs_this_step = static_cast<int>(
-        remaining_pairs < static_cast<std::size_t>(kPlannedPairsPerStep)
-            ? remaining_pairs
-            : static_cast<std::size_t>(kPlannedPairsPerStep));
-    const int values_this_step = valid_rows * pairs_this_step * 2;
-    for (int linear_index = static_cast<int>(threadIdx.x);
-         linear_index < values_this_step;
-         linear_index += static_cast<int>(blockDim.x)) {
-      const int token_index = linear_index / (pairs_this_step * 2);
-      const int within_token = linear_index % (pairs_this_step * 2);
-      const int pair_offset = within_token / 2;
-      const int value_offset = within_token % 2;
-      const std::size_t input_row =
-          static_cast<std::size_t>(row_start + token_index);
-      const std::size_t col =
-          (pair_base + static_cast<std::size_t>(pair_offset)) * 2u +
-          static_cast<std::size_t>(value_offset);
-      input_tile[token_index][within_token] =
-          input[input_row * weight.input_cols + col];
-    }
-    const int packed_values_this_step = output_rows_this_tile * pairs_this_step;
+  wmma::fragment<
+      wmma::accumulator,
+      kPlannedWmmaTileM,
+      kPlannedWmmaTileN,
+      kPlannedWmmaTileK,
+      float>
+      c_frag;
+  wmma::fill_fragment(c_frag, 0.0f);
+
+  for (std::size_t k_base = 0; k_base < weight.input_cols;
+       k_base += static_cast<std::size_t>(kPlannedWmmaTileK)) {
     for (int linear_index = tid;
-         linear_index < packed_values_this_step;
+         linear_index < (kPlannedOutputTile * kPlannedWmmaTileK);
          linear_index += static_cast<int>(blockDim.x)) {
-      const int tile_output_row = linear_index / pairs_this_step;
-      const int pair_offset = linear_index % pairs_this_step;
-      const int output_row = output_row_base + tile_output_row;
-      const std::size_t pair_index = pair_base + static_cast<std::size_t>(pair_offset);
-      const std::size_t block = pair_index / 8u;
-      const std::size_t packed_row_offset =
-          static_cast<std::size_t>(output_row) * pairs_per_row;
-      const std::size_t scale_row_offset =
-          static_cast<std::size_t>(output_row) * blocks_per_row;
-      const float block_scale =
-          fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-          tensor_scale;
-      const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
-      weight_tile[tile_output_row][pair_offset * 2] =
-          fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
-      weight_tile[tile_output_row][pair_offset * 2 + 1] =
-          fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
+      const int tile_output_row = linear_index / kPlannedWmmaTileK;
+      const int tile_k = linear_index % kPlannedWmmaTileK;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_output_row < output_rows_this_tile &&
+          (k_base + static_cast<std::size_t>(tile_k)) < weight.input_cols) {
+        const int output_row = output_row_base + tile_output_row;
+        const std::size_t pair_index =
+            (k_base / 2u) + static_cast<std::size_t>(tile_k / 2);
+        const std::size_t block = pair_index / 8u;
+        const std::size_t packed_row_offset =
+            static_cast<std::size_t>(output_row) * pairs_per_row;
+        const std::size_t scale_row_offset =
+            static_cast<std::size_t>(output_row) * blocks_per_row;
+        const float block_scale =
+            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
+            tensor_scale;
+        const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+        const std::uint8_t nibble =
+            (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
+        value = __float2bfloat16(fused_decode::DecodeFp4(nibble) * block_scale);
+      }
+      a_tile[tile_output_row][tile_k] = value;
+    }
+    for (int linear_index = tid;
+         linear_index < (kPlannedWmmaTileK * kPlannedWmmaTileM);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_k = linear_index / kPlannedWmmaTileM;
+      const int tile_token = linear_index % kPlannedWmmaTileM;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_token < valid_rows &&
+          (k_base + static_cast<std::size_t>(tile_k)) < weight.input_cols) {
+        const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+        const float input_value =
+            input[input_row * weight.input_cols + (k_base + static_cast<std::size_t>(tile_k))];
+        value = __float2bfloat16(input_value);
+      }
+      b_tile[tile_k][tile_token] = value;
     }
     __syncthreads();
 
-    if (token_index < valid_rows && output_lane < output_rows_this_tile) {
-      for (int value_index = 0; value_index < (pairs_this_step * 2); ++value_index) {
-        accum += input_tile[token_index][value_index] * weight_tile[output_lane][value_index];
-      }
-    }
+    wmma::fragment<
+        wmma::matrix_a,
+        kPlannedWmmaTileM,
+        kPlannedWmmaTileN,
+        kPlannedWmmaTileK,
+        __nv_bfloat16,
+        wmma::row_major>
+        a_frag;
+    wmma::fragment<
+        wmma::matrix_b,
+        kPlannedWmmaTileM,
+        kPlannedWmmaTileN,
+        kPlannedWmmaTileK,
+        __nv_bfloat16,
+        wmma::row_major>
+        b_frag;
+    const int warp_row = warp_id * kPlannedWmmaTileN;
+    wmma::load_matrix_sync(a_frag, &a_tile[warp_row][0], kPlannedWmmaTileK);
+    wmma::load_matrix_sync(b_frag, &b_tile[0][0], kPlannedWmmaTileM);
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
     __syncthreads();
   }
 
-  if (token_index < valid_rows && output_lane < output_rows_this_tile) {
-    const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
-    const std::size_t output_row = static_cast<std::size_t>(output_row_base + output_lane);
-    output[input_row * output_rows_per_expert + output_row] = accum;
+  const int warp_row = warp_id * kPlannedWmmaTileN;
+  wmma::store_matrix_sync(
+      &c_tile[warp_row][0], c_frag, kPlannedWmmaTileM, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int linear_index = tid;
+       linear_index < (output_rows_this_tile * valid_rows);
+       linear_index += static_cast<int>(blockDim.x)) {
+    const int tile_output_row = linear_index / valid_rows;
+    const int tile_token = linear_index % valid_rows;
+    const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+    const std::size_t output_row = static_cast<std::size_t>(output_row_base + tile_output_row);
+    output[input_row * output_rows_per_expert + output_row] =
+        c_tile[tile_output_row][tile_token];
   }
 }
 

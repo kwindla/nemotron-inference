@@ -2568,3 +2568,122 @@ Next TRT-aligned step:
    micro-fragment / GEMM tile decomposition, not around serial row groups
 4. only after routed-up advances again should routed-down be migrated to the
    same math family
+
+### Transposed BF16 WMMA checkpoint
+
+Behavioral correctness requirement for this phase:
+
+- the gate is behavioral reuse equivalence, not bitwise identity
+- benchmark-level BF16 drift is acceptable if:
+  - `multi_turn_prefix_reuse_test` still passes
+  - committed-head reuse does not diverge
+  - TTFT/cached behavior remains correct on the Nano oracle path
+
+TRT-LLM alignment that mattered here:
+
+- TRT `PermuteGemm1` runs with `routeAct=true` and
+  `transposeMmaOutput=true`
+- in practice that means grouped GEMM treats routed weights as the MMA `A`
+  operand, routed activations as `B`, and computes an output tile in the
+  transposed orientation before the later remap/finalize stage
+- our first WMMA benchmark prototype did not follow that shape and produced
+  large numeric errors even though it was fast
+
+Implemented:
+
+- benchmark-only transposed BF16 WMMA routed-up kernel in
+  `benchmarks/nano_moe_prefill/nano_routed_up_bench.cpp`
+- active runtime launch-planned matvec migrated to the same transposed WMMA
+  math core in `runtime/src/backend/fused_moe_prefill.cu`
+- kept the existing device launch plan and static workspace contract unchanged
+
+Focused routed-up microbench:
+
+- artifact:
+  `artifacts/benchmarks/nano_routed_up_bench_20260406_wmma.stdout.txt`
+- `prefix128`
+  - current runtime-like cooperative path:
+    `launch_plan_upper_bound = 2.408 ms`
+  - buggy non-TRT WMMA prototype:
+    `launch_plan_wmma_bf16_m16n32k16 = 1.110 ms`
+    with `max_abs_diff_vs_baseline = 16.448`
+  - TRT-aligned transposed WMMA:
+    `launch_plan_wmma_bf16_transposed_m16n32k16 = 1.507 ms`
+    with `max_abs_diff_vs_baseline = 0.020`
+- `prefix4096`
+  - current runtime-like cooperative path:
+    `launch_plan_upper_bound = 71.212 ms`
+  - TRT-aligned transposed WMMA:
+    `launch_plan_wmma_bf16_transposed_m16n32k16 = 27.060 ms`
+    with `max_abs_diff_vs_baseline = 0.020`
+- `prefix4`
+  - current runtime-like cooperative path:
+    `launch_plan_upper_bound = 0.154 ms`
+  - TRT-aligned transposed WMMA:
+    `launch_plan_wmma_bf16_transposed_m16n32k16 = 0.370 ms`
+    with `max_abs_diff_vs_baseline = 0.020`
+
+Interpretation:
+
+- this is the first tensor-core routed-up prototype that is both fast and
+  numerically well-behaved enough to satisfy the behavioral reuse bar
+- it is a clear cold-prefill win for `prefix128` and `prefix4096`
+- it is a clear small-`M` loss at `prefix4`, which matches the earlier regime
+  analysis: this first WMMA kernel pads the token/tile `M` dimension
+  aggressively and wastes work when only a few routed rows are active
+
+Validation after runtime promotion:
+
+- `fused_moe_prefill_test`: pass
+- `expert_routing_device_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+
+Focused TTFT after runtime promotion:
+
+- artifact:
+  `artifacts/benchmarks/ttft_20260406_transposed_wmma_prefix128_tail4.stdout.txt`
+- command:
+  - `env NEMOTRON_FORWARD_MANIFEST=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json ./build-sm120-relwithdebinfo/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench --warmup 1 --iterations 5 --prefix-length 128 --tail-token-count 4 --case cold_prefill_prefix128 --case cached_committed_head_prefix128_tail4 --case cached_global_root_prefix128_tail4`
+- results:
+  - `cold_prefill_prefix128 = 137.825 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix TTFT = 40.085 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix TTFT = 39.951 ms`
+
+Interpretation:
+
+- cold prefill now beats the older recorded baseline
+  (`~142.156 ms`) on the design-center case
+- resumed `tail4` TTFT regressed relative to the prior cooperative WMMA-free
+  runtime checkpoint because the current transposed WMMA kernel is inefficient
+  in the tiny-`M` regime
+- despite that regression, the resumed `tail4` case is still essentially on
+  top of the older project baseline (`~40.655 ms`), so this is an acceptable
+  prefill-first checkpoint
+
+Updated cold-prefill profile:
+
+- artifact:
+  `artifacts/profiles/ttft_prefill_20260406_wmma/cold_prefill_prefix128.cuda_gpu_kern_sum.csv`
+- top kernels:
+  - `Nvfp4LaunchPlannedExpertMatVecRowsKernel = 53.1%`
+  - `Nvfp4MatVecRowsKernel<false> = 24.4%`
+  - Mamba prefill kernels together are far behind those two
+
+Interpretation against TRT-LLM:
+
+- routed experts are much healthier, but the active path is still not a full
+  TRT-style grouped GEMM scheduler
+- the shared expert path is now a much larger fraction of cold prefill than it
+  was earlier because it still runs on the old scalar contiguous matvec kernel
+- the next optimization target should therefore split in two:
+  - move shared experts onto the same stronger tensor-core math family
+  - continue improving small-`M` routed scheduling so resumed short tails do
+    not pay the full padded `M16` cost
+
+Next step:
+
+1. keep the transposed WMMA routed path as the active baseline
+2. profile or microbench the shared expert path directly
+3. implement a TRT-aligned tensor-core contiguous/shared expert kernel
+4. after shared no longer consumes ~24% of cold prefill, return to small-`M`
+   routed scheduling and pack the tiny resumed-tail regime more efficiently
