@@ -357,6 +357,218 @@ Immediate interpretation:
 
 This is the current baseline to beat for the routed-up replacement.
 
+## TRT-LLM-Aligned Routed-Up Microbench Update
+
+Artifacts:
+
+- checked benchmark run:
+  - `artifacts/benchmarks/nano_routed_up_bench_20260406_row_coop_checked.stdout.txt`
+- checked `ncu` report:
+  - `artifacts/profiles/nano_routed_up_20260406_row_coop/ncu_routed_up_prefix128_row_coop_checked.csv`
+
+Implementation note:
+
+- the routed-up microbench now includes a correctness cross-check against the
+  current baseline kernel
+- the candidate path builds padded expert-major token tiles, runs a
+  row-cooperative CUDA kernel, then unpads the result back to logical token
+  order before comparing outputs
+- this keeps the experiment benchmark-only while enforcing exact output
+  agreement before any runtime integration
+
+Candidate shape:
+
+- one CTA owns one `(expert, token_tile, output_row_tile)`
+- token tile size `8`
+- output row tile size `4`
+- one warp computes one output row
+- the CTA stages the token tile in shared memory and reuses it across the
+  output-row tile
+- this is structurally closer to TRT-LLM `permute -> gemm1` than the old
+  one-block-per-row baseline, but it still uses scalar NVFP4 decode and scalar
+  accumulation
+
+Checked results:
+
+- `prefix4`
+  - baseline hot mean `0.520 ms`
+  - row-coop hot mean `2.380 ms`
+  - exact match: `max_abs_diff_vs_baseline = 0.000`
+- `prefix128`
+  - baseline hot mean `10.251 ms`
+  - row-coop hot mean `12.659 ms`
+  - exact match: `max_abs_diff_vs_baseline = 0.000`
+- `prefix4096`
+  - baseline hot mean `319.538 ms`
+  - row-coop hot mean `302.364 ms`
+  - exact match: `max_abs_diff_vs_baseline = 0.000`
+
+Interpretation:
+
+- the candidate is not good enough for the primary target case
+  `prefix128`; it is about `23.5%` slower there
+- it is much worse for `prefix4` because padding from sparse per-expert token
+  counts dominates the small amount of work
+- it does show a small `~5.4%` improvement at `prefix4096`, which means the
+  shared-input reuse is directionally helpful once `M` is large enough
+- that is useful evidence, but not a runtime integration signal
+
+Checked `ncu` comparison on `prefix128`:
+
+- block size `128`
+- grid size `59392`
+- registers per thread `48`
+- static shared memory per block `2048` bytes
+- achieved occupancy `82.64%`
+- eligible warps per scheduler `0.27`
+- issue active `18.33%`
+
+Comparison to the old standalone baseline:
+
+- warp eligibility improved from about `0.15` to `0.27`
+- issue rate improved from about `11.8%` to `18.3%`
+- but that scheduler improvement still did not overcome the extra padded work
+  and per-step synchronization on the `prefix128` case
+
+Conclusion:
+
+- this experiment rules out a tempting but insufficient next step:
+  “expert-major permutation plus shared-input reuse” by itself is not enough
+  for the exact-accumulation path we need
+- the next routed-up prototype should preserve the correctness guard, but it
+  needs to attack the remaining problem more directly:
+  - reduce or avoid padded token work for the `prefix128` regime
+  - amortize synchronization better than one shared-load barrier per `K` step
+  - move farther toward GEMM-like work decomposition rather than only
+    reorganizing scalar matvec
+
+### Follow-Up: Ragged Row-Coop Routed-Up Candidate
+
+Artifacts:
+
+- checked benchmark run:
+  - `artifacts/benchmarks/nano_routed_up_bench_20260406_ragged_row_coop.stdout.txt`
+- checked `ncu` report:
+  - `artifacts/profiles/nano_routed_up_20260406_row_coop/ncu_routed_up_prefix128_ragged_row_coop.csv`
+
+Change:
+
+- keep the same row-cooperative kernel shape
+- remove padded expert-major token storage entirely
+- build CTA metadata directly from the true `expert_offsets`
+- load only the valid token rows for each expert tile
+- keep the same exact-output cross-check against the routed-up baseline
+
+This isolates the effect of padded-token overhead from the effect of the
+shared-input row-cooperative math itself.
+
+Checked results:
+
+- `prefix4`
+  - baseline hot mean `0.520 ms`
+  - ragged row-coop hot mean `0.411 ms`
+  - speedup `1.26x`
+  - exact match: `max_abs_diff_vs_baseline = 0.000`
+- `prefix128`
+  - baseline hot mean `10.240 ms`
+  - ragged row-coop hot mean `9.560 ms`
+  - speedup `1.07x`
+  - exact match: `max_abs_diff_vs_baseline = 0.000`
+- `prefix4096`
+  - baseline hot mean `319.513 ms`
+  - ragged row-coop hot mean `297.429 ms`
+  - speedup `1.07x`
+  - exact match: `max_abs_diff_vs_baseline = 0.000`
+
+Interpretation:
+
+- removing the padded-token work completely flipped the `prefix128` result
+  from a regression into a real win
+- that confirms the previous section’s diagnosis: the padded-token overhead was
+  large enough to erase the scheduler gains on the priority case
+- the row-cooperative shape is still only a modest improvement, but it is now
+  a correct benchmark-only candidate worth considering for runtime integration
+
+Checked `ncu` comparison on `prefix128`:
+
+- block size `128`
+- grid size `59392`
+- registers per thread `47`
+- static shared memory per block `2048` bytes
+- achieved occupancy `82.67%`
+- eligible warps per scheduler `0.24`
+- issue active `16.13%`
+
+Comparison to the old standalone baseline:
+
+- warp eligibility improved from about `0.15` to `0.24`
+- issue rate improved from about `11.8%` to `16.1%`
+- the gain is smaller than the padded version, but without the padded-token
+  tax it is enough to win on `prefix4`, `prefix128`, and `prefix4096`
+
+Updated conclusion:
+
+- the next practical step is to port this routed-up shape into the runtime
+  path behind the existing device-only contract and measure TTFT impact
+- because the gain is only about `7%` on the key routed-up microbench case,
+  this is likely not the whole recovery
+- but it is the first exact benchmark-only routed-up design that beats the
+  current baseline across the Nano benchmark surface
+
+### Rejected Runtime Integration: Upper-Bound Device Mapping
+
+Artifact:
+
+- `artifacts/benchmarks/ttft_20260406_runtime_ragged_row_coop_prefix128_tail4.stdout.txt`
+
+Attempt:
+
+- replace the runtime grouped routed matvec launch with the ragged row-coop
+  kernel
+- keep the runtime device-only contract by avoiding host-built CTA metadata
+- map `(expert, row_tile)` work inside the kernel from an upper-bound
+  `linear_row_tile` index derived from `selection_count`
+
+Why it was attractive:
+
+- no DtoH
+- no second runtime code path
+- no new routing-side host metadata
+
+Measured result on the fast TTFT gate:
+
+- `cold_prefill_prefix128`
+  - retained runtime baseline: `681.460 ms`
+  - upper-bound runtime mapping: `971.287 ms`
+  - regression: `1.43x` slower
+- `cached_committed_head_prefix128_tail4`
+  - retained runtime baseline hot-prefix TTFT: `52.054 ms`
+  - upper-bound runtime mapping hot-prefix TTFT: `66.660 ms`
+  - regression: `1.28x` slower
+
+Interpretation:
+
+- the benchmark-only routed-up gain did not survive this runtime mapping
+- the device-only upper-bound launch created too much extra scheduling and
+  empty-work overhead
+- the routed-up kernel itself was not the problem; the way runtime work was
+  enumerated was
+
+Action taken:
+
+- reverted the runtime grouped-matvec integration after the TTFT regression
+- kept the benchmark-only ragged row-coop candidate and its correctness guard
+- kept the benchmark and profiling artifacts because the routed-up kernel shape
+  is still promising
+
+Updated next step:
+
+- do not retry runtime integration with an upper-bound linear row-tile scan
+- if we integrate this routed-up shape into runtime, we need a lighter
+  device-only work description:
+  - device-built CTA metadata
+  - or another exact mapping that does not explode the number of launched CTAs
+
 ## Routed-Up Standalone `ncu` Baseline
 
 Artifact:
