@@ -2687,3 +2687,84 @@ Next step:
 3. implement a TRT-aligned tensor-core contiguous/shared expert kernel
 4. after shared no longer consumes ~24% of cold prefill, return to small-`M`
    routed scheduling and pack the tiny resumed-tail regime more efficiently
+
+### Shared expert transposed WMMA checkpoint
+
+Why this was the next target:
+
+- after the routed WMMA promotion, cold-prefill profiling showed
+  `Nvfp4MatVecRowsKernel<false>` at `24.4%` of cold `prefix128`
+- that kernel is the shared expert path (`shared_up` and `shared_down`)
+- TRT-LLM `Gemm2` uses the same broad policy shape as `PermuteGemm1`:
+  `transposeMmaOutput = true`, but `routeAct = false`
+
+Implemented:
+
+- moved `LaunchContiguousMatVec()` in
+  `runtime/src/backend/fused_moe_prefill.cu` onto the same transposed BF16
+  WMMA math family as the routed path
+- kept a single kernel family and added a deterministic host-side output-tile
+  chooser for the shared path
+- hardware/model-specific inputs to that chooser:
+  - RTX 5090 device reports `170` SMs
+  - WMMA token tile is fixed at `M = 16`
+  - candidate output tiles are `32`, `64`, and `128`
+  - choose the largest output tile whose CTA count
+    `ceil(N / tile) * ceil(M / 16)` still covers the SM count; otherwise use
+    `32`
+
+Observed tile behavior before the selector:
+
+- fixed `32` tile:
+  - `cold_prefill_prefix128 = 127.768 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 54.565 ms`
+- fixed `64` tile:
+  - `cold_prefill_prefix128 = 126.926 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 54.752 ms`
+- fixed `128` tile:
+  - `cold_prefill_prefix128 = 126.042 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 59.187 ms`
+
+Interpretation:
+
+- a larger shared output tile helps cold prefill because `prefix128` has enough
+  token tiles to keep the GPU busy
+- the same larger tile hurts resumed `tail4` because `M = 4` only produces a
+  single token tile, so overly large output tiles underfill the SMs and waste
+  work
+- this is exactly the sort of shape-sensitive tradeoff TRT-LLM resolves with
+  config selection rather than one universal constant
+
+Deterministic selector checkpoint:
+
+- artifact:
+  `artifacts/benchmarks/ttft_20260406_shared_wmma_selected_prefix128_tail4.stdout.txt`
+- results:
+  - `cold_prefill_prefix128 = 126.201 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix TTFT = 54.239 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix TTFT = 54.332 ms`
+
+Interpretation:
+
+- the selector recovered the best parts of the fixed-tile experiments:
+  - essentially the best cold-prefill result from the larger shared tile family
+  - slightly better resumed `tail4` TTFT than the fixed `32` and fixed `64`
+    variants
+- this is still much slower than the older non-WMMA resumed-tail checkpoint,
+  so the next recovery target is still small-`M` routed/shared scheduling, not
+  more large-`M` cold tuning
+
+Updated cold-prefill profile after shared WMMA + deterministic selection:
+
+- artifact:
+  `artifacts/profiles/ttft_prefill_20260406_shared_wmma64/cold_prefill_prefix128.cuda_gpu_kern_sum.csv`
+- top kernels:
+  - `Nvfp4LaunchPlannedExpertMatVecRowsKernel = 57.9%`
+  - `Nvfp4ContiguousWmmaMatVecRowsKernel = 17.5%`
+
+Interpretation:
+
+- the shared expert path dropped from `24.4%` to `17.5%` of cold prefill
+- routed experts are now clearly the dominant remaining cold-prefill bucket
+- the next step should return to routed small-`M` / short-tail efficiency from
+  this stronger cold-prefill baseline

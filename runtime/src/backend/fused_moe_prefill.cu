@@ -21,6 +21,12 @@ constexpr int kPlannedWmmaTileM = 16;
 constexpr int kPlannedWmmaTileN = 16;
 constexpr int kPlannedWmmaTileK = 16;
 constexpr int kPlannedWmmaWarpsPerBlock = 2;
+constexpr int kContiguousSmallOutputTile = 32;
+constexpr int kContiguousMediumOutputTile = 64;
+constexpr int kContiguousLargeOutputTile = 128;
+constexpr int kContiguousSmallThreadsPerBlock = 64;
+constexpr int kContiguousMediumThreadsPerBlock = 128;
+constexpr int kContiguousLargeThreadsPerBlock = 256;
 
 static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
 
@@ -45,6 +51,45 @@ __host__ __device__ fused_decode::Nvfp4WeightView MakeDeviceWeightView(
       weight.output_rows,
       weight.input_cols,
   };
+}
+
+std::size_t CeilDiv(std::size_t numerator, std::size_t denominator) {
+  return (numerator + denominator - 1u) / denominator;
+}
+
+int GetMultiProcessorCount() {
+  int device = 0;
+  if (!CheckCuda(cudaGetDevice(&device))) {
+    return 0;
+  }
+  int multiprocessor_count = 0;
+  if (!CheckCuda(cudaDeviceGetAttribute(
+          &multiprocessor_count, cudaDevAttrMultiProcessorCount, device))) {
+    return 0;
+  }
+  return multiprocessor_count;
+}
+
+int SelectContiguousOutputTile(std::size_t output_rows, std::size_t input_row_count) {
+  const int multiprocessor_count = GetMultiProcessorCount();
+  if (multiprocessor_count <= 0) {
+    return kContiguousMediumOutputTile;
+  }
+  const std::size_t input_row_tiles =
+      CeilDiv(input_row_count, static_cast<std::size_t>(kPlannedWmmaTileM));
+  const auto meets_target = [&](int output_tile) {
+    const std::size_t output_row_tiles =
+        CeilDiv(output_rows, static_cast<std::size_t>(output_tile));
+    return output_row_tiles * input_row_tiles >=
+           static_cast<std::size_t>(multiprocessor_count);
+  };
+  if (meets_target(kContiguousLargeOutputTile)) {
+    return kContiguousLargeOutputTile;
+  }
+  if (meets_target(kContiguousMediumOutputTile)) {
+    return kContiguousMediumOutputTile;
+  }
+  return kContiguousSmallOutputTile;
 }
 
 __global__ void ZeroBufferKernel(float* data, std::size_t count) {
@@ -430,6 +475,138 @@ __global__ void Nvfp4MatVecRowsKernel(
   }
 }
 
+template <int kOutputTile, int kThreadsPerBlock>
+__global__ void Nvfp4ContiguousWmmaMatVecRowsKernel(
+    const float* input,
+    std::size_t input_row_count,
+    FusedNvfp4WeightView weight,
+    float* output) {
+  constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
+
+  __shared__ __nv_bfloat16 a_tile[kOutputTile][kPlannedWmmaTileK];
+  __shared__ __nv_bfloat16 b_tile[kPlannedWmmaTileK][kPlannedWmmaTileM];
+  __shared__ float c_tile[kOutputTile][kPlannedWmmaTileM];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
+  const int row_start = static_cast<int>(blockIdx.y) * kPlannedWmmaTileM;
+  if (warp_id >= kWarpsPerBlock ||
+      static_cast<std::size_t>(output_row_base) >= weight.output_rows ||
+      static_cast<std::size_t>(row_start) >= input_row_count) {
+    return;
+  }
+
+  const std::size_t remaining_input_rows =
+      input_row_count - static_cast<std::size_t>(row_start);
+  const int valid_rows = static_cast<int>(
+      remaining_input_rows < static_cast<std::size_t>(kPlannedWmmaTileM)
+          ? remaining_input_rows
+          : static_cast<std::size_t>(kPlannedWmmaTileM));
+  const std::size_t remaining_output_rows =
+      weight.output_rows - static_cast<std::size_t>(output_row_base);
+  const int output_rows_this_tile = static_cast<int>(
+      remaining_output_rows < static_cast<std::size_t>(kOutputTile)
+          ? remaining_output_rows
+          : static_cast<std::size_t>(kOutputTile));
+    const std::size_t pairs_per_row = weight.input_cols / 2;
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const float tensor_scale = *weight.tensor_scale_data;
+
+  wmma::fragment<
+      wmma::accumulator,
+      kPlannedWmmaTileM,
+      kPlannedWmmaTileN,
+      kPlannedWmmaTileK,
+      float>
+      c_frag;
+  wmma::fill_fragment(c_frag, 0.0f);
+
+  for (std::size_t k_base = 0; k_base < weight.input_cols;
+       k_base += static_cast<std::size_t>(kPlannedWmmaTileK)) {
+    for (int linear_index = tid;
+         linear_index < (kOutputTile * kPlannedWmmaTileK);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_index / kPlannedWmmaTileK;
+      const int tile_k = linear_index % kPlannedWmmaTileK;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_output_row < output_rows_this_tile &&
+          (k_base + static_cast<std::size_t>(tile_k)) < weight.input_cols) {
+        const int output_row = output_row_base + tile_output_row;
+        const std::size_t pair_index =
+            (k_base / 2u) + static_cast<std::size_t>(tile_k / 2);
+        const std::size_t block = pair_index / 8u;
+        const std::size_t packed_row_offset =
+            static_cast<std::size_t>(output_row) * pairs_per_row;
+        const std::size_t scale_row_offset =
+            static_cast<std::size_t>(output_row) * blocks_per_row;
+        const float block_scale =
+            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
+            tensor_scale;
+        const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+        const std::uint8_t nibble =
+            (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
+        value = __float2bfloat16(fused_decode::DecodeFp4(nibble) * block_scale);
+      }
+      a_tile[tile_output_row][tile_k] = value;
+    }
+    for (int linear_index = tid;
+         linear_index < (kPlannedWmmaTileK * kPlannedWmmaTileM);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_k = linear_index / kPlannedWmmaTileM;
+      const int tile_token = linear_index % kPlannedWmmaTileM;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_token < valid_rows &&
+          (k_base + static_cast<std::size_t>(tile_k)) < weight.input_cols) {
+        const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+        const float input_value =
+            input[input_row * weight.input_cols + (k_base + static_cast<std::size_t>(tile_k))];
+        value = __float2bfloat16(input_value);
+      }
+      b_tile[tile_k][tile_token] = value;
+    }
+    __syncthreads();
+
+    wmma::fragment<
+        wmma::matrix_a,
+        kPlannedWmmaTileM,
+        kPlannedWmmaTileN,
+        kPlannedWmmaTileK,
+        __nv_bfloat16,
+        wmma::row_major>
+        a_frag;
+    wmma::fragment<
+        wmma::matrix_b,
+        kPlannedWmmaTileM,
+        kPlannedWmmaTileN,
+        kPlannedWmmaTileK,
+        __nv_bfloat16,
+        wmma::row_major>
+        b_frag;
+    const int warp_row = warp_id * kPlannedWmmaTileN;
+    wmma::load_matrix_sync(a_frag, &a_tile[warp_row][0], kPlannedWmmaTileK);
+    wmma::load_matrix_sync(b_frag, &b_tile[0][0], kPlannedWmmaTileM);
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    __syncthreads();
+  }
+
+  const int warp_row = warp_id * kPlannedWmmaTileN;
+  wmma::store_matrix_sync(
+      &c_tile[warp_row][0], c_frag, kPlannedWmmaTileM, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int linear_index = tid;
+       linear_index < (output_rows_this_tile * valid_rows);
+       linear_index += static_cast<int>(blockDim.x)) {
+    const int tile_output_row = linear_index / valid_rows;
+    const int tile_token = linear_index % valid_rows;
+    const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+    const std::size_t output_row = static_cast<std::size_t>(output_row_base + tile_output_row);
+    output[input_row * weight.output_rows + output_row] =
+        c_tile[tile_output_row][tile_token];
+  }
+}
+
 __global__ void ReduceSelectionOutputsKernel(
     const float* grouped_output,
     const int* selection_to_sorted,
@@ -589,14 +766,59 @@ bool LaunchContiguousMatVec(
   if (!ValidFusedNvfp4WeightView(weight)) {
     return false;
   }
-  const dim3 block(fused_decode::kThreadsPerBlock);
-  const dim3 grid(static_cast<unsigned int>(weight.output_rows));
-  Nvfp4MatVecRowsKernel<false><<<grid, block>>>(
+  if (input_row_count == 0) {
+    return true;
+  }
+  const int output_tile = SelectContiguousOutputTile(weight.output_rows, input_row_count);
+  const std::size_t input_row_tile_count =
+      CeilDiv(input_row_count, static_cast<std::size_t>(kPlannedWmmaTileM));
+
+  if (output_tile == kContiguousLargeOutputTile) {
+    const dim3 block(kContiguousLargeThreadsPerBlock);
+    const dim3 grid(
+        static_cast<unsigned int>(CeilDiv(
+            weight.output_rows,
+            static_cast<std::size_t>(kContiguousLargeOutputTile))),
+        static_cast<unsigned int>(input_row_tile_count));
+    Nvfp4ContiguousWmmaMatVecRowsKernel<
+        kContiguousLargeOutputTile,
+        kContiguousLargeThreadsPerBlock><<<grid, block>>>(
+        input,
+        input_row_count,
+        weight,
+        output);
+    return CheckCuda(cudaGetLastError());
+  }
+
+  if (output_tile == kContiguousMediumOutputTile) {
+    const dim3 block(kContiguousMediumThreadsPerBlock);
+    const dim3 grid(
+        static_cast<unsigned int>(CeilDiv(
+            weight.output_rows,
+            static_cast<std::size_t>(kContiguousMediumOutputTile))),
+        static_cast<unsigned int>(input_row_tile_count));
+    Nvfp4ContiguousWmmaMatVecRowsKernel<
+        kContiguousMediumOutputTile,
+        kContiguousMediumThreadsPerBlock><<<grid, block>>>(
+        input,
+        input_row_count,
+        weight,
+        output);
+    return CheckCuda(cudaGetLastError());
+  }
+
+  const dim3 block(kContiguousSmallThreadsPerBlock);
+  const dim3 grid(
+      static_cast<unsigned int>(CeilDiv(
+          weight.output_rows,
+          static_cast<std::size_t>(kContiguousSmallOutputTile))),
+      static_cast<unsigned int>(input_row_tile_count));
+  Nvfp4ContiguousWmmaMatVecRowsKernel<
+      kContiguousSmallOutputTile,
+      kContiguousSmallThreadsPerBlock><<<grid, block>>>(
       input,
       input_row_count,
-      nullptr,
-      0,
-      MakeDeviceWeightView(weight),
+      weight,
       output);
   return CheckCuda(cudaGetLastError());
 }
