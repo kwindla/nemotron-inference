@@ -63,8 +63,32 @@ Current Nemotron parity status:
 - `CreateFromCache(...)` is not yet qualified for that same Nemotron parity path
 - the current cache-backed qualification attempt fails during model construction:
   - first at the `SingleTokenForwardModel::CreateFromCache(...)` memory-budget guard on DGX Spark UMA
-  - and, with that guard bypassed, in cache-backed NVFP4 view construction under [model_cache.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/src/api/model_cache.cpp)
+- and, with that guard bypassed, in cache-backed NVFP4 view construction under [model_cache.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/src/api/model_cache.cpp)
 - treat cache-backed Nemotron forward execution as in progress until that path is fixed and revalidated
+
+Interactive forward tool:
+
+- the first direct-path interactive helper now lives under [tools/interactive_forward](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward)
+- design note: [INTERACTIVE_FORWARD_DESIGN.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md)
+- it keeps the model warm in a C++ server process, but rerenders and re-prefills the full prompt each turn
+- it intentionally does not expose prefix-cache reuse or `CreateFromCache(...)` yet
+- use it as a forward-path exerciser and latency probe for the working direct `Create(...)` path
+
+Build and run it:
+
+```bash
+cmake -S . -B build
+cmake --build build --target nemotron_interactive_forward_server -j
+uv run --script tools/interactive_forward/nemotron_interactive_forward.py --graph-bytes 0
+uv run --script tools/interactive_forward/nemotron_interactive_forward.py --graph-bytes 0 --once "Hello"
+```
+
+Current interactive-tool limitations:
+
+- no prefix-cache restore/commit between turns
+- no cache-backed model creation
+- no automatic context truncation
+- prefill still materializes a `[prompt_tokens, vocab_size]` logits tensor because that is the current `RunPrefill(...)` API contract
 
 If `/usr/local/cuda/compat` or `/usr/local/cuda-13.2/compat` exists, `ctest` now prepends it automatically for the runtime test binaries. The benchmark wrapper scripts below do the same. Direct binary launches still need an equivalent `LD_LIBRARY_PATH` if the compat stack is required.
 
