@@ -46,6 +46,8 @@ That means:
 - we should optimize for RTX 5090 execution characteristics directly
 - we should prefer a single specialized fast path over a more abstract slower
   implementation, as long as we do not create a second runtime path
+- one-time load-time specialization or repacking is acceptable if it improves
+  the active path; per-request repacking is not
 
 Generality matters only where it is required to preserve correctness across the
 benchmarked prompt lengths, cache states, and serving scenarios for this same
@@ -112,6 +114,123 @@ Questions to answer for each operation:
 - what parts of TRT-LLM are useful structure for us to copy directly
 - what parts should be specialized more aggressively for `SM120` and the exact
   Nano dimensions
+
+## Assumption Audit
+
+This section records the key assumptions behind the current plan so they stay
+explicit and reviewable.
+
+### 1. Shape regime matters, and it changes with prefix length
+
+For Nano:
+
+- `prefix4`: `24` routed selections total, average `0.1875` tokens per expert
+- `prefix128`: `768` routed selections total, average `6` tokens per expert
+- `prefix4096`: `24,576` routed selections total, average `192` tokens per
+  expert
+
+These are materially different execution regimes:
+
+- `prefix4` is effectively a sparse tiny-batch regime
+- `prefix128` is an awkward small-batch grouped regime
+- `prefix4096` is a real grouped-GEMM regime
+
+Plan consequence:
+
+- we still want one runtime code path
+- we do not want three separate math stacks
+- therefore the chosen math core has to tolerate under-filled small-`M` cases
+  while still scaling well at `prefix128` and `prefix4096`
+
+Design-center assumption:
+
+- optimize primarily for `prefix128` and `prefix4096`
+- keep `prefix4` correct and accept that it is the least hardware-friendly
+  point on the benchmark surface
+- if small-`M` handling is needed, prefer padding or tile under-fill inside the
+  same grouped kernel family rather than dispatching to a second algorithmic
+  path
+
+### 2. Launch count was a structural problem, but the current routed baseline already fixed most of it
+
+The earlier grouped implementation really did suffer from huge routed launch
+fan-out. That was a valid concern.
+
+But the retained single-launch grouped baseline has already collapsed the
+routed path from per-expert launches to one routed-up and one routed-down
+launch per expert layer:
+
+- routed grouped expert matvec launches in current `nsys`:
+  `230` over `5` measured iterations = `46` per iteration = `23` layers x `2`
+  routed stages
+
+The shared path still contributes another `46` dense expert matvec launches per
+iteration, so the total expert-math launch count is still not minimal, but the
+main routed launch explosion is no longer the dominant issue.
+
+Plan consequence:
+
+- further launch-count reduction is welcome
+- but the current cold-prefill gap is now mostly a math-core efficiency
+  problem, not a `5,888`-launch structural problem
+
+### 3. Tensor-pipe use must become a hard success criterion
+
+The current `ncu` profile shows effectively `0%` tensor-pipe activity in the
+dominant routed expert math kernel.
+
+Plan consequence:
+
+- any replacement routed-up or routed-down design that still shows effectively
+  zero tensor-pipe activity should be treated as suspect
+- "clear microbench win" is not enough by itself; the win should come from a
+  better execution mechanism, not another scalar dequant-plus-dot-product loop
+
+Operational gate:
+
+- first routed-up replacement must move tensor-pipe activity above zero
+- later iterations should aim to raise it materially, not merely make it
+  nonzero
+
+### 4. cuBLASLt is not the active implementation target for this path
+
+This is an explicit architectural assumption, not an oversight.
+
+We are not currently planning to use cuBLASLt as the shipping prefill math core
+for this MoE path.
+
+Reasons:
+
+- we intentionally moved this path away from a library-controlled expert
+  execution model to keep the runtime contract fully under our control
+- we want one device-driven runtime path, not a path that depends on opaque
+  library algorithm selection and host-orchestrated grouped GEMM setup
+- the awkward `M` distribution for `prefix4` and `prefix128` would still force
+  us to make padding and scheduling decisions; cuBLASLt does not remove that
+  problem, it only moves the math into a library call
+- TRT-LLM is the architectural reference, but the goal is to reproduce its
+  strong operation shape with a much narrower custom implementation specialized
+  to this model and GPU
+
+Plan consequence:
+
+- TRT-LLM remains the reference for operation structure
+- cuBLASLt can still be used as a benchmark or sanity yardstick if needed
+- but it is not the assumed end-state implementation for the active prefill
+  path
+
+### 5. Shared experts are not a late afterthought
+
+The current single-launch profile still shows the shared expert dense path at
+about `23%` of GPU kernel time on cold `prefix128`.
+
+Plan consequence:
+
+- routed expert math is still the first priority because it is larger
+- but shared expert execution is large enough that we should evaluate it early
+  once the routed-up replacement shape is clear
+- shared should not remain parked at the end of the plan as a vague cleanup
+  task
 
 ### Benchmark Contract
 
@@ -214,6 +333,7 @@ Work:
 Success gate:
 
 - routed-up microbench shows a clear win
+- routed-up profile shows nonzero tensor-pipe activity
 - cold `prefix128` improves materially
 
 ### Phase 3. Replace Activation + Requantization with a Tiled Pipeline Stage
@@ -243,6 +363,13 @@ Work:
 - keep the intermediate layout specialized for the routed-up / routed-down tile
   shape we actually deploy
 - benchmark this stage independently before full integration
+
+Important note:
+
+- this phase does not assume activation/requant must remain a permanent
+  standalone stage
+- if the chosen grouped math core makes this boundary simpler or partially
+  fusable, take the simpler design
 
 Success gate:
 
@@ -297,6 +424,8 @@ Work:
 Decision rule:
 
 - optimize shared only after routed no longer dominates
+- if the new grouped math core is already natural for the shared dense path,
+  pull shared forward rather than waiting for a separate late phase
 
 ### Phase 6. Recover and Beat the Baseline
 
