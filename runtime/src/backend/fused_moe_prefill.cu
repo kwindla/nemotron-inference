@@ -434,6 +434,30 @@ bool LaunchAccumulateSharedOutput(
 
 }  // namespace
 
+bool RunGroupedNvfp4ExpertMatVec(
+    const float* input,
+    const int* expert_offsets,
+    std::size_t n_experts,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  if (input == nullptr ||
+      expert_offsets == nullptr ||
+      n_experts == 0 ||
+      weights == nullptr ||
+      output_rows_per_expert == 0 ||
+      output == nullptr) {
+    return false;
+  }
+  return LaunchGroupedMatVec(
+      input,
+      expert_offsets,
+      n_experts,
+      weights,
+      output_rows_per_expert,
+      output);
+}
+
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   const std::size_t selection_count = params.token_count * params.top_k;
 
@@ -512,7 +536,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   }
 
   const int* expert_offsets = params.routing->expert_offsets();
-  if (!LaunchGroupedMatVec(
+  if (!RunGroupedNvfp4ExpertMatVec(
           params.routed_gather_scratch,
           expert_offsets,
           params.n_routed_experts,
@@ -530,7 +554,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  if (!LaunchGroupedMatVec(
+  if (!RunGroupedNvfp4ExpertMatVec(
           params.routed_up_scratch,
           expert_offsets,
           params.n_routed_experts,

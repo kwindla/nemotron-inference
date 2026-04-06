@@ -31,6 +31,14 @@ struct FusedMoePrefillParams {
   float* shared_output = nullptr;  // Optional.
 };
 
+bool RunGroupedNvfp4ExpertMatVec(
+    const float* input,
+    const int* expert_offsets,
+    std::size_t n_experts,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output);
+
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params);
 
 }  // namespace nemotron

@@ -232,6 +232,114 @@ Plan consequence:
 - shared should not remain parked at the end of the plan as a vague cleanup
   task
 
+## Routed-Up Operation Comparison
+
+This is the first required operation-level comparison between the current code
+and TRT-LLM.
+
+### Current runtime path
+
+Current routed-up in `runtime/src/backend/fused_moe_prefill.cu`:
+
+- input contract is already reduced to grouped routed rows:
+  `selection_count x hidden_size`
+- launch shape is one block per `(expert, output_row)`
+- grid size is `n_experts * routed_intermediate_size`
+- each block decodes FP4 weights on the fly and computes scalar dot products
+  over the full hidden dimension
+- each block handles up to `kGroupedTokenTile = 8` routed rows at a time
+- output layout is row-major `selection_count x routed_intermediate_size`
+
+Implications:
+
+- work decomposition is output-row-major, not expert-tile-major
+- `M` only changes how many inner-loop row tiles each block processes
+- tensor-pipe usage is effectively zero
+- the kernel remains scalar and control-heavy even when `M` becomes large
+
+### TRT-LLM reference path
+
+Relevant files:
+
+- `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu`
+- `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cuteDslKernels/moeUtils.h`
+
+TRT-LLM routed-up structure:
+
+- routing builds permutation and launch metadata:
+  - `permutedIdxToTokenIdx`
+  - `numNonExitingCtas`
+  - `ctaIdxXyToBatchIdx`
+  - `ctaIdxXyToMnLimit`
+- `PermuteGemm1::Runner::run()` executes a grouped batched GEMM over the
+  routed tokens and experts
+- work is organized around expert-major or tile-major grouped GEMM launch
+  metadata rather than one block per output row
+- the grouped GEMM runner is configured with `tileTokensDim`, `routeAct`, and
+  transpose/epilogue behavior so the routed-up stage stays in a GEMM-friendly
+  layout for the next stage
+
+### Structural mismatch
+
+The key mismatch is not only "we use a different kernel." It is:
+
+- TRT-LLM decomposes routed-up as grouped GEMM over expert-major tiles
+- our current kernel decomposes routed-up as scalar row-wise matvec over
+  `n_experts * output_rows`
+
+That means TRT-LLM creates parallelism along the tile axes that matter for
+tensor-core math, while our current kernel creates a huge number of scalar
+blocks that each do their own FP4 decode and reduction work.
+
+This comparison reinforces the current architectural target:
+
+- keep the runtime contract
+- replace the routed-up math core
+- move the work decomposition toward expert-major grouped tiles
+
+## Routed-Up Microbench Baseline
+
+The first Phase-1 harness is now implemented at:
+
+- `benchmarks/nano_moe_prefill/nano_routed_up_bench.cpp`
+
+It benchmarks the current active routed-up math core directly through
+`RunGroupedNvfp4ExpertMatVec()` using the exact Nano routed-up dimensions:
+
+- hidden size `2688`
+- routed intermediate size `1856`
+- routed experts `128`
+- top-k `6`
+
+Current measured results with `--warmup 1 --iterations 5`:
+
+- `prefix4`
+  - selection count `24`
+  - active experts `24`
+  - hot mean `0.520 ms`
+  - effective routed-up throughput `0.461 TFLOP/s`
+- `prefix128`
+  - selection count `768`
+  - active experts `128`
+  - hot mean `10.282 ms`
+  - effective routed-up throughput `0.745 TFLOP/s`
+- `prefix4096`
+  - selection count `24,576`
+  - active experts `128`
+  - hot mean `320.900 ms`
+  - effective routed-up throughput `0.764 TFLOP/s`
+
+Immediate interpretation:
+
+- the kernel does not materially improve its effective compute rate from
+  `prefix128` to `prefix4096`
+- that is strong evidence that the ceiling is the scalar math core itself, not
+  only small-`M` inefficiency
+- the routed-up kernel alone already reproduces the same ~`0.75 TFLOP/s`
+  ceiling implied by the end-to-end profile
+
+This is the current baseline to beat for the routed-up replacement.
+
 ### Benchmark Contract
 
 Fast iteration benchmarks:
