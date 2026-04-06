@@ -92,6 +92,8 @@ class RequestExecutionContext {
   const DeviceTensorBf16* key_cache() const;
   DeviceTensorBf16* value_cache();
   const DeviceTensorBf16* value_cache() const;
+  DeviceTensorInt32* greedy_token_id_scratch();
+  const DeviceTensorInt32* greedy_token_id_scratch() const;
   MoePrefillWorkspace* moe_prefill_workspace();
   const MoePrefillWorkspace* moe_prefill_workspace() const;
 
@@ -119,6 +121,7 @@ class RequestExecutionContext {
       std::unique_ptr<DeviceTensorFp32> mamba_state,
       std::unique_ptr<DeviceTensorBf16> key_cache,
       std::unique_ptr<DeviceTensorBf16> value_cache,
+      std::unique_ptr<DeviceTensorInt32> greedy_token_id_scratch,
       std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace,
       std::optional<PagedKvCacheArena> kv_arena);
 
@@ -130,6 +133,7 @@ class RequestExecutionContext {
   std::unique_ptr<DeviceTensorFp32> mamba_state_;
   std::unique_ptr<DeviceTensorBf16> key_cache_;
   std::unique_ptr<DeviceTensorBf16> value_cache_;
+  std::unique_ptr<DeviceTensorInt32> greedy_token_id_scratch_;
   std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace_;
   std::optional<PagedKvCacheArena> kv_arena_;
   std::vector<std::vector<KvPageHandle>> kv_pages_by_layer_;

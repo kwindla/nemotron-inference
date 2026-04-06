@@ -14,7 +14,7 @@ This plan supersedes the earlier routed-MoE optimization plan in
   regimes
 
 This plan now tracks the current, correct `SM120` baseline on commit
-`cf0e4a1`. The original frozen reference point remains the saved April 5
+`b431e21`. The original frozen reference point remains the saved April 5
 artifacts, but implementation work should use the latest committed TTFT and
 correctness state on this branch. The optimization job remains the same:
 reduce TTFT without reintroducing fallbacks, backend ladders, env-gated
@@ -160,23 +160,23 @@ cross-product below:
 | `cold_prefill_prefix128` | `233.231 ms` |
 | `cold_prefill_prefix4096` | `1340.429 ms` |
 
-### Current committed working baseline on `cf0e4a1`
+### Current committed working baseline on `b431e21`
 
 Focused post-optimization reruns on the current branch:
 
 | Case | Median |
 |------|--------|
-| `cold_prefill_prefix4` | `44.586 ms` |
-| `cold_prefill_prefix128` | `159.985 ms` |
-| `cold_prefill_prefix4096` | `1210.456 ms` |
+| `cold_prefill_prefix4` | `40.415 ms` |
+| `cold_prefill_prefix128` | `142.156 ms` |
+| `cold_prefill_prefix4096` | `1191.797 ms` |
 
 Representative cached committed-head hot-prefix reruns:
 
 | Case | Hot TTFT |
 |------|----------|
-| `prefix4_tail4` | `38.762 ms` |
-| `prefix128_tail4` | `44.582 ms` |
-| `prefix4096_tail4` | `88.562 ms` |
+| `prefix4_tail4` | `35.281 ms` |
+| `prefix128_tail4` | `40.655 ms` |
+| `prefix4096_tail4` | `83.871 ms` |
 
 ### Hot-prefix TTFT medians
 
@@ -227,9 +227,20 @@ More concrete `nsys` findings that should drive the work order:
 - `cold_prefill_prefix128`: `cudaMemcpy` is the largest API-time bucket at
   about `53.3%`, so the plan must explicitly separate one-time/model-load
   copies from per-layer hot-path traffic before optimizing blindly
+- the large HtoD bucket is misleading if treated as a hot-path headline by
+  itself: much of that traffic is model-load or setup cost that appears in both
+  short and long profiles; the hot-path runtime burden is more clearly launch
+  count, allocation churn, dynamic scale recomputation, and synchronization
+- `cold_prefill_prefix128`: DtoH traffic is small in absolute time, but the
+  remaining routed-MoE `expert_offsets` copy is still architecturally
+  unacceptable because it keeps host control in the middle of expert execution
 - `cold_prefill_prefix128`: the current projection GEMM decision is highly
   load-bearing because the active NVFP4 GEMM kernel is still about `49.1%` of
   GPU kernel time in the representative `nsys` run
+- `cold_prefill_prefix128`: expert prefill is not "mostly GPU math". The wall
+  time still includes substantial CPU/API overhead from kernel launches,
+  `cudaMalloc` / `cudaFree`, and host-visible synchronization. Those must be
+  treated as first-class bottlenecks alongside kernel time.
 - `cached_committed_head_prefix4096_tail4096`: `cudaStreamSynchronize` is
   about `76.8%` of API time, which mostly means the host is waiting on long
   kernels, but Steps 3 and 4 should still explicitly audit for unnecessary
@@ -310,6 +321,9 @@ Immediate questions:
   scale ownership is already known
 - can `matmul_block_scales` zeroing be removed or folded into a kernel that
   already walks the same rows/blocks
+- can `WriteTensorScaleKernel<<<1, 1>>>` be removed entirely by folding tensor
+  scale derivation into a kernel that is already launched for the same pack
+  operation
 - can the pack/scaling launch chain be shortened without creating a second
   projection path
 
@@ -320,6 +334,9 @@ Current concerns inside `runtime/src/backend/fused_moe_prefill.cu`:
 - per-run DtoH copy of `expert_offsets`
 - host-side loop over active experts
 - per-expert plan construction and serial launch structure
+- hot-path `cudaMalloc` / `cudaFree` churn caused by shape-variant resource and
+  plan setup
+- repeated per-expert dynamic quantization / packing on the routed path
 
 This is not acceptable as the long-term shape of the hot path, even if the
 math kernels remain the same. The goal is to reduce stalls and transfers
@@ -336,6 +353,15 @@ Current concerns inside `runtime/src/backend/fused_moe_prefill.cu` and
 
 Some boundaries may be required, but every one of them should now be assumed
 expensive until proven otherwise.
+
+The key architectural suspicion is no longer "is gather expensive" but:
+
+- are we quantizing too late and too often because the routed path is built
+  around per-expert host-controlled execution rather than a single device-side
+  execution contract
+- can the routed path move to one-pass activation quantization before dispatch,
+  with grouped device-side execution metadata, without restoring the rejected
+  grouped-CUTLASS split-dispatch design
 
 ### 4. Token selection and logits ownership
 
@@ -357,176 +383,300 @@ Current concerns inside `runtime/src/backend/mamba_layer.cpp`:
 - supporting setup and launch structure still need to be separated from SSD
   kernel cost in profiling
 
+Expectation setting:
+
+- Mamba likely has a lower optimization ceiling than MoE or long-context
+  attention because the SSD scan is fundamentally sequential across tokens
+- unless profiling proves otherwise, assume the likely gain is meaningful but
+  bounded, not a multi-x rewrite opportunity
+
 ### 6. Attention metadata and bridge costs
 
 Current concerns inside `runtime/src/backend/attention_layer.cpp`:
 
 - request metadata is still uploaded from host each run
 - the BF16 bridge path still contains casts plus a sync
+- the current multi-token attention kernel still iterates over visible KV
+  tokens one position at a time rather than using a real block-tiled KV
+  traversal
 
 Even if these costs are smaller than MoE or Mamba today, they still belong to
 the same stall/transfer/fusion audit framework.
 
-## Optimization Order
+## Narrowing Decision
 
-The profile gives a clear order. Work should proceed in this sequence.
+Do **not** try to close every remaining architectural gap in one sweep.
 
-- short and medium TTFT first: expert prefill
-- long cold TTFT second: Mamba prefill
-- long resumed TTFT third: attention over long total context
+That would mix at least five distinct jobs:
 
-That order matches the measured bottlenecks and avoids optimizing the wrong
-operation first.
+- MoE prefill contract replacement
+- token-selection / logits-contract replacement
+- Mamba long-prefill optimization
+- attention long-tail optimization
+- possible broader projection-path replacement
+
+That scope is too wide. It would make TTFT attribution muddy, increase the
+chance of another "almost works but destabilizes correctness" detour, and
+pull us back toward generic abstractions instead of target-specific execution.
+
+The correct scope for the next implementation phase is narrower:
+
+1. replace the host-visible greedy token-selection contract with a device-side
+   token-selection contract
+2. replace the generic MoE prefill contract with a Nano / `SM120`-specific,
+   device-resident execution contract
+3. only after those land and are re-profiled, decide whether Mamba or
+   attention is the next hotspot
+
+This is still aggressive. It closes two real architectural gaps. It is simply
+not trying to close every remaining one at the same time.
+
+## Target-Specific Assumptions
+
+This phase should exploit the real, fixed target instead of preserving
+cross-model flexibility.
+
+Hard assumptions we are allowed to bake into code:
+
+- model: Nemotron 3 Nano 30B A3B NVFP4
+- GPU: single consumer Blackwell RTX 5090, `SM120`
+- hidden size: `2688`
+- vocab size: `131072`
+- routed experts: `128`
+- experts per token: `6`
+- routed expert intermediate size: `1856`
+- shared expert intermediate size: `3712`
+- attention heads / KV heads: `32 / 2`
+- total layers: `52`
+- build target: `build-sm120-relwithdebinfo`
+- serving mode in scope for token selection: greedy decode
+
+Design consequences:
+
+- prefer target-specific kernel code and workspace layouts over generic helper
+  layers
+- precompute and store any expert pointer tables, weight metadata, and
+  scale-layout metadata at model-load time if it removes runtime work
+- choose kernel launch geometry, tiling, and data layout for this exact model
+  and this exact GPU family
+- do not preserve extension points for other models, other quantization
+  schemes, or other GPU families inside the hot path
+
+Out of scope for this phase:
+
+- generalized sampling backends
+- beam search or speculative decode redesign
+- multi-model runtime generalization
+- multi-GPU MoE / expert-parallel runtime contracts
+- replacing every standalone projection GEMM in the runtime
+
+## Implementation Order
+
+The next phase should be executed in this order:
+
+1. device-side token selection and explicit logits ownership
+2. Nano-specific MoE prefill contract replacement
+3. full re-profile of `4` / `128` / `4096` and only then choose between Mamba
+   and attention as the next hotspot
+
+Why token selection first even though MoE is the larger TTFT block:
+
+- it is smaller and more isolated
+- it removes a clear hot DtoH cost from every prompt/decode path
+- it forces the forward API to stop assuming host-visible logits by default
+- it simplifies the boundary-logits story before the larger MoE refactor lands
+
+Why MoE is still the main performance target of this phase:
+
+- it is still the dominant `128`-class prefill cost
+- its remaining host loop and DtoH metadata dependency are not acceptable as a
+  production architecture
+- the grouped CUTLASS attempt already proved that we should not wait for a
+  "perfect prewritten kernel" to fix the contract problem for us
+
+Long-tail caveat:
+
+- for `cached_committed_head_prefix4096_tail4096`, long-context attention may
+  now have the highest single-step upside if a true tiled rewrite replaces the
+  current per-token KV traversal
+- that does not change the business priority of removing the greedy-logits DtoH
+  contract and the MoE host-control contract first; it only means the
+  post-Step-3 reprofile must make the next hotspot decision explicit
 
 ## Steps
 
-- [x] **0. Freeze the current baseline**
+- [x] **0. Freeze the current stable baseline**
   Save the current TTFT matrix, prefill trace, and representative `nsys`
   captures as the reference point for all follow-on work.
   Key artifacts:
   `artifacts/profiles/ttft_prefill_20260405/`
 
-- [x] **1. Re-audit the operation contracts and lock the next replacement boundary**
-  Before more kernel work, do one explicit audit of the active operation
-  surfaces and record the exact replacement boundary for each one:
-  - attention
-  - Mamba
-  - MoE
-  - projection GEMMs
+- [x] **1. Lock the current operation boundaries before replacing contracts**
+  The active operation boundaries and current projection-path decision are
+  recorded in `STEP1_OPERATION_BOUNDARY_AUDIT.md`.
 
-  This step must answer one unresolved architectural question:
+  The important consequence for this phase is:
 
-  - Are projection GEMMs staying on the current cuBLASLt / CUTLASS-backed
-    runtime path as the permanent single implementation?
-  - Or are they being fully replaced later by a native path?
+  - standalone projection GEMMs remain on the current single cuBLASLt /
+    CUTLASS-backed path unless this plan is intentionally superseded
+  - MoE execution is still allowed to become a dedicated Nano / `SM120`
+    operation with target-specific kernels and target-specific metadata if that
+    is the cleanest way to remove host control
 
-  This step must also record the external alignment conclusion:
+- [ ] **2. Replace default host-visible logits with device-side token selection**
+  The end state is:
 
-  - vLLM reference for Nano NVFP4 / `SM120`: FlashInfer CUTLASS-style MoE
-  - TRT-LLM reference for Nano NVFP4 / `SM120`: CutlassFusedMoE
-  - not TRTLLM-Gen, which is not an `SM120` implementation target
+  - default greedy prefill / decode paths do **not** copy full logits to host
+  - the device computes the next token id
+  - host copies out only the selected token id and other minimal control data
+  - full logits are copied out only when explicitly requested by the caller
 
-  Step 1 deliverable:
+  Concrete design requirements:
 
-  - a short written record in this project directory that states, for each
-    operation, what the single production implementation boundary is
-  - an explicit yes/no decision on whether the current projection GEMM stack is
-    the permanent implementation boundary
+  - add a dedicated device-side argmax path specialized for vocab size
+    `131072`
+  - support the two real cases only:
+    - last-row argmax for prefill logits
+    - row-0 argmax for single-token decode logits
+  - change the greedy forward contract so that "next token id is ready" is the
+    default result, not "host copy of logits is ready"
+  - make boundary-logits ownership explicit:
+    - default cache path stores boundary token id
+    - boundary logits are optional debug / oracle data, not mandatory serving
+      state
+  - make any full-logits copy opt-in at the API boundary rather than buried in
+    `RunGreedyDecode`, `RunGreedyConversationTurn`, or `ContinueGreedyDecode`
 
-  Status:
+  Inspiration / alignment:
 
-  - completed in `STEP1_OPERATION_BOUNDARY_AUDIT.md`
+  - TRT-LLM already carries dedicated Blackwell argmax kernels and device-side
+    sampling primitives
+  - our implementation should copy the contract idea, not their full runtime
+    sampler stack
 
-  Do not start another partial GEMM rewrite unless that record is intentionally
-  superseded in writing.
+  Explicit non-goals:
 
-- [ ] **2. Optimize expert prefill for `128`-class TTFT without adding a second MoE path**
-  The target here is `cold_prefill_prefix128` and the `tail4` / `tail128`
-  cached cases. The current evidence says the main opportunities are:
-  - runtime activation packing/scaling cost
-  - avoidable HtoD traffic
-  - workspace / allocation churn
-  - synchronization around the current expert execution sequence
+  - do not build a generic sampling subsystem in this phase
+  - do not preserve full-logits copies as the default behavior "for future
+    flexibility"
+  - do not add a second decode path just for tests or benchmarks
 
-  Step 2 should be treated as three explicit sub-targets, in this order:
+  Acceptance criteria for Step 2:
 
-  1. quantify and reduce the expert-path quantization/packing/scaling stack
-     because it is already about `125 ms` in the profiled `prefix128` run
-  2. attribute `cudaMemcpy` time into one-time/setup traffic versus per-layer
-     hot-path copies, then remove the hot-path portion
-  3. only then decide whether the remaining expert-path bottleneck is GEMM,
-     dispatch/finalize, or synchronization
+  - no full-logits DtoH copy on the default greedy path
+  - exact correctness retained on the Nano oracle path
+  - prefix-cache exact-hit flow works without requiring host-visible boundary
+    logits by default
+  - TTFT is not worse in any of the `4` / `128` / `4096` cases and should
+    improve most obviously in short / medium prompt regimes
 
-  Inside Step 2, use this implementation order unless new profiling evidence
-  clearly overturns it:
+- [ ] **3. Replace generic MoE prefill parameters with a Nano / `SM120` fused-op contract**
+  The end state is:
 
-  1. remove hot-path fixed-scale copies and other pack/scaling transfers that do
-     not need to exist at runtime
-  2. shorten the NVFP4 pack/scaling launch chain where the current contract
-     already provides enough information to do so
-  3. remove the DtoH `expert_offsets` dependency and host-driven expert loop in
-     fused prefill
-  4. only after that revisit deeper fusion inside routed/shared expert compute
+  - no runtime DtoH copy of routing metadata
+  - no host-side loop over active experts
+  - no per-expert runtime plan-build / launch-control logic on the CPU
+  - a fixed host launch schedule whose structure does not depend on active
+    expert count
+  - all routed-MoE execution metadata lives in device-resident workspace owned
+    by the layer or request context
 
-  Required diagnostics before changing kernels:
+  This step should stop treating MoE prefill as "generic tensors + generic
+  scratch + host orchestration". Replace that with a target-specific operation
+  boundary for exactly Nano on `SM120`.
 
-  - determine whether the dominant `cudaMemcpy` calls are one-time/model-load,
-    benchmark harness overhead, or true per-layer hot-path copies
-  - identify whether any `cudaStreamSynchronize` calls fence inside expert
-    execution rather than only at benchmark boundaries
-  - confirm whether the current quantization/packing work is duplicated across
-    experts, layers, or per-window processing
+  Concrete contract changes:
 
-  Allowed work:
-  - reduce or eliminate redundant per-layer packing/scaling work
-  - move scratch/workspace ownership out of the hot path
-  - restructure the existing MoE execution flow to lower launch count
+  - replace `FusedMoePrefillParams` with an opaque Nano-specific execution
+    contract that does not expose host arrays of expert descriptors / weight
+    views in the hot path
+  - prebuild and retain any device-side expert pointer tables, scale tables,
+    and other invariant metadata at model-load time
+  - move all runtime-routed metadata into device-resident workspace:
+    - sorted token ids
+    - top-k weights
+    - expert offsets / counts
+    - active expert table
+    - any packed-activation metadata needed by the final execution kernel(s)
+  - explicitly target zero hot-path `cudaMalloc` / `cudaFree` after warmup for
+    the landed MoE path
+  - replace per-expert activation quantization as the organizing principle of
+    the routed path; the target pattern is one-pass activation quantization
+    before device-side dispatch, not repeated host-driven `PackInto` per expert
+  - make the runtime API "one MoE op in, one output tensor out", not "host
+    loop over experts with scratch tensors exposed"
 
-  Disallowed work:
-  - split dispatch by token count or expert size
-  - host fallback helpers
-  - "temporary" side paths for comparison
+  Execution strategy decision:
 
-  If the final answer is a grouped expert kernel, it must replace the current
-  MoE execution path outright and the old path must be deleted in the same
-  series.
+  - because the exact grouped CUTLASS MoE kernel did not meet the bar on this
+    branch, the default strategy is now a hand-crafted Nano / `SM120`
+    execution design
+  - the relevant reference architecture is still FlashInfer / TRT-LLM style:
+    device-side routing metadata, one-pass quantization before grouped expert
+    execution, and a single fused operator boundary
+  - prewritten library kernels may remain only where they fit inside the one
+    fused production path and do not reintroduce host control, runtime split
+    dispatch, or a second MoE backend
 
-  Explicit non-goal for Step 2:
+  This means the plan is allowed to:
 
-  - do not resume the earlier grouped CUTLASS split-dispatch MoE experiment
-    from `proj-2026-04-05-0445`
+  - write target-specific kernels for routing prepare / finalize
+  - write target-specific kernels that fuse gather / activation / weighted
+    scatter / reduction
+  - hard-code Nano shape assumptions and Blackwell-friendly launch geometry
 
-- [ ] **3. Optimize Mamba prefill for `4096`-class cold TTFT**
-  The target here is `cold_prefill_prefix4096`. The current trace says Mamba is
-  the largest cold-prefill cost by far.
+  This plan is **not** allowed to:
 
-  Focus areas:
-  - `MambaSsdPrefillFixedKernel`
-  - conv-prefill support kernels
-  - fused norm/quant boundaries around Mamba input/output
-  - state-update path and chunk metadata construction
-  - launch shape, tiling, and memory traffic
-  - any remaining synchronization or workspace overhead in the Mamba layer
+  - restore grouped CUTLASS split-dispatch
+  - reintroduce per-expert host launch control
+  - keep a generic MoE path and a Nano-specific fast path side by side
+  - leave "temporary" adapters in the landed tree once the contract is
+    replaced
 
-  Required diagnostics before changing kernels:
+  Intermediate staging rule:
 
-  - verify whether the main cost is inside SSD prefill proper or in supporting
-    conv/norm/state-update setup around it
-  - use the `8192` trace as a scaling reference to distinguish linear work from
-    pathologically growing work
-  - account explicitly for remaining casts, syncs, and metadata/setup work
-    rather than attributing all time to SSD prefill automatically
+  - branch-local refactors are allowed if needed to get there
+  - each landed commit must still expose only one production MoE path in the
+    runtime tree
 
-  Keep one implementation path for Mamba. Do not introduce a special
-  "long-prefill-only" Mamba backend.
+  Acceptance criteria for Step 3:
 
-- [ ] **4. Optimize attention for long resumed tails**
-  The target here is `cached_committed_head_prefix4096_tail4096`. After the
-  cache hit, attention becomes much larger because the total active sequence is
-  `8192`.
+  - no hot-path DtoH / HtoD routing metadata traffic
+  - no host loop whose iteration count depends on active experts
+  - zero hot-path `cudaMalloc` / `cudaFree` after warmup
+  - fixed launch schedule independent of active-expert count
+  - exact correctness retained on the Nano oracle path
+  - material TTFT gain in `prefix128` and cached `tail4` / `tail128`
+  - no meaningful regression in `prefix4` or `prefix4096`
 
-  Focus areas:
-  - `PagedAttentionNanoMultiTokenKernel`
-  - long-sequence tiling and memory access
-  - minimizing wasted work when only the tail is new
-  - auditing whether any host-visible sync points serialize work inside the
-    layer, rather than only fencing at the benchmark boundary
+- [ ] **4. Re-profile the full matrix and decide the next hotspot**
+  After Steps 2 and 3 land:
 
-  Required diagnostics before changing kernels:
+  - rerun the full TTFT matrix
+  - rerun prefill tracing
+  - rerun representative `nsys`
+  - update this project plan with the new dominant hotspot
 
-  - confirm whether the dominant cost is expected long-kernel execution or
-    avoidable serialization between launches
-  - verify whether any cache-restore or tail-shape bookkeeping is causing extra
-    work inside the attention layer
-  - account explicitly for metadata HtoD uploads and the remaining BF16 bridge
-    path when judging whether the layer is "done"
+  Only then choose the next implementation target:
 
-  Keep the current native attention path as the only production path. Use
-  vLLM / TRT-LLM only as algorithm references, not as runtime templates with
-  multiple backend choices.
+  - Mamba long-prefill work if it is still the dominant cold `4096` cost
+  - attention long-tail work if resumed `4096 + 4096` is now clearly larger
 
-- [ ] **5. Treat re-profile + correctness as a stage gate after every optimization step**
-  This is not a trailing cleanup step. It is a gate after Steps 2, 3, and 4.
+  Expectations for that decision:
+
+  - if attention remains next, treat it as an architectural rewrite, not a
+    tuning pass, because the current kernel still lacks real block-level KV
+    tiling
+  - if Mamba remains next, assume a more bounded improvement ceiling unless new
+    profiling evidence says the current support code, not the SSD scan itself,
+    is the dominant cost
+
+  Do **not** assume today that both will be part of the same implementation
+  phase.
+
+- [ ] **5. Treat re-profile + correctness as a stage gate after every landed optimization**
+  This is not a trailing cleanup step. It is a gate after Steps 2 and 3 and
+  again after Step 4 decides the next hotspot.
 
   After each substantial change:
   - rerun correctness
@@ -548,6 +698,59 @@ operation first.
   - stale benchmark knobs that no longer reflect the runtime contract
 
   The end state should be faster **and** cleaner than the current baseline.
+
+## Adversarial Review Of This Plan
+
+### Why not close every architectural gap now
+
+Because that would be too broad and would likely repeat the exact failure mode
+we already saw with grouped CUTLASS MoE: too much architectural movement at
+once, unclear attribution, and correctness risk rising faster than performance
+confidence.
+
+### Why not jump straight to a full custom projection rewrite
+
+Because the current evidence still says the hottest remaining problems are
+contract and orchestration problems around MoE and greedy decode, not just raw
+GEMM throughput. A projection rewrite now would be too large and would blur
+whether the real win came from math, launch structure, or transfer removal.
+
+### Why token selection first
+
+This is the most contained contract change that removes a known DtoH tax from
+every path. If we cannot make logits ownership explicit here, then every later
+optimization is still working around a host-visible API that we already know is
+too generic.
+
+### Why the plan still narrows scope instead of "fusing everything"
+
+Because "fuse everything" is not a plan. The correct interpretation of the
+single-target constraint is:
+
+- be specific
+- hard-code shapes and hardware assumptions where that helps
+- remove genericity where it is costing us
+- but still change one dominant contract at a time so we can prove each win and
+  keep correctness locked
+
+### Main risks to watch
+
+- hidden test or cache dependencies on full host-visible logits
+- MoE refactors that accidentally keep the old host-loop control path alive in
+  another form
+- broad "helper" abstractions that sneak genericity back into the new contract
+- overfitting token-selection changes to benchmarks while breaking oracle /
+  interactive usage
+- trying to make the MoE replacement portable before it is fast and correct on
+  Nano / `SM120`
+
+### Final decision after review
+
+Keep the next phase narrow in scope but extremely specific in implementation:
+
+- fully close the greedy token-selection / logits-ownership gap
+- fully close the generic MoE prefill / host-control gap
+- then re-profile before deciding on Mamba or attention
 
 ## Measurement Discipline
 
@@ -647,6 +850,11 @@ This plan is complete only when all of the following are true:
 - TTFT is materially better in the `4`, `128`, and `4096` regimes
 - the gains survive cached-tail cases, not just cold-prefill microbenches
 - correctness remains exact on the Nano oracle path
+- the default greedy path does not perform full-logits DtoH copies
+- boundary logits are copied only when explicitly requested
+- the MoE prefill path no longer performs runtime DtoH routing-metadata copies
+- the MoE prefill path no longer contains a host loop whose trip count depends
+  on active experts
 - the active `SM120` forward pass still has one implementation path per
   operation
 - no new fallback code or backend-selection scaffolding has been introduced

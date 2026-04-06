@@ -27,6 +27,8 @@ class DeviceExpertRouting {
   int* expert_offsets() const;
   int* sorted_token_indices() const;
   float* sorted_token_weights() const;
+  int* active_expert_count() const;
+  int* active_expert_ids() const;
 
  private:
   friend bool RunDeviceExpertRouting(

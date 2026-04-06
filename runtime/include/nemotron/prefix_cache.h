@@ -52,6 +52,7 @@ struct CacheEntryView {
   std::vector<std::string> committed_conversations;
   std::uint64_t last_access_tick = 0;
   std::size_t total_bytes = 0;
+  std::optional<TokenId> boundary_token_id;
   bool has_boundary_logits = false;
   std::size_t boundary_logits_count = 0;
 };
@@ -75,25 +76,50 @@ class PrefixCache {
       const SerializedPromptIdentity& identity,
       const ReusableStateDescriptor& state,
       const std::vector<float>* boundary_logits = nullptr);
+  PrefixNodeId PublishConversationHead(
+      const std::string& conversation_id,
+      const SerializedPromptIdentity& identity,
+      const ReusableStateDescriptor& state,
+      TokenId boundary_token_id,
+      const std::vector<float>* boundary_logits = nullptr);
   PrefixNodeId PublishConversationHeadSnapshot(
       const std::string& conversation_id,
       const SerializedPromptIdentity& identity,
       const RequestExecutionContext& request_context,
       const std::string& state_label,
       const std::vector<float>* boundary_logits = nullptr);
+  PrefixNodeId PublishConversationHeadSnapshot(
+      const std::string& conversation_id,
+      const SerializedPromptIdentity& identity,
+      const RequestExecutionContext& request_context,
+      const std::string& state_label,
+      TokenId boundary_token_id,
+      const std::vector<float>* boundary_logits = nullptr);
 
   PrefixNodeId PublishGlobalRoot(
       const SerializedPromptIdentity& identity,
       const ReusableStateDescriptor& state,
+      const std::vector<float>* boundary_logits = nullptr);
+  PrefixNodeId PublishGlobalRoot(
+      const SerializedPromptIdentity& identity,
+      const ReusableStateDescriptor& state,
+      TokenId boundary_token_id,
       const std::vector<float>* boundary_logits = nullptr);
   PrefixNodeId PublishGlobalRootSnapshot(
       const SerializedPromptIdentity& identity,
       const RequestExecutionContext& request_context,
       const std::string& state_label,
       const std::vector<float>* boundary_logits = nullptr);
+  PrefixNodeId PublishGlobalRootSnapshot(
+      const SerializedPromptIdentity& identity,
+      const RequestExecutionContext& request_context,
+      const std::string& state_label,
+      TokenId boundary_token_id,
+      const std::vector<float>* boundary_logits = nullptr);
 
   CacheMatch Lookup(const CacheLookupRequest& request);
   bool RestoreMatchState(const CacheMatch& match, RequestExecutionContext& request_context) const;
+  std::optional<TokenId> CopyBoundaryTokenId(PrefixNodeId node_id) const;
   std::optional<std::vector<float>> CopyBoundaryLogits(PrefixNodeId node_id) const;
   void SetEnabled(bool enabled);
   bool enabled() const;
@@ -110,9 +136,34 @@ class PrefixCache {
  private:
   struct Impl;
 
+  PrefixNodeId PublishConversationHeadImpl(
+      const std::string& conversation_id,
+      const SerializedPromptIdentity& identity,
+      const ReusableStateDescriptor& state,
+      std::optional<TokenId> boundary_token_id,
+      const std::vector<float>* boundary_logits);
+  PrefixNodeId PublishConversationHeadSnapshotImpl(
+      const std::string& conversation_id,
+      const SerializedPromptIdentity& identity,
+      const RequestExecutionContext& request_context,
+      const std::string& state_label,
+      std::optional<TokenId> boundary_token_id,
+      const std::vector<float>* boundary_logits);
+  PrefixNodeId PublishGlobalRootImpl(
+      const SerializedPromptIdentity& identity,
+      const ReusableStateDescriptor& state,
+      std::optional<TokenId> boundary_token_id,
+      const std::vector<float>* boundary_logits);
+  PrefixNodeId PublishGlobalRootSnapshotImpl(
+      const SerializedPromptIdentity& identity,
+      const RequestExecutionContext& request_context,
+      const std::string& state_label,
+      std::optional<TokenId> boundary_token_id,
+      const std::vector<float>* boundary_logits);
   PrefixNodeId FindOrCreateNode(
       const SerializedPromptIdentity& identity,
       const ReusableStateDescriptor& state,
+      std::optional<TokenId> boundary_token_id,
       const std::vector<float>* boundary_logits);
   void Touch(PrefixNodeId node_id);
   void AssignConversationHead(PrefixNodeId node_id, const std::string& conversation_id);

@@ -186,6 +186,7 @@ class SingleTokenForwardModel {
       const GreedyDecodeConfig& decode_config,
       RequestExecutionContext& request_context,
       GreedyDecodeResult* result,
+      std::int32_t* final_boundary_token_id = nullptr,
       std::vector<float>* final_boundary_logits = nullptr) const;
 
   explicit SingleTokenForwardModel(std::unique_ptr<Impl> impl);

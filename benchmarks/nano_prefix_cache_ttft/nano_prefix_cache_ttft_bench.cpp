@@ -176,7 +176,7 @@ struct ColdPassResult {
   double first_token_decode_ms = 0.0;
   double cold_ttft_ms = 0.0;
   std::int32_t generated_token_id = -1;
-  std::vector<float> boundary_logits;
+  std::int32_t boundary_token_id = -1;
 };
 
 struct SeededCacheState {
@@ -696,11 +696,12 @@ std::optional<ColdPassResult> RunColdPass(
   }
 
   result.generated_token_id = *first_token_id;
-  result.boundary_logits = CopyTensorToHost(*step_logits);
-  if (result.boundary_logits.empty()) {
-    std::cerr << "nano_prefix_cache_ttft_bench: failed to copy cold decode logits\n";
+  const auto boundary_token_id = SelectTokenId(*step_logits, device_token_id);
+  if (!boundary_token_id.has_value()) {
+    std::cerr << "nano_prefix_cache_ttft_bench: failed to select cold boundary token\n";
     return std::nullopt;
   }
+  result.boundary_token_id = *boundary_token_id;
   result.cold_ttft_ms = result.prefill_ms + result.first_token_decode_ms;
   return result;
 }
@@ -710,7 +711,8 @@ std::optional<SeededCacheState> SeedPrefixCache(
     nemotron::SingleTokenForwardModel& model,
     nemotron::PrefixCache& prefix_cache,
     const nemotron::SerializedPromptIdentity& prefix_identity,
-    const std::string& conversation_id) {
+    const std::string& conversation_id,
+    std::int32_t* device_token_id) {
   auto request_context = model.CreateRequestContext();
   if (request_context == nullptr || !request_context->valid()) {
     std::cerr << "nano_prefix_cache_ttft_bench: failed to create cache seed request context\n";
@@ -731,9 +733,9 @@ std::optional<SeededCacheState> SeedPrefixCache(
     return std::nullopt;
   }
 
-  std::vector<float> boundary_logits = CopyTensorToHost(*prompt_logits);
-  if (boundary_logits.empty()) {
-    std::cerr << "nano_prefix_cache_ttft_bench: failed to copy cache seed boundary logits\n";
+  const auto boundary_token_id = SelectTokenId(*prompt_logits, device_token_id);
+  if (!boundary_token_id.has_value()) {
+    std::cerr << "nano_prefix_cache_ttft_bench: failed to select cache seed boundary token\n";
     return std::nullopt;
   }
 
@@ -744,13 +746,13 @@ std::optional<SeededCacheState> SeedPrefixCache(
         prefix_identity,
         *request_context,
         conversation_id + "/seed",
-        &boundary_logits);
+        *boundary_token_id);
   } else if (scenario == Scenario::kGlobalRoot) {
     node_id = prefix_cache.PublishGlobalRootSnapshot(
         prefix_identity,
         *request_context,
         conversation_id + "/root",
-        &boundary_logits);
+        *boundary_token_id);
   }
 
   if (node_id == 0) {
@@ -794,7 +796,13 @@ std::optional<IterationMetrics> RunResumeIteration(
       std::string(ScenarioName(scenario)) + "_iter_" + std::to_string(iteration_index);
   const auto prefix_identity = MakeIdentity(prefix_token_ids, model_id);
   const auto seeded_cache =
-      SeedPrefixCache(scenario, model, prefix_cache, prefix_identity, conversation_id);
+      SeedPrefixCache(
+          scenario,
+          model,
+          prefix_cache,
+          prefix_identity,
+          conversation_id,
+          device_token_id);
   if (!seeded_cache.has_value()) {
     return std::nullopt;
   }
@@ -880,9 +888,9 @@ std::optional<IterationMetrics> RunResumeIteration(
     return std::nullopt;
   }
 
-  std::vector<float> boundary_logits = CopyTensorToHost(*step_logits);
-  if (boundary_logits.empty()) {
-    std::cerr << "nano_prefix_cache_ttft_bench: failed to copy resumed decode logits\n";
+  const auto boundary_token_id = SelectTokenId(*step_logits, device_token_id);
+  if (!boundary_token_id.has_value()) {
+    std::cerr << "nano_prefix_cache_ttft_bench: failed to select resumed boundary token\n";
     return std::nullopt;
   }
 
@@ -897,7 +905,7 @@ std::optional<IterationMetrics> RunResumeIteration(
                          committed_identity,
                          *request_context,
                          conversation_id + "/committed",
-                         &boundary_logits) != 0;
+                         *boundary_token_id) != 0;
             },
             &metrics.commit_latency_ms.emplace())) {
       return std::nullopt;

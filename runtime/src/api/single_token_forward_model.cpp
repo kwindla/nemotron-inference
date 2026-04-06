@@ -21,6 +21,7 @@
 #include "nemotron/attention_layer.h"
 #include "nemotron/cublaslt_handle.h"
 #include "nemotron/cudnn_handle.h"
+#include "nemotron/device_argmax.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/embedding_catalog.h"
 #include "nemotron/embedding_table.h"
@@ -650,6 +651,40 @@ std::optional<std::int32_t> ArgMaxTokenId(
   return static_cast<std::int32_t>(std::distance(row_begin, max_it));
 }
 
+std::optional<std::int32_t> CopyTokenIdToHost(
+    const DeviceTensorInt32& token_id_buffer,
+    std::size_t vocab_size) {
+  if (!token_id_buffer.valid() || token_id_buffer.numel() != 1) {
+    return std::nullopt;
+  }
+  std::int32_t host_token_id = -1;
+  if (!token_id_buffer.CopyToHost(&host_token_id, 1) ||
+      host_token_id < 0 ||
+      static_cast<std::size_t>(host_token_id) >= vocab_size) {
+    return std::nullopt;
+  }
+  return host_token_id;
+}
+
+std::optional<std::int32_t> SelectGreedyTokenId(
+    const DeviceTensorFp32& logits_row,
+    RequestExecutionContext& request_context) {
+  DeviceTensorInt32* token_id_buffer = request_context.greedy_token_id_scratch();
+  if (token_id_buffer == nullptr ||
+      !token_id_buffer->valid() ||
+      token_id_buffer->numel() != 1 ||
+      !logits_row.valid() ||
+      logits_row.shape().size() != 2 ||
+      logits_row.shape()[0] != 1 ||
+      logits_row.shape()[1] == 0) {
+    return std::nullopt;
+  }
+  if (!DeviceArgmax(logits_row, token_id_buffer->data())) {
+    return std::nullopt;
+  }
+  return CopyTokenIdToHost(*token_id_buffer, logits_row.shape()[1]);
+}
+
 }  // namespace
 
 SingleTokenForwardConfig KnownNemotron3Super120BA12BConfig() {
@@ -1242,22 +1277,21 @@ bool SingleTokenForwardModel::RunGreedyDecode(
     return false;
   }
 
-  auto prompt_logits = DeviceTensorFp32::Create({prompt_token_count, impl_->config.vocab_size});
-  if (prompt_logits == nullptr || !prompt_logits->valid()) {
-    std::cerr << "single_token_forward_model: prompt logits buffer allocation failed\n";
+  auto prompt_boundary_logits = DeviceTensorFp32::Create({1, impl_->config.vocab_size});
+  if (prompt_boundary_logits == nullptr || !prompt_boundary_logits->valid()) {
+    std::cerr << "single_token_forward_model: prompt boundary logits buffer allocation failed\n";
     return false;
   }
-  if (!RunPrefill(prompt_token_ids, prompt_token_count, request_context, prompt_logits.get())) {
+  if (!RunPrefill(
+          prompt_token_ids,
+          prompt_token_count,
+          request_context,
+          prompt_boundary_logits.get())) {
     std::cerr << "single_token_forward_model: greedy decode prefill failed\n";
     return false;
   }
 
-  std::vector<float> logits_host = CopyTensorToHost(*prompt_logits);
-  if (logits_host.empty() || !AllFinite(logits_host)) {
-    std::cerr << "single_token_forward_model: greedy decode prompt logits invalid\n";
-    return false;
-  }
-  auto next_token = ArgMaxTokenId(logits_host, prompt_token_count - 1, impl_->config.vocab_size);
+  const auto next_token = SelectGreedyTokenId(*prompt_boundary_logits, request_context);
   if (!next_token.has_value()) {
     std::cerr << "single_token_forward_model: failed to select prompt decode token\n";
     return false;
@@ -1305,7 +1339,7 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
   std::size_t prefill_token_count = identity.token_ids.size();
   bool resumed_from_cache = false;
   bool exact_cache_hit = false;
-  std::vector<float> logits_host;
+  std::optional<std::int32_t> next_token_id;
 
   if (impl_->prefix_cache != nullptr && impl_->prefix_cache->enabled()) {
     CacheLookupRequest lookup_request;
@@ -1321,13 +1355,21 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
         prefill_token_ids += matched_prefix_tokens;
         prefill_token_count -= matched_prefix_tokens;
       } else if (match.matched_token_count == identity.token_ids.size()) {
-        const auto cached_boundary_logits = impl_->prefix_cache->CopyBoundaryLogits(match.node_id);
-        if (cached_boundary_logits.has_value() &&
-            cached_boundary_logits->size() == impl_->config.vocab_size &&
-            AllFinite(*cached_boundary_logits)) {
+        const auto cached_boundary_token_id =
+            impl_->prefix_cache->CopyBoundaryTokenId(match.node_id);
+        if (cached_boundary_token_id.has_value()) {
           exact_cache_hit = true;
           matched_prefix_tokens = match.matched_token_count;
-          logits_host = std::move(*cached_boundary_logits);
+          next_token_id = cached_boundary_token_id;
+        } else {
+          const auto cached_boundary_logits = impl_->prefix_cache->CopyBoundaryLogits(match.node_id);
+          if (cached_boundary_logits.has_value() &&
+              cached_boundary_logits->size() == impl_->config.vocab_size &&
+              AllFinite(*cached_boundary_logits)) {
+            exact_cache_hit = true;
+            matched_prefix_tokens = match.matched_token_count;
+            next_token_id = ArgMaxTokenId(*cached_boundary_logits, 0, impl_->config.vocab_size);
+          }
         }
       }
     }
@@ -1337,41 +1379,52 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
   }
 
   if (!exact_cache_hit) {
-    auto prompt_logits = DeviceTensorFp32::Create({prefill_token_count, impl_->config.vocab_size});
-    if (prompt_logits == nullptr || !prompt_logits->valid()) {
-      std::cerr << "single_token_forward_model: conversation-turn prompt logits buffer allocation failed\n";
+    if (prefill_token_count == 0) {
+      std::cerr << "single_token_forward_model: exact cache hit is missing boundary token ownership\n";
+      return false;
+    }
+    auto prompt_boundary_logits = DeviceTensorFp32::Create({1, impl_->config.vocab_size});
+    if (prompt_boundary_logits == nullptr || !prompt_boundary_logits->valid()) {
+      std::cerr << "single_token_forward_model: conversation-turn prompt boundary logits allocation failed\n";
       return false;
     }
 
     const bool prefill_ok =
         resumed_from_cache
-            ? ContinuePrefill(prefill_token_ids, prefill_token_count, request_context, prompt_logits.get())
-            : RunPrefill(identity.token_ids.data(), identity.token_ids.size(), request_context, prompt_logits.get());
+            ? ContinuePrefill(
+                  prefill_token_ids,
+                  prefill_token_count,
+                  request_context,
+                  prompt_boundary_logits.get())
+            : RunPrefill(
+                  identity.token_ids.data(),
+                  identity.token_ids.size(),
+                  request_context,
+                  prompt_boundary_logits.get());
     if (!prefill_ok) {
       std::cerr << "single_token_forward_model: conversation-turn prefill failed\n";
       return false;
     }
 
-    logits_host = CopyTensorToHost(*prompt_logits);
-    if (logits_host.empty() || !AllFinite(logits_host)) {
-      std::cerr << "single_token_forward_model: conversation-turn prompt logits invalid\n";
+    next_token_id = SelectGreedyTokenId(*prompt_boundary_logits, request_context);
+    if (!next_token_id.has_value()) {
+      std::cerr << "single_token_forward_model: failed to select conversation-turn decode token\n";
       return false;
     }
   }
 
-  const std::size_t logits_row_index = exact_cache_hit ? 0 : (prefill_token_count - 1);
-  auto next_token = ArgMaxTokenId(logits_host, logits_row_index, impl_->config.vocab_size);
-  if (!next_token.has_value()) {
-    std::cerr << "single_token_forward_model: failed to select conversation-turn decode token\n";
+  std::int32_t committed_boundary_token_id = -1;
+  if (!next_token_id.has_value() ||
+      !ContinueGreedyDecode(
+          *next_token_id,
+          decode_config,
+          request_context,
+          result,
+          &committed_boundary_token_id)) {
     return false;
   }
-  std::vector<float> committed_boundary_logits;
-  if (!ContinueGreedyDecode(*next_token, decode_config, request_context, result, &committed_boundary_logits)) {
-    return false;
-  }
-  if (committed_boundary_logits.empty()) {
-    committed_boundary_logits = logits_host;
-  }
+  const std::int32_t published_boundary_token_id =
+      result->generated_token_ids.empty() ? *next_token_id : committed_boundary_token_id;
 
   if (impl_->prefix_cache != nullptr && impl_->prefix_cache->enabled()) {
     SerializedPromptIdentity committed_identity = identity;
@@ -1384,7 +1437,7 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
         committed_identity,
         request_context,
         conversation_id + "/committed",
-        &committed_boundary_logits);
+        published_boundary_token_id);
   }
 
   return true;
@@ -1395,10 +1448,14 @@ bool SingleTokenForwardModel::ContinueGreedyDecode(
     const GreedyDecodeConfig& decode_config,
     RequestExecutionContext& request_context,
     GreedyDecodeResult* result,
+    std::int32_t* final_boundary_token_id,
     std::vector<float>* final_boundary_logits) const {
   result->generated_token_ids.clear();
   result->hit_eos = false;
   result->hit_capacity_limit = false;
+  if (final_boundary_token_id != nullptr) {
+    *final_boundary_token_id = -1;
+  }
   if (final_boundary_logits != nullptr) {
     final_boundary_logits->clear();
   }
@@ -1426,24 +1483,26 @@ bool SingleTokenForwardModel::ContinueGreedyDecode(
       return false;
     }
 
-    std::vector<float> logits_host = CopyTensorToHost(*step_logits);
-    if (logits_host.empty() || !AllFinite(logits_host)) {
-      std::cerr << "single_token_forward_model: greedy decode step logits invalid at step "
-                << step << "\n";
-      return false;
-    }
-    if (final_boundary_logits != nullptr) {
-      *final_boundary_logits = logits_host;
-    }
-    if (ContainsTokenId(decode_config.eos_token_ids, token_id)) {
-      result->hit_eos = true;
-      break;
-    }
-    const auto next_token = ArgMaxTokenId(logits_host, 0, impl_->config.vocab_size);
+    const auto next_token = SelectGreedyTokenId(*step_logits, request_context);
     if (!next_token.has_value()) {
       std::cerr << "single_token_forward_model: failed to select decode token at step "
                 << step << "\n";
       return false;
+    }
+    if (final_boundary_token_id != nullptr) {
+      *final_boundary_token_id = *next_token;
+    }
+    if (final_boundary_logits != nullptr) {
+      *final_boundary_logits = CopyTensorToHost(*step_logits);
+      if (final_boundary_logits->empty() || !AllFinite(*final_boundary_logits)) {
+        std::cerr << "single_token_forward_model: greedy decode step logits invalid at step "
+                  << step << "\n";
+        return false;
+      }
+    }
+    if (ContainsTokenId(decode_config.eos_token_ids, token_id)) {
+      result->hit_eos = true;
+      break;
     }
     token_id = *next_token;
   }

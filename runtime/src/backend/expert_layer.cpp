@@ -1148,33 +1148,9 @@ bool ExpertLayerSlice::Impl::SupportsDirectMoePrefillPath(
     std::size_t token_count,
     int device_sm_version) const {
   (void)device_sm_version;
-  const DeviceExpertRouting* routing = ResolveFusedPrefillRouting();
-  const DeviceTensorFp32* routed_output_scratch = ResolveFusedPrefillRoutedOutputScratch();
-  const DeviceTensorFp32* gather_scratch = ResolveFusedPrefillGatherScratch();
-  const DeviceTensorFp32* expert_up_scratch = ResolveFusedPrefillExpertUpScratch();
-  const DeviceTensorFp32* shared_up_scratch = ResolveFusedPrefillSharedUpScratch();
-  const DeviceNvfp4Matrix* gather_pack = ResolveFusedPrefillGatherPack();
-  const DeviceNvfp4Matrix* expert_up_pack = ResolveFusedPrefillExpertUpPack();
-  const DeviceNvfp4Matrix* shared_up_pack = ResolveFusedPrefillSharedUpPack();
   return direct_moe_execution_state.trace == nullptr &&
          token_count > 1 &&
-         SupportsResidentPreparedMoePath(path_config, token_count) &&
-         routing != nullptr &&
-         routing->valid() &&
-         routed_output_scratch != nullptr &&
-         routed_output_scratch->valid() &&
-         gather_scratch != nullptr &&
-         gather_scratch->valid() &&
-         expert_up_scratch != nullptr &&
-         expert_up_scratch->valid() &&
-         shared_up_scratch != nullptr &&
-         shared_up_scratch->valid() &&
-         gather_pack != nullptr &&
-         gather_pack->valid() &&
-         expert_up_pack != nullptr &&
-         expert_up_pack->valid() &&
-         shared_up_pack != nullptr &&
-         shared_up_pack->valid();
+         SupportsResidentPreparedMoePath(path_config, token_count);
 }
 
 bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
@@ -1186,10 +1162,12 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     const int* topk_ids,
     const float* topk_weights,
     DeviceTensorFp32* output) const {
-  if (!cublas_handle.valid() ||
-      !input.valid() ||
+  (void)cublas_handle;
+  (void)heuristic_cache;
+  (void)router_logits;
+
+  if (!input.valid() ||
       !normalized.valid() ||
-      !router_logits.valid() ||
       topk_ids == nullptr ||
       topk_weights == nullptr ||
       output == nullptr ||
@@ -1198,135 +1176,46 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       input.shape() != output->shape() ||
       input.shape().size() != 2 ||
       input.shape()[0] == 0 ||
-      input.shape()[1] != config.hidden_size ||
-      router_logits.shape().size() != 2 ||
-      router_logits.shape()[0] != input.shape()[0] ||
-      router_logits.shape()[1] != config.n_routed_experts) {
+      input.shape()[1] != config.hidden_size) {
     return false;
   }
 
   const std::size_t token_count = input.shape()[0];
-  if (token_count > ResolveMultiTokenCapacity() ||
-      token_count > (std::numeric_limits<std::size_t>::max() / config.top_k)) {
-    return false;
-  }
-
-  const std::size_t selection_count = token_count * config.top_k;
-  DeviceExpertRouting* routing = ResolveFusedPrefillRouting();
-  DeviceTensorFp32* routed_output_owner = ResolveFusedPrefillRoutedOutputScratch();
-  DeviceTensorFp32* gather_owner = ResolveFusedPrefillGatherScratch();
-  DeviceTensorFp32* expert_up_owner = ResolveFusedPrefillExpertUpScratch();
-  DeviceTensorFp32* shared_up_owner = ResolveFusedPrefillSharedUpScratch();
-  DeviceNvfp4Matrix* gather_pack = ResolveFusedPrefillGatherPack();
-  DeviceNvfp4Matrix* expert_up_pack = ResolveFusedPrefillExpertUpPack();
-  DeviceNvfp4Matrix* shared_up_pack = ResolveFusedPrefillSharedUpPack();
-  if (routing == nullptr ||
-      routed_output_owner == nullptr ||
-      gather_owner == nullptr ||
-      expert_up_owner == nullptr ||
-      shared_up_owner == nullptr ||
-      gather_pack == nullptr ||
-      expert_up_pack == nullptr ||
-      shared_up_pack == nullptr ||
-      routing->selection_count() < selection_count ||
-      shared_up_nvfp4_device == nullptr ||
-      shared_down_nvfp4_device == nullptr ||
-      !shared_up_nvfp4_device->valid() ||
-      !shared_down_nvfp4_device->valid()) {
-    return false;
-  }
-
-  if (!RunDeviceExpertRouting(
-          topk_ids,
-          topk_weights,
-          token_count,
-          config.top_k,
-          routing)) {
+  if (token_count > ResolveMultiTokenCapacity()) {
     return false;
   }
 
   if (!direct_moe_weights.prepared ||
+      !HasValidPreparedMoeWeightView(direct_moe_weights.shared_up) ||
+      !HasValidPreparedMoeWeightView(direct_moe_weights.shared_down) ||
       direct_moe_weights.routed_up_views.size() != config.n_routed_experts ||
       direct_moe_weights.routed_down_views.size() != config.n_routed_experts) {
     return false;
   }
 
-  if (routed_experts.size() != config.n_routed_experts ||
-      shared_up_nvfp4 == nullptr ||
-      shared_down_nvfp4 == nullptr) {
-    return false;
-  }
-
-  std::vector<const GemmDescriptor*> routed_up_descriptors(
-      config.n_routed_experts,
-      nullptr);
-  std::vector<const GemmDescriptor*> routed_down_descriptors(
-      config.n_routed_experts,
-      nullptr);
   for (std::size_t expert_index = 0; expert_index < config.n_routed_experts; ++expert_index) {
-    if (routed_experts[expert_index].up_proj == nullptr ||
-        routed_experts[expert_index].down_proj == nullptr) {
+    if (!HasValidPreparedMoeWeightView(direct_moe_weights.routed_up_views[expert_index]) ||
+        !HasValidPreparedMoeWeightView(direct_moe_weights.routed_down_views[expert_index])) {
       return false;
     }
-    routed_up_descriptors[expert_index] = routed_experts[expert_index].up_proj;
-    routed_down_descriptors[expert_index] = routed_experts[expert_index].down_proj;
-  }
-
-  auto routed_output = CreateWorkspaceView(
-      routed_output_owner,
-      token_count,
-      config.hidden_size);
-  auto gather_scratch = CreateWorkspaceView(
-      gather_owner,
-      selection_count,
-      config.hidden_size);
-  auto expert_up_scratch = CreateWorkspaceView(
-      expert_up_owner,
-      selection_count,
-      config.routed_expert_intermediate_size);
-  auto shared_up_scratch = CreateWorkspaceView(
-      shared_up_owner,
-      token_count,
-      config.shared_expert_intermediate_size);
-  if (!routed_output ||
-      !gather_scratch ||
-      !expert_up_scratch ||
-      !shared_up_scratch ||
-      !routed_output->FillZero()) {
-    return false;
   }
 
   FusedMoePrefillParams params;
   params.token_count = token_count;
-  params.selection_count = selection_count;
   params.hidden_size = config.hidden_size;
   params.routed_expert_intermediate_size = config.routed_expert_intermediate_size;
   params.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
   params.n_routed_experts = config.n_routed_experts;
   params.top_k = config.top_k;
-  params.cublas_handle = &cublas_handle;
-  params.heuristic_cache = heuristic_cache;
-  params.shared_up_descriptor = shared_up_nvfp4;
-  params.shared_down_descriptor = shared_down_nvfp4;
-  params.routed_up_descriptors = routed_up_descriptors.data();
-  params.routed_down_descriptors = routed_down_descriptors.data();
   params.shared_up = direct_moe_weights.shared_up;
   params.shared_down = direct_moe_weights.shared_down;
   params.routed_up = direct_moe_weights.routed_up_views.data();
   params.routed_down = direct_moe_weights.routed_down_views.data();
+  params.selected_indices = topk_ids;
+  params.selected_weights = topk_weights;
   params.input = input.data();
   params.normalized = normalized.data();
   params.output = output->data();
-  params.routed_output = routed_output->data();
-  params.gather_scratch = gather_scratch->data();
-  params.expert_up_scratch = expert_up_scratch->data();
-  params.shared_up_scratch = shared_up_scratch->data();
-  params.gather_pack = gather_pack;
-  params.expert_up_pack = expert_up_pack;
-  params.shared_up_pack = shared_up_pack;
-  params.expert_offsets = routing->expert_offsets();
-  params.sorted_token_indices = routing->sorted_token_indices();
-  params.sorted_token_weights = routing->sorted_token_weights();
 
   if (RunFusedMoePrefill(params)) {
     return true;

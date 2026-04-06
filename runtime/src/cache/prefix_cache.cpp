@@ -101,6 +101,7 @@ std::vector<std::string> sorted_strings(const std::unordered_set<std::string>& v
 std::size_t node_bytes(
     const SerializedPromptIdentity& identity,
     const ReusableStateDescriptor& state,
+    const std::optional<TokenId>& boundary_token_id,
     const std::vector<float>& boundary_logits) {
   return identity.token_ids.size() * sizeof(TokenId) +
          identity.tenant_namespace.size() +
@@ -108,6 +109,7 @@ std::size_t node_bytes(
          identity.serializer_revision.size() +
          identity.model_revision.size() +
          state.total_bytes() +
+         (boundary_token_id.has_value() ? sizeof(TokenId) : 0) +
          (boundary_logits.size() * sizeof(float));
 }
 
@@ -132,6 +134,7 @@ struct PrefixCache::Impl {
     ReusableStateDescriptor state;
     std::uint64_t fingerprint = 0;
     bool is_global_root = false;
+    std::optional<TokenId> boundary_token_id;
     std::vector<float> boundary_logits;
     std::unordered_set<std::string> committed_conversations;
     std::uint64_t last_access_tick = 0;
@@ -312,6 +315,34 @@ PrefixNodeId PrefixCache::PublishConversationHead(
     const SerializedPromptIdentity& identity,
     const ReusableStateDescriptor& state,
     const std::vector<float>* boundary_logits) {
+  return PublishConversationHeadImpl(
+      conversation_id,
+      identity,
+      state,
+      std::nullopt,
+      boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishConversationHead(
+    const std::string& conversation_id,
+    const SerializedPromptIdentity& identity,
+    const ReusableStateDescriptor& state,
+    TokenId boundary_token_id,
+    const std::vector<float>* boundary_logits) {
+  return PublishConversationHeadImpl(
+      conversation_id,
+      identity,
+      state,
+      boundary_token_id,
+      boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishConversationHeadImpl(
+    const std::string& conversation_id,
+    const SerializedPromptIdentity& identity,
+    const ReusableStateDescriptor& state,
+    std::optional<TokenId> boundary_token_id,
+    const std::vector<float>* boundary_logits) {
   if (!impl_->enabled) {
     return 0;
   }
@@ -322,7 +353,8 @@ PrefixNodeId PrefixCache::PublishConversationHead(
               << identity.token_ids.size() << "\n";
     return 0;
   }
-  const PrefixNodeId node_id = FindOrCreateNode(identity, state, boundary_logits);
+  const PrefixNodeId node_id =
+      FindOrCreateNode(identity, state, boundary_token_id, boundary_logits);
   if (node_id == 0) {
     return 0;
   }
@@ -336,6 +368,38 @@ PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
     const SerializedPromptIdentity& identity,
     const RequestExecutionContext& request_context,
     const std::string& state_label,
+    const std::vector<float>* boundary_logits) {
+  return PublishConversationHeadSnapshotImpl(
+      conversation_id,
+      identity,
+      request_context,
+      state_label,
+      std::nullopt,
+      boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
+    const std::string& conversation_id,
+    const SerializedPromptIdentity& identity,
+    const RequestExecutionContext& request_context,
+    const std::string& state_label,
+    TokenId boundary_token_id,
+    const std::vector<float>* boundary_logits) {
+  return PublishConversationHeadSnapshotImpl(
+      conversation_id,
+      identity,
+      request_context,
+      state_label,
+      boundary_token_id,
+      boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishConversationHeadSnapshotImpl(
+    const std::string& conversation_id,
+    const SerializedPromptIdentity& identity,
+    const RequestExecutionContext& request_context,
+    const std::string& state_label,
+    std::optional<TokenId> boundary_token_id,
     const std::vector<float>* boundary_logits) {
   if (!impl_->enabled || impl_->state_arena == nullptr) {
     return 0;
@@ -359,10 +423,11 @@ PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
     impl_->state_arena->Release(*state);
     return 0;
   }
-  const PrefixNodeId node_id = PublishConversationHead(
+  const PrefixNodeId node_id = PublishConversationHeadImpl(
       conversation_id,
       identity,
       *state,
+      boundary_token_id,
       boundary_logits);
   impl_->state_arena->Release(*state);
   return node_id;
@@ -371,6 +436,22 @@ PrefixNodeId PrefixCache::PublishConversationHeadSnapshot(
 PrefixNodeId PrefixCache::PublishGlobalRoot(
     const SerializedPromptIdentity& identity,
     const ReusableStateDescriptor& state,
+    const std::vector<float>* boundary_logits) {
+  return PublishGlobalRootImpl(identity, state, std::nullopt, boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishGlobalRoot(
+    const SerializedPromptIdentity& identity,
+    const ReusableStateDescriptor& state,
+    TokenId boundary_token_id,
+    const std::vector<float>* boundary_logits) {
+  return PublishGlobalRootImpl(identity, state, boundary_token_id, boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishGlobalRootImpl(
+    const SerializedPromptIdentity& identity,
+    const ReusableStateDescriptor& state,
+    std::optional<TokenId> boundary_token_id,
     const std::vector<float>* boundary_logits) {
   if (!impl_->enabled) {
     return 0;
@@ -382,7 +463,8 @@ PrefixNodeId PrefixCache::PublishGlobalRoot(
               << identity.token_ids.size() << "\n";
     return 0;
   }
-  const PrefixNodeId node_id = FindOrCreateNode(identity, state, boundary_logits);
+  const PrefixNodeId node_id =
+      FindOrCreateNode(identity, state, boundary_token_id, boundary_logits);
   if (node_id == 0) {
     return 0;
   }
@@ -395,6 +477,34 @@ PrefixNodeId PrefixCache::PublishGlobalRootSnapshot(
     const SerializedPromptIdentity& identity,
     const RequestExecutionContext& request_context,
     const std::string& state_label,
+    const std::vector<float>* boundary_logits) {
+  return PublishGlobalRootSnapshotImpl(
+      identity,
+      request_context,
+      state_label,
+      std::nullopt,
+      boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishGlobalRootSnapshot(
+    const SerializedPromptIdentity& identity,
+    const RequestExecutionContext& request_context,
+    const std::string& state_label,
+    TokenId boundary_token_id,
+    const std::vector<float>* boundary_logits) {
+  return PublishGlobalRootSnapshotImpl(
+      identity,
+      request_context,
+      state_label,
+      boundary_token_id,
+      boundary_logits);
+}
+
+PrefixNodeId PrefixCache::PublishGlobalRootSnapshotImpl(
+    const SerializedPromptIdentity& identity,
+    const RequestExecutionContext& request_context,
+    const std::string& state_label,
+    std::optional<TokenId> boundary_token_id,
     const std::vector<float>* boundary_logits) {
   if (!impl_->enabled || impl_->state_arena == nullptr) {
     return 0;
@@ -411,7 +521,11 @@ PrefixNodeId PrefixCache::PublishGlobalRootSnapshot(
     impl_->state_arena->Release(*state);
     return 0;
   }
-  const PrefixNodeId node_id = PublishGlobalRoot(identity, *state, boundary_logits);
+  const PrefixNodeId node_id = PublishGlobalRootImpl(
+      identity,
+      *state,
+      boundary_token_id,
+      boundary_logits);
   impl_->state_arena->Release(*state);
   return node_id;
 }
@@ -476,6 +590,14 @@ bool PrefixCache::RestoreMatchState(const CacheMatch& match, RequestExecutionCon
       request_context);
 }
 
+std::optional<TokenId> PrefixCache::CopyBoundaryTokenId(PrefixNodeId node_id) const {
+  auto it = impl_->nodes.find(node_id);
+  if (it == impl_->nodes.end()) {
+    return std::nullopt;
+  }
+  return it->second.boundary_token_id;
+}
+
 std::optional<std::vector<float>> PrefixCache::CopyBoundaryLogits(PrefixNodeId node_id) const {
   auto it = impl_->nodes.find(node_id);
   if (it == impl_->nodes.end() || it->second.boundary_logits.empty()) {
@@ -524,6 +646,7 @@ std::optional<CacheEntryView> PrefixCache::Describe(PrefixNodeId node_id) const 
       sorted_strings(node.committed_conversations),
       node.last_access_tick,
       node.total_bytes,
+      node.boundary_token_id,
       !node.boundary_logits.empty(),
       node.boundary_logits.size(),
   };
@@ -548,6 +671,7 @@ std::size_t PrefixCache::global_root_count() const {
 PrefixNodeId PrefixCache::FindOrCreateNode(
     const SerializedPromptIdentity& identity,
     const ReusableStateDescriptor& state,
+    std::optional<TokenId> boundary_token_id,
     const std::vector<float>* boundary_logits) {
   const std::uint64_t fingerprint = fingerprint_identity(identity);
   auto range = impl_->nodes_by_fingerprint.equal_range(fingerprint);
@@ -556,6 +680,8 @@ PrefixNodeId PrefixCache::FindOrCreateNode(
     if (!same_identity(node.identity, identity)) {
       continue;
     }
+    const bool replace_boundary_token_id =
+        boundary_token_id.has_value() && node.boundary_token_id != boundary_token_id;
     const bool replace_boundary_logits =
         boundary_logits != nullptr && node.boundary_logits != *boundary_logits;
     if (!(node.state == state)) {
@@ -567,15 +693,25 @@ PrefixNodeId PrefixCache::FindOrCreateNode(
       }
       impl_->current_bytes -= node.total_bytes;
       node.state = state;
+      if (replace_boundary_token_id) {
+        node.boundary_token_id = boundary_token_id;
+      }
       if (replace_boundary_logits) {
         node.boundary_logits = *boundary_logits;
       }
-      node.total_bytes = node_bytes(node.identity, node.state, node.boundary_logits);
+      node.total_bytes =
+          node_bytes(node.identity, node.state, node.boundary_token_id, node.boundary_logits);
       impl_->current_bytes += node.total_bytes;
-    } else if (replace_boundary_logits) {
+    } else if (replace_boundary_token_id || replace_boundary_logits) {
       impl_->current_bytes -= node.total_bytes;
-      node.boundary_logits = *boundary_logits;
-      node.total_bytes = node_bytes(node.identity, node.state, node.boundary_logits);
+      if (replace_boundary_token_id) {
+        node.boundary_token_id = boundary_token_id;
+      }
+      if (replace_boundary_logits) {
+        node.boundary_logits = *boundary_logits;
+      }
+      node.total_bytes =
+          node_bytes(node.identity, node.state, node.boundary_token_id, node.boundary_logits);
       impl_->current_bytes += node.total_bytes;
     }
     Touch(node.id);
@@ -589,11 +725,15 @@ PrefixNodeId PrefixCache::FindOrCreateNode(
   node.id = impl_->next_node_id++;
   node.identity = identity;
   node.state = state;
+  if (boundary_token_id.has_value()) {
+    node.boundary_token_id = boundary_token_id;
+  }
   if (boundary_logits != nullptr) {
     node.boundary_logits = *boundary_logits;
   }
   node.fingerprint = fingerprint;
-  node.total_bytes = node_bytes(identity, state, node.boundary_logits);
+  node.total_bytes =
+      node_bytes(identity, state, node.boundary_token_id, node.boundary_logits);
   node.last_access_tick = impl_->tick++;
   impl_->current_bytes += node.total_bytes;
 

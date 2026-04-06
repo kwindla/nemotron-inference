@@ -866,8 +866,7 @@ bool run_full_forward_manifest_smoke() {
   const auto turn2_committed_view = environment->prefix_cache().Describe(*turn2_committed_head);
   if (!expect(
           turn2_committed_view.has_value() &&
-              turn2_committed_view->has_boundary_logits &&
-              turn2_committed_view->boundary_logits_count == config.vocab_size &&
+              turn2_committed_view->boundary_token_id.has_value() &&
               turn2_committed_view->identity.token_ids.size() ==
                   turn2_identity.token_ids.size() + turn2_cached_result.generated_token_ids.size(),
           "turn-2 committed head should extend the prompt with generated tokens")) {

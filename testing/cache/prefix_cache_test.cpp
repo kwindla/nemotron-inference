@@ -347,6 +347,32 @@ bool test_replacing_node_state_releases_old_owned_state() {
          expect(arena.current_bytes() == 6144, "arena bytes should reflect only the replacement descriptor");
 }
 
+bool test_boundary_token_id_round_trip() {
+  PrefixCache cache(/*max_bytes=*/1 << 20);
+  constexpr TokenId kBoundaryTokenId = 12345;
+  const auto node_id = cache.PublishConversationHead(
+      "conv-boundary-token",
+      make_identity({6, 7, 8}),
+      make_state(55, 65),
+      kBoundaryTokenId);
+  const auto entry = cache.Describe(node_id);
+  const auto cached_boundary_token_id = cache.CopyBoundaryTokenId(node_id);
+
+  return expect(node_id != 0, "boundary-token publish should succeed") &&
+         expect(
+             cached_boundary_token_id.has_value() &&
+                 *cached_boundary_token_id == kBoundaryTokenId,
+             "boundary token id should round-trip through the cache") &&
+         expect(
+             entry.has_value() &&
+                 entry->boundary_token_id.has_value() &&
+                 *entry->boundary_token_id == kBoundaryTokenId,
+             "described cache entry should expose the cached boundary token id") &&
+         expect(
+             !entry->has_boundary_logits && entry->boundary_logits_count == 0,
+             "boundary token id should not require cached boundary logits");
+}
+
 bool test_snapshot_publish_and_restore_round_trip() {
   auto source = RequestExecutionContext::Create(make_request_config());
   auto restored = RequestExecutionContext::Create(make_request_config());
@@ -557,6 +583,7 @@ int main() {
       test_eviction_by_bytes_clears_mappings() &&
       test_cache_eviction_releases_owned_state() &&
       test_replacing_node_state_releases_old_owned_state() &&
+      test_boundary_token_id_round_trip() &&
       test_snapshot_publish_and_restore_round_trip() &&
       test_snapshot_publish_retries_by_replacing_unique_conversation_head();
 

@@ -10,6 +10,7 @@
 namespace {
 
 using nemotron::DeviceArgmax;
+using nemotron::DeviceArgmaxLastRow;
 using nemotron::DeviceTensorFp32;
 
 bool expect(bool condition, const std::string& message) {
@@ -73,6 +74,52 @@ bool RunArgmaxCase(
       case_name + ": expected token " + std::to_string(expected_token_id) + ", got " + std::to_string(actual_token_id));
 }
 
+bool RunLastRowArgmaxCase(
+    const std::vector<float>& logits,
+    std::size_t row_count,
+    std::int32_t expected_token_id,
+    const std::string& case_name) {
+  if (row_count == 0 || logits.empty() || (logits.size() % row_count) != 0) {
+    return false;
+  }
+  const std::size_t vocab_size = logits.size() / row_count;
+  auto logits_matrix = DeviceTensorFp32::Create({row_count, vocab_size});
+  if (!expect(
+          logits_matrix != nullptr && logits_matrix->valid(),
+          case_name + ": logits matrix should create")) {
+    return false;
+  }
+  if (!expect(
+          logits_matrix->CopyFromHost(logits.data(), logits.size()),
+          case_name + ": logits matrix upload should succeed")) {
+    return false;
+  }
+
+  DeviceTokenBuffer token_buffer;
+  if (!expect(CheckCuda(cudaMalloc(reinterpret_cast<void**>(&token_buffer.data), sizeof(std::int32_t)), "cudaMalloc token"),
+              case_name + ": token buffer allocation should succeed")) {
+    return false;
+  }
+
+  if (!expect(
+          DeviceArgmaxLastRow(*logits_matrix, token_buffer.data),
+          case_name + ": DeviceArgmaxLastRow should succeed")) {
+    return false;
+  }
+
+  std::int32_t actual_token_id = -1;
+  if (!expect(CheckCuda(
+                  cudaMemcpy(&actual_token_id, token_buffer.data, sizeof(actual_token_id), cudaMemcpyDeviceToHost),
+                  "cudaMemcpy token"),
+              case_name + ": token download should succeed")) {
+    return false;
+  }
+
+  return expect(
+      actual_token_id == expected_token_id,
+      case_name + ": expected token " + std::to_string(expected_token_id) + ", got " + std::to_string(actual_token_id));
+}
+
 bool test_device_argmax_cases() {
   auto probe = DeviceTensorFp32::Create({1, 1});
   if (!probe || !probe->valid()) {
@@ -89,6 +136,17 @@ bool test_device_argmax_cases() {
   }
 
   if (!RunArgmaxCase({-8.0f, -7.0f, -6.0f, -5.0f, -4.0f, 10.0f}, 5, "last_position")) {
+    return false;
+  }
+
+  if (!RunLastRowArgmaxCase(
+          {
+              -100.0f, 1.0f, 3.0f, 2.0f,
+              -10.0f, -4.0f, 7.0f, 9.0f,
+          },
+          2,
+          3,
+          "last_row")) {
     return false;
   }
 

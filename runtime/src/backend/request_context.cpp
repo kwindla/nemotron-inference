@@ -363,6 +363,10 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
 
   std::unique_ptr<DeviceTensorBf16> key_cache;
   std::unique_ptr<DeviceTensorBf16> value_cache;
+  auto greedy_token_id_scratch = DeviceTensorInt32::Create({1});
+  if (!greedy_token_id_scratch || !greedy_token_id_scratch->FillZero()) {
+    return nullptr;
+  }
   std::optional<PagedKvCacheArena> kv_arena;
   if (config.attention_kv_cache.layer_count != 0) {
     kv_arena = PagedKvCacheArena::Create(config.attention_kv_cache, config.attention_total_pages);
@@ -405,6 +409,7 @@ std::unique_ptr<RequestExecutionContext> RequestExecutionContext::Create(
       std::move(mamba_state),
       std::move(key_cache),
       std::move(value_cache),
+      std::move(greedy_token_id_scratch),
       std::move(moe_prefill_workspace),
       std::move(kv_arena)));
 }
@@ -418,6 +423,7 @@ RequestExecutionContext::RequestExecutionContext(
     std::unique_ptr<DeviceTensorFp32> mamba_state,
     std::unique_ptr<DeviceTensorBf16> key_cache,
     std::unique_ptr<DeviceTensorBf16> value_cache,
+    std::unique_ptr<DeviceTensorInt32> greedy_token_id_scratch,
     std::unique_ptr<MoePrefillWorkspace> moe_prefill_workspace,
     std::optional<PagedKvCacheArena> kv_arena)
     : config_(std::move(config)),
@@ -428,6 +434,7 @@ RequestExecutionContext::RequestExecutionContext(
       mamba_state_(std::move(mamba_state)),
       key_cache_(std::move(key_cache)),
       value_cache_(std::move(value_cache)),
+      greedy_token_id_scratch_(std::move(greedy_token_id_scratch)),
       moe_prefill_workspace_(std::move(moe_prefill_workspace)),
       kv_arena_(std::move(kv_arena)),
       kv_pages_by_layer_(config_.attention_kv_cache.layer_count) {}
@@ -438,6 +445,10 @@ RequestExecutionContext::~RequestExecutionContext() = default;
 
 bool RequestExecutionContext::valid() const {
   if (!hidden_ || !hidden_->valid() || !residual_ || !residual_->valid() || !scratch_ || !scratch_->valid()) {
+    return false;
+  }
+  if (!greedy_token_id_scratch_ || !greedy_token_id_scratch_->valid() ||
+      greedy_token_id_scratch_->numel() != 1) {
     return false;
   }
   if (config_.mamba_state_bytes_fp32 != 0 && (!mamba_state_ || !mamba_state_->valid())) {
@@ -533,6 +544,14 @@ DeviceTensorBf16* RequestExecutionContext::value_cache() {
 
 const DeviceTensorBf16* RequestExecutionContext::value_cache() const {
   return value_cache_.get();
+}
+
+DeviceTensorInt32* RequestExecutionContext::greedy_token_id_scratch() {
+  return greedy_token_id_scratch_.get();
+}
+
+const DeviceTensorInt32* RequestExecutionContext::greedy_token_id_scratch() const {
+  return greedy_token_id_scratch_.get();
 }
 
 MoePrefillWorkspace* RequestExecutionContext::moe_prefill_workspace() {
@@ -653,6 +672,9 @@ bool RequestExecutionContext::ResetForNewRequest() {
   }
   if (value_cache_) {
     ok = ok && value_cache_->FillZero();
+  }
+  if (greedy_token_id_scratch_) {
+    ok = ok && greedy_token_id_scratch_->FillZero();
   }
 
   if (kv_arena_.has_value()) {
