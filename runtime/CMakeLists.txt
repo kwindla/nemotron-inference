@@ -130,6 +130,7 @@ add_library(
   src/backend/fused_mamba_decode.cu
   src/backend/fused_moe_decode.cu
   src/backend/fused_moe_prefill.cu
+  src/backend/moe_launch_plan_device.cu
   src/backend/linear_op.cpp
   src/backend/linear_op_counters.cpp
   src/backend/linear_op_trace.cpp

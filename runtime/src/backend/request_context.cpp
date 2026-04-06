@@ -93,6 +93,12 @@ std::optional<std::size_t> DeviceExpertRoutingBytes(
              : std::nullopt;
 }
 
+std::optional<std::size_t> DeviceMoeLaunchPlanBytes(
+    std::size_t n_experts,
+    std::size_t selection_count) {
+  return DeviceMoeLaunchPlan::Bytes(n_experts, selection_count);
+}
+
 bool HandlesSatisfyLayerInvariant(
     const AttentionKvCacheConfig& config,
     const std::vector<KvPageHandle>& pages,
@@ -197,6 +203,7 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(token_capacity, config.top_k, sizeof(int))) &&
                  add_bytes(MatrixBytes(token_capacity, config.top_k, sizeof(float))) &&
                  add_bytes(DeviceExpertRoutingBytes(config.num_experts, *selection_capacity)) &&
+                 add_bytes(DeviceMoeLaunchPlanBytes(config.num_experts, *selection_capacity)) &&
                  add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
                  add_bytes(MatrixBytes(*selection_capacity, config.hidden_size, sizeof(float))) &&
                  add_bytes(MatrixBytes(
@@ -244,6 +251,8 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   workspace->topk_weights = DeviceTensorFp32::Create({token_capacity, config.top_k});
   workspace->fused_prefill_routing =
       DeviceExpertRouting::Create(config.num_experts, selection_capacity);
+  workspace->fused_prefill_launch_plan =
+      DeviceMoeLaunchPlan::Create(config.num_experts, selection_capacity);
   workspace->fused_prefill_routed_output_scratch =
       DeviceTensorFp32::Create({token_capacity, config.hidden_size});
   workspace->fused_prefill_gather_scratch =
@@ -287,6 +296,11 @@ bool MoePrefillWorkspace::valid() const {
          fused_prefill_routing->valid() &&
          fused_prefill_routing->n_experts() == config.num_experts &&
          fused_prefill_routing->selection_count() >= selection_capacity &&
+         fused_prefill_launch_plan != nullptr &&
+         fused_prefill_launch_plan->valid() &&
+         fused_prefill_launch_plan->n_experts() == config.num_experts &&
+         fused_prefill_launch_plan->selection_count() >= selection_capacity &&
+         fused_prefill_launch_plan->cta_capacity() > 0 &&
          TensorMatchesShape(
              fused_prefill_routed_output_scratch.get(),
              token_capacity_value,

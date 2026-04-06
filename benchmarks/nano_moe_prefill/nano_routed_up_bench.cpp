@@ -27,7 +27,12 @@ using nemotron::DeviceTensorFp32;
 using nemotron::FusedNvfp4WeightView;
 using nemotron::MonolithicNvfp4ExpertWeights;
 using nemotron::PackRowMajorFp32ToNvfp4;
+using nemotron::BuildDeviceMoeLaunchPlan;
+using nemotron::DeviceExpertRouting;
+using nemotron::DeviceMoeLaunchPlan;
+using nemotron::RunDeviceExpertRouting;
 using nemotron::RunGroupedNvfp4ExpertMatVec;
+using nemotron::RunLaunchPlannedNvfp4ExpertMatVec;
 
 constexpr std::size_t kHiddenSize = 2688;
 constexpr std::size_t kRoutedIntermediateSize = 1856;
@@ -350,6 +355,23 @@ std::size_t CountActiveExperts(const std::vector<int>& offsets) {
     }
   }
   return active;
+}
+
+std::vector<int> BuildSelectedIndicesForOffsets(const std::vector<int>& offsets) {
+  std::vector<int> selected_indices;
+  if (offsets.size() < 2) {
+    return selected_indices;
+  }
+  selected_indices.reserve(static_cast<std::size_t>(offsets.back()));
+  for (std::size_t expert = 0; expert + 1 < offsets.size(); ++expert) {
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    for (int index = begin; index < end; ++index) {
+      (void)index;
+      selected_indices.push_back(static_cast<int>(expert));
+    }
+  }
+  return selected_indices;
 }
 
 void PopulateDiffSummary(
@@ -685,6 +707,138 @@ std::optional<BenchmarkResult> RunRaggedRowCoopCase(
   return result;
 }
 
+std::optional<BenchmarkResult> RunLaunchPlanUpperBoundCase(
+    const BenchmarkCase& benchmark_case,
+    const BenchmarkOptions& options,
+    std::vector<float>* output_host = nullptr) {
+  const std::size_t selection_count = benchmark_case.prefix_tokens * kTopK;
+  const auto expert_offsets = BuildExpertOffsets(selection_count);
+  const std::size_t active_experts = CountActiveExperts(expert_offsets);
+  const auto selected_indices_host = BuildSelectedIndicesForOffsets(expert_offsets);
+  const std::vector<float> selected_weights_host(selection_count, 1.0f);
+
+  auto selected_indices_device = DeviceArray<int>::CopyFromHost(selected_indices_host);
+  auto selected_weights_device = DeviceArray<float>::CopyFromHost(selected_weights_host);
+  auto routing = DeviceExpertRouting::Create(kRoutedExperts, selection_count);
+  auto launch_plan = DeviceMoeLaunchPlan::Create(kRoutedExperts, selection_count);
+  if (selected_indices_device == nullptr ||
+      selected_weights_device == nullptr ||
+      routing == nullptr ||
+      !routing->valid() ||
+      launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      !RunDeviceExpertRouting(
+          selected_indices_device->data(),
+          selected_weights_device->data(),
+          benchmark_case.prefix_tokens,
+          kTopK,
+          routing.get()) ||
+      !BuildDeviceMoeLaunchPlan(*routing, launch_plan.get()) ||
+      cudaDeviceSynchronize() != cudaSuccess) {
+    return std::nullopt;
+  }
+
+  const auto routed_up = BuildUploadedRoutedUpViews();
+  if (!routed_up.has_value()) {
+    return std::nullopt;
+  }
+  auto routed_up_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up->views);
+  if (routed_up_views_device == nullptr) {
+    return std::nullopt;
+  }
+
+  const auto input_host = MakePatternedValues(selection_count, kHiddenSize, 23, 0.03125f);
+  auto input = DeviceTensorFp32::Create({selection_count, kHiddenSize});
+  auto output = DeviceTensorFp32::Create({selection_count, kRoutedIntermediateSize});
+  if (input == nullptr || output == nullptr) {
+    return std::nullopt;
+  }
+  if (!input->CopyFromHost(input_host.data(), input_host.size())) {
+    return std::nullopt;
+  }
+
+  ScopedCudaEventTimer timer;
+  if (!timer.valid()) {
+    return std::nullopt;
+  }
+
+  auto run_once = [&]() {
+    return RunLaunchPlannedNvfp4ExpertMatVec(
+        input->data(),
+        launch_plan.get(),
+        routed_up_views_device->data(),
+        kRoutedIntermediateSize,
+        output->data());
+  };
+
+  for (std::size_t iteration = 0; iteration < options.warmup_iterations; ++iteration) {
+    const auto elapsed = timer.Measure(run_once);
+    if (!elapsed.has_value()) {
+      return std::nullopt;
+    }
+  }
+
+  const auto cold_ms = timer.Measure(run_once);
+  if (!cold_ms.has_value()) {
+    return std::nullopt;
+  }
+
+  double hot_sum_ms = 0.0;
+  double hot_min_ms = 0.0;
+  double hot_max_ms = 0.0;
+  for (std::size_t iteration = 0; iteration < options.hot_iterations; ++iteration) {
+    const auto hot_elapsed = timer.Measure(run_once);
+    if (!hot_elapsed.has_value()) {
+      return std::nullopt;
+    }
+    const double elapsed_ms = *hot_elapsed;
+    hot_sum_ms += elapsed_ms;
+    if (iteration == 0 || elapsed_ms < hot_min_ms) {
+      hot_min_ms = elapsed_ms;
+    }
+    if (iteration == 0 || elapsed_ms > hot_max_ms) {
+      hot_max_ms = elapsed_ms;
+    }
+  }
+
+  const double hot_mean_ms =
+      hot_sum_ms / static_cast<double>(std::max<std::size_t>(1, options.hot_iterations));
+  const double logical_flops =
+      2.0 * static_cast<double>(selection_count) *
+      static_cast<double>(kHiddenSize) *
+      static_cast<double>(kRoutedIntermediateSize);
+  const double weight_bytes =
+      static_cast<double>(active_experts) *
+      static_cast<double>(kHiddenSize) *
+      static_cast<double>(kRoutedIntermediateSize) *
+      kNvfp4BytesPerWeight;
+
+  BenchmarkResult result;
+  result.variant_name = "launch_plan_upper_bound";
+  result.case_name = benchmark_case.name;
+  result.prefix_tokens = benchmark_case.prefix_tokens;
+  result.selection_count = selection_count;
+  result.padded_selection_count = static_cast<std::size_t>(
+      selection_count == 0 ? 0 : selection_count);
+  result.active_experts = active_experts;
+  result.cold_ms = *cold_ms;
+  result.hot_mean_ms = hot_mean_ms;
+  result.hot_min_ms = hot_min_ms;
+  result.hot_max_ms = hot_max_ms;
+  result.hot_tflops =
+      hot_mean_ms > 0.0 ? logical_flops / (hot_mean_ms / 1000.0) / 1.0e12 : 0.0;
+  result.hot_weight_gib_per_s =
+      hot_mean_ms > 0.0 ? weight_bytes / (hot_mean_ms / 1000.0) / (1024.0 * 1024.0 * 1024.0) : 0.0;
+  if (output_host != nullptr) {
+    output_host->resize(selection_count * kRoutedIntermediateSize);
+    if (!output->CopyToHost(output_host->data(), output_host->size())) {
+      return std::nullopt;
+    }
+  }
+  return result;
+}
+
 BenchmarkOptions ParseOptions(int argc, char** argv) {
   BenchmarkOptions options;
   for (int i = 1; i < argc; ++i) {
@@ -761,6 +915,17 @@ int main(int argc, char** argv) {
     }
     PopulateDiffSummary(baseline_output_host, permuted_output_host, &*permuted_result);
     PrintResult(*permuted_result);
+
+    std::vector<float> launch_plan_output_host;
+    auto launch_plan_result =
+        RunLaunchPlanUpperBoundCase(benchmark_case, options, &launch_plan_output_host);
+    if (!launch_plan_result.has_value()) {
+      std::cerr << "nano_routed_up_bench: launch-plan upper-bound case failed: "
+                << benchmark_case.name << "\n";
+      return 1;
+    }
+    PopulateDiffSummary(baseline_output_host, launch_plan_output_host, &*launch_plan_result);
+    PrintResult(*launch_plan_result);
   }
 
   if (!ran_any) {

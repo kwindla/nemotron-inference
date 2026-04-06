@@ -11,6 +11,11 @@ namespace nemotron {
 namespace {
 
 constexpr int kGroupedTokenTile = 8;
+constexpr int kPlannedOutputTile = 4;
+constexpr int kPlannedPairsPerStep = 32;
+constexpr int kPlannedThreadsPerBlock = kPlannedOutputTile * 32;
+
+static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -168,6 +173,107 @@ __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
       }
     }
     __syncthreads();
+  }
+}
+
+__global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
+    const float* input,
+    const int* cta_count,
+    const int* cta_expert_ids,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  __shared__ float input_tile[kGroupedTokenTile][kPlannedPairsPerStep * 2];
+
+  const int cta_index = static_cast<int>(blockIdx.x);
+  const int warp_index = static_cast<int>(threadIdx.x) / 32;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int exact_cta_count = cta_count[0];
+  if (cta_index >= exact_cta_count) {
+    return;
+  }
+
+  const int output_row_tile = static_cast<int>(blockIdx.y);
+  const int output_row = output_row_tile * kPlannedOutputTile + warp_index;
+  const int expert_index = cta_expert_ids[cta_index];
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
+  if (expert_index < 0 ||
+      warp_index >= kPlannedOutputTile ||
+      static_cast<std::size_t>(output_row) >= output_rows_per_expert ||
+      valid_rows <= 0) {
+    return;
+  }
+
+  const fused_decode::Nvfp4WeightView weight =
+      MakeDeviceWeightView(weights[expert_index]);
+  const std::size_t pairs_per_row = weight.input_cols / 2;
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset = static_cast<std::size_t>(output_row) * pairs_per_row;
+  const std::size_t scale_row_offset = static_cast<std::size_t>(output_row) * blocks_per_row;
+  const float tensor_scale = *weight.tensor_scale_data;
+  double accum[kGroupedTokenTile] = {0.0};
+
+  for (std::size_t pair_base = 0; pair_base < pairs_per_row;
+       pair_base += static_cast<std::size_t>(kPlannedPairsPerStep)) {
+    const std::size_t remaining_pairs = pairs_per_row - pair_base;
+    const int pairs_this_step = static_cast<int>(
+        remaining_pairs < static_cast<std::size_t>(kPlannedPairsPerStep)
+            ? remaining_pairs
+            : static_cast<std::size_t>(kPlannedPairsPerStep));
+    const int values_this_step = valid_rows * pairs_this_step * 2;
+    for (int linear_index = static_cast<int>(threadIdx.x);
+         linear_index < values_this_step;
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int token_index = linear_index / (pairs_this_step * 2);
+      const int within_token = linear_index % (pairs_this_step * 2);
+      const int pair_offset = within_token / 2;
+      const int value_offset = within_token % 2;
+      const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
+      const std::size_t col =
+          (pair_base + static_cast<std::size_t>(pair_offset)) * 2u +
+          static_cast<std::size_t>(value_offset);
+      input_tile[token_index][within_token] =
+          input[input_row * weight.input_cols + col];
+    }
+    __syncthreads();
+
+    const std::size_t pair_index = pair_base + static_cast<std::size_t>(lane);
+    if (lane < pairs_this_step) {
+      const std::size_t block = pair_index / 8u;
+      const float block_scale =
+          fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
+          tensor_scale;
+      const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+      const float w0 = fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
+      const float w1 = fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
+      for (int token_index = 0; token_index < valid_rows; ++token_index) {
+        const int value_index = lane * 2;
+        accum[token_index] +=
+            static_cast<double>(input_tile[token_index][value_index]) *
+            static_cast<double>(w0);
+        accum[token_index] +=
+            static_cast<double>(input_tile[token_index][value_index + 1]) *
+            static_cast<double>(w1);
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int token_index = 0; token_index < valid_rows; ++token_index) {
+    for (int stride = 16; stride > 0; stride >>= 1) {
+      accum[token_index] += __shfl_down_sync(0xffffffffu, accum[token_index], stride);
+    }
+  }
+
+  if (lane == 0) {
+    for (int token_index = 0; token_index < valid_rows; ++token_index) {
+      const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row)] =
+          static_cast<float>(accum[token_index]);
+    }
   }
 }
 
@@ -393,6 +499,41 @@ bool LaunchContiguousMatVec(
   return CheckCuda(cudaGetLastError());
 }
 
+bool LaunchPlannedMatVec(
+    const float* input,
+    const DeviceMoeLaunchPlan* launch_plan,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  if (launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      launch_plan->cta_capacity() == 0 ||
+      weights == nullptr ||
+      output_rows_per_expert == 0) {
+    return false;
+  }
+  const std::size_t output_row_tile_count =
+      (output_rows_per_expert + static_cast<std::size_t>(kPlannedOutputTile) - 1u) /
+      static_cast<std::size_t>(kPlannedOutputTile);
+  if (output_row_tile_count == 0) {
+    return false;
+  }
+  const dim3 block(kPlannedThreadsPerBlock);
+  const dim3 grid(
+      static_cast<unsigned int>(launch_plan->cta_capacity()),
+      static_cast<unsigned int>(output_row_tile_count));
+  Nvfp4LaunchPlannedExpertMatVecRowsKernel<<<grid, block>>>(
+      input,
+      launch_plan->cta_count(),
+      launch_plan->cta_expert_ids(),
+      launch_plan->cta_row_starts(),
+      launch_plan->cta_valid_rows(),
+      weights,
+      output_rows_per_expert,
+      output);
+  return CheckCuda(cudaGetLastError());
+}
+
 bool LaunchReduceSelectionOutputs(
     const float* grouped_output,
     const int* selection_to_sorted,
@@ -458,6 +599,28 @@ bool RunGroupedNvfp4ExpertMatVec(
       output);
 }
 
+bool RunLaunchPlannedNvfp4ExpertMatVec(
+    const float* input,
+    const DeviceMoeLaunchPlan* launch_plan,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  if (input == nullptr ||
+      launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      weights == nullptr ||
+      output_rows_per_expert == 0 ||
+      output == nullptr) {
+    return false;
+  }
+  return LaunchPlannedMatVec(
+      input,
+      launch_plan,
+      weights,
+      output_rows_per_expert,
+      output);
+}
+
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   const std::size_t selection_count = params.token_count * params.top_k;
 
@@ -480,6 +643,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       params.input == nullptr ||
       params.normalized == nullptr ||
       params.routing == nullptr ||
+      params.launch_plan == nullptr ||
       params.routed_gather_scratch == nullptr ||
       params.routed_up_scratch == nullptr ||
       params.shared_up_scratch == nullptr ||
@@ -489,7 +653,10 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
 
   if (!params.routing->valid() ||
       params.routing->n_experts() != params.n_routed_experts ||
-      params.routing->selection_count() < selection_count) {
+      params.routing->selection_count() < selection_count ||
+      !params.launch_plan->valid() ||
+      params.launch_plan->n_experts() != params.n_routed_experts ||
+      params.launch_plan->selection_count() < selection_count) {
     return false;
   }
 
@@ -518,6 +685,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
           params.token_count,
           params.top_k,
           params.routing) ||
+      !BuildDeviceMoeLaunchPlan(*params.routing, params.launch_plan) ||
       !LaunchZeroBuffer(params.output, token_hidden_count) ||
       !LaunchZeroBuffer(params.routed_output, token_hidden_count) ||
       !LaunchZeroBuffer(params.shared_output, token_hidden_count) ||
@@ -535,11 +703,9 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  const int* expert_offsets = params.routing->expert_offsets();
-  if (!RunGroupedNvfp4ExpertMatVec(
+  if (!RunLaunchPlannedNvfp4ExpertMatVec(
           params.routed_gather_scratch,
-          expert_offsets,
-          params.n_routed_experts,
+          params.launch_plan,
           params.routed_up_device,
           params.routed_expert_intermediate_size,
           params.routed_up_scratch)) {
@@ -554,10 +720,9 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  if (!RunGroupedNvfp4ExpertMatVec(
+  if (!RunLaunchPlannedNvfp4ExpertMatVec(
           params.routed_up_scratch,
-          expert_offsets,
-          params.n_routed_experts,
+          params.launch_plan,
           params.routed_down_device,
           params.hidden_size,
           params.routed_gather_scratch)) {

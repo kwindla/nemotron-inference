@@ -8,6 +8,7 @@
 #include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/expert_routing_device.h"
+#include "nemotron/moe_launch_plan_device.h"
 #include "nemotron/paged_kv_cache.h"
 
 namespace nemotron {
@@ -53,6 +54,7 @@ struct MoePrefillWorkspace {
   std::unique_ptr<DeviceTensorInt32> topk_ids;
   std::unique_ptr<DeviceTensorFp32> topk_weights;
   std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
+  std::unique_ptr<DeviceMoeLaunchPlan> fused_prefill_launch_plan;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;

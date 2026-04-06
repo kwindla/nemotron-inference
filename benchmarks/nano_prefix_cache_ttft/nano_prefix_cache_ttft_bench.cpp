@@ -389,11 +389,17 @@ std::optional<ResolvedMoePrefillSettings> ResolveMoePrefillSettingsForHeader(
   ResolvedMoePrefillSettings resolved;
   resolved.cli_window_tokens = model.config().moe_prefill_window_tokens;
   resolved.runtime_capacity_tokens = request_context->config().moe_prefill_capacity_tokens;
-  if (const nemotron::MoePrefillWorkspace* workspace = request_context->moe_prefill_workspace();
-      workspace != nullptr && workspace->valid() && workspace->token_capacity() != 0) {
-    resolved.runtime_window_tokens = workspace->token_capacity();
-  } else if (resolved.cli_window_tokens != 0) {
+  const nemotron::MoePrefillWorkspace* workspace = request_context->moe_prefill_workspace();
+  const std::size_t workspace_capacity =
+      workspace != nullptr && workspace->valid() ? workspace->token_capacity() : 0;
+  if (resolved.cli_window_tokens != 0) {
     resolved.runtime_window_tokens = resolved.cli_window_tokens;
+    if (workspace_capacity != 0) {
+      resolved.runtime_window_tokens =
+          std::min(resolved.runtime_window_tokens, workspace_capacity);
+    }
+  } else if (workspace_capacity != 0) {
+    resolved.runtime_window_tokens = workspace_capacity;
   }
   return resolved;
 }

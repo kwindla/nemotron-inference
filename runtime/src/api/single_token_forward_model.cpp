@@ -162,11 +162,8 @@ std::size_t RequestMoePrefillCapacityTokens(
   if (request_max_tokens == 0) {
     return 0;
   }
-  std::size_t resolved_capacity =
+  const std::size_t resolved_capacity =
       std::min(ConfiguredMoePrefillCapacityTokens(config), request_max_tokens);
-  if (config.moe_prefill_window_tokens > 0) {
-    resolved_capacity = std::min(resolved_capacity, config.moe_prefill_window_tokens);
-  }
   if (resolved_capacity <= 1) {
     return 0;
   }
@@ -183,11 +180,20 @@ std::size_t EffectiveMoePrefillWindowTokens(
   if (token_count == 0) {
     return 0;
   }
-  const std::size_t resolved_capacity =
-      workspace != nullptr && workspace->valid() && workspace->token_capacity() != 0
-          ? workspace->token_capacity()
+  const std::size_t workspace_capacity =
+      workspace != nullptr && workspace->valid() ? workspace->token_capacity() : 0;
+  std::size_t resolved_window =
+      config.moe_prefill_window_tokens > 0
+          ? config.moe_prefill_window_tokens
           : ResolveMoePrefillWindowTokens(config);
-  return std::min(token_count, resolved_capacity);
+  if (workspace_capacity != 0) {
+    if (config.moe_prefill_window_tokens == 0) {
+      resolved_window = workspace_capacity;
+    } else {
+      resolved_window = std::min(resolved_window, workspace_capacity);
+    }
+  }
+  return std::min(token_count, resolved_window);
 }
 
 const char* ForwardLayerKindName(ForwardLayerKind kind) {

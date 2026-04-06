@@ -569,6 +569,74 @@ Updated next step:
   - device-built CTA metadata
   - or another exact mapping that does not explode the number of launched CTAs
 
+## Runtime Launch-Plan Architecture
+
+This is the concrete next runtime step.
+
+Keep these parts unchanged:
+
+- `DeviceExpertRouting` remains the logical routing result
+- routed gather stays expert-major through `sorted_token_indices`
+- finalize continues to use `selection_to_sorted`
+- no hot-path DtoH is introduced
+
+Add one new device-resident object:
+
+- `DeviceMoeLaunchPlan`
+
+Current first-version contents:
+
+- `row_tile_count`
+- `row_tile_expert_ids`
+- `row_tile_row_starts`
+- `row_tile_valid_rows`
+
+Why this boundary:
+
+- the retained benchmark-only ragged row-coop kernel already proved that exact
+  `(expert, row_tile)` descriptors are enough to beat the scalar routed-up
+  baseline
+- the rejected runtime attempt failed because CTAs rediscovered their work from
+  an upper-bound linear row-tile index inside the kernel
+- TRT-LLM uses the same architectural split: routing emits compact launch
+  metadata, and grouped math consumes it
+
+Current implementation strategy:
+
+1. run `RunDeviceExpertRouting()` exactly as today
+2. build `DeviceMoeLaunchPlan` on device from:
+   - `expert_offsets`
+   - `active_expert_count`
+   - `active_expert_ids`
+3. launch routed-up and routed-down against that plan instead of scanning
+   `expert_offsets` inside the math kernel
+4. keep shared expert and finalize unchanged for this step
+
+Careful-review notes:
+
+- this is not throwaway work if we later move to a richer TRT-style CTA map
+- the reusable part is the separation between logical routing and device launch
+  metadata
+- the row-tile plan is only the first plan format, not the final ceiling
+- the runtime consumer may still use a bounded overlaunch on the host, but the
+  kernel must index exact descriptors directly and must not scan to find work
+- if this integration still leaves too much empty-CTA overhead, the next
+  extension should be richer CTA metadata or a persistent worker schedule, not
+  a return to kernel-side discovery
+
+Implementation status:
+
+- the device launch-plan object and builder are now worth keeping
+- a first runtime consumer was tested against the retained `prefix128/tail4`
+  TTFT gate and regressed badly
+- so the active runtime path should stay on the retained grouped kernel until
+  the plan-driven consumer wins both its microbench and the TTFT gate
+- failed consumer artifacts:
+  - `artifacts/benchmarks/ttft_20260406_launch_plan_prefix128_tail4.stdout.txt`
+  - `artifacts/benchmarks/ttft_20260406_launch_plan_routed_up_only_prefix128_tail4.stdout.txt`
+- retained grouped-baseline recheck after reverting the active consumer:
+  - `artifacts/benchmarks/ttft_20260406_launch_plan_foundation_prefix128_tail4.stdout.txt`
+
 ## Routed-Up Standalone `ncu` Baseline
 
 Artifact:
@@ -1717,3 +1785,99 @@ it can beat these bars:
 - clear progress toward the old `142.156 ms` cold `prefix128` baseline
 
 If a change does not move those metrics, it is not the right kind of change.
+
+## Exact CTA Launch-Plan Checkpoint
+
+The TRT-LLM-style launch-plan foundation is now integrated into the active
+runtime path for both routed expert stages:
+
+- `RunFusedMoePrefill()` now builds the device CTA plan immediately after
+  `RunDeviceExpertRouting()`
+- the active routed-up and routed-down stages consume
+  `RunLaunchPlannedNvfp4ExpertMatVec(...)`
+- the launch plan is still statically preallocated in the request-scoped MoE
+  workspace; there is no hot-path DtoH and no hot-path `cudaMalloc`
+
+Focused validation after switching the active path:
+
+- `single_token_forward_model_test`: pass
+- `moe_launch_plan_device_test`: pass
+- `fused_moe_prefill_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+
+Focused design-center TTFT gate, artifact:
+
+- `artifacts/benchmarks/ttft_20260406_launch_plan_exact_prefix128_tail4.stdout.txt`
+
+Results against the retained grouped-launch baseline
+(`artifacts/benchmarks/ttft_20260406_launch_plan_foundation_prefix128_tail4.stdout.txt`):
+
+- `cold_prefill_prefix128`: `681.114 ms` -> `654.778 ms`
+  (`1.040x`, `3.87%` faster)
+- `cached_committed_head_prefix128_tail4`: `51.638 ms` -> `46.787 ms`
+  (`1.104x`, `9.39%` faster)
+
+Interpretation:
+
+- the exact device CTA map is a real runtime win, not just a microbench win
+- the earlier bad runtime result was largely due to the looser row-tile
+  overlaunch strategy, not the launch-plan architecture itself
+
+## Static Capacity vs Active Window
+
+The next result is important for deployment strategy.
+
+The full short-tail sweep artifact
+`artifacts/benchmarks/ttft_20260406_launch_plan_exact_tail4_prefix4_128_4096.stdout.txt`
+was run with the default runtime resolution and therefore reported:
+
+- `resolved_runtime_moe_prefill_capacity_tokens=4096`
+- `resolved_runtime_moe_prefill_window_tokens=4096`
+
+Short-tail results in that fully static `4096` setup:
+
+- `cold_prefill_prefix4`: `67.083 ms`
+- `cold_prefill_prefix128`: `661.138 ms`
+- `cold_prefill_prefix4096`: `20353.969 ms`
+- `cached_committed_head_prefix4_tail4` hot-prefix: `67.877 ms`
+- `cached_committed_head_prefix128_tail4` hot-prefix: `69.369 ms`
+- `cached_committed_head_prefix4096_tail4` hot-prefix: `110.831 ms`
+
+That exposed an architectural problem: the runtime had been coupling
+preallocated MoE workspace capacity to the active MoE prefill window.
+
+That coupling is now removed:
+
+- `moe_prefill_capacity_tokens` controls static workspace size
+- `moe_prefill_window_tokens` now clamps the active prefill window without
+  shrinking the preallocated workspace
+- the TTFT bench header now reports those two values separately
+
+Proof artifact with explicit small window and large static allocation:
+
+- `artifacts/benchmarks/ttft_20260406_launch_plan_capacity4096_window133_prefix128_tail4.stdout.txt`
+- reported header:
+  - `resolved_runtime_moe_prefill_capacity_tokens=4096`
+  - `resolved_runtime_moe_prefill_window_tokens=133`
+
+Measured result in that decoupled configuration:
+
+- `cold_prefill_prefix128`: `657.918 ms`
+- `cached_committed_head_prefix128_tail4` hot-prefix: `68.912 ms`
+
+Interpretation:
+
+- decoupling capacity from window is required and now works
+- but the large-request/static-4096 short-tail slowdown is **not** primarily
+  the MoE window anymore
+- most of the remaining short-tail penalty under the full-static setup is
+  coming from some other max-context or request-sizing effect
+
+Current best explanation:
+
+- exact CTA launch metadata improved the active MoE math path
+- explicit small MoE window did not recover the short-tail regression once the
+  request itself was still sized for `4096`
+- so the next profiling target should be broader request-sized overhead:
+  snapshot size, KV reservation, request views, or another max-context-scaled
+  component outside the MoE window logic

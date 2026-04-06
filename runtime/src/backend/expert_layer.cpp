@@ -814,6 +814,7 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceTensorInt32> device_topk_ids;
   std::unique_ptr<DeviceTensorFp32> device_topk_weights;
   std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
+  std::unique_ptr<DeviceMoeLaunchPlan> fused_prefill_launch_plan;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
@@ -866,6 +867,8 @@ struct ExpertLayerSlice::Impl {
   DeviceTensorFp32* ResolveTopkWeightsTensor() const;
 
   DeviceExpertRouting* ResolveFusedPrefillRouting() const;
+
+  DeviceMoeLaunchPlan* ResolveFusedPrefillLaunchPlan() const;
 
   DeviceTensorFp32* ResolveFusedPrefillRoutedOutputScratch() const;
 
@@ -979,6 +982,15 @@ DeviceExpertRouting* ExpertLayerSlice::Impl::ResolveFusedPrefillRouting() const 
     return direct_moe_execution_state.workspace->fused_prefill_routing.get();
   }
   return fused_prefill_routing.get();
+}
+
+DeviceMoeLaunchPlan* ExpertLayerSlice::Impl::ResolveFusedPrefillLaunchPlan() const {
+  if (direct_moe_execution_state.workspace != nullptr &&
+      direct_moe_execution_state.workspace->fused_prefill_launch_plan != nullptr &&
+      direct_moe_execution_state.workspace->fused_prefill_launch_plan->valid()) {
+    return direct_moe_execution_state.workspace->fused_prefill_launch_plan.get();
+  }
+  return fused_prefill_launch_plan.get();
 }
 
 DeviceTensorFp32* ExpertLayerSlice::Impl::ResolveFusedPrefillRoutedOutputScratch() const {
@@ -1188,6 +1200,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   }
 
   DeviceExpertRouting* routing = ResolveFusedPrefillRouting();
+  DeviceMoeLaunchPlan* launch_plan = ResolveFusedPrefillLaunchPlan();
   DeviceTensorFp32* routed_output_scratch = ResolveFusedPrefillRoutedOutputScratch();
   DeviceTensorFp32* gather_scratch = ResolveFusedPrefillGatherScratch();
   DeviceTensorFp32* expert_up_scratch = ResolveFusedPrefillExpertUpScratch();
@@ -1202,6 +1215,9 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   const auto shared_up_shape =
       shared_up_scratch != nullptr ? shared_up_scratch->shape() : std::vector<std::size_t>{};
   if (routing == nullptr ||
+      launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      launch_plan->selection_count() < selection_count ||
       !routing->valid() ||
       routing->selection_count() < selection_count ||
       routed_output_scratch == nullptr ||
@@ -1262,6 +1278,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.input = input.data();
   params.normalized = normalized.data();
   params.routing = routing;
+  params.launch_plan = launch_plan;
   params.routed_gather_scratch = gather_scratch->data();
   params.routed_up_scratch = expert_up_scratch->data();
   params.shared_up_scratch = shared_up_scratch->data();
@@ -2045,6 +2062,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   std::unique_ptr<DeviceTensorInt32> device_topk_ids;
   std::unique_ptr<DeviceTensorFp32> device_topk_weights;
   std::unique_ptr<DeviceExpertRouting> fused_prefill_routing;
+  std::unique_ptr<DeviceMoeLaunchPlan> fused_prefill_launch_plan;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
@@ -2066,6 +2084,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     const Nvfp4ScaleLayout pack_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
     fused_prefill_routing =
         DeviceExpertRouting::Create(config.n_routed_experts, max_selection_count);
+    fused_prefill_launch_plan =
+        DeviceMoeLaunchPlan::Create(config.n_routed_experts, max_selection_count);
     fused_prefill_routed_output_scratch =
         DeviceTensorFp32::Create({config.max_token_count, config.hidden_size});
     fused_prefill_gather_scratch =
@@ -2085,6 +2105,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
         config.shared_expert_intermediate_size,
         pack_scale_layout);
     if (!fused_prefill_routing ||
+        !fused_prefill_launch_plan ||
         !fused_prefill_routed_output_scratch ||
         !fused_prefill_gather_scratch ||
         !fused_prefill_expert_up_scratch ||
@@ -2124,6 +2145,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->device_topk_ids = std::move(device_topk_ids);
   impl->device_topk_weights = std::move(device_topk_weights);
   impl->fused_prefill_routing = std::move(fused_prefill_routing);
+  impl->fused_prefill_launch_plan = std::move(fused_prefill_launch_plan);
   impl->fused_prefill_routed_output_scratch = std::move(fused_prefill_routed_output_scratch);
   impl->fused_prefill_gather_scratch = std::move(fused_prefill_gather_scratch);
   impl->fused_prefill_expert_up_scratch = std::move(fused_prefill_expert_up_scratch);
@@ -2277,6 +2299,8 @@ bool ExpertLayerSlice::valid() const {
             impl_->monolithic_resident &&
             impl_->config.max_token_count > 0) ||
           (impl_->fused_prefill_routing != nullptr &&
+           impl_->fused_prefill_launch_plan != nullptr &&
+           impl_->fused_prefill_launch_plan->valid() &&
            impl_->fused_prefill_routed_output_scratch != nullptr &&
            impl_->fused_prefill_routed_output_scratch->valid() &&
            impl_->fused_prefill_gather_scratch != nullptr &&

@@ -24,6 +24,7 @@ namespace {
 using nemotron::DeviceTensorFp32;
 using nemotron::DeviceTensorInt32;
 using nemotron::DeviceExpertRouting;
+using nemotron::DeviceMoeLaunchPlan;
 using nemotron::FusedMoePrefillParams;
 using nemotron::FusedNvfp4WeightView;
 using nemotron::HostNvfp4Matrix;
@@ -747,6 +748,10 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       DeviceExpertRouting::Create(
           test_case.n_routed_experts,
           test_case.token_count * test_case.top_k);
+  auto launch_plan =
+      DeviceMoeLaunchPlan::Create(
+          test_case.n_routed_experts,
+          test_case.token_count * test_case.top_k);
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
           {test_case.token_count * test_case.top_k, test_case.hidden_size});
@@ -765,6 +770,8 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               topk_weights != nullptr &&
               routing != nullptr &&
               routing->valid() &&
+              launch_plan != nullptr &&
+              launch_plan->valid() &&
               routed_gather_scratch != nullptr &&
               routed_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
@@ -804,6 +811,7 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.input = input->data();
   params.normalized = normalized->data();
   params.routing = routing.get();
+  params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
   params.routed_up_scratch = routed_up_scratch->data();
   params.shared_up_scratch = shared_up_scratch->data();
@@ -942,6 +950,10 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
       DeviceExpertRouting::Create(
           test_case.n_routed_experts,
           test_case.token_count * test_case.top_k);
+  auto launch_plan =
+      DeviceMoeLaunchPlan::Create(
+          test_case.n_routed_experts,
+          test_case.token_count * test_case.top_k);
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
           {test_case.token_count * test_case.top_k, test_case.hidden_size});
@@ -960,6 +972,8 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               topk_weights != nullptr &&
               routing != nullptr &&
               routing->valid() &&
+              launch_plan != nullptr &&
+              launch_plan->valid() &&
               routed_gather_scratch != nullptr &&
               routed_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
@@ -1000,6 +1014,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.input = input->data();
   params.normalized = normalized->data();
   params.routing = routing.get();
+  params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
   params.routed_up_scratch = routed_up_scratch->data();
   params.shared_up_scratch = shared_up_scratch->data();
