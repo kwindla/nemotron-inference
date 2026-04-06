@@ -4,9 +4,7 @@ This repo is the active implementation for **Nemotron 3 Super on DGX Spark**.
 
 ## Current Status
 
-- Direct `SingleTokenForwardModel::Create(...)` prompt parity is green against the pinned `vLLM` oracle.
-- `SingleTokenForwardModel::CreateFromCache(...)` is not yet qualified.
-- The interactive forward tool works on the direct path only.
+See [docs/RUNBOOK.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/RUNBOOK.md#current-status) for the current status and latest validation results.
 
 ## Start Here
 
@@ -19,9 +17,8 @@ ctest --test-dir build --output-on-failure -R '^full_forward_manifest_smoke_test
 
 Then use:
 
-- [docs/RUNBOOK.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/RUNBOOK.md) for correctness tests, profiling, and the interactive forward tool
-- [tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md) for helper design details
-- start with the `Repo Health Check` section in [docs/RUNBOOK.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/RUNBOOK.md)
+- [docs/RUNBOOK.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/RUNBOOK.md) — start with the `Repo Health Check` section, then correctness tests, profiling, and the interactive forward tool
+- [tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md) for helper design details (only if working on the interactive tool)
 
 ## Quick Commands
 

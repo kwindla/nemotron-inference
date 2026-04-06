@@ -221,6 +221,9 @@ Safe sequential suite run:
 ```bash
 set -euo pipefail
 TESTS=$(ctest --test-dir build --show-only=json-v1 | jq -r '.tests[].name')
+PASS=0
+FAIL=0
+FAIL_NAMES=""
 
 for test_name in $TESTS; do
   mem_avail_kb=$(awk '/MemAvailable:/{print $2}' /proc/meminfo)
@@ -233,15 +236,26 @@ for test_name in $TESTS; do
   fi
 
   echo "RUN $test_name (MemAvailable=${mem_avail_kb}kB SwapFree=${swap_free_kb}kB)"
-  ctest --test-dir build --output-on-failure -R "^${test_name}$"
+  if ctest --test-dir build --output-on-failure -R "^${test_name}$"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAIL_NAMES="$FAIL_NAMES $test_name"
+  fi
   sleep 1
 done
+
+echo "PASSED: $PASS  FAILED: $FAIL"
+if [ -n "$FAIL_NAMES" ]; then
+  echo "Failed tests:$FAIL_NAMES"
+fi
 ```
 
 Important:
 
-- keep `set -euo pipefail` in the shell before running this loop
-- without that, `bash` will continue after a failed `ctest` and can return a misleading success status at the end
+- keep `set -euo pipefail` — it still protects the memory check and `jq` pipeline
+- the `if ctest ...` wrapper lets known-red tests fail without aborting the loop
+- the summary at the end gives the real pass/fail count
 
 Pinned oracle note:
 
