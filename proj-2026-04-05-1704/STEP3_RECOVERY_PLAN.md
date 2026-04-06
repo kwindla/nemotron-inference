@@ -78,6 +78,23 @@ Required benchmark gates before claiming success:
 - throughput bench
 - full `ctest`
 
+### Test Strategy
+
+To stay focused on specialization without losing basic kernel coverage:
+
+- deployment-shape MoE correctness tests should use the exact Nemotron Nano
+  NVFP4 dimensions by default
+- synthetic contract tests should remain only where they catch edge conditions
+  that Nano-shaped tests would miss, such as ragged tails, tiny dimensions, and
+  optional-output contract validation
+
+For the current MoE prefill work, that means:
+
+- `fused_moe_prefill_test` should contain both:
+  - a minimal synthetic contract case
+  - a Nano deployment-shape correctness case
+- `expert_routing_device_test` remains synthetic and contract-focused
+
 ### Guiding Principles
 
 1. Do not add a second implementation path.

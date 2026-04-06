@@ -21,6 +21,10 @@ using nemotron::RunDeviceExpertSelection;
 using nemotron::RunDeviceExpertRouting;
 using nemotron::kMaxDeviceExpertRoutingExperts;
 
+// Synthetic contract test: this file intentionally keeps small, explicit
+// routing fixtures so edge cases stay easy to reason about. Deployment-shape
+// MoE correctness lives in fused_moe_prefill_test with Nano-sized dimensions.
+
 template <typename T>
 class DeviceBuffer {
  public:

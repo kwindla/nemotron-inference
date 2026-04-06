@@ -162,6 +162,12 @@ struct UploadedWeights {
   std::vector<std::vector<float>> dequantized;
 };
 
+struct RepeatedUploadedWeights {
+  std::unique_ptr<MonolithicNvfp4ExpertWeights> storage;
+  std::vector<FusedNvfp4WeightView> views;
+  std::vector<float> dequantized;
+};
+
 std::optional<UploadedWeights> UploadWeights(
     const std::vector<std::vector<float>>& matrices,
     std::size_t rows,
@@ -190,6 +196,40 @@ std::optional<UploadedWeights> UploadWeights(
     uploaded.dequantized.push_back(DequantizeNvfp4Matrix(*packed));
   }
   uploaded.views = uploaded.storage->BuildAllViews();
+  return uploaded;
+}
+
+std::optional<RepeatedUploadedWeights> UploadRepeatedWeights(
+    const std::vector<float>& matrix,
+    std::size_t repeat_count,
+    std::size_t rows,
+    std::size_t cols) {
+  auto storage = MonolithicNvfp4ExpertWeights::Create(repeat_count, rows, cols);
+  if (!storage || !storage->valid()) {
+    return std::nullopt;
+  }
+
+  const auto packed = PackRowMajorFp32ToNvfp4(matrix.data(), rows, cols);
+  if (!packed.has_value()) {
+    return std::nullopt;
+  }
+
+  for (std::size_t expert_index = 0; expert_index < repeat_count; ++expert_index) {
+    if (!storage->UploadExpert(
+            expert_index,
+            packed->packed_data(),
+            packed->packed_nbytes(),
+            packed->block_scales_data(),
+            packed->block_scales_nbytes(),
+            reinterpret_cast<const float*>(packed->tensor_scale_data()))) {
+      return std::nullopt;
+    }
+  }
+
+  RepeatedUploadedWeights uploaded;
+  uploaded.storage = std::move(storage);
+  uploaded.views = uploaded.storage->BuildAllViews();
+  uploaded.dequantized = DequantizeNvfp4Matrix(*packed);
   return uploaded;
 }
 
@@ -235,6 +275,9 @@ struct PrefillReferenceCase {
   std::vector<float> shared_down;
 };
 
+// Synthetic contract case: intentionally tiny and ragged so the active kernel
+// path is forced through tail handling, optional outputs, and small-shape
+// contract validation. These tests stay small on purpose.
 PrefillReferenceCase BuildReferenceCase() {
   PrefillReferenceCase test_case;
   test_case.input = MakePatternedValues(
@@ -289,6 +332,62 @@ PrefillReferenceCase BuildReferenceCase() {
       test_case.shared_expert_intermediate_size,
       37,
       0.0166015625f);
+  return test_case;
+}
+
+// Deployment-shape case: exact Nemotron Nano NVFP4 dimensions. All routed
+// experts share one weight matrix so the reference remains tractable while the
+// runtime still exercises the real expert count, top-k, and tensor shapes.
+PrefillReferenceCase BuildNanoDeploymentCase() {
+  PrefillReferenceCase test_case;
+  test_case.token_count = 2;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 128;
+  test_case.top_k = 6;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      41,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      43,
+      0.01171875f);
+  test_case.topk_ids = {
+      0, 7, 13, 31, 63, 127,
+      5, 6, 62, 64, 65, 126,
+  };
+  test_case.topk_weights = {
+      0.21f, 0.17f, 0.13f, 0.19f, 0.11f, 0.19f,
+      0.18f, 0.15f, 0.14f, 0.16f, 0.17f, 0.20f,
+  };
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          47,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          53,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      59,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      61,
+      0.0068359375f);
   return test_case;
 }
 
@@ -383,6 +482,99 @@ bool BuildReferenceOutputs(
       shared_output_row[dim] = shared_down_output[dim];
     }
   }
+  return true;
+}
+
+bool BuildNanoReferenceOutputs(
+    const PrefillReferenceCase& test_case,
+    const RepeatedUploadedWeights& routed_up,
+    const RepeatedUploadedWeights& routed_down,
+    const UploadedWeights& shared_up,
+    const UploadedWeights& shared_down,
+    std::vector<float>* expected_output,
+    std::vector<float>* expected_routed_output,
+    std::vector<float>* expected_shared_output) {
+  if (expected_output == nullptr ||
+      expected_routed_output == nullptr ||
+      expected_shared_output == nullptr) {
+    return false;
+  }
+
+  expected_output->assign(
+      test_case.token_count * test_case.hidden_size,
+      0.0f);
+  expected_routed_output->assign(
+      test_case.token_count * test_case.hidden_size,
+      0.0f);
+  expected_shared_output->assign(
+      test_case.token_count * test_case.hidden_size,
+      0.0f);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    const float* normalized_row =
+        test_case.normalized.data() + token_index * test_case.hidden_size;
+    std::vector<float> normalized_vec(
+        normalized_row,
+        normalized_row + test_case.hidden_size);
+    const auto quantized_input = QuantizeDequantizeRow(normalized_vec);
+    if (!quantized_input.has_value()) {
+      return false;
+    }
+
+    auto expert_up = RowMajorMatVec(
+        routed_up.dequantized,
+        test_case.routed_expert_intermediate_size,
+        test_case.hidden_size,
+        *quantized_input);
+    Relu2InPlace(&expert_up);
+    const auto quantized_expert_up = QuantizeDequantizeRow(expert_up);
+    if (!quantized_expert_up.has_value()) {
+      return false;
+    }
+    const auto expert_down = RowMajorMatVec(
+        routed_down.dequantized,
+        test_case.hidden_size,
+        test_case.routed_expert_intermediate_size,
+        *quantized_expert_up);
+
+    float routed_scale = 0.0f;
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      routed_scale += test_case.topk_weights[token_index * test_case.top_k + slot];
+    }
+
+    float* output_row = expected_output->data() + token_index * test_case.hidden_size;
+    float* routed_output_row =
+        expected_routed_output->data() + token_index * test_case.hidden_size;
+    float* shared_output_row =
+        expected_shared_output->data() + token_index * test_case.hidden_size;
+
+    for (std::size_t dim = 0; dim < test_case.hidden_size; ++dim) {
+      const float weighted = routed_scale * expert_down[dim];
+      output_row[dim] += weighted;
+      routed_output_row[dim] = weighted;
+    }
+
+    auto shared_up_output = RowMajorMatVec(
+        shared_up.dequantized.front(),
+        test_case.shared_expert_intermediate_size,
+        test_case.hidden_size,
+        *quantized_input);
+    Relu2InPlace(&shared_up_output);
+    const auto quantized_shared_up = QuantizeDequantizeRow(shared_up_output);
+    if (!quantized_shared_up.has_value()) {
+      return false;
+    }
+    const auto shared_down_output = RowMajorMatVec(
+        shared_down.dequantized.front(),
+        test_case.hidden_size,
+        test_case.shared_expert_intermediate_size,
+        *quantized_shared_up);
+    for (std::size_t dim = 0; dim < test_case.hidden_size; ++dim) {
+      output_row[dim] += shared_down_output[dim];
+      shared_output_row[dim] = shared_down_output[dim];
+    }
+  }
+
   return true;
 }
 
@@ -688,12 +880,203 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       "prefill output should equal routed + shared contributions");
 }
 
+bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
+  if (!HasCudaDevice()) {
+    std::cout << "fused_moe_prefill_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  const PrefillReferenceCase test_case = BuildNanoDeploymentCase();
+  auto routed_up = UploadRepeatedWeights(
+      test_case.routed_up.front(),
+      test_case.n_routed_experts,
+      test_case.routed_expert_intermediate_size,
+      test_case.hidden_size);
+  auto routed_down = UploadRepeatedWeights(
+      test_case.routed_down.front(),
+      test_case.n_routed_experts,
+      test_case.hidden_size,
+      test_case.routed_expert_intermediate_size);
+  auto shared_up = UploadWeights(
+      {test_case.shared_up},
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size);
+  auto shared_down = UploadWeights(
+      {test_case.shared_down},
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size);
+  if (!Expect(
+          routed_up.has_value() &&
+              routed_down.has_value() &&
+              shared_up.has_value() &&
+              shared_down.has_value(),
+          "Nano deployment-shape weights should upload")) {
+    return false;
+  }
+  auto routed_up_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_up->views);
+  auto routed_down_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(routed_down->views);
+  if (!Expect(
+          routed_up_views_device != nullptr &&
+              routed_down_views_device != nullptr,
+          "Nano deployment-shape weight-view tables should upload")) {
+    return false;
+  }
+
+  auto input =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.hidden_size});
+  auto normalized =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.hidden_size});
+  auto output =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.hidden_size});
+  auto routed_output =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.hidden_size});
+  auto shared_output =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.hidden_size});
+  auto topk_ids =
+      DeviceTensorInt32::Create({test_case.token_count, test_case.top_k});
+  auto topk_weights =
+      DeviceTensorFp32::Create({test_case.token_count, test_case.top_k});
+  auto routing =
+      DeviceExpertRouting::Create(
+          test_case.n_routed_experts,
+          test_case.token_count * test_case.top_k);
+  auto routed_gather_scratch =
+      DeviceTensorFp32::Create(
+          {test_case.token_count * test_case.top_k, test_case.hidden_size});
+  auto routed_up_scratch = DeviceTensorFp32::Create(
+      {test_case.token_count * test_case.top_k,
+       test_case.routed_expert_intermediate_size});
+  auto shared_up_scratch = DeviceTensorFp32::Create(
+      {test_case.token_count, test_case.shared_expert_intermediate_size});
+  if (!Expect(
+          input != nullptr &&
+              normalized != nullptr &&
+              output != nullptr &&
+              routed_output != nullptr &&
+              shared_output != nullptr &&
+              topk_ids != nullptr &&
+              topk_weights != nullptr &&
+              routing != nullptr &&
+              routing->valid() &&
+              routed_gather_scratch != nullptr &&
+              routed_up_scratch != nullptr &&
+              shared_up_scratch != nullptr,
+          "Nano deployment-shape tensors should allocate") ||
+      !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
+              "Nano deployment-shape input should upload") ||
+      !Expect(
+          normalized->CopyFromHost(
+              test_case.normalized.data(),
+              test_case.normalized.size()),
+          "Nano deployment-shape normalized should upload") ||
+      !Expect(
+          topk_ids->CopyFromHost(test_case.topk_ids.data(), test_case.topk_ids.size()),
+          "Nano deployment-shape topk ids should upload") ||
+      !Expect(
+          topk_weights->CopyFromHost(
+              test_case.topk_weights.data(),
+              test_case.topk_weights.size()),
+          "Nano deployment-shape topk weights should upload")) {
+    return false;
+  }
+
+  FusedMoePrefillParams params;
+  params.token_count = test_case.token_count;
+  params.hidden_size = test_case.hidden_size;
+  params.routed_expert_intermediate_size =
+      test_case.routed_expert_intermediate_size;
+  params.shared_expert_intermediate_size =
+      test_case.shared_expert_intermediate_size;
+  params.n_routed_experts = test_case.n_routed_experts;
+  params.top_k = test_case.top_k;
+  params.shared_up = shared_up->views.front();
+  params.shared_down = shared_down->views.front();
+  params.routed_up_device = routed_up_views_device->data();
+  params.routed_down_device = routed_down_views_device->data();
+  params.selected_indices = topk_ids->data();
+  params.selected_weights = topk_weights->data();
+  params.input = input->data();
+  params.normalized = normalized->data();
+  params.routing = routing.get();
+  params.routed_gather_scratch = routed_gather_scratch->data();
+  params.routed_up_scratch = routed_up_scratch->data();
+  params.shared_up_scratch = shared_up_scratch->data();
+  params.output = output->data();
+  params.routed_output = routed_output->data();
+  params.shared_output = shared_output->data();
+  if (!Expect(RunFusedMoePrefill(params), "Nano deployment-shape prefill should launch") ||
+      !Expect(cudaDeviceSynchronize() == cudaSuccess,
+              "Nano deployment-shape prefill should synchronize")) {
+    return false;
+  }
+
+  std::vector<float> actual_output(output->numel(), 0.0f);
+  std::vector<float> actual_routed_output(routed_output->numel(), 0.0f);
+  std::vector<float> actual_shared_output(shared_output->numel(), 0.0f);
+  if (!Expect(output->CopyToHost(actual_output.data(), actual_output.size()),
+              "Nano deployment-shape output should copy to host") ||
+      !Expect(
+          routed_output->CopyToHost(
+              actual_routed_output.data(),
+              actual_routed_output.size()),
+          "Nano deployment-shape routed output should copy to host") ||
+      !Expect(
+          shared_output->CopyToHost(
+              actual_shared_output.data(),
+              actual_shared_output.size()),
+          "Nano deployment-shape shared output should copy to host")) {
+    return false;
+  }
+
+  std::vector<float> expected_output;
+  std::vector<float> expected_routed_output;
+  std::vector<float> expected_shared_output;
+  if (!Expect(
+          BuildNanoReferenceOutputs(
+              test_case,
+              *routed_up,
+              *routed_down,
+              *shared_up,
+              *shared_down,
+              &expected_output,
+              &expected_routed_output,
+              &expected_shared_output),
+          "Nano deployment-shape CPU reference should build")) {
+    return false;
+  }
+
+  const float output_diff = MaxAbsDiff(actual_output, expected_output);
+  const float routed_diff =
+      MaxAbsDiff(actual_routed_output, expected_routed_output);
+  const float shared_diff =
+      MaxAbsDiff(actual_shared_output, expected_shared_output);
+  if (!Expect(
+          output_diff <= kMaxAbsDiffTolerance,
+          "Nano deployment-shape output should match reference") ||
+      !Expect(
+          routed_diff <= kMaxAbsDiffTolerance,
+          "Nano deployment-shape routed output should match reference") ||
+      !Expect(
+          shared_diff <= kMaxAbsDiffTolerance,
+          "Nano deployment-shape shared output should match reference")) {
+    std::cerr << "nano_prefill_output_max_abs_diff=" << output_diff << "\n";
+    std::cerr << "nano_prefill_routed_max_abs_diff=" << routed_diff << "\n";
+    std::cerr << "nano_prefill_shared_max_abs_diff=" << shared_diff << "\n";
+    return false;
+  }
+
+  return true;
+}
+
 }  // namespace
 
 int main() {
   const bool ok =
       TestFusedMoePrefillRejectsMissingSelectionContract() &&
-      TestFusedMoePrefillMatchesReferenceAndOptionalOutputs();
+      TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() &&
+      TestFusedMoePrefillNanoDeploymentShapeMatchesReference();
   if (!ok) {
     return 1;
   }
