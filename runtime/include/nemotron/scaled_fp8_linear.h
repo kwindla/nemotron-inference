@@ -39,6 +39,12 @@ bool QuantizeFp32ToScaledFp8RoundTrip(
     DeviceTensorFp32* output,
     cudaStream_t stream = nullptr);
 
+bool QuantizeBf16ToFp8E4M3(
+    const DeviceTensorBf16& input,
+    float input_scale,
+    DeviceTensorFp8E4M3* output,
+    cudaStream_t stream = nullptr);
+
 class ScaledFp8LinearOp {
  public:
   static std::unique_ptr<ScaledFp8LinearOp> Create(const ScaledFp8LinearConfig& config);

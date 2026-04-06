@@ -355,9 +355,21 @@ void PopulateDequantizedDescriptor(
   descriptor->packed_nbytes = config.output_rows * config.input_cols * sizeof(float);
 }
 
-bool CutlassFp8DenseGemmEnabledForRows(std::size_t rows) {
+constexpr std::size_t kCutlassFp8MaxRowsPerLaunch = 16u;
+
+bool CutlassFp8DenseGemmEnabledForSurface(
+    ScaledFp8RuntimeOpFamily family,
+    std::size_t rows) {
   static const bool kAvailable = CutlassFp8DenseGemmAvailable();
-  return rows <= 16u && ExperimentalCutlassFp8Enabled() && kAvailable;
+  if (!ExperimentalCutlassFp8Enabled() || !kAvailable) {
+    return false;
+  }
+  if (rows <= kCutlassFp8MaxRowsPerLaunch) {
+    return true;
+  }
+  // Only widen the rollout beyond a single CUTLASS launch for the Mamba
+  // in-proj surface that we have exact pinned-vLLM evidence for.
+  return family == ScaledFp8RuntimeOpFamily::kMambaInProj;
 }
 
 void LogCutlassFp8OutcomeOnce(
@@ -404,6 +416,41 @@ bool RunCutlassFp8DenseGemmRaw(
       stream);
 }
 
+bool RunCutlassFp8DenseGemmTiledRaw(
+    const DeviceTensorFp8E4M3& activations,
+    const DeviceTensorFp8E4M3& weights,
+    float alpha,
+    float* output,
+    cudaStream_t stream) {
+  if (!activations.valid() ||
+      !weights.valid() ||
+      output == nullptr ||
+      activations.shape().size() != 2 ||
+      weights.shape().size() != 2 ||
+      activations.shape()[1] != weights.shape()[1]) {
+    return false;
+  }
+  const std::size_t rows = activations.shape()[0];
+  const std::size_t output_rows = weights.shape()[0];
+  const std::size_t input_cols = weights.shape()[1];
+  for (std::size_t row_offset = 0; row_offset < rows; row_offset += kCutlassFp8MaxRowsPerLaunch) {
+    const std::size_t tile_rows =
+        std::min(kCutlassFp8MaxRowsPerLaunch, rows - row_offset);
+    if (!RunCutlassFp8DenseGemm(
+            static_cast<int>(tile_rows),
+            static_cast<int>(output_rows),
+            static_cast<int>(input_cols),
+            activations.data() + (row_offset * input_cols),
+            weights.data(),
+            alpha,
+            output + (row_offset * output_rows),
+            stream)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool TryRunCutlassFp8DenseGemmToFp32(
     std::string_view tensor_name,
     ScaledFp8RuntimeOpFamily family,
@@ -412,12 +459,12 @@ bool TryRunCutlassFp8DenseGemmToFp32(
     float alpha,
     DeviceTensorFp32* output,
     cudaStream_t stream) {
-  if (!CutlassFp8DenseGemmEnabledForRows(activations.shape()[0]) ||
+  if (!CutlassFp8DenseGemmEnabledForSurface(family, activations.shape()[0]) ||
       output == nullptr ||
       !output->valid()) {
     return false;
   }
-  if (!RunCutlassFp8DenseGemmRaw(activations, weights, alpha, output->data(), stream)) {
+  if (!RunCutlassFp8DenseGemmTiledRaw(activations, weights, alpha, output->data(), stream)) {
     LogCutlassFp8OutcomeOnce(
         "failed_fallback_to_cublaslt",
         tensor_name,
@@ -446,17 +493,46 @@ bool TryRunCutlassFp8DenseGemmToBf16(
     DeviceTensorFp32* output_scratch,
     DeviceTensorBf16* output,
     cudaStream_t stream) {
-  if (!CutlassFp8DenseGemmEnabledForRows(activations.shape()[0]) ||
+  const bool surface_enabled =
+      CutlassFp8DenseGemmEnabledForSurface(family, activations.shape()[0]);
+  if (!surface_enabled ||
       output_scratch == nullptr ||
       !output_scratch->valid() ||
       output == nullptr ||
       !output->valid()) {
+    std::ostringstream message;
+    message << "scaled_fp8_linear: CUTLASS FP8 skipped"
+            << " tensor=" << tensor_name
+            << " family=" << ScaledFp8FamilyName(family)
+            << " m=" << activations.shape()[0]
+            << " n=" << weights.shape()[0]
+            << " k=" << weights.shape()[1]
+            << " surface_enabled=" << surface_enabled
+            << " output_scratch_valid="
+            << (output_scratch != nullptr && output_scratch->valid())
+            << " output_valid=" << (output != nullptr && output->valid());
+    LogScaledFp8NativeDiagnosticOnce(
+        "cutlass_skipped:" + std::string(tensor_name),
+        message.str());
     return false;
   }
   if (output_scratch->shape() != output->shape()) {
+    std::ostringstream message;
+    message << "scaled_fp8_linear: CUTLASS FP8 skipped"
+            << " tensor=" << tensor_name
+            << " family=" << ScaledFp8FamilyName(family)
+            << " m=" << activations.shape()[0]
+            << " n=" << weights.shape()[0]
+            << " k=" << weights.shape()[1]
+            << " reason=shape_mismatch"
+            << " output_scratch_shape_rank=" << output_scratch->shape().size()
+            << " output_shape_rank=" << output->shape().size();
+    LogScaledFp8NativeDiagnosticOnce(
+        "cutlass_shape_mismatch:" + std::string(tensor_name),
+        message.str());
     return false;
   }
-  if (!RunCutlassFp8DenseGemmRaw(
+  if (!RunCutlassFp8DenseGemmTiledRaw(
           activations,
           weights,
           alpha,
@@ -624,6 +700,8 @@ std::unique_ptr<ScaledFp8LinearOp> ScaledFp8LinearOp::Create(const ScaledFp8Line
   impl->family = ClassifyScaledFp8RuntimeOpFamily(descriptor.tensor_name);
   impl->descriptor = descriptor;
   impl->packed_weight = std::move(packed_weight);
+  impl->descriptor.packed_data = impl->packed_weight->data();
+  impl->descriptor.packed_nbytes = impl->packed_weight->bytes();
   return std::unique_ptr<ScaledFp8LinearOp>(new ScaledFp8LinearOp(std::move(impl)));
 }
 
@@ -854,7 +932,7 @@ bool ScaledFp8LinearOp::Run(
               " family=" + std::string(ScaledFp8FamilyName(impl_->family)));
     } else {
       fp8_activations_ready = true;
-      if (CutlassFp8DenseGemmEnabledForRows(activations.shape()[0]) &&
+      if (CutlassFp8DenseGemmEnabledForSurface(impl_->family, activations.shape()[0]) &&
           TryRunCutlassFp8DenseGemmToFp32(
               impl_->descriptor.tensor_name,
               impl_->family,
@@ -1147,7 +1225,7 @@ bool ScaledFp8LinearOp::Run(
             fp8_activation_scratch,
             stream)) {
       fp8_activations_ready = true;
-      if (CutlassFp8DenseGemmEnabledForRows(activations.shape()[0]) &&
+      if (CutlassFp8DenseGemmEnabledForSurface(impl_->family, activations.shape()[0]) &&
           TryRunCutlassFp8DenseGemmToFp32(
               impl_->descriptor.tensor_name,
               impl_->family,
@@ -1298,7 +1376,7 @@ bool ScaledFp8LinearOp::Run(
             fp8_activation_scratch,
             stream)) {
       fp8_activations_ready = true;
-      if (CutlassFp8DenseGemmEnabledForRows(activations.shape()[0])) {
+      if (CutlassFp8DenseGemmEnabledForSurface(impl_->family, activations.shape()[0])) {
         if (!impl_->cutlass_output_scratch_ ||
             impl_->cutlass_output_scratch_->shape() != output->shape()) {
           impl_->cutlass_output_scratch_ = DeviceTensorFp32::Create(output->shape());

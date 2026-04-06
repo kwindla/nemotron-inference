@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--image-tag", required=True)
     parser.add_argument("--decode-capture-layers", action="store_true")
+    parser.add_argument("--expert-capture-layer", type=int, default=None)
     return parser.parse_args()
 
 
@@ -54,6 +55,10 @@ def append_jsonl(path: Path, payload: Any) -> None:
 
 def write_tensor(path: Path, tensor: torch.Tensor) -> None:
     path.write_bytes(tensor.contiguous().cpu().float().numpy().tobytes())
+
+
+def write_int32_tensor(path: Path, tensor: torch.Tensor) -> None:
+    path.write_bytes(tensor.contiguous().cpu().to(dtype=torch.int32).numpy().tobytes())
 
 
 def to_cpu_fp32(tensor: torch.Tensor) -> torch.Tensor:
@@ -125,12 +130,19 @@ class TraceCapture:
     step_layer_counts: dict[int, int] = field(default_factory=dict)
     forward_log_path: Path | None = None
     forward_call_index: int = 0
+    expert_capture_layer: int | None = None
+    current_expert_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    current_expert_selected_ids: torch.Tensor | None = None
+    current_expert_selected_weights: torch.Tensor | None = None
 
     def reset_current_stage(self) -> None:
         self.current_embedding = None
         self.current_layers = {}
         self.current_final_hidden = None
         self.current_final_hidden_normed = None
+        self.current_expert_tensors = {}
+        self.current_expert_selected_ids = None
+        self.current_expert_selected_weights = None
 
     def record_forward_call(
         self,
@@ -207,6 +219,56 @@ class TraceCapture:
         self.current_final_hidden = to_cpu_fp32(final_hidden_tensor)
         self.current_final_hidden_normed = to_cpu_fp32(normed_tensor)
 
+    def capture_expert_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if self.active_stage != "prefill":
+            return
+        self.current_expert_tensors[name] = to_cpu_fp32(tensor)
+
+    def capture_expert_selection(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> None:
+        if self.active_stage != "prefill":
+            return
+        self.current_expert_selected_weights = to_cpu_fp32(topk_weights)
+        self.current_expert_selected_ids = (
+            topk_ids.detach().contiguous().cpu().to(dtype=torch.int32)
+        )
+
+    def _write_expert_payload(self) -> None:
+        if self.expert_capture_layer is None:
+            return
+        expert_dir = self.output_dir / f"expert_layer_{self.expert_capture_layer:03d}"
+        expert_dir.mkdir(parents=True, exist_ok=True)
+        for stem, tensor in self.current_expert_tensors.items():
+            write_tensor(expert_dir / f"{stem}_fp32.bin", tensor)
+        if self.current_expert_selected_ids is not None:
+            write_int32_tensor(
+                expert_dir / "selected_expert_ids_i32.bin",
+                self.current_expert_selected_ids,
+            )
+        if self.current_expert_selected_weights is not None:
+            write_tensor(
+                expert_dir / "selected_expert_weights_fp32.bin",
+                self.current_expert_selected_weights,
+            )
+        metadata = {
+            "layer_index": self.expert_capture_layer,
+            "captured_tensors": sorted(self.current_expert_tensors.keys()),
+            "selected_expert_ids_shape": (
+                None
+                if self.current_expert_selected_ids is None
+                else list(self.current_expert_selected_ids.shape)
+            ),
+            "selected_expert_weights_shape": (
+                None
+                if self.current_expert_selected_weights is None
+                else list(self.current_expert_selected_weights.shape)
+            ),
+        }
+        write_json(expert_dir / "metadata.json", metadata)
+
     def _step_dir(self, step: int) -> Path:
         return self.output_dir / f"decode_step_{step:03d}"
 
@@ -273,6 +335,7 @@ class TraceCapture:
                 self.current_final_hidden_normed,
             )
             write_tensor(self.output_dir / "vllm_prefill_logits_fp32.bin", logits_cpu)
+            self._write_expert_payload()
 
             self.prefill_argmax_token_id = argmax_token_id
             step0_layers = None
@@ -316,6 +379,8 @@ def install_trace_hooks(
     prompt_token_count: int,
 ):
     handles: list[Any] = []
+    original_expert_select = None
+    expert_router = None
 
     def embedding_hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
         trace.capture_embedding(extract_hidden_tensor(output))
@@ -334,6 +399,119 @@ def install_trace_hooks(
     for layer_idx in range(trace.num_layers):
         handles.append(runtime_model.model.layers[layer_idx].register_forward_hook(layer_hook(layer_idx)))
     handles.append(runtime_model.model.norm_f.register_forward_hook(final_norm_hook))
+
+    if trace.expert_capture_layer is not None:
+        if trace.expert_capture_layer < 0 or trace.expert_capture_layer >= trace.num_layers:
+            raise ValueError(
+                f"expert capture layer {trace.expert_capture_layer} is out of range for {trace.num_layers} layers"
+            )
+        expert_layer = runtime_model.model.layers[trace.expert_capture_layer]
+
+        def expert_norm_pre_hook(_module: Any, inputs: tuple[Any, ...]) -> None:
+            if not inputs:
+                raise TypeError("Expected expert norm hook inputs")
+            hidden_input = inputs[0]
+            if not isinstance(hidden_input, torch.Tensor):
+                raise TypeError(
+                    f"Expected expert norm hidden input tensor, got {type(hidden_input)!r}"
+                )
+            trace.capture_expert_tensor("norm_hidden_input", hidden_input)
+            residual_input = None
+            if len(inputs) > 1:
+                residual_input = inputs[1]
+            if residual_input is not None:
+                if not isinstance(residual_input, torch.Tensor):
+                    raise TypeError(
+                        f"Expected expert norm residual tensor, got {type(residual_input)!r}"
+                    )
+                trace.capture_expert_tensor("norm_residual_input", residual_input)
+                trace.capture_expert_tensor(
+                    "norm_combined_input",
+                    hidden_input + residual_input,
+                )
+            else:
+                trace.capture_expert_tensor("norm_combined_input", hidden_input)
+
+        def expert_norm_hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+            trace.capture_expert_tensor("normalized_input", extract_hidden_tensor(output))
+
+        def expert_gate_hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+            trace.capture_expert_tensor("router_logits", extract_hidden_tensor(output))
+
+        def expert_latent_hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+            trace.capture_expert_tensor("latent_output", extract_hidden_tensor(output))
+
+        def expert_shared_fused_hook(
+            _module: Any,
+            _inputs: tuple[Any, ...],
+            output: Any,
+        ) -> None:
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise TypeError(f"Expected expert tuple output, got {type(output)!r}")
+            shared_output, routed_output = output
+            if shared_output is not None:
+                if not isinstance(shared_output, torch.Tensor):
+                    raise TypeError(
+                        f"Expected shared output tensor, got {type(shared_output)!r}"
+                    )
+                trace.capture_expert_tensor("shared_output", shared_output)
+            if not isinstance(routed_output, torch.Tensor):
+                raise TypeError(
+                    f"Expected routed output tensor, got {type(routed_output)!r}"
+                )
+            trace.capture_expert_tensor("routed_latent_output", routed_output)
+
+        def expert_projected_routed_hook(
+            _module: Any,
+            _inputs: tuple[Any, ...],
+            output: Any,
+        ) -> None:
+            trace.capture_expert_tensor(
+                "projected_routed_output",
+                extract_hidden_tensor(output),
+            )
+
+        def expert_mixer_hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+            trace.capture_expert_tensor("mixer_output", extract_hidden_tensor(output))
+
+        handles.append(expert_layer.norm.register_forward_pre_hook(expert_norm_pre_hook))
+        handles.append(expert_layer.norm.register_forward_hook(expert_norm_hook))
+        handles.append(expert_layer.mixer.gate.register_forward_hook(expert_gate_hook))
+        if getattr(expert_layer.mixer, "fc1_latent_proj", None) is not None:
+            handles.append(
+                expert_layer.mixer.fc1_latent_proj.register_forward_hook(expert_latent_hook)
+            )
+        handles.append(expert_layer.mixer.experts.register_forward_hook(expert_shared_fused_hook))
+        if getattr(expert_layer.mixer, "fc2_latent_proj", None) is not None:
+            handles.append(
+                expert_layer.mixer.fc2_latent_proj.register_forward_hook(
+                    expert_projected_routed_hook
+                )
+            )
+        handles.append(expert_layer.mixer.register_forward_hook(expert_mixer_hook))
+
+        expert_router = expert_layer.mixer.experts.router
+        original_expert_select = expert_router.select_experts
+
+        def wrapped_select_experts(router_self: Any, *args: Any, **kwargs: Any) -> Any:
+            del router_self
+            result = original_expert_select(*args, **kwargs)
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise TypeError(
+                    f"Expected router select_experts to return a 2-tuple, got {type(result)!r}"
+                )
+            topk_weights, topk_ids = result
+            if not isinstance(topk_weights, torch.Tensor) or not isinstance(
+                topk_ids, torch.Tensor
+            ):
+                raise TypeError("Expected select_experts to return tensor outputs")
+            trace.capture_expert_selection(topk_weights, topk_ids)
+            return result
+
+        expert_router.select_experts = types.MethodType(
+            wrapped_select_experts,
+            expert_router,
+        )
 
     original_inner_forward = runtime_model.model.forward
     original_compute_logits = runtime_model.compute_logits
@@ -414,6 +592,8 @@ def install_trace_hooks(
     runtime_model.compute_logits = types.MethodType(wrapped_compute_logits, runtime_model)
 
     def cleanup() -> None:
+        if expert_router is not None and original_expert_select is not None:
+            expert_router.select_experts = original_expert_select
         runtime_model.model.forward = original_inner_forward
         runtime_model.compute_logits = original_compute_logits
         for handle in reversed(handles):
@@ -470,6 +650,8 @@ def main() -> None:
 
     if args.decode_steps < 1:
         raise ValueError("--decode-steps must be at least 1")
+    if args.expert_capture_layer is not None and args.expert_capture_layer < 0:
+        raise ValueError("--expert-capture-layer must be non-negative")
 
     output_dir = Path(args.output_dir)
     if output_dir.exists():
@@ -517,6 +699,7 @@ def main() -> None:
             total_decode_steps=args.decode_steps,
             decode_capture_layers=args.decode_capture_layers,
             forward_log_path=output_dir / "forward_calls.jsonl",
+            expert_capture_layer=args.expert_capture_layer,
         )
         cleanup_hooks = install_trace_hooks(runtime_model, trace, len(prompt_token_ids))
 
@@ -573,6 +756,7 @@ def main() -> None:
             "num_layers": num_layers,
             "prompt_token_count": len(prompt_token_ids),
             "decode_step_count": args.decode_steps,
+            "expert_capture_layer": args.expert_capture_layer,
         }
         write_json(output_dir / "metadata.json", metadata)
     except Exception as exc:

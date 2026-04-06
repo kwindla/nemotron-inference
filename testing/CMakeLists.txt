@@ -450,6 +450,21 @@ if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   )
 
   nemotron_add_test(attention_layer7_runtime_input_oracle_test)
+
+  add_executable(
+    attention_layer_decode_oracle_test
+    backend/attention_layer_decode_oracle_test.cpp
+  )
+
+  target_link_libraries(attention_layer_decode_oracle_test PRIVATE nemotron_runtime_backend)
+  target_compile_features(attention_layer_decode_oracle_test PRIVATE cxx_std_17)
+  target_compile_definitions(
+    attention_layer_decode_oracle_test
+    PRIVATE
+      NEMOTRON_ATTENTION_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/attention_layer7_runtime_input_block_cuda"
+  )
+
+  nemotron_add_test(attention_layer_decode_oracle_test)
 endif()
 
 add_executable(
@@ -571,6 +586,28 @@ target_compile_definitions(
 nemotron_add_test(mamba_layer_oracle_test)
 
 add_executable(
+  chunk_cumsum_kernel_probe_test
+  backend/chunk_cumsum_kernel_probe_test.cpp
+)
+target_link_libraries(
+  chunk_cumsum_kernel_probe_test
+  PRIVATE nemotron_runtime_backend
+)
+target_compile_features(chunk_cumsum_kernel_probe_test PRIVATE cxx_std_17)
+nemotron_add_test(chunk_cumsum_kernel_probe_test)
+
+add_executable(
+  softplus_probe_test
+  backend/softplus_probe_test.cu
+)
+target_link_libraries(
+  softplus_probe_test
+  PRIVATE nemotron_runtime_backend
+)
+target_compile_features(softplus_probe_test PRIVATE cxx_std_17)
+nemotron_add_test(softplus_probe_test)
+
+add_executable(
   chunked_scan_kernel_verify_test
   backend/chunked_scan_kernel_verify_test.cpp
 )
@@ -580,6 +617,91 @@ target_link_libraries(
     nemotron_runtime_backend)
 target_compile_features(chunked_scan_kernel_verify_test PRIVATE cxx_std_17)
 nemotron_add_test(chunked_scan_kernel_verify_test)
+
+add_executable(
+  chunk_scan_only_kernel_probe_test
+  backend/chunk_scan_only_kernel_probe_test.cpp
+)
+target_link_libraries(
+  chunk_scan_only_kernel_probe_test
+  PRIVATE
+    nemotron_runtime_backend)
+target_compile_features(chunk_scan_only_kernel_probe_test PRIVATE cxx_std_17)
+nemotron_add_test(chunk_scan_only_kernel_probe_test)
+
+add_executable(
+  chunked_scan_from_stage1_probe_test
+  backend/chunked_scan_from_stage1_probe_test.cpp
+)
+target_link_libraries(
+  chunked_scan_from_stage1_probe_test
+  PRIVATE
+    nemotron_runtime_backend)
+target_compile_features(chunked_scan_from_stage1_probe_test PRIVATE cxx_std_17)
+nemotron_add_test(chunked_scan_from_stage1_probe_test)
+
+add_executable(
+  conv1d_kernel_probe_test
+  backend/conv1d_kernel_probe_test.cpp
+)
+target_link_libraries(
+  conv1d_kernel_probe_test
+  PRIVATE
+    nemotron_runtime_backend)
+target_compile_features(conv1d_kernel_probe_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  conv1d_kernel_probe_test
+  PRIVATE
+    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer0_decode_block"
+)
+nemotron_add_test(conv1d_kernel_probe_test)
+
+add_executable(
+  in_proj_kernel_probe_test
+  backend/in_proj_kernel_probe_test.cpp
+)
+target_link_libraries(
+  in_proj_kernel_probe_test
+  PRIVATE
+    nemotron_runtime_backend)
+target_compile_features(in_proj_kernel_probe_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  in_proj_kernel_probe_test
+  PRIVATE
+    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer0_decode_block"
+)
+nemotron_add_test(in_proj_kernel_probe_test)
+
+add_executable(
+  in_proj_fp8_contract_probe
+  backend/in_proj_fp8_contract_probe.cpp
+)
+target_link_libraries(
+  in_proj_fp8_contract_probe
+  PRIVATE
+    nemotron_runtime_backend
+    nemotron_runtime_loader)
+target_compile_features(in_proj_fp8_contract_probe PRIVATE cxx_std_17)
+target_compile_definitions(
+  in_proj_fp8_contract_probe
+  PRIVATE
+    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer0_decode_block"
+)
+
+add_executable(
+  mamba_out_proj_vllm_probe
+  backend/mamba_out_proj_vllm_probe.cpp
+)
+target_link_libraries(
+  mamba_out_proj_vllm_probe
+  PRIVATE
+    nemotron_runtime_backend)
+target_compile_features(mamba_out_proj_vllm_probe PRIVATE cxx_std_17)
+target_compile_definitions(
+  mamba_out_proj_vllm_probe
+  PRIVATE
+    NEMOTRON_MAMBA_LAYER_ORACLE_FIXTURE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/oracle/mamba_layer0_decode_block"
+)
 
 add_executable(
   mamba_layer18_runtime_input_oracle_test

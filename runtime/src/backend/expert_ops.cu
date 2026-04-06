@@ -51,6 +51,12 @@ __device__ float ClampScale(float value) {
   return value;
 }
 
+__device__ __forceinline__ float ReciprocalApproximateFtz(float value) {
+  float out;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(out) : "f"(value));
+  return out;
+}
+
 __device__ float DecodeFp4E2M1(std::uint8_t code) {
   const __half raw = static_cast<__half>(__nv_cvt_fp4_to_halfraw(
       static_cast<__nv_fp4_storage_t>(code & 0x0fu),
@@ -184,6 +190,7 @@ __global__ void SelectTopExpertsSerialKernel(
       expert_count % n_group != 0) {
     return;
   }
+  (void) routed_scaling_factor;
 
   if (expert_count > kSelectTopExpertsMaxExperts || n_group > kSelectTopExpertsMaxGroups) {
     for (std::size_t i = 0; i < top_k; ++i) {
@@ -277,9 +284,6 @@ __global__ void SelectTopExpertsSerialKernel(
       selected_weights[row * top_k + pick] /= denom;
     }
   }
-  for (std::size_t pick = 0; pick < expert_pick_count; ++pick) {
-    selected_weights[row * top_k + pick] *= routed_scaling_factor;
-  }
 }
 
 __global__ void SelectTopExpertsParallelKernel(
@@ -298,6 +302,7 @@ __global__ void SelectTopExpertsParallelKernel(
   if (row >= rows || expert_count == 0 || n_group == 0 || top_k == 0 || expert_count % n_group != 0) {
     return;
   }
+  (void) routed_scaling_factor;
 
   __shared__ float shared_scores[kSelectTopExpertsMaxExperts];
   __shared__ float shared_scores_for_choice[kSelectTopExpertsMaxExperts];
@@ -422,9 +427,6 @@ __global__ void SelectTopExpertsParallelKernel(
         selected_weights[row * top_k + pick] /= denom;
       }
     }
-    for (std::size_t pick = 0; pick < expert_pick_count; ++pick) {
-      selected_weights[row * top_k + pick] *= routed_scaling_factor;
-    }
   }
 }
 
@@ -509,11 +511,17 @@ __global__ void PackScaledRelu2RowsToNvfp4Kernel(
   block_scales[block_index] = static_cast<std::uint8_t>(
       __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
 
-  const float scale = tensor_scale * block_scale;
+  const float block_scale_rounded = DecodeFp8E4M3(block_scales[block_index]);
+  const float input_global_scale = ReciprocalApproximateFtz(tensor_scale);
+  const float output_scale =
+      block_scale_rounded != 0.0f
+          ? ReciprocalApproximateFtz(
+                block_scale_rounded * ReciprocalApproximateFtz(input_global_scale))
+          : 0.0f;
   #pragma unroll
   for (std::size_t i = 0; i < kNvfp4BlockWidth; i += 2) {
-    const float lhs = transformed[i] / scale;
-    const float rhs = transformed[i + 1] / scale;
+    const float lhs = transformed[i] * output_scale;
+    const float rhs = transformed[i + 1] * output_scale;
     const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
                                      __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
                                  0x0fu;
@@ -665,11 +673,17 @@ __global__ void FusedRelu2PackRowsToNvfp4Kernel(
         __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
     block_scales[scale_offset] = block_scale_fp8;
 
-    const float scale = tensor_scale * block_scale;
+    const float block_scale_rounded = DecodeFp8E4M3(block_scale_fp8);
+    const float input_global_scale = ReciprocalApproximateFtz(tensor_scale);
+    const float output_scale =
+        block_scale_rounded != 0.0f
+            ? ReciprocalApproximateFtz(
+                  block_scale_rounded * ReciprocalApproximateFtz(input_global_scale))
+            : 0.0f;
     #pragma unroll
     for (std::size_t i = 0; i < kNvfp4BlockWidth; i += 2) {
-      const float lhs = transformed[i] / scale;
-      const float rhs = transformed[i + 1] / scale;
+      const float lhs = transformed[i] * output_scale;
+      const float rhs = transformed[i + 1] * output_scale;
       const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
                                        __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
                                    0x0fu;

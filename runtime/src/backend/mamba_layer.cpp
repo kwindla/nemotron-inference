@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -78,6 +80,95 @@ bool MambaSubLayerProfileEnabled() {
     return value != nullptr && std::strcmp(value, "2") == 0;
   }();
   return kEnabled;
+}
+
+struct ChunkedScanLayerDumpConfig {
+  bool enabled = false;
+  int target_layer = -1;
+  std::filesystem::path runtime_root;
+
+  static ChunkedScanLayerDumpConfig FromEnv() {
+    ChunkedScanLayerDumpConfig config;
+    const char* layer_env = std::getenv("NEMOTRON_DUMP_CHUNKED_SCAN_LAYER");
+    const char* root_env = std::getenv("NEMOTRON_DUMP_CHUNKED_SCAN_ROOT");
+    if (layer_env != nullptr && root_env != nullptr) {
+      config.enabled = true;
+      config.target_layer = std::atoi(layer_env);
+      config.runtime_root = std::filesystem::path(root_env) / "runtime";
+    }
+    return config;
+  }
+
+  bool Matches(std::size_t layer_index) const {
+    return enabled && target_layer >= 0 &&
+           static_cast<std::size_t>(target_layer) == layer_index;
+  }
+};
+
+const ChunkedScanLayerDumpConfig& GetChunkedScanLayerDumpConfig() {
+  static const ChunkedScanLayerDumpConfig config =
+      ChunkedScanLayerDumpConfig::FromEnv();
+  return config;
+}
+
+bool DumpDeviceFp32ToFile(
+    const float* device_ptr,
+    std::size_t count,
+    const std::filesystem::path& path,
+    cudaStream_t stream) {
+  if (count == 0) {
+    return true;
+  }
+  std::vector<float> host(count, 0.0f);
+  if (cudaStreamSynchronize(stream) != cudaSuccess) {
+    return false;
+  }
+  if (cudaMemcpy(
+          host.data(),
+          device_ptr,
+          count * sizeof(float),
+          cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return false;
+  }
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  out.write(
+      reinterpret_cast<const char*>(host.data()),
+      static_cast<std::streamsize>(count * sizeof(float)));
+  std::cerr << "dump: " << path.string() << " (" << count << " floats)\n";
+  return out.good();
+}
+
+bool DumpDeviceBf16ToFile(
+    const __nv_bfloat16* device_ptr,
+    std::size_t count,
+    const std::filesystem::path& path,
+    cudaStream_t stream) {
+  if (count == 0) {
+    return true;
+  }
+  std::vector<__nv_bfloat16> host_bf16(count);
+  if (cudaStreamSynchronize(stream) != cudaSuccess) {
+    return false;
+  }
+  if (cudaMemcpy(
+          host_bf16.data(),
+          device_ptr,
+          count * sizeof(__nv_bfloat16),
+          cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return false;
+  }
+  std::vector<float> host_fp32(count, 0.0f);
+  for (std::size_t i = 0; i < count; ++i) {
+    host_fp32[i] = __bfloat162float(host_bf16[i]);
+  }
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  out.write(
+      reinterpret_cast<const char*>(host_fp32.data()),
+      static_cast<std::streamsize>(count * sizeof(float)));
+  std::cerr << "dump: " << path.string() << " (" << count << " bf16->fp32)\n";
+  return out.good();
 }
 
 void LogSubLayerProfileCudaFailure(const char* caller, cudaError_t error) {
@@ -454,7 +545,7 @@ struct MambaLayerSlice::Impl {
   std::unique_ptr<DeviceTensorFp32> mixer_norm_weight;
   std::unique_ptr<DeviceTensorFp32> conv1d_weight;
   std::unique_ptr<DeviceTensorFp32> conv1d_bias;
-  std::unique_ptr<DeviceTensorFp32> A_log;
+  std::unique_ptr<DeviceTensorFp32> A;
   std::unique_ptr<DeviceTensorFp32> D;
   std::unique_ptr<DeviceTensorFp32> dt_bias;
   ProjectionFamily in_proj_family = ProjectionFamily::kNone;
@@ -464,6 +555,31 @@ struct MambaLayerSlice::Impl {
   std::unique_ptr<ScaledFp8LinearOp> in_proj_scaled_fp8;
   std::unique_ptr<ScaledFp8LinearOp> out_proj_scaled_fp8;
 };
+
+std::unique_ptr<DeviceTensorFp32> PrecomputeMambaAFromDevice(const DeviceTensorFp32& a_log) {
+  if (!a_log.valid()) {
+    return nullptr;
+  }
+  std::vector<float> host(a_log.numel());
+  if (cudaMemcpy(
+          host.data(), a_log.data(), host.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
+      cudaSuccess) {
+    return nullptr;
+  }
+  for (float& value : host) {
+    value = -std::exp(value);
+  }
+  auto device = DeviceTensorFp32::Create(a_log.shape());
+  if (!device) {
+    return nullptr;
+  }
+  if (cudaMemcpy(
+          device->data(), host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) !=
+      cudaSuccess) {
+    return nullptr;
+  }
+  return device;
+}
 
 std::optional<MambaLayerBindings> BuildMambaLayerBindings(
     const LayerScheduleEntry& layer,
@@ -809,7 +925,7 @@ std::unique_ptr<MambaLayerSlice> MambaLayerSlice::CreatePrepared(
   impl->mixer_norm_weight = std::move(bindings.mixer_norm_weight);
   impl->conv1d_weight = std::move(bindings.conv1d_weight);
   impl->conv1d_bias = std::move(bindings.conv1d_bias);
-  impl->A_log = std::move(bindings.A_log);
+  impl->A = PrecomputeMambaAFromDevice(*bindings.A_log);
   impl->D = std::move(bindings.D);
   impl->dt_bias = std::move(bindings.dt_bias);
   impl->in_proj_family = in_proj_family;
@@ -836,8 +952,8 @@ bool MambaLayerSlice::valid() const {
          impl_->conv1d_weight->valid() &&
          impl_->conv1d_bias != nullptr &&
          impl_->conv1d_bias->valid() &&
-         impl_->A_log != nullptr &&
-         impl_->A_log->valid() &&
+         impl_->A != nullptr &&
+         impl_->A->valid() &&
          impl_->D != nullptr &&
          impl_->D->valid() &&
          impl_->dt_bias != nullptr &&
@@ -987,18 +1103,12 @@ bool MambaLayerSlice::Run(
           MambaSubLayerStage::kRmsNorm,
           &norm_ok,
           [&]() {
-            return RmsNormFp32(
-                       input,
-                       *impl_->input_norm_weight,
-                       impl_->config.input_rms_epsilon,
-                       normalized_fp32,
-                       stream) &&
-                   ConvertDeviceFp32ToBf16(
-                       normalized_fp32->data(),
-                       normalized_fp32->numel(),
-                       normalized->data(),
-                       stream) &&
-                   true;
+            return RmsNormFp32ToBf16(
+                input,
+                *impl_->input_norm_weight,
+                impl_->config.input_rms_epsilon,
+                normalized,
+                stream);
           })) {
     return false;
   }
@@ -1006,9 +1116,17 @@ bool MambaLayerSlice::Run(
     return false;
   }
 
-  if (trace != nullptr) {
-    trace->norm_output.resize(normalized_fp32->numel(), 0.0f);
-    if (!normalized_fp32->CopyToHost(trace->norm_output.data(), trace->norm_output.size())) {
+  if (trace != nullptr && !CopyTensorToHost(*normalized, &trace->norm_output)) {
+    return false;
+  }
+  if (token_count != 1) {
+    const auto& dump_config = GetChunkedScanLayerDumpConfig();
+    if (dump_config.Matches(impl_->config.layer_index) &&
+        !DumpDeviceBf16ToFile(
+            normalized->data(),
+            normalized->numel(),
+            dump_config.runtime_root / "norm_output_fp32.bin",
+            stream)) {
       return false;
     }
   }
@@ -1073,7 +1191,7 @@ bool MambaLayerSlice::Run(
                     impl_->config.n_groups,
                     impl_->config.time_step_min,
                     impl_->config.ssm_state_offset_elems,
-                    *impl_->A_log,
+                    *impl_->A,
                     *impl_->D,
                     *impl_->dt_bias,
                     request_context.mamba_state(),
@@ -1125,7 +1243,7 @@ bool MambaLayerSlice::Run(
                     impl_->config.ssm_state_offset_elems,
                     *impl_->conv1d_weight,
                     *impl_->conv1d_bias,
-                    *impl_->A_log,
+                    *impl_->A,
                     *impl_->D,
                     *impl_->dt_bias,
                     *impl_->mixer_norm_weight,
@@ -1182,7 +1300,7 @@ bool MambaLayerSlice::Run(
                     impl_->config.n_groups,
                     impl_->config.time_step_min,
                     impl_->config.ssm_state_offset_elems,
-                    *impl_->A_log,
+                    *impl_->A,
                     *impl_->D,
                     *impl_->dt_bias,
                     request_context.mamba_state(),
@@ -1200,7 +1318,7 @@ bool MambaLayerSlice::Run(
                   impl_->config.n_groups,
                   kMambaChunkScanSize,
                   impl_->config.ssm_state_offset_elems,
-                  *impl_->A_log,
+                  *impl_->A,
                   *impl_->D,
                   *impl_->dt_bias,
                   request_context.mamba_state(),
@@ -1491,7 +1609,7 @@ bool MambaLayerSlice::Run(
                     impl_->config.n_groups,
                     impl_->config.time_step_min,
                     impl_->config.ssm_state_offset_elems,
-                    *impl_->A_log,
+                    *impl_->A,
                     *impl_->D,
                     *impl_->dt_bias,
                     request_context.mamba_state(),
@@ -1540,7 +1658,7 @@ bool MambaLayerSlice::Run(
                     impl_->config.ssm_state_offset_elems,
                     *impl_->conv1d_weight,
                     *impl_->conv1d_bias,
-                    *impl_->A_log,
+                    *impl_->A,
                     *impl_->D,
                     *impl_->dt_bias,
                     *impl_->mixer_norm_weight,
@@ -1597,7 +1715,7 @@ bool MambaLayerSlice::Run(
                     impl_->config.n_groups,
                     impl_->config.time_step_min,
                     impl_->config.ssm_state_offset_elems,
-                    *impl_->A_log,
+                    *impl_->A,
                     *impl_->D,
                     *impl_->dt_bias,
                     request_context.mamba_state(),
@@ -1615,7 +1733,7 @@ bool MambaLayerSlice::Run(
                   impl_->config.n_groups,
                   kMambaChunkScanSize,
                   impl_->config.ssm_state_offset_elems,
-                  *impl_->A_log,
+                  *impl_->A,
                   *impl_->D,
                   *impl_->dt_bias,
                   request_context.mamba_state(),

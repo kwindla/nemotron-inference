@@ -1,5 +1,7 @@
 #include "nemotron/primitive_ops.h"
 
+#include <algorithm>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -7,6 +9,7 @@ namespace nemotron {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+constexpr int kMaxNormThreads = 1024;
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -89,6 +92,13 @@ __device__ void StoreNormValue(__nv_bfloat16* output, std::size_t index, float v
   output[index] = __float2bfloat16(value);
 }
 
+int ResolveBf16NormBlockSize(std::size_t rows, std::size_t hidden_size) {
+  constexpr int kVecSize = 8;
+  const int max_block_size = rows < 256 ? kMaxNormThreads : kThreadsPerBlock;
+  const int candidate = static_cast<int>(hidden_size / kVecSize);
+  return std::max(1, std::min(candidate, max_block_size));
+}
+
 template <typename InputT, typename OutputT>
 __global__ void RmsNormTypedKernel(
     const InputT* input,
@@ -126,9 +136,63 @@ __global__ void RmsNormTypedKernel(
   }
 }
 
+template <typename InputT>
+__global__ void RmsNormVllmBf16Kernel(
+    const InputT* input,
+    const float* weight,
+    __nv_bfloat16* output,
+    std::size_t rows,
+    std::size_t hidden_size,
+    float epsilon) {
+  const std::size_t row = static_cast<std::size_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float shared_sum[kMaxNormThreads];
+  float local_sum = 0.0f;
+  const std::size_t row_offset = row * hidden_size;
+  for (std::size_t column = threadIdx.x; column < hidden_size; column += blockDim.x) {
+    const float value = LoadNormValue(input, row_offset + column);
+    local_sum += value * value;
+  }
+  shared_sum[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv_rms = rsqrtf((shared_sum[0] / static_cast<float>(hidden_size)) + epsilon);
+  for (std::size_t column = threadIdx.x; column < hidden_size; column += blockDim.x) {
+    const float input_value = LoadNormValue(input, row_offset + column);
+    const __nv_bfloat16 normalized_bf16 = __float2bfloat16(input_value * inv_rms);
+    const __nv_bfloat16 weight_bf16 = __float2bfloat16(weight[column]);
+    const float output_value =
+        __bfloat162float(normalized_bf16) * __bfloat162float(weight_bf16);
+    output[row_offset + column] = __float2bfloat16(output_value);
+  }
+}
+
 bool HasCompatibleMatrixShape(
     const DeviceTensorFp32& input,
     const DeviceTensorFp32& output,
+    std::size_t* rows,
+    std::size_t* hidden_size) {
+  if (!input.valid() || !output.valid() || input.shape().size() != 2 || output.shape() != input.shape()) {
+    return false;
+  }
+  *rows = input.shape()[0];
+  *hidden_size = input.shape()[1];
+  return *rows != 0 && *hidden_size != 0;
+}
+
+bool HasCompatibleMatrixShape(
+    const DeviceTensorFp32& input,
+    const DeviceTensorBf16& output,
     std::size_t* rows,
     std::size_t* hidden_size) {
   if (!input.valid() || !output.valid() || input.shape().size() != 2 || output.shape() != input.shape()) {
@@ -226,9 +290,35 @@ bool RmsNormBf16(
     return false;
   }
 
-  const dim3 block(kThreadsPerBlock);
+  const dim3 block(static_cast<unsigned int>(ResolveBf16NormBlockSize(rows, hidden_size)));
   const dim3 grid(static_cast<unsigned int>(rows));
-  RmsNormTypedKernel<<<grid, block, 0, stream>>>(
+  RmsNormVllmBf16Kernel<<<grid, block, 0, stream>>>(
+      input.data(),
+      weight.data(),
+      output->data(),
+      rows,
+      hidden_size,
+      epsilon);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool RmsNormFp32ToBf16(
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& weight,
+    float epsilon,
+    DeviceTensorBf16* output,
+    cudaStream_t stream) {
+  std::size_t rows = 0;
+  std::size_t hidden_size = 0;
+  if (output == nullptr || !HasCompatibleMatrixShape(input, *output, &rows, &hidden_size) ||
+      !weight.valid() || weight.shape().size() != 1 || weight.shape()[0] != hidden_size ||
+      epsilon <= 0.0f) {
+    return false;
+  }
+
+  const dim3 block(static_cast<unsigned int>(ResolveBf16NormBlockSize(rows, hidden_size)));
+  const dim3 grid(static_cast<unsigned int>(rows));
+  RmsNormVllmBf16Kernel<<<grid, block, 0, stream>>>(
       input.data(),
       weight.data(),
       output->data(),

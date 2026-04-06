@@ -58,11 +58,77 @@ def write_tensor(path: Path, tensor: torch.Tensor) -> None:
     print(f"dump: {path} ({tensor.numel()} -> fp32, shape={list(tensor.shape)})")
 
 
+def tensor_metadata(tensor: torch.Tensor) -> dict[str, Any]:
+    return {
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "is_contiguous": bool(tensor.is_contiguous()),
+    }
+
+
 def load_prompt_token_ids(path: Path) -> list[int]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list) or not all(isinstance(t, int) for t in payload):
         raise TypeError(f"{path} must contain a JSON array of integer token IDs")
     return payload
+
+
+def build_in_proj_metadata(llm: LLM, target_layer: int) -> dict[str, Any]:
+    def resolve_layer_root(model: Any) -> Any | None:
+        seen: set[int] = set()
+        queue = [model]
+        while queue:
+            current = queue.pop(0)
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            if hasattr(current, "backbone") or hasattr(current, "layers"):
+                return current
+            for attr in ("model", "module", "inner_model"):
+                if hasattr(current, attr):
+                    queue.append(getattr(current, attr))
+        return None
+
+    runtime_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    root_model = resolve_layer_root(runtime_model)
+    if root_model is None:
+        return {
+            "error": "runtime model has no layer container",
+            "runtime_model_type": type(runtime_model).__name__,
+        }
+    layer_container = getattr(root_model, "backbone", root_model)
+    layer = layer_container.layers[target_layer]
+    mixer = layer.mixer
+    in_proj = mixer.in_proj
+    quant_method = getattr(in_proj, "quant_method", None)
+    fp8_linear = getattr(quant_method, "fp8_linear", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    return {
+        "runtime_model_type": type(runtime_model).__name__,
+        "root_model_type": type(root_model).__name__,
+        "layer_container_type": type(layer_container).__name__,
+        "layer_type": type(layer).__name__,
+        "mixer_type": type(mixer).__name__,
+        "in_proj_type": type(in_proj).__name__,
+        "quant_method_type": type(quant_method).__name__ if quant_method is not None else None,
+        "fp8_linear_type": type(fp8_linear).__name__ if fp8_linear is not None else None,
+        "fp8_output_padding": (
+            fp8_linear.get_output_padding() if fp8_linear is not None else None
+        ),
+        "weight_dtype": str(getattr(in_proj, "weight").dtype),
+        "weight_shape": list(getattr(in_proj, "weight").shape),
+        "weight_stride": list(getattr(in_proj, "weight").stride()),
+        "weight_is_contiguous": bool(getattr(in_proj, "weight").is_contiguous()),
+        "weight_scale_dtype": str(getattr(in_proj, "weight_scale").dtype),
+        "weight_scale_shape": list(getattr(in_proj, "weight_scale").shape),
+        "input_scale_dtype": str(getattr(in_proj, "input_scale").dtype),
+        "input_scale_shape": list(getattr(in_proj, "input_scale").shape),
+        "quant_config_type": type(quant_config).__name__ if quant_config is not None else None,
+    }
 
 
 class ChunkedScanCapture:
@@ -72,7 +138,80 @@ class ChunkedScanCapture:
         self.output_dir = output_dir
         self.target_call = target_call
         self.call_count = 0
+        self.conv_call_count = 0
+        self.forward_call_count = 0
         self.captured = False
+        self.captured_norm = False
+        self.captured_preconv = False
+        self.captured_postconv = False
+        self.capture_postconv_next = False
+
+    def patched_mixer_forward(
+        self,
+        original_mixer_forward,
+        mixer,
+        hidden_states,
+        mup_vector,
+    ):
+        current_call = self.forward_call_count
+        self.forward_call_count += 1
+
+        if current_call == self.target_call and not self.captured_norm:
+            self.captured_norm = True
+            dr = self.output_dir
+            write_tensor(dr / "norm_output_fp32.bin", hidden_states)
+            if mup_vector is not None:
+                write_tensor(dr / "mup_vector_fp32.bin", mup_vector)
+
+        return original_mixer_forward(
+            mixer,
+            hidden_states,
+            mup_vector=mup_vector,
+        )
+
+    def patched_conv_ssm_forward(
+        self,
+        original_conv_ssm_forward,
+        mixer,
+        projected_states,
+        output,
+    ):
+        current_call = self.conv_call_count
+        self.conv_call_count += 1
+
+        if current_call == self.target_call and not self.captured_preconv:
+            self.captured_preconv = True
+            hidden_states_B_C, dt = torch.split(
+                projected_states[..., mixer.tped_intermediate_size :],
+                [mixer.tped_conv_size, mixer.tped_dt_size],
+                dim=-1,
+            )
+            dr = self.output_dir
+            write_tensor(dr / "projected_states_fp32.bin", projected_states)
+            write_tensor(dr / "hidden_states_B_C_pre_conv_fp32.bin", hidden_states_B_C)
+            write_tensor(dr / "dt_pre_conv_fp32.bin", dt)
+            write_tensor(dr / "conv1d_weight_fp32.bin", mixer.conv_weights)
+            write_tensor(dr / "conv1d_bias_fp32.bin", mixer.conv1d.bias)
+
+        should_capture_postconv = (
+            current_call == self.target_call and not self.captured_postconv
+        )
+        if should_capture_postconv:
+            self.capture_postconv_next = True
+        try:
+            return original_conv_ssm_forward(mixer, projected_states, output)
+        finally:
+            if should_capture_postconv:
+                self.capture_postconv_next = False
+
+    def patched_causal_conv1d_fn(self, original_causal_conv1d_fn, *args, **kwargs):
+        out = original_causal_conv1d_fn(*args, **kwargs)
+        if self.capture_postconv_next and not self.captured_postconv:
+            self.captured_postconv = True
+            # causal_conv1d_fn returns channel-major [dim, tokens]; dump token-major
+            # to match the rest of the captured Mamba surfaces.
+            write_tensor(self.output_dir / "hidden_states_B_C_post_conv_fp32.bin", out.transpose(0, 1))
+        return out
 
     def patched_fwd(
         self,
@@ -106,6 +245,32 @@ class ChunkedScanCapture:
         print(f"\n=== Capturing chunked-scan intermediates for call {current_call} ===")
         print(f"x.shape={list(x.shape)}, dt.shape={list(dt.shape)}, B.shape={list(B.shape)}")
         print(f"chunk_size={chunk_size}, dt_softplus={dt_softplus}, dt_limit={dt_limit}")
+
+        metadata = {
+            "call_index": current_call,
+            "chunk_size": int(chunk_size),
+            "dt_softplus": bool(dt_softplus),
+            "dt_limit": [float(dt_limit[0]), str(dt_limit[1])],
+            "x": tensor_metadata(x),
+            "dt": tensor_metadata(dt),
+            "A": tensor_metadata(A),
+            "B": tensor_metadata(B),
+            "C": tensor_metadata(C),
+            "out": tensor_metadata(out),
+        }
+        if D is not None:
+            metadata["D"] = tensor_metadata(D)
+        if dt_bias is not None:
+            metadata["dt_bias"] = tensor_metadata(dt_bias)
+        if initial_states is not None:
+            metadata["initial_states"] = tensor_metadata(initial_states)
+        if z is not None:
+            metadata["z"] = tensor_metadata(z)
+        (dr / "capture_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"dump: {dr / 'capture_metadata.json'}")
 
         # Dump inputs
         write_tensor(dr / "x_fp32.bin", x)
@@ -202,7 +367,9 @@ def main() -> None:
     model_dir = Path(args.model_dir)
     prompts_fixture = Path(args.prompts_fixture)
     prompt_token_ids = load_prompt_token_ids(prompts_fixture)
-    assert len(prompt_token_ids) == 40, f"expected 40 tokens, got {len(prompt_token_ids)}"
+    prompt_token_count = len(prompt_token_ids)
+    if prompt_token_count == 0:
+        raise ValueError("prompt fixture must contain at least one token")
 
     # Write prompt tokens for verification
     (output_dir / "prompt_token_ids.json").write_text(
@@ -219,10 +386,15 @@ def main() -> None:
         tokenizer=str(model_dir),
         trust_remote_code=True,
         enforce_eager=True,
-        max_model_len=48,
-        max_num_batched_tokens=48,
+        max_model_len=max(48, prompt_token_count + 8),
+        max_num_batched_tokens=max(48, prompt_token_count + 8),
         max_num_seqs=1,
         enable_chunked_prefill=False,
+    )
+    in_proj_metadata = build_in_proj_metadata(llm, args.target_layer)
+    (output_dir / "in_proj_metadata.json").write_text(
+        json.dumps(in_proj_metadata, indent=2) + "\n",
+        encoding="utf-8",
     )
 
     # Set up the capture
@@ -241,8 +413,46 @@ def main() -> None:
     # (it may import the function directly)
     try:
         import vllm.model_executor.layers.mamba.mamba_mixer2 as mixer_mod
+        import vllm.model_executor.layers.mamba.ops.causal_conv1d as causal_conv_mod
         if hasattr(mixer_mod, '_mamba_chunk_scan_combined_fwd'):
             mixer_mod._mamba_chunk_scan_combined_fwd = patched
+        if hasattr(mixer_mod, "MambaMixer2") and hasattr(mixer_mod.MambaMixer2, "forward"):
+            original_mixer_forward = mixer_mod.MambaMixer2.forward
+
+            def patched_mixer_forward(self, hidden_states, mup_vector=None):
+                return capture.patched_mixer_forward(
+                    original_mixer_forward,
+                    self,
+                    hidden_states,
+                    mup_vector,
+                )
+
+            mixer_mod.MambaMixer2.forward = patched_mixer_forward
+        if hasattr(mixer_mod, "MambaMixer2") and hasattr(mixer_mod.MambaMixer2, "conv_ssm_forward"):
+            original_conv_ssm_forward = mixer_mod.MambaMixer2.conv_ssm_forward
+
+            def patched_conv_ssm_forward(self, projected_states, output):
+                return capture.patched_conv_ssm_forward(
+                    original_conv_ssm_forward,
+                    self,
+                    projected_states,
+                    output,
+                )
+
+            mixer_mod.MambaMixer2.conv_ssm_forward = patched_conv_ssm_forward
+        if hasattr(causal_conv_mod, "causal_conv1d_fn"):
+            original_causal_conv1d_fn = causal_conv_mod.causal_conv1d_fn
+
+            def patched_causal_conv1d_fn(*args, **kwargs):
+                return capture.patched_causal_conv1d_fn(
+                    original_causal_conv1d_fn,
+                    *args,
+                    **kwargs,
+                )
+
+            causal_conv_mod.causal_conv1d_fn = patched_causal_conv1d_fn
+            if hasattr(mixer_mod, "causal_conv1d_fn"):
+                mixer_mod.causal_conv1d_fn = patched_causal_conv1d_fn
     except ImportError:
         pass
 
@@ -270,9 +480,13 @@ def main() -> None:
     metadata = {
         "target_layer": args.target_layer,
         "captured": capture.captured,
+        "captured_norm": capture.captured_norm,
+        "captured_preconv": capture.captured_preconv,
+        "captured_postconv": capture.captured_postconv,
         "total_calls": capture.call_count,
         "prompt_token_count": len(prompt_token_ids),
         "image_tag": args.image_tag,
+        "in_proj_metadata": in_proj_metadata,
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"

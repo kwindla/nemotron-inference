@@ -38,6 +38,66 @@ Describe the concrete implementation objective.
 
 Explain how this step supports the overall runtime architecture and milestone plan.
 
+### 2026-04-06 - Pinned vLLM Prompt Parity Reached, Cache-Backed Nemotron Path Still Unqualified
+
+#### Goal
+
+Close the long-running pinned-vLLM prompt-parity gap on the real Nemotron forward path, then qualify the same path across the post-parity acceptance matrix.
+
+#### Fit In Plan And Architecture
+
+This step closes the main correctness gate for the direct serving path. It also sharply separates two concerns that had been mixed together:
+
+- direct manifest-backed forward correctness against the pinned vLLM oracle
+- cache-backed `CreateFromCache(...)` startup and serving viability on the same model
+
+That separation matters because the direct path is now green, while the cache-backed Nemotron path is still a startup/loader problem rather than a remaining token-parity problem.
+
+#### Files Added Or Changed
+
+- decode-attention parity fix in:
+  - [runtime/src/backend/cudnn_paged_attention.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/src/backend/cudnn_paged_attention.cpp)
+- new decode-attention oracle coverage in:
+  - [testing/backend/attention_layer_decode_oracle_test.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/backend/attention_layer_decode_oracle_test.cpp)
+  - [testing/CMakeLists.txt](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/CMakeLists.txt)
+- acceptance-matrix hooks in:
+  - [testing/api/prompt_matched_parity_test.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/api/prompt_matched_parity_test.cpp)
+- status note updates in:
+  - [README.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/README.md)
+
+#### Implementation Details That Matter
+
+- The remaining token-6 bug was in decode attention, not Mamba.
+- Teacher-forced layer-7 decode fixtures showed:
+  - `q`, `k`, `v`, and KV-cache writes already matched the pinned oracle
+  - the residual was in the attention compute itself
+- The root cause was causal-mask alignment for single-token decode:
+  - the cuDNN paged-attention builder was still using top-left causal alignment when `query_len < kv_len`
+  - single-token decode needs bottom-right alignment so the query can attend the full prefix rather than only the earliest keys
+- The runtime now switches to `BOTTOM_RIGHT` causal alignment for decode-style plans and keeps `TOP_LEFT` for equal-length prefill-style plans.
+
+#### Tests And Validation
+
+- Focused decode-attention oracle:
+  - [testing/backend/attention_layer_decode_oracle_test.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/backend/attention_layer_decode_oracle_test.cpp)
+  - teacher-forced step-5 / step-6 layer-7 fixtures improved from `attention_output_diff=0.640244 / 0.532623` to `0.00195312 / 0.00390625`
+- Prefill attention regression:
+  - `ctest -R '^attention_layer_oracle_test$' --output-on-failure`
+- Primary acceptance gate:
+  - manifest-backed `prompt_matched_parity_test`
+  - full generated 16-token sequence now matches the pinned vLLM oracle on the direct `Create(...)` path
+
+#### Findings, Limitations, And Next Steps
+
+- Direct manifest-backed Nemotron forward parity is now green against the pinned vLLM oracle.
+- Cache-backed Nemotron forward is not yet qualified:
+  - `CreateFromCache(...)` currently fails the runtime memory-budget guard on DGX Spark UMA for the real parity setup
+  - with `NEMOTRON_SKIP_MEMORY_CHECK=1`, the same path then segfaults in `LoadedModelCache::CreateNvfp4LinearView(...)`
+- So the next cache-backed work is a focused loader/view-construction debug, not another whole-model parity investigation.
+- Post-parity qualification still needs:
+  - the remaining `CreateFromCache` rows in the acceptance matrix
+  - the planned TRT-LLM contract audit
+
 #### Files
 
 List the files added or modified for this step.

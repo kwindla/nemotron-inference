@@ -91,6 +91,7 @@ struct ExpertLayerPreparedBindings {
   std::unique_ptr<UploadedLinearOp> shared_down_dense;
   std::unique_ptr<ScaledFp8LinearOp> shared_down_scaled_fp8;
   std::unique_ptr<UploadedLinearOp> shared_down_nvfp4;
+  std::optional<float> shared_down_nvfp4_input_scale;
   std::vector<ExpertLayerPreparedExpert> routed_experts;
 };
 

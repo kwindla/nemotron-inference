@@ -30,7 +30,6 @@ using nemotron::DeviceTensorFp32;
 using nemotron::MambaChunkScanWorkspace;
 using nemotron::MambaChunkedScanPrefillBf16;
 
-constexpr std::size_t kT = 40;
 constexpr std::size_t kH = 128;
 constexpr std::size_t kP = 64;
 constexpr std::size_t kN = 128;
@@ -123,8 +122,12 @@ bool run_verify() {
   const auto vllm_dt_bias = read_fp32(vllm_dir / "dt_bias_fp32.bin"); // [H] = 128
   const auto vllm_D = read_fp32(vllm_dir / "D_fp32.bin");           // [H] = 128
 
-  if (vllm_x.size() != kT * kH * kP ||
-      vllm_B.size() != kT * kG * kN ||
+  if (vllm_x.size() % (kH * kP) != 0) {
+    std::cerr << "FAIL: x dump size is not divisible by H*P\n";
+    return false;
+  }
+  const std::size_t kT = vllm_x.size() / (kH * kP);
+  if (vllm_B.size() != kT * kG * kN ||
       vllm_C.size() != kT * kG * kN ||
       vllm_dt_pre.size() != kT * kH ||
       vllm_A.size() != kH ||
@@ -132,12 +135,6 @@ bool run_verify() {
       vllm_D.size() != kH) {
     std::cerr << "FAIL: unexpected vLLM dump sizes\n";
     return false;
-  }
-
-  // Convert vLLM A (= -exp(A_log)) back to A_log
-  std::vector<float> a_log(kH);
-  for (std::size_t h = 0; h < kH; ++h) {
-    a_log[h] = std::log(-vllm_A[h]);  // A = -exp(A_log) => A_log = log(-A)
   }
 
   // Pack vLLM inputs into runtime format:
@@ -175,13 +172,13 @@ bool run_verify() {
   // Upload to device
   auto dev_conv_output = DeviceTensorBf16::Create({kT, kConvDim});
   auto dev_projected = DeviceTensorBf16::Create({kT, kProjSize});
-  auto dev_a_log = DeviceTensorFp32::Create({kH});
+  auto dev_a = DeviceTensorFp32::Create({kH});
   auto dev_dt_bias = DeviceTensorFp32::Create({kH});
   auto dev_d = DeviceTensorFp32::Create({kH});
   auto dev_ssm_state = DeviceTensorFp32::Create({kH * kP * kN});
   auto dev_y_output = DeviceTensorBf16::Create({kT, kI});
 
-  if (!dev_conv_output || !dev_projected || !dev_a_log || !dev_dt_bias ||
+  if (!dev_conv_output || !dev_projected || !dev_a || !dev_dt_bias ||
       !dev_d || !dev_ssm_state || !dev_y_output) {
     std::cerr << "FAIL: device tensor allocation\n";
     return false;
@@ -191,7 +188,7 @@ bool run_verify() {
              conv_output_bf16.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
   cudaMemcpy(dev_projected->data(), projected_bf16.data(),
              projected_bf16.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_a_log->data(), a_log.data(), a_log.size() * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_a->data(), vllm_A.data(), vllm_A.size() * sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(dev_dt_bias->data(), vllm_dt_bias.data(), vllm_dt_bias.size() * sizeof(float), cudaMemcpyHostToDevice);
   cudaMemcpy(dev_d->data(), vllm_D.data(), vllm_D.size() * sizeof(float), cudaMemcpyHostToDevice);
   // Zero initial state
@@ -221,7 +218,7 @@ bool run_verify() {
       *dev_projected, *dev_conv_output,
       kI, kConvDim, kH, kP, kN, kG, kQ,
       0,  // ssm_state_offset_elems
-      *dev_a_log, *dev_d, *dev_dt_bias,
+      *dev_a, *dev_d, *dev_dt_bias,
       dev_ssm_state.get(), dev_y_output.get(),
       &workspace, nullptr);
 
@@ -250,7 +247,7 @@ bool run_verify() {
   auto our_y = download_bf16_as_fp32(*dev_y_output);
   auto our_state_out = download_fp32(*dev_ssm_state);
 
-  // vLLM dt_chunk/dA_cumsum shape is [H, C, Q] = [128, 1, 128], ours is [C, H, Q] = [1, 128, 128]
+  // vLLM dt_chunk/dA_cumsum shape is [H, C, Q], ours is [C, H, Q]
   // Transpose vLLM to [C, H, Q]
   std::vector<float> vllm_dt_transposed(vllm_dt_chunk.size());
   std::vector<float> vllm_dA_transposed(vllm_dA_cumsum.size());

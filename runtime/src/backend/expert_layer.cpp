@@ -290,8 +290,8 @@ bool CutlassMoeEnabled() {
 }
 
 bool DisableGroupedRoutedNvfp4() {
-  // FROZEN: direct custom grouped fused kernels only -- grouped NVFP4 stays enabled.
-  return false;
+  static const bool kDisabled = std::getenv("NEMOTRON_DISABLE_GROUPED_ROUTED_NVFP4") != nullptr;
+  return kDisabled;
 }
 
 constexpr std::size_t kNvfp4BlockWidth = 16;
@@ -1016,6 +1016,7 @@ struct ExpertLayerSlice::Impl {
   bool shared_down_nvfp4_buffers_ready = false;
   std::unique_ptr<Nvfp4AlignedBuffers> shared_down_nvfp4_buffers;
   std::unique_ptr<UploadedLinearOp> shared_down_nvfp4;
+  std::optional<float> shared_down_nvfp4_input_scale;
   std::vector<RoutedExpertEntry> routed_experts;
   RoutedMoEBackendKind routed_backend_kind = RoutedMoEBackendKind::kCustomFused;
   std::string routed_backend_detail =
@@ -1932,11 +1933,14 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   bool shared_down_nvfp4_buffers_ready = false;
   std::unique_ptr<Nvfp4AlignedBuffers> shared_down_nvfp4_buffers;
   std::unique_ptr<UploadedLinearOp> shared_down_nvfp4;
+  std::optional<float> shared_down_nvfp4_input_scale;
   const auto shared_down_begin = std::chrono::steady_clock::now();
   if (bindings.shared_down_gemm_weight != nullptr &&
       bindings.shared_down_gemm_weight->kernel_family ==
           GemmKernelFamily::kCublasLtNvfp4BlockScaled) {
     shared_down_family = Impl::SharedDownFamily::kNvfp4;
+    shared_down_nvfp4_input_scale =
+        ReadOptionalScalarTensorToHostFp32(bindings.shared_down_input_scale);
     shared_down_nvfp4_buffers = std::make_unique<Nvfp4AlignedBuffers>();
     shared_down_nvfp4 = MaterializeRoutedExpertOp(
         *bindings.shared_down_gemm_weight,
@@ -2224,6 +2228,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->shared_down_nvfp4_buffers_ready = shared_down_nvfp4_buffers_ready;
   impl->shared_down_nvfp4_buffers = std::move(shared_down_nvfp4_buffers);
   impl->shared_down_nvfp4 = std::move(shared_down_nvfp4);
+  impl->shared_down_nvfp4_input_scale = shared_down_nvfp4_input_scale;
   impl->routed_experts = std::move(routed_experts);
   impl->dense_pool = dense_pool;
   impl->dense_pool_numel = dense_pool_numel;
@@ -2701,6 +2706,7 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::CreatePrepared(
   impl->shared_down_dense = std::move(bindings.shared_down_dense);
   impl->shared_down_scaled_fp8 = std::move(bindings.shared_down_scaled_fp8);
   impl->shared_down_nvfp4 = std::move(bindings.shared_down_nvfp4);
+  impl->shared_down_nvfp4_input_scale = bindings.shared_down_nvfp4_input_scale;
   impl->routed_experts = std::move(routed_experts);
   if (routed_experts_can_stack &&
       !InitializeContiguousRoutedExperts(impl.get())) {
@@ -3068,7 +3074,17 @@ bool RunExpertRmsNorm(
     float epsilon,
     DeviceTensorFp32* output,
     cudaStream_t stream) {
-  return RmsNormFp32(input, weight, epsilon, output, stream);
+  if (output == nullptr || !output->valid()) {
+    return false;
+  }
+  auto bf16_output = DeviceTensorBf16::Create(output->shape());
+  return bf16_output != nullptr &&
+         RmsNormFp32ToBf16(input, weight, epsilon, bf16_output.get(), stream) &&
+         ConvertDeviceBf16ToFp32(
+             bf16_output->data(),
+             bf16_output->numel(),
+             output->data(),
+             stream);
 }
 
 bool RunExpertRmsNorm(
@@ -3136,6 +3152,32 @@ bool RunExpertAddScaledRow(
     DeviceTensorBf16* accumulator,
     cudaStream_t stream) {
   return AddScaledRowBf16(input_row, scale, row_index, accumulator, stream);
+}
+
+bool RunExpertScaleInPlace(
+    DeviceTensorFp32* tensor,
+    float scale,
+    cudaStream_t stream) {
+  if (tensor == nullptr || !tensor->valid()) {
+    return false;
+  }
+  if (scale == 1.0f) {
+    return true;
+  }
+  return AddScaledFp32(*tensor, scale - 1.0f, tensor, stream);
+}
+
+bool RunExpertScaleInPlace(
+    DeviceTensorBf16* tensor,
+    float scale,
+    cudaStream_t stream) {
+  if (tensor == nullptr || !tensor->valid()) {
+    return false;
+  }
+  if (scale == 1.0f) {
+    return true;
+  }
+  return AddScaledBf16(*tensor, scale - 1.0f, tensor, stream);
 }
 
 bool RunExpertCopyRow(
@@ -3266,7 +3308,7 @@ bool RunExpertLayerImpl(
   }
 
   const std::size_t token_count = input.shape()[0];
-  if (token_count == 0 || (trace != nullptr && token_count != 1)) {
+  if (token_count == 0) {
     if (debug) {
       std::cout << "expert_layer: unsupported token count/tracing combination\n";
     }
@@ -3511,6 +3553,28 @@ bool RunExpertLayerImpl(
       }
       return false;
     }
+    if (token_count > 1) {
+      if (!ensure_selection_metadata_host()) {
+        if (debug) {
+          std::cout << "expert_layer: batch trace selection metadata download failed\n";
+        }
+        return false;
+      }
+      trace_selections.reserve(selection_count);
+      for (std::size_t selection_index = 0; selection_index < selection_count; ++selection_index) {
+        const std::int32_t expert_index = selected_indices_host[selection_index];
+        if (expert_index < 0) {
+          if (debug) {
+            std::cout << "expert_layer: invalid selected expert index in batch trace\n";
+          }
+          return false;
+        }
+        trace_selections.push_back(
+            ExpertSelection{
+                static_cast<std::size_t>(expert_index),
+                selected_weights_host[selection_index]});
+      }
+    }
   }
 
   using RoutedExpertEntry = typename std::decay_t<decltype(impl.routed_experts)>::value_type;
@@ -3649,7 +3713,8 @@ bool RunExpertLayerImpl(
       return nullptr;
     }
     const auto& entry = impl.routed_experts[expert_index];
-    if (impl.experts_contiguous) {
+    if (impl.experts_contiguous &&
+        impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lock(entry.materialize_mutex);
       if (entry.up_proj == nullptr &&
           !CreateContiguousProjectionView(
@@ -4047,7 +4112,7 @@ bool RunExpertLayerImpl(
       return true;
     };
 
-    if (trace != nullptr) {
+    if (trace != nullptr && token_count == 1) {
       RecordGroupedRoutedExpertFastpathFallback();
       RecordGroupedRoutedExpertPrereqFallback();
       return GroupedRoutedResult::kFallback;
@@ -4059,7 +4124,9 @@ bool RunExpertLayerImpl(
           " expected=custom_fused");
     }
     if (!impl.grouped_routed_nvfp4_enabled.load(std::memory_order_relaxed)) {
-      return grouped_fatal("grouped_routed_nvfp4_enabled=false on frozen custom fused path");
+      RecordGroupedRoutedExpertFastpathFallback();
+      RecordGroupedRoutedExpertPrereqFallback();
+      return GroupedRoutedResult::kFallback;
     }
     if (!latent_input_row.valid() ||
         latent_input_row.numel() != impl.config.moe_latent_size) {
@@ -5696,7 +5763,7 @@ bool RunExpertLayerImpl(
         }
         return false;
       }
-      if (trace != nullptr && token_index == 0) {
+      if (trace != nullptr && token_count == 1 && token_index == 0) {
         std::vector<float> activated_up_host(impl.config.routed_expert_intermediate_size, 0.0f);
         std::vector<float> expert_down_host(impl.config.moe_latent_size, 0.0f);
         if (!CopyToHost(*expert_up, &activated_up_host) ||
@@ -5732,7 +5799,7 @@ bool RunExpertLayerImpl(
       }
     }
 
-    if (trace != nullptr) {
+    if (trace != nullptr && token_count == 1) {
       trace->normalized_input.assign(
           normalized_row,
           normalized_row + impl.config.hidden_size);
@@ -5749,6 +5816,32 @@ bool RunExpertLayerImpl(
       trace->routed_expert_outputs = trace_routed_expert_outputs;
       trace->routed_expert_weighted_contributions = trace_routed_weighted_contributions;
     }
+  }
+
+  if (trace != nullptr && !CopyToHost(*routed_tensor, &trace_routed_output)) {
+    if (debug) {
+      std::cout << "expert_layer: trace routed output download failed\n";
+    }
+    return false;
+  }
+
+  bool route_scale_ok = false;
+  if (!measure_stage(
+          ExpertSubLayerStage::kWeightedMerge,
+          &route_scale_ok,
+          [&]() {
+            return RunExpertScaleInPlace(
+                routed_tensor.get(),
+                impl.config.routed_scaling_factor,
+                stream);
+          })) {
+    return false;
+  }
+  if (!route_scale_ok) {
+    if (debug) {
+      std::cout << "expert_layer: routed scaling failed\n";
+    }
+    return false;
   }
 
   bool shared_relu_ok = false;
@@ -5773,6 +5866,15 @@ bool RunExpertLayerImpl(
           &shared_down_ok,
           [&]() {
             if (impl.shared_down_nvfp4 != nullptr) {
+              if (impl.shared_down_nvfp4_input_scale.has_value()) {
+                return impl.shared_down_nvfp4->Run(
+                    cublas_handle,
+                    heuristic_cache,
+                    *shared_up,
+                    shared_output_device.get(),
+                    Nvfp4PackOptions{impl.shared_down_nvfp4_input_scale},
+                    stream);
+              }
               return impl.shared_down_nvfp4->Run(
                   cublas_handle,
                   heuristic_cache,
@@ -5858,14 +5960,23 @@ bool RunExpertLayerImpl(
   }
 
   if (trace != nullptr) {
-    if (!CopyToHost(*routed_tensor, &trace_routed_output) ||
-        !CopyToHost(*projected_routed, &trace->projected_routed_output) ||
+    if (!CopyToHost(*projected_routed, &trace->projected_routed_output) ||
         !CopyToHost(*shared_output_device, &trace_shared_output) ||
         !CopyToHost(*mixer_output_device, &trace->mixer_output)) {
       if (debug) {
         std::cout << "expert_layer: trace output download failed\n";
       }
       return false;
+    }
+    if (token_count > 1) {
+      trace->normalized_input = std::move(normalized_host);
+      trace_router_logits = std::move(router_logits_host);
+      trace_latent_output = std::move(latent_host);
+      trace->routed_expert_order.clear();
+      trace->routed_expert_pre_activation_hidden.clear();
+      trace->routed_expert_activated_hidden.clear();
+      trace->routed_expert_outputs.clear();
+      trace->routed_expert_weighted_contributions.clear();
     }
     trace->router_logits = std::move(trace_router_logits);
     trace->selected_experts = std::move(trace_selections);

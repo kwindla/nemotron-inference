@@ -1,4 +1,5 @@
 #include "nemotron/device_tensor.h"
+#include "nemotron/model_cache.h"
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
 
@@ -261,12 +262,14 @@ std::optional<PrefillFixtureMetadata> load_prefill_fixture_metadata(const std::f
   return metadata;
 }
 
-nemotron::RuntimeBootstrapOptions make_options(std::size_t target_context_tokens) {
+nemotron::RuntimeBootstrapOptions make_options(
+    std::size_t target_context_tokens,
+    std::optional<std::size_t> graph_bytes_override = std::nullopt) {
   nemotron::RuntimeBootstrapOptions options;
   options.service_target.total_memory_bytes = GiB(128);
   options.service_target.weights_bytes = GiB(100);
   options.service_target.workspace_bytes = GiB(8);
-  options.service_target.graph_bytes = GiB(4);
+  options.service_target.graph_bytes = graph_bytes_override.value_or(GiB(4));
   options.service_target.safety_headroom_bytes = GiB(4);
   options.service_target.target_active_requests = 1;
   options.service_target.target_context_tokens = target_context_tokens;
@@ -537,11 +540,15 @@ bool run_prompt_matched_parity() {
   const bool dump_decode_trace =
       std::getenv("NEMOTRON_PROMPT_MATCHED_DUMP_DECODE_TRACE") != nullptr;
   const auto token_limit = parse_env_uint("NEMOTRON_PROMPT_MATCHED_TOKEN_LIMIT");
+  const auto graph_bytes_override = parse_env_uint("NEMOTRON_PROMPT_MATCHED_GRAPH_BYTES");
   const auto capture_layers_override = parse_env_uint_list("NEMOTRON_PROMPT_MATCHED_CAPTURE_LAYERS");
   const auto stop_layer_override = parse_env_uint("NEMOTRON_PROMPT_MATCHED_STOP_LAYER");
   const char* dump_root_env = std::getenv("NEMOTRON_PROMPT_MATCHED_DUMP_ROOT");
   const char* compare_fixture_env =
       std::getenv("NEMOTRON_PROMPT_MATCHED_COMPARE_PREFILL_FIXTURE_ROOT");
+  const char* model_cache_env = std::getenv("NEMOTRON_PROMPT_MATCHED_MODEL_CACHE_PATH");
+  const bool write_model_cache =
+      std::getenv("NEMOTRON_PROMPT_MATCHED_WRITE_MODEL_CACHE") != nullptr;
   const char* manifest_env = std::getenv("NEMOTRON_FORWARD_MANIFEST");
   if (manifest_env == nullptr || std::string(manifest_env).empty()) {
     std::cout << "prompt_matched_parity_test: SKIP (NEMOTRON_FORWARD_MANIFEST is unset)\n";
@@ -632,14 +639,35 @@ bool run_prompt_matched_parity() {
 
   const std::size_t total_context_tokens = active_prompt_token_ids.size() + oracle->generated_token_ids.size();
   const auto environment =
-      nemotron::RuntimeEnvironment::BuildFromManifestFile(manifest_path, make_options(total_context_tokens));
+      nemotron::RuntimeEnvironment::BuildFromManifestFile(
+          manifest_path,
+          make_options(total_context_tokens, graph_bytes_override));
   if (!expect(static_cast<bool>(environment), "runtime environment should build for prompt-matched parity")) {
     return false;
   }
 
   nemotron::SingleTokenForwardConfig config = nemotron::KnownNemotron3Super120BA12BConfig();
   config.max_tokens = total_context_tokens;
-  auto model = nemotron::SingleTokenForwardModel::Create(*environment, config);
+  std::unique_ptr<nemotron::SingleTokenForwardModel> model;
+  if (model_cache_env != nullptr && std::string(model_cache_env).size() != 0) {
+    const std::filesystem::path model_cache_path(model_cache_env);
+    if (write_model_cache || !std::filesystem::exists(model_cache_path)) {
+      nemotron::ModelCacheWriteReport cache_report;
+      if (!expect(
+              nemotron::WriteDeterministicModelCache(
+                  *environment,
+                  config,
+                  model_cache_path,
+                  &cache_report),
+              "prompt-matched parity model cache should write successfully") ||
+          !expect(cache_report.entry_count > 0, "prompt-matched parity model cache should contain entries")) {
+        return false;
+      }
+    }
+    model = nemotron::SingleTokenForwardModel::CreateFromCache(*environment, config, model_cache_path);
+  } else {
+    model = nemotron::SingleTokenForwardModel::Create(*environment, config);
+  }
   if (!expect(model != nullptr && model->valid(), "forward model should build for prompt-matched parity")) {
     return false;
   }

@@ -121,6 +121,53 @@ bool MambaChunkedScanPrefillBf16(
     MambaChunkScanWorkspace* workspace,
     cudaStream_t stream = nullptr);
 
+bool MambaChunkCumsumBf16(
+    const DeviceTensorBf16& projected,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t chunk_size,
+    const DeviceTensorFp32& a_log,
+    const DeviceTensorFp32& dt_bias,
+    DeviceTensorFp32* dt_chunk,
+    DeviceTensorFp32* dA_cumsum,
+    cudaStream_t stream = nullptr);
+
+bool MambaChunkScanOnlyBf16(
+    const DeviceTensorBf16& conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    std::size_t chunk_size,
+    const DeviceTensorFp32& d,
+    const DeviceTensorFp32& dt_chunk,
+    const DeviceTensorFp32& dA_cumsum,
+    const DeviceTensorFp32& boundary_state,
+    const DeviceTensorFp32& cb_chunk,
+    DeviceTensorBf16* y_output,
+    cudaStream_t stream = nullptr);
+
+bool MambaChunkedScanFromStage1Bf16(
+    const DeviceTensorBf16& conv_output,
+    std::size_t intermediate_size,
+    std::size_t conv_dim,
+    std::size_t num_heads,
+    std::size_t head_dim,
+    std::size_t state_size,
+    std::size_t n_groups,
+    std::size_t chunk_size,
+    std::size_t ssm_state_offset_elems,
+    const DeviceTensorFp32& d,
+    const DeviceTensorFp32& dt_chunk,
+    const DeviceTensorFp32& dA_cumsum,
+    DeviceTensorFp32* ssm_state,
+    DeviceTensorBf16* y_output,
+    MambaChunkScanWorkspace* workspace,
+    cudaStream_t stream = nullptr);
+
 bool MambaSelectiveStateUpdateDecodeFp32(
     const DeviceTensorFp32& projected,
     const DeviceTensorFp32& conv_output,

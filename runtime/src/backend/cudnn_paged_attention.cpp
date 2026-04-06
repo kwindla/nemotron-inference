@@ -302,7 +302,14 @@ std::unique_ptr<CudnnPagedAttentionPlan> CudnnPagedAttentionPlan::Create(
                           .set_attn_scale(config.attn_scale);
 
   if (config.causal) {
-    sdpa_options.set_diagonal_alignment(fe::DiagonalAlignment_t::TOP_LEFT)
+    // Single-token decode needs the causal band aligned to the newest KV position,
+    // not the start of the cache. With q_len < kv_len, top-left alignment masks
+    // almost the entire prefix and produces the wrong decode attention output.
+    const fe::DiagonalAlignment_t diagonal_alignment =
+        config.max_query_tokens < config.max_kv_tokens
+            ? fe::DiagonalAlignment_t::BOTTOM_RIGHT
+            : fe::DiagonalAlignment_t::TOP_LEFT;
+    sdpa_options.set_diagonal_alignment(diagonal_alignment)
         .set_diagonal_band_right_bound(0);
   }
 

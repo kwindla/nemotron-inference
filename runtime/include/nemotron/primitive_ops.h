@@ -32,4 +32,11 @@ bool RmsNormBf16(
     DeviceTensorBf16* output,
     cudaStream_t stream = nullptr);
 
+bool RmsNormFp32ToBf16(
+    const DeviceTensorFp32& input,
+    const DeviceTensorFp32& weight,
+    float epsilon,
+    DeviceTensorBf16* output,
+    cudaStream_t stream = nullptr);
+
 }  // namespace nemotron

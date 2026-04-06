@@ -57,6 +57,15 @@ Current vLLM parity baseline note:
 - that pinned image is the active parity oracle today; it is not automatically the latest upstream `vllm` `main`
 - if you want parity against current upstream `main`, update the image pin intentionally and regenerate the vLLM trace artifacts before treating comparisons as authoritative
 
+Current Nemotron parity status:
+
+- manifest-backed [prompt_matched_parity_test.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/testing/api/prompt_matched_parity_test.cpp) is now green against the pinned vLLM oracle on the direct `Create(...)` path
+- `CreateFromCache(...)` is not yet qualified for that same Nemotron parity path
+- the current cache-backed qualification attempt fails during model construction:
+  - first at the `SingleTokenForwardModel::CreateFromCache(...)` memory-budget guard on DGX Spark UMA
+  - and, with that guard bypassed, in cache-backed NVFP4 view construction under [model_cache.cpp](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/runtime/src/api/model_cache.cpp)
+- treat cache-backed Nemotron forward execution as in progress until that path is fixed and revalidated
+
 If `/usr/local/cuda/compat` or `/usr/local/cuda-13.2/compat` exists, `ctest` now prepends it automatically for the runtime test binaries. The benchmark wrapper scripts below do the same. Direct binary launches still need an equivalent `LD_LIBRARY_PATH` if the compat stack is required.
 
 Run the first GB10 dense microbenchmark harness:

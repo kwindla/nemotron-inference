@@ -55,6 +55,18 @@ __device__ float NormalizeFixedTensorScaleDevice(float value) {
   return value;
 }
 
+__device__ __forceinline__ float ReciprocalApproximateFtz(float value) {
+  float out;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(out) : "f"(value));
+  return out;
+}
+
+__device__ __forceinline__ float DecodeFp8E4M3(std::uint8_t bits) {
+  __nv_fp8_e4m3 value;
+  reinterpret_cast<std::uint8_t&>(value) = bits;
+  return static_cast<float>(value);
+}
+
 __device__ float LoadSourceValue(const float* source, std::size_t index) {
   return source[index];
 }
@@ -142,10 +154,16 @@ __global__ void PackRowMajorToNvfp4Kernel(
   block_scales[block_index] = static_cast<std::uint8_t>(
       __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
 
-  const float scale = tensor_scale * block_scale;
+  const float block_scale_rounded = DecodeFp8E4M3(block_scales[block_index]);
+  const float input_global_scale = ReciprocalApproximateFtz(tensor_scale);
+  const float output_scale =
+      block_scale_rounded != 0.0f
+          ? ReciprocalApproximateFtz(
+                block_scale_rounded * ReciprocalApproximateFtz(input_global_scale))
+          : 0.0f;
   for (std::size_t i = 0; i < kBlockWidth; i += 2) {
-    const float lhs = LoadSourceValue(source, input_offset + i) / scale;
-    const float rhs = LoadSourceValue(source, input_offset + i + 1) / scale;
+    const float lhs = LoadSourceValue(source, input_offset + i) * output_scale;
+    const float rhs = LoadSourceValue(source, input_offset + i + 1) * output_scale;
     const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
                                      __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
                                  0x0fu;
@@ -266,10 +284,16 @@ __global__ void FusedPackSingleRowToNvfp4Kernel(
         __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
     block_scales[block_index] = block_scale_fp8;
 
-    const float scale = tensor_scale * block_scale;
+    const float block_scale_rounded = DecodeFp8E4M3(block_scale_fp8);
+    const float input_global_scale = ReciprocalApproximateFtz(tensor_scale);
+    const float output_scale =
+        block_scale_rounded != 0.0f
+            ? ReciprocalApproximateFtz(
+                  block_scale_rounded * ReciprocalApproximateFtz(input_global_scale))
+            : 0.0f;
     for (std::size_t i = 0; i < kBlockWidth; i += 2) {
-      const float lhs = LoadSourceValue(source, input_offset + i) / scale;
-      const float rhs = LoadSourceValue(source, input_offset + i + 1) / scale;
+      const float lhs = LoadSourceValue(source, input_offset + i) * output_scale;
+      const float rhs = LoadSourceValue(source, input_offset + i + 1) * output_scale;
       const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
                                        __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
                                    0x0fu;
@@ -342,10 +366,16 @@ __global__ void PackLatentPerSelectedExpertToNvfp4Kernel(
         __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
     row_block_scales[block_index] = block_scale_fp8;
 
-    const float scale = tensor_scale * block_scale;
+    const float block_scale_rounded = DecodeFp8E4M3(block_scale_fp8);
+    const float input_global_scale = ReciprocalApproximateFtz(tensor_scale);
+    const float output_scale =
+        block_scale_rounded != 0.0f
+            ? ReciprocalApproximateFtz(
+                  block_scale_rounded * ReciprocalApproximateFtz(input_global_scale))
+            : 0.0f;
     for (std::size_t i = 0; i < kBlockWidth; i += 2) {
-      const float lhs = LoadSourceValue(source_row, input_offset + i) / scale;
-      const float rhs = LoadSourceValue(source_row, input_offset + i + 1) / scale;
+      const float lhs = LoadSourceValue(source_row, input_offset + i) * output_scale;
+      const float rhs = LoadSourceValue(source_row, input_offset + i + 1) * output_scale;
       const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
                                        __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
                                    0x0fu;
