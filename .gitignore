@@ -2,7 +2,11 @@ build/
 build_cutlass/
 plugins/
 artifacts/
+Testing/
 testing/oracle/**/*.bin
+testing/oracle/expert_layer3_prefix_input_block_cuda_v2/
+testing/oracle/full_model_single_token_short_chat_cuda_v4/
+testing/oracle/prefix_prefill_short_chat_layer7_t4_oracle_v2/
 claude-todo.md
 **/__pycache__/
 *.pyc
