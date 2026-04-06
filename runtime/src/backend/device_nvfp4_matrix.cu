@@ -154,6 +154,7 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4Kernel(
     const float* source,
     std::size_t rows,
     std::size_t cols,
+    std::size_t padded_rows,
     std::size_t padded_blocks_per_row,
     Nvfp4ScaleLayout scale_layout,
     const float* tensor_scale_data,
@@ -161,14 +162,22 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4Kernel(
     std::uint8_t* block_scales,
     std::uint8_t* matmul_scales) {
   const std::size_t blocks_per_row = cols / kBlockWidth;
-  const std::size_t block_index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
-  const std::size_t total_blocks = rows * blocks_per_row;
-  if (block_index >= total_blocks) {
+  const std::size_t swizzled_index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
+  if (swizzled_index >= total_scale_entries) {
     return;
   }
 
-  const std::size_t row = block_index / blocks_per_row;
-  const std::size_t block = block_index % blocks_per_row;
+  const std::size_t row = swizzled_index / padded_blocks_per_row;
+  const std::size_t block = swizzled_index % padded_blocks_per_row;
+  const std::size_t destination_offset =
+      ExecutionScaleOffset(row, block, padded_blocks_per_row, scale_layout);
+  if (row >= rows || block >= blocks_per_row) {
+    matmul_scales[destination_offset] = 0u;
+    return;
+  }
+
+  const std::size_t block_index = row * blocks_per_row + block;
   const std::size_t input_offset = row * cols + (block * kBlockWidth);
   const std::size_t packed_offset = row * (cols / 2u) + (block * (kBlockWidth / 2u));
   const float tensor_scale = *tensor_scale_data;
@@ -191,8 +200,6 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4Kernel(
       
   block_scales[block_index] = block_scale_fp8;
 
-  const std::size_t destination_offset =
-      ExecutionScaleOffset(row, block, padded_blocks_per_row, scale_layout);
   matmul_scales[destination_offset] = block_scale_fp8;
 
   const float scale = tensor_scale * block_scale;
@@ -334,6 +341,14 @@ const float* DeviceNvfp4Matrix::device_tensor_scale_ptr() const {
   return impl_ ? reinterpret_cast<const float*>(impl_->tensor_scale_data) : nullptr;
 }
 
+const float* DeviceNvfp4Matrix::effective_device_tensor_scale_ptr(
+    const Nvfp4PackOptions& options) const {
+  if (options.fixed_tensor_scale.has_value() && options.fixed_tensor_scale_device != nullptr) {
+    return options.fixed_tensor_scale_device;
+  }
+  return device_tensor_scale_ptr();
+}
+
 const std::uint8_t* DeviceNvfp4Matrix::packed_data() const {
   return impl_ ? impl_->packed_data : nullptr;
 }
@@ -382,14 +397,19 @@ bool DeviceNvfp4Matrix::PackInto(
   }
 
   auto* tensor_scale_data = reinterpret_cast<float*>(impl_->tensor_scale_data);
+  const float* tensor_scale_data_for_pack = tensor_scale_data;
   if (fixed_tensor_scale.has_value()) {
-    const float host_tensor_scale = *fixed_tensor_scale;
-    if (!CheckCuda(cudaMemcpy(
-            tensor_scale_data,
-            &host_tensor_scale,
-            sizeof(host_tensor_scale),
-            cudaMemcpyHostToDevice))) {
-      return false;
+    if (options.fixed_tensor_scale_device != nullptr) {
+      tensor_scale_data_for_pack = options.fixed_tensor_scale_device;
+    } else {
+      const float host_tensor_scale = *fixed_tensor_scale;
+      if (!CheckCuda(cudaMemcpy(
+              tensor_scale_data,
+              &host_tensor_scale,
+              sizeof(host_tensor_scale),
+              cudaMemcpyHostToDevice))) {
+        return false;
+      }
     }
   } else {
     auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
@@ -418,23 +438,17 @@ bool DeviceNvfp4Matrix::PackInto(
   }
 
   constexpr std::size_t kThreadsPerBlock = 128;
-  const std::size_t total_blocks = rows * (cols / kBlockWidth);
-  const std::size_t grid_size = (total_blocks + kThreadsPerBlock - 1u) / kThreadsPerBlock;
-  
-  if (!CheckCuda(cudaMemset(
-          impl_->matmul_block_scales_data,
-          0,
-          impl_->matmul_block_scales_nbytes))) {
-    return false;
-  }
+  const std::size_t total_scale_entries = layout->padded_rows * layout->padded_blocks_per_row;
+  const std::size_t grid_size = (total_scale_entries + kThreadsPerBlock - 1u) / kThreadsPerBlock;
 
   PackAndSwizzleRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
       source.data(),
       rows,
       cols,
+      layout->padded_rows,
       layout->padded_blocks_per_row,
       scale_layout,
-      tensor_scale_data,
+      tensor_scale_data_for_pack,
       impl_->packed_data,
       impl_->block_scales_data,
       impl_->matmul_block_scales_data);

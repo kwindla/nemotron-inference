@@ -812,7 +812,9 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options) {
+    const Nvfp4PackOptions& pack_options,
+    std::optional<float> activation_tensor_scale_host,
+    std::optional<float> weight_tensor_scale_host) {
   if (!weights.valid()) {
     return std::nullopt;
   }
@@ -827,11 +829,21 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
   if (packed == nullptr || !packed->PackInto(activations, pack_options)) {
     return std::nullopt;
   }
+  if (activation_tensor_scale_host.has_value() && weight_tensor_scale_host.has_value()) {
+    return RunNvfp4RowMajorFp32AccumToDevice(
+        handle,
+        plan,
+        MakeNvfp4PackedMatrixDeviceView(*packed, rows),
+        *activation_tensor_scale_host,
+        weights,
+        *weight_tensor_scale_host,
+        output);
+  }
   const auto stats = RunNvfp4RowMajorFp32AccumToDevice(
       handle,
       plan,
       MakeNvfp4PackedMatrixDeviceView(*packed, rows),
-      packed->device_tensor_scale_ptr(),
+      packed->effective_device_tensor_scale_ptr(pack_options),
       weights,
       weights.tensor_scale_data,
       output);
@@ -847,14 +859,17 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options) {
+    const Nvfp4PackOptions& pack_options,
+    std::optional<float> activation_tensor_scale_host) {
   return RunNvfp4RowMajorFp32SourceToDevice(
       handle,
       plan,
       activations,
       MakeNvfp4PackedMatrixDeviceView(weights),
       output,
-      pack_options);
+      pack_options,
+      activation_tensor_scale_host,
+      activation_tensor_scale_host.has_value() ? std::make_optional(weights.host_tensor_scale()) : std::nullopt);
 }
 
 }  // namespace nemotron

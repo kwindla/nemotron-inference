@@ -24,6 +24,7 @@ namespace nemotron {
 struct UploadedLinearOp::Impl {
   GemmDescriptor descriptor;
   std::optional<float> fixed_activation_tensor_scale;
+  std::unique_ptr<DeviceTensorFp32> fixed_activation_tensor_scale_device;
   std::unique_ptr<DeviceDenseWeightFp32> dense_weight_fp32;
   std::unique_ptr<DeviceDenseWeightBf16> dense_weight_bf16;
   std::unique_ptr<DeviceNvfp4Weight> nvfp4_weight;
@@ -112,7 +113,8 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(
     bool debug,
     const GemmDescriptor& descriptor,
     std::size_t rows,
-    std::optional<float> fixed_activation_tensor_scale = std::nullopt) {
+    std::optional<float> fixed_activation_tensor_scale = std::nullopt,
+    const float* fixed_activation_tensor_scale_device = nullptr) {
   Nvfp4PackOptions options;
   // The row-major cuBLASLt NVFP4 fastpath is numerically stable with the
   // 128x4 activation scale-factor layout, but the 8x4 variant still diverges
@@ -121,6 +123,7 @@ Nvfp4PackOptions RuntimeNvfp4PackOptions(
   // use the validated 128x4 layout until the 8x4 execute contract is fixed.
   options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
   options.fixed_tensor_scale = fixed_activation_tensor_scale;
+  options.fixed_tensor_scale_device = fixed_activation_tensor_scale_device;
   if (debug) {
     std::cerr << "linear_op: NVFP4 activation pack options for "
               << descriptor.tensor_name
@@ -341,6 +344,20 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(
       }
       break;
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
+      if (impl->fixed_activation_tensor_scale.has_value()) {
+        impl->fixed_activation_tensor_scale_device = DeviceTensorFp32::Create({1});
+        if (!impl->fixed_activation_tensor_scale_device ||
+            !impl->fixed_activation_tensor_scale_device->valid() ||
+            !impl->fixed_activation_tensor_scale_device->CopyFromHost(
+                &*impl->fixed_activation_tensor_scale,
+                1)) {
+          if (debug) {
+            std::cerr << "linear_op_create: fixed activation tensor-scale upload failed for "
+                      << descriptor.tensor_name << "\n";
+          }
+          return nullptr;
+        }
+      }
       impl->nvfp4_weight = DeviceNvfp4Weight::Upload(descriptor);
       if (!impl->nvfp4_weight || !impl->nvfp4_weight->valid()) {
         if (debug) {
@@ -365,7 +382,10 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(
                   debug,
                   descriptor,
                   1,
-                  impl->fixed_activation_tensor_scale)
+                  impl->fixed_activation_tensor_scale,
+                  impl->fixed_activation_tensor_scale_device != nullptr
+                      ? impl->fixed_activation_tensor_scale_device->data()
+                      : nullptr)
                   .execution_scale_layout));
       if (!impl->activation_pack || !impl->activation_pack->valid()) {
         if (debug) {
@@ -397,6 +417,9 @@ bool UploadedLinearOp::valid() const {
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       return impl_->nvfp4_weight &&
              impl_->nvfp4_weight->valid() &&
+             (!impl_->fixed_activation_tensor_scale.has_value() ||
+              (impl_->fixed_activation_tensor_scale_device &&
+               impl_->fixed_activation_tensor_scale_device->valid())) &&
              impl_->activation_pack &&
              impl_->activation_pack->valid();
   }
@@ -506,7 +529,10 @@ bool UploadedLinearOp::Run(
                 debug,
                 impl_->descriptor,
                 rows,
-                impl_->fixed_activation_tensor_scale);
+                impl_->fixed_activation_tensor_scale,
+                impl_->fixed_activation_tensor_scale_device != nullptr
+                    ? impl_->fixed_activation_tensor_scale_device->data()
+                    : nullptr);
         const std::optional<Nvfp4ScaleLayout> activation_scale_layout =
             pack_options.execution_scale_layout;
         const char* plan_source = "runtime";
@@ -544,15 +570,25 @@ bool UploadedLinearOp::Run(
                 impl_->activation_pack != nullptr &&
                 impl_->activation_pack->valid() &&
                 impl_->activation_pack->PackInto(activations, pack_options) &&
-                RunNvfp4RowMajorFp32AccumToDevice(
-                    handle,
-                    *plan,
-                    MakeNvfp4PackedMatrixDeviceView(*impl_->activation_pack),
-                    impl_->activation_pack->device_tensor_scale_ptr(),
-                    weight_view,
-                    weight_view.tensor_scale_data,
-                    output)
-                    .has_value();
+                (impl_->fixed_activation_tensor_scale.has_value()
+                     ? RunNvfp4RowMajorFp32AccumToDevice(
+                           handle,
+                           *plan,
+                           MakeNvfp4PackedMatrixDeviceView(*impl_->activation_pack),
+                           *impl_->fixed_activation_tensor_scale,
+                           weight_view,
+                           impl_->nvfp4_weight->host_tensor_scale(),
+                           output)
+                           .has_value()
+                     : RunNvfp4RowMajorFp32AccumToDevice(
+                           handle,
+                           *plan,
+                           MakeNvfp4PackedMatrixDeviceView(*impl_->activation_pack),
+                           impl_->activation_pack->effective_device_tensor_scale_ptr(pack_options),
+                           weight_view,
+                           weight_view.tensor_scale_data,
+                           output)
+                           .has_value());
           } else {
             execute_ok = RunNvfp4RowMajorFp32SourceToDevice(
                              handle,
@@ -560,7 +596,8 @@ bool UploadedLinearOp::Run(
                              activations,
                              *impl_->nvfp4_weight,
                              output,
-                             pack_options)
+                             pack_options,
+                             impl_->fixed_activation_tensor_scale)
                              .has_value();
           }
         }

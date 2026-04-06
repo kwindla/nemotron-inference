@@ -34,6 +34,7 @@ class DeviceNvfp4Matrix {
   std::size_t tensor_scale_nbytes() const;
   float host_tensor_scale() const;
   const float* device_tensor_scale_ptr() const;
+  const float* effective_device_tensor_scale_ptr(const Nvfp4PackOptions& options) const;
   const std::uint8_t* packed_data() const;
   const std::uint8_t* block_scales_data() const;
   const std::uint8_t* matmul_block_scales_data() const;

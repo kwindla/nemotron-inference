@@ -13,10 +13,12 @@ This plan supersedes the earlier routed-MoE optimization plan in
 - fresh TTFT profiling was captured for short, medium, and long prefill/tail
   regimes
 
-This plan starts from the current, correct `SM120` baseline on commit
-`e2196e5`. The optimization job now is to reduce TTFT without reintroducing
-fallbacks, backend ladders, env-gated alternate paths, or size-based split
-dispatch.
+This plan now tracks the current, correct `SM120` baseline on commit
+`cf0e4a1`. The original frozen reference point remains the saved April 5
+artifacts, but implementation work should use the latest committed TTFT and
+correctness state on this branch. The optimization job remains the same:
+reduce TTFT without reintroducing fallbacks, backend ladders, env-gated
+alternate paths, or size-based split dispatch.
 
 This plan is intentionally written as the implementation source of truth. It
 should be possible to execute the work from this file alone without having to
@@ -108,6 +110,27 @@ Use vLLM and TRT-LLM for:
 Do **not** mirror their internal "multiple backend" runtime structure in this
 repo.
 
+### 4. Every hot path is judged on stalls, transfers, and launch count
+
+For every material optimization step, evaluate the hot path against all three
+of these criteria, not just GPU math time:
+
+- avoid host-visible pipeline stalls
+- avoid HtoD and DtoH transfers in the runtime hot path
+- fuse operations or otherwise reduce kernel-launch count where practical
+
+Treat these as implementation rules:
+
+- any hot-path `cudaMemcpy` / `cudaMemcpyAsync` must be either removed or
+  explicitly justified by the API contract
+- any explicit `cudaStreamSynchronize` / `cudaDeviceSynchronize` must be either
+  removed or explicitly justified by the API contract
+- any long serial kernel chain must be treated as suspicious until we explain
+  why the boundaries must remain
+
+Correctness and the single-path rule still dominate. Do not satisfy these
+criteria by adding alternate runtime implementations.
+
 ## Current Baseline
 
 Reference artifacts:
@@ -136,6 +159,24 @@ cross-product below:
 | `cold_prefill_prefix4` | `59.707 ms` |
 | `cold_prefill_prefix128` | `233.231 ms` |
 | `cold_prefill_prefix4096` | `1340.429 ms` |
+
+### Current committed working baseline on `cf0e4a1`
+
+Focused post-optimization reruns on the current branch:
+
+| Case | Median |
+|------|--------|
+| `cold_prefill_prefix4` | `44.586 ms` |
+| `cold_prefill_prefix128` | `159.985 ms` |
+| `cold_prefill_prefix4096` | `1210.456 ms` |
+
+Representative cached committed-head hot-prefix reruns:
+
+| Case | Hot TTFT |
+|------|----------|
+| `prefix4_tail4` | `38.762 ms` |
+| `prefix128_tail4` | `44.582 ms` |
+| `prefix4096_tail4` | `88.562 ms` |
 
 ### Hot-prefix TTFT medians
 
@@ -247,6 +288,85 @@ External alignment note:
 Those systems are useful references for support matrices and kernel contracts,
 but our main branch must not copy their multi-backend runtime structure.
 
+## Cross-Cutting Audit Targets
+
+This section translates the stall/transfer/fusion rules into concrete hot-path
+targets in the current tree.
+
+### 1. NVFP4 pack/scaling
+
+Current concerns inside `runtime/src/backend/device_nvfp4_matrix.cu`:
+
+- fixed-scale packing still performs a hot-path HtoD tensor-scale copy
+- dynamic packing still runs a serial chain of reduction, tensor-scale write,
+  scale-buffer clear, pack, and later tensor-scale multiply before GEMM
+- the pack path is still optimized primarily around the current cuBLASLt NVFP4
+  contract, not around minimum launches
+
+Immediate questions:
+
+- can fixed tensor scales remain device-resident end-to-end
+- can the tensor-scale multiply path be removed or folded when host/device
+  scale ownership is already known
+- can `matmul_block_scales` zeroing be removed or folded into a kernel that
+  already walks the same rows/blocks
+- can the pack/scaling launch chain be shortened without creating a second
+  projection path
+
+### 2. MoE prefill control flow
+
+Current concerns inside `runtime/src/backend/fused_moe_prefill.cu`:
+
+- per-run DtoH copy of `expert_offsets`
+- host-side loop over active experts
+- per-expert plan construction and serial launch structure
+
+This is not acceptable as the long-term shape of the hot path, even if the
+math kernels remain the same. The goal is to reduce stalls and transfers
+without restoring split-dispatch or any alternate MoE backend.
+
+### 3. MoE launch chain around GEMMs
+
+Current concerns inside `runtime/src/backend/fused_moe_prefill.cu` and
+`runtime/src/backend/expert_layer.cpp`:
+
+- routed path is still `gather -> pack -> GEMM -> activation -> pack -> GEMM -> scatter`
+- shared path is still `pack -> GEMM -> activation -> pack -> GEMM -> residual add`
+- decode follows the same general shape
+
+Some boundaries may be required, but every one of them should now be assumed
+expensive until proven otherwise.
+
+### 4. Token selection and logits ownership
+
+Current concerns inside `runtime/src/api/single_token_forward_model.cpp`:
+
+- prompt logits are still copied to host for argmax
+- decode-step logits are still copied to host for argmax
+- top-level "ready on return" syncs are still part of the API contract
+
+These are not just small glue costs. They are part of the TTFT contract and
+should be reviewed explicitly as part of the optimization series.
+
+### 5. Mamba boundary costs
+
+Current concerns inside `runtime/src/backend/mamba_layer.cpp`:
+
+- fused norm and scan are surrounded by explicit dtype / projection boundaries
+- Mamba remains one of the largest long-prefill costs
+- supporting setup and launch structure still need to be separated from SSD
+  kernel cost in profiling
+
+### 6. Attention metadata and bridge costs
+
+Current concerns inside `runtime/src/backend/attention_layer.cpp`:
+
+- request metadata is still uploaded from host each run
+- the BF16 bridge path still contains casts plus a sync
+
+Even if these costs are smaller than MoE or Mamba today, they still belong to
+the same stall/transfer/fusion audit framework.
+
 ## Optimization Order
 
 The profile gives a clear order. Work should proceed in this sequence.
@@ -266,7 +386,7 @@ operation first.
   Key artifacts:
   `artifacts/profiles/ttft_prefill_20260405/`
 
-- [ ] **1. Re-audit the operation contracts and lock the next replacement boundary**
+- [x] **1. Re-audit the operation contracts and lock the next replacement boundary**
   Before more kernel work, do one explicit audit of the active operation
   surfaces and record the exact replacement boundary for each one:
   - attention
@@ -293,7 +413,12 @@ operation first.
   - an explicit yes/no decision on whether the current projection GEMM stack is
     the permanent implementation boundary
 
-  Do not start another partial GEMM rewrite until that answer is explicit.
+  Status:
+
+  - completed in `STEP1_OPERATION_BOUNDARY_AUDIT.md`
+
+  Do not start another partial GEMM rewrite unless that record is intentionally
+  superseded in writing.
 
 - [ ] **2. Optimize expert prefill for `128`-class TTFT without adding a second MoE path**
   The target here is `cold_prefill_prefix128` and the `tail4` / `tail128`
@@ -311,6 +436,17 @@ operation first.
      hot-path copies, then remove the hot-path portion
   3. only then decide whether the remaining expert-path bottleneck is GEMM,
      dispatch/finalize, or synchronization
+
+  Inside Step 2, use this implementation order unless new profiling evidence
+  clearly overturns it:
+
+  1. remove hot-path fixed-scale copies and other pack/scaling transfers that do
+     not need to exist at runtime
+  2. shorten the NVFP4 pack/scaling launch chain where the current contract
+     already provides enough information to do so
+  3. remove the DtoH `expert_offsets` dependency and host-driven expert loop in
+     fused prefill
+  4. only after that revisit deeper fusion inside routed/shared expert compute
 
   Required diagnostics before changing kernels:
 
@@ -358,6 +494,8 @@ operation first.
     conv/norm/state-update setup around it
   - use the `8192` trace as a scaling reference to distinguish linear work from
     pathologically growing work
+  - account explicitly for remaining casts, syncs, and metadata/setup work
+    rather than attributing all time to SSD prefill automatically
 
   Keep one implementation path for Mamba. Do not introduce a special
   "long-prefill-only" Mamba backend.
@@ -380,6 +518,8 @@ operation first.
     avoidable serialization between launches
   - verify whether any cache-restore or tail-shape bookkeeping is causing extra
     work inside the attention layer
+  - account explicitly for metadata HtoD uploads and the remaining BF16 bridge
+    path when judging whether the layer is "done"
 
   Keep the current native attention path as the only production path. Use
   vLLM / TRT-LLM only as algorithm references, not as runtime templates with
@@ -392,6 +532,7 @@ operation first.
   - rerun correctness
   - rerun the `4` / `128` / `4096` TTFT buckets
   - rerun the representative trace / `nsys` capture if the hotspot moved
+  - rerun the stall/transfer/fusion audit for the code that changed
 
   Any change that removes code must be tested immediately before the next
   cleanup step begins.

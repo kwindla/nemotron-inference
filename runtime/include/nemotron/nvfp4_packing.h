@@ -11,6 +11,7 @@ namespace nemotron {
 
 struct Nvfp4PackOptions {
   std::optional<float> fixed_tensor_scale;
+  const float* fixed_tensor_scale_device = nullptr;
   std::optional<Nvfp4ScaleLayout> execution_scale_layout;
 };
 

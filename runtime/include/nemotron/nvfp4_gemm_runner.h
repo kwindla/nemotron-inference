@@ -77,7 +77,9 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const Nvfp4PackedMatrixDeviceView& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options = {});
+    const Nvfp4PackOptions& pack_options = {},
+    std::optional<float> activation_tensor_scale_host = std::nullopt,
+    std::optional<float> weight_tensor_scale_host = std::nullopt);
 
 std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     CublasLtHandle& handle,
@@ -85,6 +87,7 @@ std::optional<Nvfp4RowMajorDeviceStats> RunNvfp4RowMajorFp32SourceToDevice(
     const DeviceTensorFp32& activations,
     const DeviceNvfp4Weight& weights,
     DeviceTensorFp32* output,
-    const Nvfp4PackOptions& pack_options = {});
+    const Nvfp4PackOptions& pack_options = {},
+    std::optional<float> activation_tensor_scale_host = std::nullopt);
 
 }  // namespace nemotron
