@@ -11,9 +11,9 @@ namespace nemotron {
 namespace {
 
 constexpr int kGroupedTokenTile = 8;
-constexpr int kPlannedOutputTile = 8;
+constexpr int kPlannedOutputTile = 32;
 constexpr int kPlannedPairsPerStep = 32;
-constexpr int kPlannedThreadsPerBlock = kPlannedOutputTile * 32;
+constexpr int kPlannedThreadsPerBlock = kGroupedTokenTile * kPlannedOutputTile;
 
 static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
 
@@ -215,23 +215,23 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
     std::size_t output_rows_per_expert,
     float* output) {
   __shared__ float input_tile[kGroupedTokenTile][kPlannedPairsPerStep * 2];
+  __shared__ float weight_tile[kPlannedOutputTile][kPlannedPairsPerStep * 2];
 
   const int cta_index = static_cast<int>(blockIdx.y);
-  const int warp_index = static_cast<int>(threadIdx.x) / 32;
-  const int lane = static_cast<int>(threadIdx.x) & 31;
   const int exact_cta_count = cta_count[0];
   if (cta_index >= exact_cta_count) {
     return;
   }
 
-  const int output_row_tile = static_cast<int>(blockIdx.x);
-  const int output_row = output_row_tile * kPlannedOutputTile + warp_index;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int token_index = tid / kPlannedOutputTile;
+  const int output_lane = tid % kPlannedOutputTile;
+  const int output_row_base = static_cast<int>(blockIdx.x) * kPlannedOutputTile;
   const int expert_index = cta_expert_ids[cta_index];
   const int row_start = cta_row_starts[cta_index];
   const int valid_rows = cta_valid_rows[cta_index];
   if (expert_index < 0 ||
-      warp_index >= kPlannedOutputTile ||
-      static_cast<std::size_t>(output_row) >= output_rows_per_expert ||
+      static_cast<std::size_t>(output_row_base) >= output_rows_per_expert ||
       valid_rows <= 0) {
     return;
   }
@@ -240,10 +240,13 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
       MakeDeviceWeightView(weights[expert_index]);
   const std::size_t pairs_per_row = weight.input_cols / 2;
   const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
-  const std::size_t packed_row_offset = static_cast<std::size_t>(output_row) * pairs_per_row;
-  const std::size_t scale_row_offset = static_cast<std::size_t>(output_row) * blocks_per_row;
+  const int output_rows_this_tile = static_cast<int>(
+      (output_rows_per_expert - static_cast<std::size_t>(output_row_base)) <
+              static_cast<std::size_t>(kPlannedOutputTile)
+          ? (output_rows_per_expert - static_cast<std::size_t>(output_row_base))
+          : static_cast<std::size_t>(kPlannedOutputTile));
   const float tensor_scale = *weight.tensor_scale_data;
-  float accum[kGroupedTokenTile] = {0.0f};
+  float accum = 0.0f;
 
   for (std::size_t pair_base = 0; pair_base < pairs_per_row;
        pair_base += static_cast<std::size_t>(kPlannedPairsPerStep)) {
@@ -268,39 +271,42 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
       input_tile[token_index][within_token] =
           input[input_row * weight.input_cols + col];
     }
-    __syncthreads();
-
-    const std::size_t pair_index = pair_base + static_cast<std::size_t>(lane);
-    if (lane < pairs_this_step) {
+    const int packed_values_this_step = output_rows_this_tile * pairs_this_step;
+    for (int linear_index = tid;
+         linear_index < packed_values_this_step;
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_index / pairs_this_step;
+      const int pair_offset = linear_index % pairs_this_step;
+      const int output_row = output_row_base + tile_output_row;
+      const std::size_t pair_index = pair_base + static_cast<std::size_t>(pair_offset);
       const std::size_t block = pair_index / 8u;
+      const std::size_t packed_row_offset =
+          static_cast<std::size_t>(output_row) * pairs_per_row;
+      const std::size_t scale_row_offset =
+          static_cast<std::size_t>(output_row) * blocks_per_row;
       const float block_scale =
           fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
           tensor_scale;
       const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
-      const float w0 = fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
-      const float w1 = fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
-      for (int token_index = 0; token_index < valid_rows; ++token_index) {
-        const int value_index = lane * 2;
-        accum[token_index] += input_tile[token_index][value_index] * w0;
-        accum[token_index] += input_tile[token_index][value_index + 1] * w1;
+      weight_tile[tile_output_row][pair_offset * 2] =
+          fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
+      weight_tile[tile_output_row][pair_offset * 2 + 1] =
+          fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
+    }
+    __syncthreads();
+
+    if (token_index < valid_rows && output_lane < output_rows_this_tile) {
+      for (int value_index = 0; value_index < (pairs_this_step * 2); ++value_index) {
+        accum += input_tile[token_index][value_index] * weight_tile[output_lane][value_index];
       }
     }
     __syncthreads();
   }
 
-  for (int token_index = 0; token_index < valid_rows; ++token_index) {
-    for (int stride = 16; stride > 0; stride >>= 1) {
-      accum[token_index] += __shfl_down_sync(0xffffffffu, accum[token_index], stride);
-    }
-  }
-
-  if (lane == 0) {
-    for (int token_index = 0; token_index < valid_rows; ++token_index) {
-      const std::size_t input_row =
-          static_cast<std::size_t>(row_start + token_index);
-      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row)] =
-          accum[token_index];
-    }
+  if (token_index < valid_rows && output_lane < output_rows_this_tile) {
+    const std::size_t input_row = static_cast<std::size_t>(row_start + token_index);
+    const std::size_t output_row = static_cast<std::size_t>(output_row_base + output_lane);
+    output[input_row * output_rows_per_expert + output_row] = accum;
   }
 }
 

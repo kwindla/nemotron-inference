@@ -2093,7 +2093,10 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
     fused_prefill_routing =
         DeviceExpertRouting::Create(config.n_routed_experts, max_selection_count);
     fused_prefill_launch_plan =
-        DeviceMoeLaunchPlan::Create(config.n_routed_experts, max_selection_count);
+        DeviceMoeLaunchPlan::Create(
+            config.n_routed_experts,
+            max_selection_count,
+            config.hidden_size);
     fused_prefill_routed_output_scratch =
         DeviceTensorFp32::Create({config.max_token_count, config.hidden_size});
     fused_prefill_gather_scratch =

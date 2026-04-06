@@ -95,8 +95,12 @@ std::optional<std::size_t> DeviceExpertRoutingBytes(
 
 std::optional<std::size_t> DeviceMoeLaunchPlanBytes(
     std::size_t n_experts,
-    std::size_t selection_count) {
-  return DeviceMoeLaunchPlan::Bytes(n_experts, selection_count);
+    std::size_t selection_count,
+    std::size_t max_output_rows_per_expert) {
+  return DeviceMoeLaunchPlan::Bytes(
+      n_experts,
+      selection_count,
+      max_output_rows_per_expert);
 }
 
 std::optional<std::size_t> PaddedSelectionCapacity(
@@ -216,7 +220,10 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(token_capacity, config.top_k, sizeof(int))) &&
                  add_bytes(MatrixBytes(token_capacity, config.top_k, sizeof(float))) &&
                  add_bytes(DeviceExpertRoutingBytes(config.num_experts, *selection_capacity)) &&
-                 add_bytes(DeviceMoeLaunchPlanBytes(config.num_experts, *selection_capacity)) &&
+                 add_bytes(DeviceMoeLaunchPlanBytes(
+                     config.num_experts,
+                     *selection_capacity,
+                     config.hidden_size)) &&
                  add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
                  add_bytes(
                      MatrixBytes(*padded_selection_capacity, config.hidden_size, sizeof(float))) &&
@@ -271,7 +278,10 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   workspace->fused_prefill_routing =
       DeviceExpertRouting::Create(config.num_experts, selection_capacity);
   workspace->fused_prefill_launch_plan =
-      DeviceMoeLaunchPlan::Create(config.num_experts, selection_capacity);
+      DeviceMoeLaunchPlan::Create(
+          config.num_experts,
+          selection_capacity,
+          config.hidden_size);
   workspace->fused_prefill_routed_output_scratch =
       DeviceTensorFp32::Create({token_capacity, config.hidden_size});
   workspace->fused_prefill_gather_scratch =

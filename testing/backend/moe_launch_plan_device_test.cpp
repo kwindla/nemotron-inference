@@ -12,6 +12,7 @@
 namespace {
 
 using nemotron::BuildDeviceMoeLaunchPlan;
+using nemotron::BuildDeviceMoeExactTaskMap;
 using nemotron::DeviceExpertRouting;
 using nemotron::DeviceMoeLaunchPlan;
 
@@ -264,6 +265,135 @@ bool RunLaunchPlanCase(
              "sorted_to_permuted_indices");
 }
 
+bool RunExactTaskMapCase() {
+  const std::vector<int> selected_indices = {
+      3, 1,
+      3, 1,
+      3, 4,
+      4, 1,
+  };
+  const std::vector<float> selected_weights(selected_indices.size(), 1.0f);
+  constexpr std::size_t kExperts = 5;
+  constexpr std::size_t kTokenCount = 4;
+  constexpr std::size_t kTopK = 2;
+  constexpr std::size_t kOutputRows = 18;
+  const std::size_t selection_count = kTokenCount * kTopK;
+
+  auto selected_indices_device = DeviceBuffer<int>::Create(selection_count);
+  auto selected_weights_device = DeviceBuffer<float>::Create(selection_count);
+  auto routing = DeviceExpertRouting::Create(kExperts, selection_count);
+  auto launch_plan = DeviceMoeLaunchPlan::Create(kExperts, selection_count, kOutputRows);
+  if (!Expect(
+          selected_indices_device != nullptr &&
+              selected_weights_device != nullptr &&
+              routing != nullptr &&
+              routing->valid() &&
+              launch_plan != nullptr &&
+              launch_plan->valid(),
+          "exact-task device allocations should succeed") ||
+      !Expect(
+          selected_indices_device->CopyFromHost(selected_indices),
+          "selected indices upload should succeed") ||
+      !Expect(
+          selected_weights_device->CopyFromHost(selected_weights),
+          "selected weights upload should succeed") ||
+      !Expect(
+          nemotron::RunDeviceExpertRouting(
+              selected_indices_device->data(),
+              selected_weights_device->data(),
+              kTokenCount,
+              kTopK,
+              routing.get()),
+          "RunDeviceExpertRouting should succeed") ||
+      !Expect(
+          BuildDeviceMoeLaunchPlan(*routing, selection_count, launch_plan.get()),
+          "BuildDeviceMoeLaunchPlan should succeed") ||
+      !Expect(
+          BuildDeviceMoeExactTaskMap(kOutputRows, launch_plan.get()),
+          "BuildDeviceMoeExactTaskMap should succeed") ||
+      !Expect(
+          cudaDeviceSynchronize() == cudaSuccess,
+          "exact task-map kernels should synchronize")) {
+    return false;
+  }
+
+  std::vector<int> task_count;
+  std::vector<int> task_expert_ids;
+  std::vector<int> task_row_starts;
+  std::vector<int> task_valid_rows;
+  std::vector<int> task_output_row_bases;
+  if (!Expect(
+          CopyDeviceValues(launch_plan->task_count(), 1, &task_count),
+          "task_count should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->task_expert_ids(),
+              launch_plan->task_capacity(),
+              &task_expert_ids),
+          "task_expert_ids should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->task_row_starts(),
+              launch_plan->task_capacity(),
+              &task_row_starts),
+          "task_row_starts should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->task_valid_rows(),
+              launch_plan->task_capacity(),
+              &task_valid_rows),
+          "task_valid_rows should download") ||
+      !Expect(
+          CopyDeviceValues(
+              launch_plan->task_output_row_bases(),
+              launch_plan->task_capacity(),
+              &task_output_row_bases),
+          "task_output_row_bases should download")) {
+    return false;
+  }
+
+  const std::vector<int> expected_task_expert_ids = {
+      1, 1, 1,
+      3, 3, 3,
+      4, 4, 4,
+  };
+  const std::vector<int> expected_task_row_starts = {
+      0, 0, 0,
+      3, 3, 3,
+      6, 6, 6,
+  };
+  const std::vector<int> expected_task_valid_rows = {
+      3, 3, 3,
+      3, 3, 3,
+      2, 2, 2,
+  };
+  const std::vector<int> expected_task_output_row_bases = {
+      0, 8, 16,
+      0, 8, 16,
+      0, 8, 16,
+  };
+  return Expect(
+             task_count.size() == 1 &&
+                 task_count[0] == static_cast<int>(expected_task_expert_ids.size()),
+             "task_count should match expected") &&
+         ExpectVectorPrefix(
+             task_expert_ids,
+             expected_task_expert_ids,
+             "task_expert_ids") &&
+         ExpectVectorPrefix(
+             task_row_starts,
+             expected_task_row_starts,
+             "task_row_starts") &&
+         ExpectVectorPrefix(
+             task_valid_rows,
+             expected_task_valid_rows,
+             "task_valid_rows") &&
+         ExpectVectorPrefix(
+             task_output_row_bases,
+             expected_task_output_row_bases,
+             "task_output_row_bases");
+}
+
 bool RunLaunchPlanValidationCase() {
   return Expect(
              DeviceMoeLaunchPlan::Create(0, 8) == nullptr,
@@ -336,6 +466,7 @@ int main() {
   };
 
   if (!RunLaunchPlanValidationCase() ||
+      !RunExactTaskMapCase() ||
       !RunLaunchPlanCase(
           5,
           4,

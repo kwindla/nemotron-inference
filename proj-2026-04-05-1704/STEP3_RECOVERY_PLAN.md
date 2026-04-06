@@ -2349,3 +2349,222 @@ Practical conclusion:
   tile
 - that still keeps the runtime device-only and statically allocated, but gives
   the math kernel the exact grouped-task list it needs
+
+## Active Micro-Plan
+
+Current state, cleaned up:
+
+- routed-up math is now much better than the regression state, but still
+  dominated by a custom row kernel
+- wider `8`-row CTAs are the right direction
+- the active runtime path still leaves performance on the table because its
+  launch plan stops at routed-row tiles instead of continuing to exact routed
+  tasks
+- behavioral reuse is the correctness gate; bitwise identity is not required
+
+Immediate micro-plan:
+
+1. Extend `DeviceMoeLaunchPlan` so it can store an exact routed task map, not
+   just routed-row tiles.
+2. Build that exact task map on device after the existing routed-row plan is
+   built, using statically preallocated buffers sized at workspace creation.
+3. Add a benchmark-only exact-task consumer that takes the device-built task
+   map instead of the current host-built exact ragged metadata.
+4. Compare that benchmark-only exact-task consumer against:
+   - retained active runtime-like launch-plan tile8
+   - host-built exact ragged tile8
+5. If the device-built exact-task consumer wins materially, promote it into the
+   runtime routed-up path first.
+6. After routed-up wins in runtime TTFT, apply the same exact-task contract to
+   routed-down.
+7. Only after routed-up and routed-down consume the richer exact-task contract
+   should we spend more time on shared-expert math-core changes.
+
+TRT-LLM comparison, line by line:
+
+1. TRT routing computes `numCtaPerExpert`, `ctaOffsetPerExpert`, and
+   `numNonExitingCtas`.
+   Our next step: compute exact routed task count on device from the existing
+   routed-row plan and store it in the launch plan.
+
+2. TRT routing writes `ctaIdxXyToBatchIdx`.
+   Our next step: write one device task record per real
+   `(expert, row_tile, output_row_tile)` block. The first version can encode
+   this as `task_cta_index + task_output_row_base`.
+
+3. TRT routing writes `ctaIdxXyToMnLimit`.
+   Our next step: keep `cta_valid_rows` / `cta_m_limits` on the routed-row plan
+   and let each exact task reference that row-tile metadata.
+
+4. TRT grouped Gemm1 / Gemm2 consume exact routing metadata directly.
+   Our next step: make the benchmark and then the runtime routed kernels consume
+   the exact task map directly instead of deriving work from an upper-bound
+   launch shape.
+
+5. TRT keeps everything device-side and statically provisioned for the chosen
+   workspace.
+   Our next step: do the same. No hot-path DtoH, no per-call allocation, and no
+   alternate runtime path.
+
+Intentional divergence to watch carefully:
+
+- TRT-LLM has a mature grouped-GEMM launch/runtime stack that can consume exact
+  CTA metadata directly.
+- We do not have that stack yet.
+- So the first local end-state is not “fully port TRT-LLM”; it is “make our
+  runtime consume an exact device-built routed task map, with a kernel that
+  benefits from it materially.”
+- That work is not throwaway because the exact task map is the same contract a
+  stronger grouped-GEMM-style kernel will eventually want.
+
+### Exact-task checkpoint
+
+Status:
+
+- landed a device-built exact task map in `DeviceMoeLaunchPlan`
+- first version stored `(task_cta_index, task_output_row_base)`
+- second version flattened that to direct task records:
+  `task_expert_id`, `task_row_start`, `task_valid_rows`,
+  `task_output_row_base`
+- both variants passed focused correctness tests
+
+Focused routed-up microbench result:
+
+- `prefix128`
+  - `ragged_row_coop_tile8`: `1.530 ms`
+  - `launch_plan_upper_bound`: `2.528 ms`
+  - `launch_plan_exact_task_tile8`: `2.537 ms`
+- `prefix4096`
+  - `ragged_row_coop_tile8`: `35.666 ms`
+  - `launch_plan_upper_bound`: `81.360 ms`
+  - `launch_plan_exact_task_tile8`: `82.324 ms`
+
+Conclusion:
+
+- flattening the exact task record removed an extra metadata indirection, but it
+  did not materially move the routed-up kernel
+- the remaining gap is therefore not mainly `task -> cta` pointer chasing
+- comparing against TRT-LLM makes the deeper mismatch clear: our current exact
+  task map is still the task map for a row kernel, not the CTA map for grouped
+  GEMM tiles
+
+TRT-LLM-aligned interpretation:
+
+- TRT routing writes `ctaIdxXyToBatchIdx`, `ctaIdxXyToMnLimit`,
+  `numNonExitingCtas`, and padded-token metadata for grouped GEMM runners
+- TRT does not externalize output-row tiles as a separate task list the way our
+  current `task_output_row_base` path does
+- TRT grouped GEMM kernels consume CTA metadata where the CTA is already a GEMM
+  work tile; output/N tiling is internal to the math kernel
+- our current launch-plan exact-task path still uses CTA = `(expert row tile,
+  output row tile)` for a scalar row-coop kernel, so even “exact task” remains
+  the wrong work unit
+
+Updated immediate next step:
+
+1. Stop using host-ragged row-kernel speed as the architectural target.
+2. Keep the exact launch-plan foundation; it is still useful.
+3. Build the next routed-up microbench around TRT-like grouped work units:
+   CTA metadata should identify routed batch/expert work and token limits, while
+   the kernel computes a larger `M x N` tile internally.
+4. Remove `task_output_row_base` from the design center once the grouped-tile
+   microbench exists, because that field is a symptom of the row-kernel model,
+   not the TRT grouped-GEMM model.
+
+### First grouped-tile attempt
+
+Implemented:
+
+- a benchmark-only `launch_plan_grouped_tile32` routed-up kernel
+- scheduler shape:
+  - `grid.y = cta_count` from the routed launch plan
+  - `grid.x = ceil_div(intermediate_size, 32)`
+  - each CTA consumes the existing routed-row launch-plan metadata directly
+
+Focused routed-up microbench result:
+
+- `prefix128`
+  - `launch_plan_upper_bound`: `2.528 ms`
+  - `launch_plan_grouped_tile32`: `2.774 ms`
+- `prefix4096`
+  - `launch_plan_upper_bound`: `81.537 ms`
+  - `launch_plan_grouped_tile32`: `89.809 ms`
+
+Interpretation against TRT-LLM:
+
+- this was the right scheduler direction, but still the wrong math core
+- the current `tile32` kernel is still a row kernel internally:
+  each warp loops over multiple output rows and accumulates them serially
+- TRT grouped GEMM kernels do not serialize output rows that way; warps
+  cooperate on a GEMM tile and the `N` dimension is internal to the MMA/tile
+  algorithm, not a per-warp serial loop
+- so this result should not push us back to row-task variants; it tells us the
+  next attempt must change the intra-CTA work decomposition, not just the CTA
+  scheduler
+
+Updated next implementation step:
+
+1. keep the current launch-plan scheduler as the control-plane baseline
+2. prototype a benchmark-only routed-up kernel where warps cooperate on an
+   `M x N` tile instead of one warp owning one output row stream
+3. only compare new variants against TRT-like grouped scheduling principles:
+   direct CTA metadata, internal `N` tiling, and larger work units per CTA
+
+### Cooperative `M8 x N32` checkpoint
+
+Implemented:
+
+- benchmark-only cooperative routed-up kernel with:
+  - CTA scheduler from the current launch plan
+  - `M = 8` routed rows per CTA
+  - `N = 32` output rows per CTA
+  - shared-memory staging for both the input tile and the decoded weight tile
+  - one thread per output element inside the `8 x 32` tile
+- promoted that cooperative kernel into the active runtime
+  `LaunchPlannedMatVec()` path
+
+Focused routed-up microbench after runtime promotion:
+
+- `prefix128`
+  - retained row-style launch-planned runtime path had been about `2.528 ms`
+  - active `launch_plan_upper_bound`: `2.409 ms`
+  - `launch_plan_cooperative_m8n32`: `2.408 ms`
+- `prefix4096`
+  - retained row-style launch-planned runtime path had been about `81.537 ms`
+  - active `launch_plan_upper_bound`: `71.207 ms`
+  - `launch_plan_cooperative_m8n32`: `71.213 ms`
+- `launch_plan_microtile2_m8n32` regressed badly and is not a candidate:
+  - `prefix128`: `4.191 ms`
+  - `prefix4096`: `137.772 ms`
+
+Focused TTFT after runtime promotion:
+
+- command:
+  - `env NEMOTRON_FORWARD_MANIFEST=artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json ./build-sm120-relwithdebinfo/benchmarks/nano_prefix_cache_ttft/nano_prefix_cache_ttft_bench --prefix-length 128 --tail-token-count 4 --warmup 0 --iterations 5`
+- results:
+  - `cold_prefill_prefix128`: `184.083 ms`
+  - `cached_committed_head_prefix128_tail4` hot-prefix TTFT: `32.423 ms`
+  - `cached_global_root_prefix128_tail4` hot-prefix TTFT: `32.323 ms`
+
+Interpretation:
+
+- this is the first post-regression runtime change that clearly moves the
+  active launch-planned path toward TRT-style grouped execution and improves the
+  design-center cold prefill case materially
+- relative to the previously retained active runtime checkpoint
+  (`cold_prefill_prefix128 ~= 190.134 ms`, hot-prefix `~= 30.547 ms`),
+  the cooperative kernel improved cold prefill by about `3.2%` while regressing
+  hot-prefix TTFT by about `6%`
+- that trade is acceptable for now because cold prefill is the primary recovery
+  target
+- the remaining gap to the fast ragged benchmark confirms that the next step is
+  still the math core, not more scheduler bookkeeping
+
+Next TRT-aligned step:
+
+1. keep the cooperative `M8 x N32` kernel as the active runtime baseline
+2. remove dead-end row-task assumptions from the launch-plan design center
+3. prototype the next grouped routed-up math core around a true thread
+   micro-fragment / GEMM tile decomposition, not around serial row groups
+4. only after routed-up advances again should routed-down be migrated to the
+   same math family
