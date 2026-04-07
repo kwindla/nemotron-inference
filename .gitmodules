@@ -1,3 +1,3 @@
-[submodule "third_party/cudnn-frontend"]
-	path = third_party/cudnn-frontend
+[submodule "platforms/super-spark/third_party/cudnn-frontend"]
+	path = platforms/super-spark/third_party/cudnn-frontend
 	url = https://github.com/NVIDIA/cudnn-frontend.git

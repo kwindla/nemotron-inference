@@ -1,0 +1,206 @@
+{
+  "fixture_kind": "mamba_target_chat_trace_v2",
+  "generator": "dump_mamba_target_trace_fixture.py",
+  "profile_path": "/workspace/nemotron-runtime/platforms/super-spark/testing/oracle/mamba_target_chat_profile.json",
+  "layer_index": 0,
+  "batch_size": 1,
+  "hidden_size": 4096,
+  "num_heads": 128,
+  "head_dim": 64,
+  "state_size": 128,
+  "n_groups": 8,
+  "shared_system_root_tokens": 8192,
+  "committed_head_tokens": 49152,
+  "actual_shared_system_root_tokens": 1436,
+  "actual_committed_head_tokens": 2820,
+  "seed_prefix_replay_steps": 128,
+  "trace_step_count": 1566,
+  "trace_phases": [
+    {
+      "name": "user_turn_1_tail_prefill",
+      "kind": "user_tail",
+      "length": 323,
+      "start_step": 0,
+      "end_step": 323,
+      "source_repeat": 8,
+      "prefix_overlap_tokens": 2820,
+      "replaced_generation_prompt_tokens": 0,
+      "preview_tokens": [
+        "<|im_start|>",
+        "user",
+        "\n",
+        "Current",
+        " turn",
+        " request",
+        " ",
+        "1",
+        ":",
+        " refine",
+        " the",
+        " C"
+      ]
+    },
+    {
+      "name": "assistant_turn_1_decode",
+      "kind": "assistant_decode",
+      "length": 304,
+      "start_step": 323,
+      "end_step": 627,
+      "source_repeat": 7,
+      "prefix_overlap_tokens": 3142,
+      "replaced_generation_prompt_tokens": 1,
+      "preview_tokens": [
+        "</think>",
+        "Assistant",
+        " draft",
+        " ",
+        "1",
+        ":",
+        " the",
+        " runtime",
+        " should",
+        " keep",
+        " FP",
+        "3"
+      ]
+    },
+    {
+      "name": "user_turn_2_tail_prefill",
+      "kind": "user_tail",
+      "length": 277,
+      "start_step": 627,
+      "end_step": 904,
+      "source_repeat": 7,
+      "prefix_overlap_tokens": 3446,
+      "replaced_generation_prompt_tokens": 0,
+      "preview_tokens": [
+        "<|im_start|>",
+        "user",
+        "\n",
+        "Follow",
+        "-up",
+        " request",
+        " ",
+        "1",
+        ":",
+        " expand",
+        " the",
+        " benchmark"
+      ]
+    },
+    {
+      "name": "assistant_turn_2_decode",
+      "kind": "assistant_decode",
+      "length": 261,
+      "start_step": 904,
+      "end_step": 1165,
+      "source_repeat": 6,
+      "prefix_overlap_tokens": 3722,
+      "replaced_generation_prompt_tokens": 1,
+      "preview_tokens": [
+        "</think>",
+        "Assistant",
+        " reply",
+        " ",
+        "1",
+        ":",
+        " the",
+        " benchmark",
+        " already",
+        " shows",
+        " that",
+        " plain"
+      ]
+    },
+    {
+      "name": "user_turn_3_tail_prefill",
+      "kind": "user_tail",
+      "length": 203,
+      "start_step": 1165,
+      "end_step": 1368,
+      "source_repeat": 6,
+      "prefix_overlap_tokens": 3983,
+      "replaced_generation_prompt_tokens": 0,
+      "preview_tokens": [
+        "<|im_start|>",
+        "user",
+        "\n",
+        "Final",
+        " clarification",
+        " ",
+        "1",
+        ":",
+        " keep",
+        " documentation",
+        " synchronized",
+        " with"
+      ]
+    },
+    {
+      "name": "assistant_turn_3_decode",
+      "kind": "assistant_decode",
+      "length": 198,
+      "start_step": 1368,
+      "end_step": 1566,
+      "source_repeat": 5,
+      "prefix_overlap_tokens": 4185,
+      "replaced_generation_prompt_tokens": 1,
+      "preview_tokens": [
+        "</think>",
+        "Final",
+        " answer",
+        " ",
+        "1",
+        ":",
+        " use",
+        " richer",
+        " oracle",
+        "-derived",
+        " traces",
+        ","
+      ]
+    }
+  ],
+  "source_tensors": {
+    "embeddings": "backbone.embeddings.weight",
+    "layer_norm": "backbone.layers.0.norm.weight",
+    "in_proj": "backbone.layers.0.mixer.in_proj.weight",
+    "conv1d_weight": "backbone.layers.0.mixer.conv1d.weight",
+    "conv1d_bias": "backbone.layers.0.mixer.conv1d.bias",
+    "A_log": "backbone.layers.0.mixer.A_log",
+    "D": "backbone.layers.0.mixer.D",
+    "dt_bias": "backbone.layers.0.mixer.dt_bias"
+  },
+  "messages": {
+    "shared_system_root": [
+      {
+        "role": "system",
+        "content": "Runtime policy section 1: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 2: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 3: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 4: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 5: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 6: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 7: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 8: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 9: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 10: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 11: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 12: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 13: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 14: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 15: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 16: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 17: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 18: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 19: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 20: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 21: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 22: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 23: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 24: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 25: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 26: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 27: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 28: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 29: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 30: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 31: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 32: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 33: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 34: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 35: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration.\nRuntime policy section 36: preserve user intent, summarize constraints before proposing optimizations, do not invent evidence, call out cache invalidation boundaries, and keep multi-turn answers stable under repeated regeneration."
+      }
+    ],
+    "committed_history": [
+      {
+        "role": "user",
+        "content": "Background note 1: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 2: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 3: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 4: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 5: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 6: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 7: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 8: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 9: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread. Background note 10: the serving system reuses a shared system prompt, stores committed conversation heads, and appends each new user turn instead of rewriting the whole thread."
+      },
+      {
+        "role": "assistant",
+        "content": "Committed answer 1: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 2: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 3: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 4: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 5: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 6: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 7: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 8: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 9: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count. Committed answer 10: prefix reuse is only complete when both attention KV and Mamba recurrent state are restored, and admission or eviction decisions must be measured in bytes rather than entry count."
+      },
+      {
+        "role": "user",
+        "content": "Prior request 1: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 2: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 3: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 4: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 5: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 6: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 7: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary. Prior request 8: evaluate decode bottlenecks on GB10, compare FP32 against FP16 plus stochastic rounding, and explain how multi-turn chat changes the useful cache boundary."
+      },
+      {
+        "role": "assistant",
+        "content": "Prior reply 1: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 2: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 3: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 4: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 5: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 6: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 7: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately. Prior reply 8: the realistic target workload is long shared-root chat with append-only turns, so benchmarks should capture committed-head restore, user-tail prefill, and assistant decode separately."
+      }
+    ]
+  },
+  "notes": [
+    "This target-shaped trace now uses real tokenizer output, real embedding vectors, layer-0 RMSNorm, the checkpoint FP8 in_proj, and the real depthwise conv1d weights.",
+    "The initial SSM state is no longer fixed synthetic state; it is seeded by replaying the last committed-prefix steps through the real projected prefix operands.",
+    "The target shared-root and committed-head token counts remain service-profile targets, while actual tokenized counts are recorded separately in metadata.",
+    "trace_tokens.json records the per-step token ids and decoded token pieces so operand hotspots can be mapped back to serializer patterns."
+  ]
+}

@@ -1,78 +1,30 @@
 # Nemotron Runtime
 
-This repo is the active implementation for **Nemotron 3 Super on DGX Spark**.
+From-scratch C++/CUDA inference implementations for Nemotron-3 hybrid Mamba-attention-MoE models, specialized per model and hardware platform.
 
-## Current Status
+Each platform specialization is a self-contained implementation optimized for its specific model variant, hardware target, and performance goals. Specializations do not share runtime code — they are free to diverge on data layouts, kernel contracts, execution paths, and precision policies.
 
-See [docs/RUNBOOK.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/RUNBOOK.md#current-status) for the current status and latest validation results.
+## Platforms
 
-## Start Here
+| Directory | Model | Hardware | SM Arch |
+|---|---|---|---|
+| [platforms/super-spark](platforms/super-spark/) | Nemotron 3 Super NVFP4 | DGX Spark (GB10) | SM 121 |
+
+## Quick Start
 
 ```bash
+# Build a specific platform (default: super-spark)
 cmake -S . -B build
 cmake --build build -j2
-export NEMOTRON_FORWARD_MANIFEST=$PWD/artifacts/manifests/forward_runtime_manifest_unverified.json
-ctest --test-dir build --output-on-failure -R '^full_forward_manifest_smoke_test$'
+
+# Or select explicitly
+cmake -S . -B build -DNEMOTRON_PLATFORM=super-spark
 ```
 
-Then use:
-
-- [docs/RUNBOOK.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/RUNBOOK.md) — start with the `Repo Health Check` section, then correctness tests, profiling, and the interactive forward tool
-- [tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/interactive_forward/INTERACTIVE_FORWARD_DESIGN.md) for helper design details (only if working on the interactive tool)
-
-## Quick Commands
-
-Correctness:
-
-```bash
-ctest --test-dir build --output-on-failure -R '^full_forward_manifest_smoke_test$'
-ctest --test-dir build --output-on-failure -R '^prompt_matched_parity_test$'
-ctest --test-dir build --output-on-failure -R '^cache_backed_dense_regression_test$'
-ctest --test-dir build --output-on-failure -R '^single_token_forward_model_test$'
-ctest --test-dir build --output-on-failure -R '^attention_layer_oracle_test$'
-ctest --test-dir build --output-on-failure -R '^attention_layer_decode_oracle_test$'
-```
-
-Current red diagnostics are still available, but they are not acceptance gates:
-
-```bash
-ctest --test-dir build --output-on-failure -R '^prefill_prefix_oracle_test$'
-ctest --test-dir build --output-on-failure -R '^single_token_decode_oracle_test$'
-```
-
-Profiling:
-
-```bash
-./build/benchmarks/decode_bench/single_token_decode_bench \
-  --manifest ./artifacts/manifests/forward_runtime_manifest_unverified.json \
-  --iterations 1
-
-./benchmarks/decode_bench/run_bench.sh
-```
-
-Interactive forward:
-
-```bash
-cmake --build build --target nemotron_interactive_forward_server -j2
-./tools/interactive_forward/nemotron_interactive_forward.py
-./tools/interactive_forward/nemotron_interactive_forward.py --once "Hello"
-```
-
-## Oracle
-
-The active parity oracle is the pinned image in [tools/oracle/generate_vllm_trace.sh](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/tools/oracle/generate_vllm_trace.sh):
-
-- `nemotron-local/dgx-spark-vllm:0.17.1-b31e9326a-fi065`
-
-This repo is not automatically tracking upstream `vLLM` `main`.
+See each platform's README for platform-specific build instructions, status, and test commands.
 
 ## Repo Layout
 
-- `runtime/`: serving runtime implementation
-- `kernels/`: CUDA kernels
-- `testing/`: tests and oracle fixtures
-- `benchmarks/`: profiling and performance harnesses
-- `tools/`: offline utilities and interactive forward helper
-- `docs/`: current reference docs
-
-Historical project notes under the workspace root `proj-*` directories are not the primary instructions for this repo.
+- `platforms/` — self-contained platform specializations (runtime, tests, benchmarks, docs, tools)
+- `docs/` — cross-cutting research notes
+- `server/` — multi-model serving infrastructure

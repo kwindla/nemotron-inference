@@ -1,0 +1,206 @@
+{
+  "fixture_kind": "mamba_target_chat_trace_v2",
+  "generator": "dump_mamba_target_trace_fixture.py",
+  "profile_path": "/workspace/nemotron-runtime/platforms/super-spark/testing/oracle/mamba_target_chat_profile_structured.json",
+  "layer_index": 0,
+  "batch_size": 1,
+  "hidden_size": 4096,
+  "num_heads": 128,
+  "head_dim": 64,
+  "state_size": 128,
+  "n_groups": 8,
+  "shared_system_root_tokens": 8192,
+  "committed_head_tokens": 49152,
+  "actual_shared_system_root_tokens": 1987,
+  "actual_committed_head_tokens": 3555,
+  "seed_prefix_replay_steps": 128,
+  "trace_step_count": 2012,
+  "trace_phases": [
+    {
+      "name": "user_turn_1_tail_prefill",
+      "kind": "user_tail",
+      "length": 438,
+      "start_step": 0,
+      "end_step": 438,
+      "source_repeat": 7,
+      "prefix_overlap_tokens": 3555,
+      "replaced_generation_prompt_tokens": 0,
+      "preview_tokens": [
+        "<|im_start|>",
+        "user",
+        "\n",
+        "Current",
+        " request",
+        " ",
+        "1",
+        ":",
+        " write",
+        " a",
+        " compact",
+        " status"
+      ]
+    },
+    {
+      "name": "assistant_turn_1_decode",
+      "kind": "assistant_decode",
+      "length": 435,
+      "start_step": 438,
+      "end_step": 873,
+      "source_repeat": 6,
+      "prefix_overlap_tokens": 3992,
+      "replaced_generation_prompt_tokens": 1,
+      "preview_tokens": [
+        "</think>",
+        "Status",
+        " block",
+        " ",
+        "1",
+        ":",
+        " objective",
+        "=",
+        "free",
+        "ze",
+        " the",
+        " cache"
+      ]
+    },
+    {
+      "name": "user_turn_2_tail_prefill",
+      "kind": "user_tail",
+      "length": 299,
+      "start_step": 873,
+      "end_step": 1172,
+      "source_repeat": 6,
+      "prefix_overlap_tokens": 4427,
+      "replaced_generation_prompt_tokens": 0,
+      "preview_tokens": [
+        "<|im_start|>",
+        "user",
+        "\n",
+        "Follow",
+        "-up",
+        " ",
+        "1",
+        ":",
+        " ref",
+        "rame",
+        " the",
+        " same"
+      ]
+    },
+    {
+      "name": "assistant_turn_2_decode",
+      "kind": "assistant_decode",
+      "length": 348,
+      "start_step": 1172,
+      "end_step": 1520,
+      "source_repeat": 5,
+      "prefix_overlap_tokens": 4725,
+      "replaced_generation_prompt_tokens": 1,
+      "preview_tokens": [
+        "</think>",
+        "Check",
+        "list",
+        " item",
+        " ",
+        "1",
+        ":",
+        " ",
+        "1",
+        ".",
+        " keep",
+        " FP"
+      ]
+    },
+    {
+      "name": "user_turn_3_tail_prefill",
+      "kind": "user_tail",
+      "length": 241,
+      "start_step": 1520,
+      "end_step": 1761,
+      "source_repeat": 5,
+      "prefix_overlap_tokens": 5073,
+      "replaced_generation_prompt_tokens": 0,
+      "preview_tokens": [
+        "<|im_start|>",
+        "user",
+        "\n",
+        "Final",
+        " clarification",
+        " ",
+        "1",
+        ":",
+        " summarize",
+        " the",
+        " cache",
+        "-format"
+      ]
+    },
+    {
+      "name": "assistant_turn_3_decode",
+      "kind": "assistant_decode",
+      "length": 251,
+      "start_step": 1761,
+      "end_step": 2012,
+      "source_repeat": 4,
+      "prefix_overlap_tokens": 5313,
+      "replaced_generation_prompt_tokens": 1,
+      "preview_tokens": [
+        "</think>",
+        "Final",
+        " status",
+        " ",
+        "1",
+        ":",
+        " control",
+        "_trace",
+        "=s",
+        "ynthetic",
+        " phase",
+        "_end"
+      ]
+    }
+  ],
+  "source_tensors": {
+    "embeddings": "backbone.embeddings.weight",
+    "layer_norm": "backbone.layers.0.norm.weight",
+    "in_proj": "backbone.layers.0.mixer.in_proj.weight",
+    "conv1d_weight": "backbone.layers.0.mixer.conv1d.weight",
+    "conv1d_bias": "backbone.layers.0.mixer.conv1d.bias",
+    "A_log": "backbone.layers.0.mixer.A_log",
+    "D": "backbone.layers.0.mixer.D",
+    "dt_bias": "backbone.layers.0.mixer.dt_bias"
+  },
+  "messages": {
+    "shared_system_root": [
+      {
+        "role": "system",
+        "content": "SYSTEM POLICY BLOCK 1\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 2\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 3\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 4\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 5\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 6\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 7\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 8\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 9\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 10\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 11\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 12\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 13\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 14\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 15\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 16\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 17\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 18\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 19\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 20\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 21\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 22\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 23\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact\n\nSYSTEM POLICY BLOCK 24\n- preserve cache salt boundaries\n- report phase_end metrics for user_tail and assistant_decode\n- prefer compact sections with explicit numbers\n- when summarizing runtime state, keep the fields cache_mode=committed_head, state_format=fp16_sr_candidate, attention_backend=cudnn_fe, and evidence_source=measured_artifact"
+      }
+    ],
+    "committed_history": [
+      {
+        "role": "user",
+        "content": "Prior request 1: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 2: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 3: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 4: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 5: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 6: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 7: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 8: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput.\nPrior request 9: provide an execution note with the headings Scope, Constraints, Risks, and Next Step, and keep the content tied to measured GB10 artifacts instead of hypothetical throughput."
+      },
+      {
+        "role": "assistant",
+        "content": "Committed note 1: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 2: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 3: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 4: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 5: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 6: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 7: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 8: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format.\n\nCommitted note 9: Scope=prefix reuse and Mamba drift. Constraints=small concurrency, low TTFT, append-only chat. Risks=cache policy drift, optimistic synthetic traces, runtime repacking. Next Step=measure the next profile before freezing the format."
+      },
+      {
+        "role": "user",
+        "content": "Background item 1: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy.\n\nBackground item 2: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy.\n\nBackground item 3: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy.\n\nBackground item 4: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy.\n\nBackground item 5: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy.\n\nBackground item 6: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy.\n\nBackground item 7: compare a narrative answer against a structured answer, keep the same underlying request, and record whether phase-end drift is stable when serialization becomes more list-heavy and punctuation-heavy."
+      },
+      {
+        "role": "assistant",
+        "content": "Committed reply 1: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough.\nCommitted reply 2: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough.\nCommitted reply 3: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough.\nCommitted reply 4: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough.\nCommitted reply 5: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough.\nCommitted reply 6: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough.\nCommitted reply 7: Observations=[service-shaped trace, assistant-phase spikes, bounded SR variance]. Action items=[add oracle profile, compare artifacts, keep FP32 baseline]. Do not replace the synthetic control until the richer trace family is broad enough."
+      }
+    ]
+  },
+  "notes": [
+    "This target-shaped trace now uses real tokenizer output, real embedding vectors, layer-0 RMSNorm, the checkpoint FP8 in_proj, and the real depthwise conv1d weights.",
+    "The initial SSM state is no longer fixed synthetic state; it is seeded by replaying the last committed-prefix steps through the real projected prefix operands.",
+    "The target shared-root and committed-head token counts remain service-profile targets, while actual tokenized counts are recorded separately in metadata.",
+    "trace_tokens.json records the per-step token ids and decoded token pieces so operand hotspots can be mapped back to serializer patterns."
+  ]
+}
