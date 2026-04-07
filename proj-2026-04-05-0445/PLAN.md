@@ -875,6 +875,28 @@ specialized runtime:
     - next rewrite:
       use the now-working `P5` scale-smem bridge as the template for the next
       traced FP4 regimes, starting with `P12` / `P13`
+  - `P13` source-first bridge rollout:
+    - reused the now-working traced `P5` `128x128x64 swap_ab=true`
+      `SFA/SFB` bridge pattern for FC2 `P13`
+    - only `P13` was re-routed to the new exact-scale-smem FP4 kernel; `P12`
+      and `P15` stayed unchanged
+    - validation:
+      - `fused_moe_prefill_test: PASS`
+      - `multi_turn_prefix_reuse_test: PASS`
+      - `compute-sanitizer --tool memcheck ./testing/fused_moe_prefill_test`
+        reports `0 errors`
+    - focused TTFT artifact:
+      [ttft_20260407_p13_exact_scale_smem_prefix4096_tail4.stdout.txt](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/ttft_20260407_p13_exact_scale_smem_prefix4096_tail4.stdout.txt)
+    - focused TTFT:
+      - `cold_prefill_prefix4096 = 1633.296 ms`
+      - `cached_committed_head_prefix4096_tail4 hot-prefix = 95.505 ms`
+      - `cached_global_root_prefix4096_tail4 hot-prefix = 95.450 ms`
+    - conclusion:
+      the traced `P5` scale-smem bridge pattern carries over cleanly to `P13`
+      without needing a separate TRT probe
+    - next target:
+      `P12` exact `128x128x128` FC2 path for the `prefix128 / tail4`
+      design-center regime
 
 #### Full TRT Mainloop Alignment Plan
 
@@ -1550,7 +1572,7 @@ Next definitive probes for `P5`:
 | 0 | Freeze the post-attention baseline and root-cause profile | done | Historical baseline frozen; newer external race targets now live above and in `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md` |
 | 1 | Lock the revised optimization contract | done | One runtime path, device-only execution, behavioral reuse equivalence |
 | 2 | Decide routed-expert input format and packing strategy | done | `FP4xFP4` on tensor cores; quantize activations once per layer; grouped GEMM for all experts |
-| 3 | Grouped `FP4xFP4` tensor core MoE kernel | in progress | Device launch plan, padded row layout, C++20, and the narrow local `TiledCopy` bridge are in place; the traced `P5` routed FP4 path is now active with exact `SmemLayoutSFA/SFB` scale staging, `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` pass, `compute-sanitizer` reports `0 errors`, and focused TTFT improved to `cold_prefill_prefix128 = 107.552 ms`; next exactness/perf target is to carry the same traced scale-smem and copy-view strategy into `P12` / `P13` |
+| 3 | Grouped `FP4xFP4` tensor core MoE kernel | in progress | Device launch plan, padded row layout, C++20, and the narrow local `TiledCopy` bridge are in place; traced `P5` and `P13` routed FP4 paths are now active with exact `SmemLayoutSFA/SFB` scale staging, `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` pass, `compute-sanitizer` reports `0 errors`, focused TTFT improved to `cold_prefill_prefix128 = 107.552 ms` and `cold_prefill_prefix4096 = 1633.296 ms`; next exactness/perf target is `P12` (`128x128x128 swap_ab=true`) for the `prefix128 / tail4` design-center FC2 regime |
 | 4 | Shared-expert alignment | pending | Shared experts still distort short-prefix cold prefill and need the same stronger math family |
 | 5 | Optimize Mamba prefill | pending | Still the second blocker at `prefix4096` after routed MoE |
 | 6 | Re-profile and choose the next default workstream | pending | Final race phase only after routed MoE, shared, and long-prefix Mamba move materially |
