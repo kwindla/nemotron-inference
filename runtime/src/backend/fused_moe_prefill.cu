@@ -31,6 +31,8 @@ constexpr int kPlannedWmmaWarpsPerBlock = 8;
 // warp-specialized CTA shape.
 constexpr int kGroupedThreadsPerBlock = 384;
 constexpr int kGroupedConsumerWarpsPerBlock = 8;
+constexpr int kGroupedProducerWarpsPerBlock =
+    (kGroupedThreadsPerBlock / 32) - kGroupedConsumerWarpsPerBlock;
 constexpr int kRoutedLargeOutputTile = 256;
 constexpr int kRoutedThreadsPerBlock = kGroupedThreadsPerBlock;
 constexpr int kContiguousSmallOutputTile = 32;
@@ -1462,8 +1464,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
   constexpr int kWarpSubTiles =
       kOutputTile / (kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileN);
   static_assert(kWarpSubTiles >= 1);
-  __shared__ __nv_bfloat16 a_tile[kPlannedWmmaTileM][kMacroTileK];
-  __shared__ __nv_bfloat16 b_tile[kOutputTile][kMacroTileK];
+  __shared__ __nv_bfloat16 a_tile[2][kPlannedWmmaTileM][kMacroTileK];
+  __shared__ __nv_bfloat16 b_tile[2][kOutputTile][kMacroTileK];
   __shared__ float c_tile_storage[kPlannedWmmaTileM * kOutputTile];
   auto* c_tile = reinterpret_cast<float (*)[kOutputTile]>(c_tile_storage);
 
@@ -1480,6 +1482,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
   const int tid = static_cast<int>(threadIdx.x);
   const int warp_id = tid / 32;
   const bool mma_warp = warp_id < kGroupedConsumerWarpsPerBlock;
+  const bool producer_warp = warp_id >= kGroupedConsumerWarpsPerBlock;
+  const int producer_tid = tid - (kGroupedConsumerWarpsPerBlock * 32);
   const int expert_index = cta_batch_indices[cta_index];
   const int row_start = cta_row_starts[cta_index];
   const int valid_rows = cta_valid_rows[cta_index];
@@ -1513,19 +1517,23 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
     }
   }
 
-  for (std::size_t k_base = 0; k_base < weight.input_cols;
-       k_base += static_cast<std::size_t>(kMacroTileK)) {
+  auto stage_macro_tile = [&](int buffer_index, std::size_t k_base) {
+    if (!producer_warp) {
+      return;
+    }
+    const int producer_threads = kGroupedProducerWarpsPerBlock * 32;
     const int macro_k = static_cast<int>(
         min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
     const int macro_blocks = macro_k / static_cast<int>(fused_decode::kNvfp4BlockWidth);
     const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
-    for (int linear_block = tid;
+    for (int linear_block = producer_tid;
          linear_block < (kPlannedWmmaTileM * macro_blocks);
-         linear_block += static_cast<int>(blockDim.x)) {
+         linear_block += producer_threads) {
       const int tile_token = linear_block / macro_blocks;
       const int tile_block = linear_block % macro_blocks;
       __nv_bfloat16* dst =
-          &a_tile[tile_token][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+          &a_tile[buffer_index][tile_token]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       if (tile_token < valid_rows) {
         DecodeGroupedPackedInputBlockBf16(
             packed_input,
@@ -1540,30 +1548,44 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
         ZeroBf16Block16(dst);
       }
     }
-    for (int linear_block = tid;
+    for (int linear_block = producer_tid;
          linear_block < (output_rows_this_tile * macro_blocks);
-         linear_block += static_cast<int>(blockDim.x)) {
+         linear_block += producer_threads) {
       const int tile_output_row = linear_block / macro_blocks;
       const int tile_block = linear_block % macro_blocks;
       __nv_bfloat16* dst =
-          &b_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+          &b_tile[buffer_index][tile_output_row]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       DecodeNvfp4WeightBlockBf16(
           weight,
           static_cast<std::size_t>(output_row_base + tile_output_row),
           block_base + static_cast<std::size_t>(tile_block),
           dst);
     }
-    for (int linear_block = tid + output_rows_this_tile * macro_blocks;
+    for (int linear_block = producer_tid + output_rows_this_tile * macro_blocks;
          linear_block < (kOutputTile * macro_blocks);
-         linear_block += static_cast<int>(blockDim.x)) {
+         linear_block += producer_threads) {
       const int tile_output_row = linear_block / macro_blocks;
       const int tile_block = linear_block % macro_blocks;
       __nv_bfloat16* dst =
-          &b_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+          &b_tile[buffer_index][tile_output_row]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       ZeroBf16Block16(dst);
     }
-    __syncthreads();
+  };
 
+  const std::size_t k_step = static_cast<std::size_t>(kMacroTileK);
+  int buffer_index = 0;
+  stage_macro_tile(buffer_index, 0);
+  __syncthreads();
+  for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += k_step) {
+    const int macro_k = static_cast<int>(
+        min(k_step, weight.input_cols - k_base));
+    const int next_buffer = buffer_index ^ 1;
+    const std::size_t next_k_base = k_base + k_step;
+    if (next_k_base < weight.input_cols) {
+      stage_macro_tile(next_buffer, next_k_base);
+    }
     if (mma_warp) {
       wmma::fragment<
           wmma::matrix_a,
@@ -1574,7 +1596,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
           wmma::row_major>
           a_frag;
       for (int tile_k_base = 0; tile_k_base < macro_k; tile_k_base += kPlannedWmmaTileK) {
-        wmma::load_matrix_sync(a_frag, &a_tile[0][tile_k_base], kMacroTileK);
+        wmma::load_matrix_sync(a_frag, &a_tile[buffer_index][0][tile_k_base], kMacroTileK);
         for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
           const int warp_col = warp_id * kPlannedWmmaTileN +
               subtile * kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileN;
@@ -1587,13 +1609,15 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
                 __nv_bfloat16,
                 wmma::col_major>
                 b_frag;
-            wmma::load_matrix_sync(b_frag, &b_tile[warp_col][tile_k_base], kMacroTileK);
+            wmma::load_matrix_sync(
+                b_frag, &b_tile[buffer_index][warp_col][tile_k_base], kMacroTileK);
             wmma::mma_sync(c_frags[subtile], a_frag, b_frag, c_frags[subtile]);
           }
         }
       }
     }
     __syncthreads();
+    buffer_index ^= 1;
   }
 
   if (mma_warp) {
@@ -1649,8 +1673,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
   constexpr int kWarpSubTiles =
       kOutputTile / (kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileN);
   static_assert(kWarpSubTiles >= 1);
-  __shared__ __nv_bfloat16 a_tile[kOutputTile][kMacroTileK];
-  __shared__ __nv_bfloat16 b_tile[kPlannedWmmaTileM][kMacroTileK];
+  __shared__ __nv_bfloat16 a_tile[2][kOutputTile][kMacroTileK];
+  __shared__ __nv_bfloat16 b_tile[2][kPlannedWmmaTileM][kMacroTileK];
   __shared__ float c_tile_storage[kOutputTile * kPlannedWmmaTileM];
   auto* c_tile = reinterpret_cast<float (*)[kPlannedWmmaTileM]>(c_tile_storage);
 
@@ -1667,6 +1691,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
   const int tid = static_cast<int>(threadIdx.x);
   const int warp_id = tid / 32;
   const bool mma_warp = warp_id < kGroupedConsumerWarpsPerBlock;
+  const bool producer_warp = warp_id >= kGroupedConsumerWarpsPerBlock;
+  const int producer_tid = tid - (kGroupedConsumerWarpsPerBlock * 32);
   const int expert_index = cta_batch_indices[cta_index];
   const int row_start = cta_row_starts[cta_index];
   const int valid_rows = cta_valid_rows[cta_index];
@@ -1700,41 +1726,47 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
     }
   }
 
-  for (std::size_t k_base = 0; k_base < weight.input_cols;
-       k_base += static_cast<std::size_t>(kMacroTileK)) {
+  auto stage_macro_tile = [&](int buffer_index, std::size_t k_base) {
+    if (!producer_warp) {
+      return;
+    }
+    const int producer_threads = kGroupedProducerWarpsPerBlock * 32;
     const int macro_k = static_cast<int>(
         min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
     const int macro_blocks = macro_k / static_cast<int>(fused_decode::kNvfp4BlockWidth);
     const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
-    for (int linear_block = tid;
+    for (int linear_block = producer_tid;
          linear_block < (output_rows_this_tile * macro_blocks);
-         linear_block += static_cast<int>(blockDim.x)) {
+         linear_block += producer_threads) {
       const int tile_output_row = linear_block / macro_blocks;
       const int tile_block = linear_block % macro_blocks;
       __nv_bfloat16* dst =
-          &a_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+          &a_tile[buffer_index][tile_output_row]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       DecodeNvfp4WeightBlockBf16(
           weight,
           static_cast<std::size_t>(output_row_base + tile_output_row),
           block_base + static_cast<std::size_t>(tile_block),
           dst);
     }
-    for (int linear_block = tid + output_rows_this_tile * macro_blocks;
+    for (int linear_block = producer_tid + output_rows_this_tile * macro_blocks;
          linear_block < (kOutputTile * macro_blocks);
-         linear_block += static_cast<int>(blockDim.x)) {
+         linear_block += producer_threads) {
       const int tile_output_row = linear_block / macro_blocks;
       const int tile_block = linear_block % macro_blocks;
       __nv_bfloat16* dst =
-          &a_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+          &a_tile[buffer_index][tile_output_row]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       ZeroBf16Block16(dst);
     }
-    for (int linear_block = tid;
+    for (int linear_block = producer_tid;
          linear_block < (kPlannedWmmaTileM * macro_blocks);
-         linear_block += static_cast<int>(blockDim.x)) {
+         linear_block += producer_threads) {
       const int tile_token = linear_block / macro_blocks;
       const int tile_block = linear_block % macro_blocks;
       __nv_bfloat16* dst =
-          &b_tile[tile_token][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+          &b_tile[buffer_index][tile_token]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       if (tile_token < valid_rows) {
         DecodeGroupedPackedInputBlockBf16(
             packed_input,
@@ -1749,8 +1781,20 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
         ZeroBf16Block16(dst);
       }
     }
-    __syncthreads();
+  };
 
+  const std::size_t k_step = static_cast<std::size_t>(kMacroTileK);
+  int buffer_index = 0;
+  stage_macro_tile(buffer_index, 0);
+  __syncthreads();
+  for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += k_step) {
+    const int macro_k = static_cast<int>(
+        min(k_step, weight.input_cols - k_base));
+    const int next_buffer = buffer_index ^ 1;
+    const std::size_t next_k_base = k_base + k_step;
+    if (next_k_base < weight.input_cols) {
+      stage_macro_tile(next_buffer, next_k_base);
+    }
     if (mma_warp) {
       for (int tile_k_base = 0; tile_k_base < macro_k; tile_k_base += kPlannedWmmaTileK) {
         for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
@@ -1773,14 +1817,17 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
                 __nv_bfloat16,
                 wmma::col_major>
                 b_frag;
-            wmma::load_matrix_sync(a_frag, &a_tile[warp_row][tile_k_base], kMacroTileK);
-            wmma::load_matrix_sync(b_frag, &b_tile[0][tile_k_base], kMacroTileK);
+            wmma::load_matrix_sync(
+                a_frag, &a_tile[buffer_index][warp_row][tile_k_base], kMacroTileK);
+            wmma::load_matrix_sync(
+                b_frag, &b_tile[buffer_index][0][tile_k_base], kMacroTileK);
             wmma::mma_sync(c_frags[subtile], a_frag, b_frag, c_frags[subtile]);
           }
         }
       }
     }
     __syncthreads();
+    buffer_index ^= 1;
   }
 
   if (mma_warp) {

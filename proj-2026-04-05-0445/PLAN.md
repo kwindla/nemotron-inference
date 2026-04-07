@@ -852,6 +852,39 @@ Conclusion:
 - the launch plan now serves as the native routed `computeStrides` stage
 - the remaining routed gap is still the grouped hot loop itself
 
+#### Current Routed Status (`2026-04-07`, Warp-Specialized Ping-Pong Mainloop)
+
+The active grouped routed FC1/FC2 kernels now use the extra four staging warps
+as real producers:
+
+- one shared-memory buffer is consumed by the eight WMMA warps
+- the other buffer is filled with the next `K` tile by the producer warps
+- the loop alternates buffers with one CTA barrier per macro tile
+
+This is the first routed hot-loop step that actually overlaps staging with MMA
+inside the native grouped body, rather than only matching TRT's CTA shape and
+helper boundaries.
+
+Focused gate after the ping-pong cutover:
+
+- artifact:
+  `artifacts/benchmarks/ttft_20260407_warp_specialized_pingpong_prefix128_tail4.stdout.txt`
+- result:
+  - `cold_prefill_prefix128 = 125.483 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 54.657 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix = 54.397 ms`
+- focused validation:
+  - `fused_moe_prefill_test`
+  - `moe_launch_plan_device_test`
+  - `multi_turn_prefix_reuse_test`
+
+Conclusion:
+
+- keep the warp-specialized ping-pong mainloop
+- this confirms that native producer/consumer overlap is directionally right
+- the remaining routed gap is now even more specifically the lack of TRT's
+  block-scaled FP4 MMA/TMA transport, not just missing warp specialization
+
 #### How To Unblock This
 
 1. Add one more round of targeted TRT tracing / profiling.

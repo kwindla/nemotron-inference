@@ -421,6 +421,28 @@ Interpretation:
     - the launch plan now serves as the native analogue of TRT's
       `computeStrides...` helper for the active grouped consumers
     - the remaining routed gap is the grouped mainloop body, not row-span setup
+
+- warp-specialized ping-pong grouped mainloop (`2026-04-07`):
+  - active native change:
+    - use the extra four staging warps in the `384`-thread grouped CTA as real
+      producers
+    - double-buffer grouped shared tiles so producer warps fill the next
+      `K` tile while the eight consumer warps run WMMA on the current tile
+  - focused validation:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+  - artifact:
+    - `artifacts/benchmarks/ttft_20260407_warp_specialized_pingpong_prefix128_tail4.stdout.txt`
+  - result:
+    - `cold_prefill_prefix128 = 125.483 ms`
+    - `cached_committed_head_prefix128_tail4 hot-prefix = 54.657 ms`
+    - `cached_global_root_prefix128_tail4 hot-prefix = 54.397 ms`
+  - conclusion:
+    - keep the warp-specialized ping-pong grouped body
+    - this confirms producer/consumer overlap is directionally right
+    - the remaining routed gap is now the lack of TRT's block-scaled FP4
+      MMA/TMA transport, not just missing warp specialization
     - hot-prefix remains flat, so the next bottleneck is the true FP4/TMA
       mainloop rather than CTA size alone
 
