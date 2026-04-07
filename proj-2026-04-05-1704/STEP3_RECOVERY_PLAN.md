@@ -53,13 +53,25 @@ Focused TTFT on the same `prefix128 / tail4` gate after that FC2 step is:
 - `cached_committed_head_prefix128_tail4 hot-prefix = 54.423 ms`
 - `cached_global_root_prefix128_tail4 hot-prefix = 54.766 ms`
 
+The next TRT-style contract jump is now landed:
+
+- the active packed path computes Gemm1/activation output scales directly
+- activated FC1 output is packed straight into the grouped FC2 input contract
+- `routed_up_scratch` is no longer the active FC1->FC2 seam
+- packed focused tests now run with `routed_up_scratch = nullptr`
+
+Focused TTFT on the same gate after removing that FP32 boundary is:
+
+- `cold_prefill_prefix128 = 126.959 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.447 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.684 ms`
+
 Interpretation:
 
-- the FC2 expert-scale contract work is correct
-- by itself it is roughly performance-neutral
-- the remaining gap is now the bigger TRT contract jump: stop materializing
-  FP32 `routed_up_scratch` as the long-lived boundary and instead produce the
-  Gemm1 output / activation scale contract directly for Gemm2
+- the direct Gemm1-output contract is correct and behaviorally stable
+- this step is structurally necessary, but still roughly performance-neutral
+- the remaining gap is now squarely in the grouped math core, not the packed
+  FC1->FC2 boundary
 
 That means the priority is no longer "prove the contract." The priority is:
 

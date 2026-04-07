@@ -168,13 +168,29 @@ Focused TTFT on the same gate with that FC2 expert-scale contract is:
 - `cached_committed_head_prefix128_tail4 hot-prefix = 54.423 ms`
 - `cached_global_root_prefix128_tail4 hot-prefix = 54.766 ms`
 
+The next TRT-style contract step is now landed too:
+
+- the active packed prefill path no longer keeps `routed_up_scratch` as the
+  FC1->FC2 boundary
+- it now computes Gemm1/activation output scales directly from the packed FC1
+  output and packs activated rows straight into the grouped FC2 input matrix
+- `routed_up_scratch` remains only as a fallback-only path, not the active
+  packed contract
+- packed-path focused tests now run with `routed_up_scratch = nullptr`
+
+Focused TTFT on the same gate after removing the FP32 boundary is:
+
+- `cold_prefill_prefix128 = 126.959 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.447 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.684 ms`
+
 Interpretation:
 
-- carrying FC2 expert-scale metadata is necessary contract work
-- by itself, it is roughly performance-neutral on the current gate
-- the next missing TRT piece is to stop routing through FP32 `routed_up_scratch`
-  at all and instead produce the Gemm1 output / activation scale contract
-  directly for Gemm2 consumption
+- the direct Gemm1-output contract is now correct and green
+- this step is structurally important, but it is still roughly
+  performance-neutral on the `prefix128 / tail4` gate
+- the next remaining win has to come from stronger grouped math, not from more
+  boundary cleanups
 
 ## Goal
 

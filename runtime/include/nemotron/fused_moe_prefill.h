@@ -29,10 +29,10 @@ struct FusedMoePrefillParams {
   DeviceExpertRouting* routing = nullptr;
   DeviceMoeLaunchPlan* launch_plan = nullptr;
   float* routed_gather_scratch = nullptr;  // padded_row_capacity x hidden_size
-  float* fc1_expert_activation_scales = nullptr;  // n_routed_experts
+  float* fc1_expert_activation_scales = nullptr;  // n_routed_experts, used as Gemm1/activation output scales.
   DeviceNvfp4Matrix* fc1_grouped_pack = nullptr;  // Optional TRT-like grouped FC1 input contract.
-  float* routed_up_scratch = nullptr;      // padded_row_capacity x routed_expert_intermediate_size
-  float* fc2_expert_activation_scales = nullptr;  // n_routed_experts
+  float* routed_up_scratch = nullptr;      // Optional fallback-only FP32 FC1->FC2 boundary.
+  float* fc2_expert_activation_scales = nullptr;  // Legacy fallback FC2 input scales.
   DeviceNvfp4Matrix* fc2_grouped_pack = nullptr;  // Optional TRT-like grouped FC2 input contract.
   float* shared_up_scratch = nullptr;      // token_count x shared_expert_intermediate_size
   float* output = nullptr;  // Receives routed + shared expert contributions.

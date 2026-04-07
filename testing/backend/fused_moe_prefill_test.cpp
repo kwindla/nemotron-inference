@@ -885,15 +885,16 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
           {padded_selection_count.value_or(0), test_case.hidden_size});
+  auto normalized_pack = DeviceNvfp4Matrix::Create(
+      test_case.token_count,
+      test_case.hidden_size,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto fc1_expert_activation_scales =
       DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
   auto fc1_grouped_pack = DeviceNvfp4Matrix::Create(
       padded_selection_count.value_or(0),
       test_case.hidden_size,
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
-  auto routed_up_scratch = DeviceTensorFp32::Create(
-      {padded_selection_count.value_or(0),
-       test_case.routed_expert_intermediate_size});
   auto fc2_expert_activation_scales =
       DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
   auto fc2_grouped_pack = DeviceNvfp4Matrix::Create(
@@ -902,6 +903,8 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
+  nemotron::Nvfp4PackOptions pack_options;
+  pack_options.execution_scale_layout = nemotron::Nvfp4ScaleLayout::kSwizzled128x4;
   if (!Expect(
           input != nullptr &&
               normalized != nullptr &&
@@ -916,9 +919,9 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               launch_plan->valid() &&
               padded_selection_count.has_value() &&
               routed_gather_scratch != nullptr &&
+              normalized_pack != nullptr &&
               fc1_expert_activation_scales != nullptr &&
               fc1_grouped_pack != nullptr &&
-              routed_up_scratch != nullptr &&
               fc2_expert_activation_scales != nullptr &&
               fc2_grouped_pack != nullptr &&
               shared_up_scratch != nullptr,
@@ -936,7 +939,10 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
           topk_weights->CopyFromHost(
               test_case.topk_weights.data(),
               test_case.topk_weights.size()),
-          "topk weights should upload")) {
+          "topk weights should upload") ||
+      !Expect(
+          normalized_pack->PackInto(*normalized, pack_options),
+          "normalized pack should build")) {
     return false;
   }
 
@@ -957,12 +963,13 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.selected_weights = topk_weights->data();
   params.input = input->data();
   params.normalized = normalized->data();
+  params.normalized_pack = normalized_pack.get();
   params.routing = routing.get();
   params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
   params.fc1_expert_activation_scales = fc1_expert_activation_scales->data();
   params.fc1_grouped_pack = fc1_grouped_pack.get();
-  params.routed_up_scratch = routed_up_scratch->data();
+  params.routed_up_scratch = nullptr;
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.shared_up_scratch = shared_up_scratch->data();
@@ -1111,15 +1118,16 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
           {padded_selection_count.value_or(0), test_case.hidden_size});
+  auto normalized_pack = DeviceNvfp4Matrix::Create(
+      test_case.token_count,
+      test_case.hidden_size,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto fc1_expert_activation_scales =
       DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
   auto fc1_grouped_pack = DeviceNvfp4Matrix::Create(
       padded_selection_count.value_or(0),
       test_case.hidden_size,
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
-  auto routed_up_scratch = DeviceTensorFp32::Create(
-      {padded_selection_count.value_or(0),
-       test_case.routed_expert_intermediate_size});
   auto fc2_expert_activation_scales =
       DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
   auto fc2_grouped_pack = DeviceNvfp4Matrix::Create(
@@ -1128,6 +1136,8 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
+  nemotron::Nvfp4PackOptions pack_options;
+  pack_options.execution_scale_layout = nemotron::Nvfp4ScaleLayout::kSwizzled128x4;
   if (!Expect(
           input != nullptr &&
               normalized != nullptr &&
@@ -1142,9 +1152,9 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               launch_plan->valid() &&
               padded_selection_count.has_value() &&
               routed_gather_scratch != nullptr &&
+              normalized_pack != nullptr &&
               fc1_expert_activation_scales != nullptr &&
               fc1_grouped_pack != nullptr &&
-              routed_up_scratch != nullptr &&
               fc2_expert_activation_scales != nullptr &&
               fc2_grouped_pack != nullptr &&
               shared_up_scratch != nullptr,
@@ -1163,7 +1173,10 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
           topk_weights->CopyFromHost(
               test_case.topk_weights.data(),
               test_case.topk_weights.size()),
-          "Nano deployment-shape topk weights should upload")) {
+          "Nano deployment-shape topk weights should upload") ||
+      !Expect(
+          normalized_pack->PackInto(*normalized, pack_options),
+          "Nano deployment-shape normalized pack should build")) {
     return false;
   }
 
@@ -1184,12 +1197,13 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.selected_weights = topk_weights->data();
   params.input = input->data();
   params.normalized = normalized->data();
+  params.normalized_pack = normalized_pack.get();
   params.routing = routing.get();
   params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
   params.fc1_expert_activation_scales = fc1_expert_activation_scales->data();
   params.fc1_grouped_pack = fc1_grouped_pack.get();
-  params.routed_up_scratch = routed_up_scratch->data();
+  params.routed_up_scratch = nullptr;
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.shared_up_scratch = shared_up_scratch->data();
