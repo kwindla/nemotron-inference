@@ -73,6 +73,31 @@ Interpretation:
 - the remaining gap is now squarely in the grouped math core, not the packed
   FC1->FC2 boundary
 
+The next routed-stage alignment step is now also landed:
+
+- launch-plan aliases now expose the TRT-style grouped metadata names:
+  `permuted_idx_to_token_idx`, `total_num_padded_tokens`,
+  `num_non_exiting_ctas`, `cta_idx_xy_to_batch_idx`,
+  `cta_idx_xy_to_mn_limit`
+- the active routed BF16 path no longer pre-packs FC1 input activations into an
+  NVFP4 matrix
+- the active path now does `BF16 grouped Gemm1 -> gemm1_output_scale -> packed
+  Gemm2 input`, which matches TRT's BF16 x NVFP4 routed entry far better than
+  the previous packed-FC1 experiment
+
+Focused TTFT on the same `prefix128 / tail4` gate after that cutover is:
+
+- `cold_prefill_prefix128 = 126.012 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.447 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.616 ms`
+
+Interpretation:
+
+- this confirms that the packed FC1 input path should not remain active for the
+  BF16 Nemotron Nano route
+- the remaining gap is now even more clearly the grouped FC1/FC2 math core
+  itself, not the routed launch metadata or BF16 FC1 entry contract
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first

@@ -477,21 +477,18 @@ bool BuildReferenceOutputs(
       test_case.token_count * test_case.hidden_size,
       0.0f);
 
-  const auto routed_quantized_inputs =
-      QuantizeDequantizeMatrixRows(test_case.normalized, test_case.token_count, test_case.hidden_size);
-  if (!routed_quantized_inputs.has_value()) {
-    return false;
-  }
-
+  std::vector<std::vector<float>> routed_input_rows(
+      test_case.token_count * test_case.top_k,
+      std::vector<float>{});
   std::vector<std::vector<float>> routed_up_outputs(
       test_case.token_count * test_case.top_k,
       std::vector<float>{});
   std::vector<int> routed_expert_ids(test_case.token_count * test_case.top_k, -1);
 
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
-    std::vector<float> routed_quantized_input(
-        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
-        routed_quantized_inputs->begin() +
+    std::vector<float> routed_input(
+        test_case.normalized.begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
+        test_case.normalized.begin() +
             static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
 
     for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
@@ -501,11 +498,33 @@ bool BuildReferenceOutputs(
         continue;
       }
       routed_expert_ids[selection_index] = expert_index;
+      routed_input_rows[selection_index] = routed_input;
+    }
+  }
+
+  const std::vector<float> fc1_expert_scales = ComputeExpertTensorScalesHost(
+      routed_input_rows,
+      routed_expert_ids,
+      test_case.n_routed_experts);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const std::size_t selection_index = token_index * test_case.top_k + slot;
+      const int expert_index = routed_expert_ids[selection_index];
+      if (expert_index < 0) {
+        continue;
+      }
+      const auto routed_quantized_input = QuantizeDequantizeRowWithFixedTensorScale(
+          routed_input_rows[selection_index],
+          fc1_expert_scales[static_cast<std::size_t>(expert_index)]);
+      if (!routed_quantized_input.has_value()) {
+        return false;
+      }
       routed_up_outputs[selection_index] = RowMajorMatVec(
           routed_up.dequantized[static_cast<std::size_t>(expert_index)],
           test_case.routed_expert_intermediate_size,
           test_case.hidden_size,
-          routed_quantized_input);
+          *routed_quantized_input);
       Relu2InPlace(&routed_up_outputs[selection_index]);
     }
   }
@@ -605,21 +624,18 @@ bool BuildNanoReferenceOutputs(
       test_case.token_count * test_case.hidden_size,
       0.0f);
 
-  const auto routed_quantized_inputs =
-      QuantizeDequantizeMatrixRows(test_case.normalized, test_case.token_count, test_case.hidden_size);
-  if (!routed_quantized_inputs.has_value()) {
-    return false;
-  }
-
+  std::vector<std::vector<float>> routed_input_rows(
+      test_case.token_count * test_case.top_k,
+      std::vector<float>{});
   std::vector<std::vector<float>> routed_up_outputs(
       test_case.token_count * test_case.top_k,
       std::vector<float>{});
   std::vector<int> routed_expert_ids(test_case.token_count * test_case.top_k, -1);
 
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
-    std::vector<float> routed_quantized_input(
-        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
-        routed_quantized_inputs->begin() +
+    std::vector<float> routed_input(
+        test_case.normalized.begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
+        test_case.normalized.begin() +
             static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
     for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
       const std::size_t selection_index = token_index * test_case.top_k + slot;
@@ -628,11 +644,33 @@ bool BuildNanoReferenceOutputs(
         continue;
       }
       routed_expert_ids[selection_index] = expert_index;
+      routed_input_rows[selection_index] = routed_input;
+    }
+  }
+
+  const std::vector<float> fc1_expert_scales = ComputeExpertTensorScalesHost(
+      routed_input_rows,
+      routed_expert_ids,
+      test_case.n_routed_experts);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const std::size_t selection_index = token_index * test_case.top_k + slot;
+      const int expert_index = routed_expert_ids[selection_index];
+      if (expert_index < 0) {
+        continue;
+      }
+      const auto routed_quantized_input = QuantizeDequantizeRowWithFixedTensorScale(
+          routed_input_rows[selection_index],
+          fc1_expert_scales[static_cast<std::size_t>(expert_index)]);
+      if (!routed_quantized_input.has_value()) {
+        return false;
+      }
       routed_up_outputs[selection_index] = RowMajorMatVec(
           routed_up.dequantized,
           test_case.routed_expert_intermediate_size,
           test_case.hidden_size,
-          routed_quantized_input);
+          *routed_quantized_input);
       Relu2InPlace(&routed_up_outputs[selection_index]);
     }
   }
@@ -970,11 +1008,14 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.routing = routing.get();
   params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
-  params.fc1_expert_activation_scales = fc1_expert_activation_scales->data();
-  params.fc1_grouped_pack = fc1_grouped_pack.get();
+  params.fc1_expert_activation_scales = nullptr;
+  params.fc1_grouped_pack = nullptr;
   params.routed_up_scratch = nullptr;
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
+  params.gemm1_output = fc2_grouped_pack.get();
+  params.gemm1_output_scale = fc2_expert_activation_scales->data();
+  params.activation_output_scale = fc2_expert_activation_scales->data();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();
@@ -1207,11 +1248,14 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.routing = routing.get();
   params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
-  params.fc1_expert_activation_scales = fc1_expert_activation_scales->data();
-  params.fc1_grouped_pack = fc1_grouped_pack.get();
+  params.fc1_expert_activation_scales = nullptr;
+  params.fc1_grouped_pack = nullptr;
   params.routed_up_scratch = nullptr;
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
+  params.gemm1_output = fc2_grouped_pack.get();
+  params.gemm1_output_scale = fc2_expert_activation_scales->data();
+  params.activation_output_scale = fc2_expert_activation_scales->data();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();

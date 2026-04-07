@@ -510,6 +510,30 @@ int* DeviceMoeLaunchPlan::sorted_to_permuted_indices() const {
   return impl_ != nullptr ? impl_->sorted_to_permuted_indices : nullptr;
 }
 
+int* DeviceMoeLaunchPlan::num_non_exiting_ctas() const {
+  return cta_count();
+}
+
+int* DeviceMoeLaunchPlan::total_num_padded_tokens() const {
+  return total_padded_rows();
+}
+
+int* DeviceMoeLaunchPlan::cta_idx_xy_to_batch_idx() const {
+  return cta_expert_ids();
+}
+
+int* DeviceMoeLaunchPlan::cta_idx_xy_to_mn_limit() const {
+  return cta_m_limits();
+}
+
+int* DeviceMoeLaunchPlan::permuted_idx_to_token_idx() const {
+  return permuted_token_indices();
+}
+
+int* DeviceMoeLaunchPlan::expanded_idx_to_permuted_idx() const {
+  return sorted_to_permuted_indices();
+}
+
 int* DeviceMoeLaunchPlan::task_count() const {
   return impl_ != nullptr ? impl_->task_count : nullptr;
 }

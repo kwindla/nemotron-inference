@@ -8,9 +8,11 @@
 
 namespace nemotron {
 
-constexpr std::size_t kMoeLaunchPlanTokenTile = 8;
+constexpr std::size_t kMoeLaunchPlanTokenTile = 16;
 constexpr std::size_t kMoeLaunchPlanOutputTile = 8;
-constexpr std::size_t kMoeLaunchPlanExpertRowAlignment = 128;
+// Match TRT-style routed batching: expert segments are padded only to the token tile.
+// The NVFP4 128x4 swizzle is handled inside DeviceNvfp4Matrix's global packed layout.
+constexpr std::size_t kMoeLaunchPlanExpertRowAlignment = kMoeLaunchPlanTokenTile;
 
 class DeviceMoeLaunchPlan {
  public:
@@ -57,6 +59,13 @@ class DeviceMoeLaunchPlan {
   int* cta_m_limits() const;
   int* permuted_token_indices() const;
   int* sorted_to_permuted_indices() const;
+  // TRT-style grouped-GEMM aliases for the active single-GPU routed contract.
+  int* num_non_exiting_ctas() const;
+  int* total_num_padded_tokens() const;
+  int* cta_idx_xy_to_batch_idx() const;
+  int* cta_idx_xy_to_mn_limit() const;
+  int* permuted_idx_to_token_idx() const;
+  int* expanded_idx_to_permuted_idx() const;
   int* task_count() const;
   int* task_expert_ids() const;
   int* task_row_starts() const;

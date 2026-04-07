@@ -121,7 +121,8 @@ Interpretation:
 That next packed-activation contract is now partially landed on the active
 runtime side:
 
-- routed prefill launch-plan rows are expert-major and `128`-row aligned
+- routed prefill launch-plan rows are expert-major and padded to the routed
+  token tile (`16`) rather than separated by standalone `128`-row expert gaps
 - routed reduction now correctly maps `selection_to_sorted` through
   `sorted_to_permuted_indices`, which restored behavioral reuse equivalence
   after the padded-layout switch
@@ -148,12 +149,12 @@ Focused validation is currently green:
 - `fused_moe_prefill_test`
 - `multi_turn_prefix_reuse_test`
 
-Focused TTFT on the design-center `prefix128 / tail4` case after removing the
-dead expert-scale kernels from the packed path is:
+Focused TTFT on the design-center `prefix128 / tail4` case after moving FC1 to
+per-expert input scales is:
 
-- `cold_prefill_prefix128 = 125.663 ms`
-- `cached_committed_head_prefix128_tail4 hot-prefix = 54.480 ms`
-- `cached_global_root_prefix128_tail4 hot-prefix = 54.246 ms`
+- `cold_prefill_prefix128 = 125.352 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.328 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.612 ms`
 
 The next FC2/output-scale step is now also landed in the working tree:
 
@@ -192,6 +193,21 @@ Interpretation:
 - the next remaining win has to come from stronger grouped math, not from more
   boundary cleanups
 
+The FC1 contract then moved one more step toward TRT-LLM:
+
+- the active packed routed FC1/FC2 path now executes from the planned CTA grid
+  instead of the exact-task queue
+- the active planned packed kernels derive token work from `cta_m_limits`
+  with implicit `tileTokensDim` row starts, instead of consuming a separate
+  `row_start + valid_rows` task contract
+- the runtime file no longer carries a second packed routed consumer
+
+Focused TTFT on the same gate after this FC1 alignment work is:
+
+- `cold_prefill_prefix128 = 125.592 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.557 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.158 ms`
+
 ### Next Jump: Match TRT-LLM For The Routed Math Stage
 
 Yes, this is the point where we should jump to the TRT-LLM execution shape for
@@ -223,7 +239,7 @@ What still should not be "one shot":
 The implementation plan for this jump is:
 
 1. Replace the routed FC1 consumer with a true grouped GEMM tile kernel that
-   consumes the current exact CTA metadata directly, rather than one CTA
+   consumes the current planned CTA metadata directly, rather than one CTA
    externalizing output-row tiles.
 2. Match TRT-LLM's handoff exactly at the stage boundary:
    `gemm1_output`, `gemm1_output_scale`, activation, packed FC2 input,
@@ -241,7 +257,7 @@ The acceptance criteria for this jump are:
 - `moe_launch_plan_device_test`
 - `fused_moe_prefill_test`
 - `multi_turn_prefix_reuse_test`
-- `cold_prefill_prefix128` must improve versus the current `126.959 ms`
+- `cold_prefill_prefix128` must improve versus the current `125.592 ms`
 - no regression in behavioral reuse equivalence
 
 The reason this is safe now is that the contract work is no longer the blocker.
@@ -250,23 +266,41 @@ and that gap will not close through more incremental cleanup.
 
 Progress on this jump:
 
-- The active packed FC1/FC2 routed path now executes from an exact task map
-  instead of the old coarse `grid=(output_row_tiles, cta_capacity)` scheduler.
-- The exact task map now takes an explicit output-row tile size so the runtime
-  WMMA consumer and the launch-plan contract agree on `32`-row routed tasks.
+- The active packed FC1/FC2 routed path now executes from the planned CTA grid
+  rather than the old exact-task queue.
+- The launch plan now pads expert batches to `tileTokensDim=16`, which makes
+  `cta_m_limits` sufficient to describe active token rows the TRT way.
+- The active planned packed kernels now consume `cta_expert_ids + cta_m_limits`
+  as their token-batch contract instead of a second task-local
+  `row_start + valid_rows` map.
+- The active routed stage now follows TRT-LLM's BF16 x NVFP4 contract more
+  closely:
+  - launch-plan aliases now expose
+    `permuted_idx_to_token_idx`,
+    `total_num_padded_tokens`,
+    `num_non_exiting_ctas`,
+    `cta_idx_xy_to_batch_idx`, and
+    `cta_idx_xy_to_mn_limit`
+  - routed FC1 no longer pre-packs BF16 activations into an NVFP4 input matrix
+    on the active path
+  - the active path now does `BF16 grouped Gemm1 -> gemm1_output_scale ->
+    packed Gemm2 input`, which matches TRT's BF16 routed entry much better than
+    the earlier packed-FC1 experiment
 - Focused correctness remains green:
   `device_nvfp4_matrix_test`, `moe_launch_plan_device_test`,
   `fused_moe_prefill_test`, `multi_turn_prefix_reuse_test`.
 - Focused TTFT moved only slightly:
-  `cold_prefill_prefix128 = 126.738 ms`,
-  `cached_committed_head_prefix128_tail4 hot-prefix = 54.703 ms`,
-  `cached_global_root_prefix128_tail4 hot-prefix = 54.663 ms`.
+  `cold_prefill_prefix128 = 126.012 ms`,
+  `cached_committed_head_prefix128_tail4 hot-prefix = 54.447 ms`,
+  `cached_global_root_prefix128_tail4 hot-prefix = 54.616 ms`.
 
 Interpretation:
 
-- The routed CTA scheduling mismatch is no longer the main blocker.
-- Exact task descriptors are necessary infrastructure, but on their own they do
-  not produce the large win.
+- The routed launch contract is now close enough to TRT that it is unlikely to
+  be the dominant remaining blocker.
+- The BF16 routed FC1 entry is now also structurally aligned with TRT's BF16
+  runner, so further FC1-input packing experiments should not remain on the
+  active path.
 - The next remaining jump is the grouped math core itself: replace the current
   task-driven WMMA row-tile consumer with a fuller TRT-like grouped GEMM
   consumer for routed FC1 and FC2.
