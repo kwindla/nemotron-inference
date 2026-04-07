@@ -878,7 +878,10 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   auto launch_plan =
       DeviceMoeLaunchPlan::Create(
           test_case.n_routed_experts,
-          test_case.token_count * test_case.top_k);
+          test_case.token_count * test_case.top_k,
+          std::max(
+              test_case.hidden_size,
+              test_case.routed_expert_intermediate_size));
   const auto padded_selection_count = DeviceMoeLaunchPlan::PaddedRowCapacity(
       test_case.n_routed_experts,
       test_case.token_count * test_case.top_k);
@@ -1111,7 +1114,10 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   auto launch_plan =
       DeviceMoeLaunchPlan::Create(
           test_case.n_routed_experts,
-          test_case.token_count * test_case.top_k);
+          test_case.token_count * test_case.top_k,
+          std::max(
+              test_case.hidden_size,
+              test_case.routed_expert_intermediate_size));
   const auto padded_selection_count = DeviceMoeLaunchPlan::PaddedRowCapacity(
       test_case.n_routed_experts,
       test_case.token_count * test_case.top_k);

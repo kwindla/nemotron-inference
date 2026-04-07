@@ -192,6 +192,85 @@ Interpretation:
 - the next remaining win has to come from stronger grouped math, not from more
   boundary cleanups
 
+### Next Jump: Match TRT-LLM For The Routed Math Stage
+
+Yes, this is the point where we should jump to the TRT-LLM execution shape for
+this stage in one deliberate rewrite rather than keep iterating on the old row
+kernel family.
+
+The target stage shape is:
+
+1. exact routed CTA metadata
+2. grouped `PermuteGemm1`
+3. TRT-style activation/output-scale production
+4. grouped `Gemm2`
+5. finalize
+
+What "jump in one shot" means here:
+
+- replace the active routed-up and routed-down math kernels together
+- keep the existing device-only routing and launch-plan foundation
+- keep one runtime path only
+- preserve the new packed FC1/FC2 contracts we just landed
+- stop carrying forward the old row-kernel family as an equal implementation
+
+What still should not be "one shot":
+
+- do not rewrite routing, shared experts, and Mamba in the same patch
+- do not merge the new grouped math core before the focused correctness gates
+  and `prefix128 / tail4` TTFT gate pass on the new stage
+
+The implementation plan for this jump is:
+
+1. Replace the routed FC1 consumer with a true grouped GEMM tile kernel that
+   consumes the current exact CTA metadata directly, rather than one CTA
+   externalizing output-row tiles.
+2. Match TRT-LLM's handoff exactly at the stage boundary:
+   `gemm1_output`, `gemm1_output_scale`, activation, packed FC2 input,
+   `gemm2_output`.
+3. Replace routed FC2 with the same grouped kernel family and CTA map, rather
+   than keeping a mixed FC1-new / FC2-old implementation.
+4. Keep finalize unchanged initially so the only moving part is the routed math
+   stage.
+5. After the routed stage wins, move shared experts onto the same stronger math
+   family.
+
+The acceptance criteria for this jump are:
+
+- `device_nvfp4_matrix_test`
+- `moe_launch_plan_device_test`
+- `fused_moe_prefill_test`
+- `multi_turn_prefix_reuse_test`
+- `cold_prefill_prefix128` must improve versus the current `126.959 ms`
+- no regression in behavioral reuse equivalence
+
+The reason this is safe now is that the contract work is no longer the blocker.
+The remaining gap versus TRT-LLM is the grouped math and CTA scheduling itself,
+and that gap will not close through more incremental cleanup.
+
+Progress on this jump:
+
+- The active packed FC1/FC2 routed path now executes from an exact task map
+  instead of the old coarse `grid=(output_row_tiles, cta_capacity)` scheduler.
+- The exact task map now takes an explicit output-row tile size so the runtime
+  WMMA consumer and the launch-plan contract agree on `32`-row routed tasks.
+- Focused correctness remains green:
+  `device_nvfp4_matrix_test`, `moe_launch_plan_device_test`,
+  `fused_moe_prefill_test`, `multi_turn_prefix_reuse_test`.
+- Focused TTFT moved only slightly:
+  `cold_prefill_prefix128 = 126.738 ms`,
+  `cached_committed_head_prefix128_tail4 hot-prefix = 54.703 ms`,
+  `cached_global_root_prefix128_tail4 hot-prefix = 54.663 ms`.
+
+Interpretation:
+
+- The routed CTA scheduling mismatch is no longer the main blocker.
+- Exact task descriptors are necessary infrastructure, but on their own they do
+  not produce the large win.
+- The next remaining jump is the grouped math core itself: replace the current
+  task-driven WMMA row-tile consumer with a fuller TRT-like grouped GEMM
+  consumer for routed FC1 and FC2.
+
 ## Goal
 
 Optimize the remaining dominant prefill work for Nemotron 3 Nano NVFP4 on the

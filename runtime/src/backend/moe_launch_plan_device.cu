@@ -202,6 +202,7 @@ __global__ void BuildExactTaskMapKernel(
     const int* cta_valid_rows,
     int current_task_capacity,
     int output_row_tile_count,
+    int output_row_tile_size,
     int* task_count,
     int* task_expert_ids,
     int* task_row_starts,
@@ -222,8 +223,7 @@ __global__ void BuildExactTaskMapKernel(
       task_expert_ids[write_index] = cta_expert_ids[cta_index];
       task_row_starts[write_index] = cta_row_starts[cta_index];
       task_valid_rows[write_index] = cta_valid_rows[cta_index];
-      task_output_row_bases[write_index] =
-          output_row_tile * static_cast<int>(kMoeLaunchPlanOutputTile);
+      task_output_row_bases[write_index] = output_row_tile * output_row_tile_size;
       ++write_index;
     }
   }
@@ -590,10 +590,12 @@ bool BuildDeviceMoeLaunchPlan(
 
 bool BuildDeviceMoeExactTaskMap(
     std::size_t output_rows_per_expert,
+    std::size_t output_row_tile_size,
     DeviceMoeLaunchPlan* plan) {
   if (plan == nullptr ||
       !plan->valid() ||
       output_rows_per_expert == 0 ||
+      output_row_tile_size == 0 ||
       plan->task_count() == nullptr ||
       plan->task_expert_ids() == nullptr ||
       plan->task_row_starts() == nullptr ||
@@ -609,8 +611,8 @@ bool BuildDeviceMoeExactTaskMap(
   }
 
   const std::size_t output_row_tile_count =
-      (output_rows_per_expert + kMoeLaunchPlanOutputTile - 1u) /
-      kMoeLaunchPlanOutputTile;
+      (output_rows_per_expert + output_row_tile_size - 1u) /
+      output_row_tile_size;
   if (output_row_tile_count == 0 ||
       output_row_tile_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return false;
@@ -631,6 +633,7 @@ bool BuildDeviceMoeExactTaskMap(
       plan->cta_valid_rows(),
       static_cast<int>(*exact_task_capacity),
       static_cast<int>(output_row_tile_count),
+      static_cast<int>(output_row_tile_size),
       plan->task_count(),
       plan->task_expert_ids(),
       plan->task_row_starts(),

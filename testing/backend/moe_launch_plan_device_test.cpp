@@ -321,7 +321,10 @@ bool RunExactTaskMapCase() {
           BuildDeviceMoeLaunchPlan(*routing, selection_count, launch_plan.get()),
           "BuildDeviceMoeLaunchPlan should succeed") ||
       !Expect(
-          BuildDeviceMoeExactTaskMap(kOutputRows, launch_plan.get()),
+          BuildDeviceMoeExactTaskMap(
+              kOutputRows,
+              nemotron::kMoeLaunchPlanOutputTile,
+              launch_plan.get()),
           "BuildDeviceMoeExactTaskMap should succeed") ||
       !Expect(
           cudaDeviceSynchronize() == cudaSuccess,

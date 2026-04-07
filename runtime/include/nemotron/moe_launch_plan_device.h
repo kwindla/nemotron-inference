@@ -77,6 +77,7 @@ bool BuildDeviceMoeLaunchPlan(
     DeviceMoeLaunchPlan* plan);
 bool BuildDeviceMoeExactTaskMap(
     std::size_t output_rows_per_expert,
+    std::size_t output_row_tile_size,
     DeviceMoeLaunchPlan* plan);
 
 }  // namespace nemotron

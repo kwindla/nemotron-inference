@@ -2928,7 +2928,10 @@ std::optional<BenchmarkResult> RunLaunchPlanExactTaskTile8Case(
           kTopK,
           routing.get()) ||
       !BuildDeviceMoeLaunchPlan(*routing, selection_count, launch_plan.get()) ||
-      !BuildDeviceMoeExactTaskMap(kRoutedIntermediateSize, launch_plan.get()) ||
+      !BuildDeviceMoeExactTaskMap(
+          kRoutedIntermediateSize,
+          nemotron::kMoeLaunchPlanOutputTile,
+          launch_plan.get()) ||
       cudaDeviceSynchronize() != cudaSuccess) {
     return std::nullopt;
   }
