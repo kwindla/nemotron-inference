@@ -29,6 +29,7 @@ The Blackwell inference progress log is in [docs/blackwell_inference_progress.md
 The short GB10 operator policy note is in [docs/gb10_execution_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/gb10_execution_policy.md).
 The provisional startup-residency note is in [docs/startup_residency_policy.md](/home/khkramer/src/nemotron-march-2026/nemotron-runtime/docs/startup_residency_policy.md).
 The local vLLM runbook for Nemotron Nano NVFP4 on RTX 5090 is in [docs/vllm_rtx5090.md](docs/vllm_rtx5090.md).
+The external baseline tracing runbook for vLLM and TRT-LLM is in [docs/external_baseline_tracing.md](docs/external_baseline_tracing.md).
 
 ## Build
 
