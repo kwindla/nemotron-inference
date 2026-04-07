@@ -940,6 +940,9 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto fc2_expert_activation_scales =
       DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
+  auto gemm1_output_scales = DeviceTensorFp32::Create(
+      {padded_selection_count.value_or(0),
+       test_case.routed_expert_intermediate_size / 16});
   auto fc2_grouped_pack = DeviceNvfp4Matrix::Create(
       padded_selection_count.value_or(0),
       test_case.routed_expert_intermediate_size,
@@ -970,6 +973,7 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               fc1_expert_activation_scales != nullptr &&
               fc1_grouped_pack != nullptr &&
               fc2_expert_activation_scales != nullptr &&
+              gemm1_output_scales != nullptr &&
               fc2_grouped_pack != nullptr &&
               gemm1_output_bf16 != nullptr &&
               expert_up_scratch != nullptr &&
@@ -1023,8 +1027,8 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.gemm1_output = fc2_grouped_pack.get();
-  params.gemm1_output_scale = fc2_expert_activation_scales->data();
-  params.activation_output_scale = fc2_expert_activation_scales->data();
+  params.gemm1_output_scale = gemm1_output_scales->data();
+  params.activation_output_scale = gemm1_output_scales->data();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();
@@ -1186,6 +1190,9 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto fc2_expert_activation_scales =
       DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
+  auto gemm1_output_scales = DeviceTensorFp32::Create(
+      {padded_selection_count.value_or(0),
+       test_case.routed_expert_intermediate_size / 16});
   auto fc2_grouped_pack = DeviceNvfp4Matrix::Create(
       padded_selection_count.value_or(0),
       test_case.routed_expert_intermediate_size,
@@ -1216,6 +1223,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               fc1_expert_activation_scales != nullptr &&
               fc1_grouped_pack != nullptr &&
               fc2_expert_activation_scales != nullptr &&
+              gemm1_output_scales != nullptr &&
               fc2_grouped_pack != nullptr &&
               gemm1_output_bf16 != nullptr &&
               expert_up_scratch != nullptr &&
@@ -1270,8 +1278,8 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.gemm1_output = fc2_grouped_pack.get();
-  params.gemm1_output_scale = fc2_expert_activation_scales->data();
-  params.activation_output_scale = fc2_expert_activation_scales->data();
+  params.gemm1_output_scale = gemm1_output_scales->data();
+  params.activation_output_scale = gemm1_output_scales->data();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();

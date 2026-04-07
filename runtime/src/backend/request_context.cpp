@@ -6,6 +6,8 @@
 namespace nemotron {
 namespace {
 
+constexpr std::size_t kMoeNvfp4ScaleBlockWidth = 16;
+
 std::optional<std::size_t> CheckedMul(std::size_t lhs, std::size_t rhs) {
   if (lhs == 0 || rhs == 0) {
     return std::size_t{0};
@@ -66,6 +68,7 @@ bool WorkspaceConfigSupported(const MoePrefillWorkspaceConfig& config) {
          config.top_k != 0 &&
          config.top_k <= config.num_experts &&
          config.routed_expert_intermediate_size != 0 &&
+         config.routed_expert_intermediate_size % kMoeNvfp4ScaleBlockWidth == 0 &&
          config.shared_expert_intermediate_size != 0;
 }
 
@@ -235,6 +238,10 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                      sizeof(__nv_bfloat16))) &&
                  add_bytes(MatrixBytes(
                      *padded_selection_capacity,
+                     config.routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth,
+                     sizeof(float))) &&
+                 add_bytes(MatrixBytes(
+                     *padded_selection_capacity,
                      config.routed_expert_intermediate_size,
                      sizeof(float))) &&
                  add_bytes(MatrixBytes(
@@ -299,6 +306,10 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   workspace->fused_prefill_gemm1_output_bf16 =
       DeviceTensorBf16::Create(
           {*padded_selection_capacity, config.routed_expert_intermediate_size});
+  workspace->fused_prefill_gemm1_output_scales =
+      DeviceTensorFp32::Create(
+          {*padded_selection_capacity,
+           config.routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth});
   workspace->fused_prefill_expert_up_scratch =
       DeviceTensorFp32::Create(
           {*padded_selection_capacity, config.routed_expert_intermediate_size});
@@ -377,6 +388,10 @@ bool MoePrefillWorkspace::valid() const {
              fused_prefill_gemm1_output_bf16.get(),
              *padded_selection_capacity,
              config.routed_expert_intermediate_size) &&
+         TensorMatchesShape(
+             fused_prefill_gemm1_output_scales.get(),
+             *padded_selection_capacity,
+             config.routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth) &&
          TensorMatchesShape(
              fused_prefill_expert_up_scratch.get(),
              *padded_selection_capacity,

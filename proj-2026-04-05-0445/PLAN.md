@@ -235,6 +235,36 @@ Interpretation:
 - the gain is still modest, which confirms the next win must come from the
   grouped FC1/FC2 math core itself rather than more boundary cleanups
 
+The next routed-stage contract cutover is now also landed:
+
+- `gemm1_output_scale` / `activation_output_scale` are no longer just
+  per-expert placeholders on the active path; the BF16 packer now writes real
+  per-row / per-block dequant scales for the routed FC2 input contract
+- the active FC2 consumer now decodes from those routed dequant scales directly
+  instead of reconstructing scale from `expert tensor scale + encoded block
+  scales`
+- the active routed FC1 and FC2 kernels now derive token work from
+  `cta_idx_xy_to_batch_idx + cta_idx_xy_to_mn_limit + expert_first_token_offsets +
+  selected_token_tile`, rather than the older explicit
+  `cta_row_starts + cta_valid_rows` contract
+- focused correctness remains green:
+  `fused_moe_prefill_test`, `moe_launch_plan_device_test`,
+  `multi_turn_prefix_reuse_test`
+
+Focused TTFT on the same gate after these contract and consumer cutovers is:
+
+- `cold_prefill_prefix128 = 126.178 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.652 ms`
+
+Interpretation:
+
+- this is now very close to the TRT grouped-contract shape for the active
+  routed path
+- TTFT is still effectively flat, which means the remaining gap is not in the
+  routed metadata or FC1->FC2 scale contract anymore
+- the next step must jump to the grouped FC1/FC2 kernel body itself
+
 ### Next Jump: Match TRT-LLM For The Routed Math Stage
 
 Yes, this is the point where we should jump to the TRT-LLM execution shape for
@@ -328,6 +358,8 @@ Interpretation:
 - The BF16 routed FC1 entry and BF16 `gemm1_output` seam are now structurally
   aligned with TRT's routed stage, so further FC1-input packing experiments
   should not remain on the active path.
+- The routed dequant-scale contract and grouped batch/limit metadata are now
+  active too, so the next remaining mismatch is the grouped math core itself.
 - The next remaining jump is the grouped math core itself: replace the current
   task-driven WMMA row-tile consumer with a fuller TRT-like grouped GEMM
   consumer for routed FC1 and FC2.

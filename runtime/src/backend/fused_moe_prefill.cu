@@ -595,9 +595,10 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
 __global__ void Nvfp4LaunchPlannedExpertMatVecRowsBf16Kernel(
     const float* input,
     const int* cta_count,
-    const int* cta_expert_ids,
-    const int* cta_row_starts,
-    const int* cta_valid_rows,
+    const int* cta_batch_indices,
+    const int* cta_m_limits,
+    const int* expert_first_token_offsets,
+    int token_tile_dim,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     __nv_bfloat16* output) {
@@ -613,9 +614,13 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsBf16Kernel(
 
   const int tid = static_cast<int>(threadIdx.x);
   const int warp_id = tid / 32;
-  const int expert_index = cta_expert_ids[cta_index];
-  const int row_start = cta_row_starts[cta_index];
-  const int valid_rows = cta_valid_rows[cta_index];
+  const int expert_index = cta_batch_indices[cta_index];
+  const int batch_row_begin = expert_first_token_offsets[expert_index];
+  const int batch_cta_begin = batch_row_begin / token_tile_dim;
+  const int row_start =
+      batch_row_begin + (cta_index - batch_cta_begin) * token_tile_dim;
+  const int m_limit = cta_m_limits[cta_index];
+  const int valid_rows = max(0, min(m_limit - row_start, token_tile_dim));
   const int output_row_base = static_cast<int>(blockIdx.x) * kPlannedOutputTile;
   if (expert_index < 0 ||
       static_cast<std::size_t>(output_row_base) >= output_rows_per_expert ||
@@ -1065,10 +1070,12 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
     const std::uint8_t* input_block_scales,
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
     const int* cta_count,
-    const int* cta_expert_ids,
-    const int* cta_row_starts,
-    const int* cta_valid_rows,
+    const int* cta_batch_indices,
+    const int* cta_m_limits,
+    const int* expert_first_token_offsets,
+    int token_tile_dim,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     float* output) {
@@ -1081,16 +1088,20 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
   if (cta_index >= exact_cta_count ||
       packed_input == nullptr ||
       input_block_scales == nullptr ||
-      input_tensor_scale_data == nullptr) {
+      (input_tensor_scale_data == nullptr && input_dq_scales == nullptr)) {
     return;
   }
 
   const int tid = static_cast<int>(threadIdx.x);
   const int warp_id = tid / 32;
   const int output_row_base = static_cast<int>(blockIdx.x) * kPlannedOutputTile;
-  const int expert_index = cta_expert_ids[cta_index];
-  const int row_start = cta_row_starts[cta_index];
-  const int valid_rows = cta_valid_rows[cta_index];
+  const int expert_index = cta_batch_indices[cta_index];
+  const int batch_row_begin = expert_first_token_offsets[expert_index];
+  const int batch_cta_begin = batch_row_begin / token_tile_dim;
+  const int row_start =
+      batch_row_begin + (cta_index - batch_cta_begin) * token_tile_dim;
+  const int m_limit = cta_m_limits[cta_index];
+  const int valid_rows = max(0, min(m_limit - row_start, token_tile_dim));
   if (expert_index < 0 ||
       valid_rows <= 0 ||
       static_cast<std::size_t>(output_row_base) >= output_rows_per_expert ||
@@ -1108,8 +1119,10 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
           : static_cast<std::size_t>(kPlannedOutputTile));
   const float weight_tensor_scale = *weight.tensor_scale_data;
   const float input_tensor_scale =
-      input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
-                                            : *input_tensor_scale_data;
+      input_dq_scales == nullptr
+          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
+                                                   : *input_tensor_scale_data)
+          : 1.0f;
 
   wmma::fragment<
       wmma::accumulator,
@@ -1163,8 +1176,10 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
         const std::size_t packed_row_offset = input_row * pairs_per_row;
         const std::size_t scale_row_offset = input_row * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(input_block_scales[scale_row_offset + block]) *
-            input_tensor_scale;
+            input_dq_scales != nullptr
+                ? input_dq_scales[scale_row_offset + block]
+                : fused_decode::DecodeFp8(input_block_scales[scale_row_offset + block]) *
+                      input_tensor_scale;
         const std::uint8_t packed = packed_input[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -2193,9 +2208,10 @@ bool LaunchPlannedMatVecBf16(
   Nvfp4LaunchPlannedExpertMatVecRowsBf16Kernel<<<grid, block>>>(
       input,
       launch_plan->num_non_exiting_ctas(),
-      launch_plan->cta_expert_ids(),
-      launch_plan->cta_row_starts(),
-      launch_plan->cta_valid_rows(),
+      launch_plan->cta_idx_xy_to_batch_idx(),
+      launch_plan->cta_idx_xy_to_mn_limit(),
+      launch_plan->expert_first_token_offsets(),
+      static_cast<int>(launch_plan->selected_token_tile()),
       weights,
       output_rows_per_expert,
       output);
@@ -2321,6 +2337,7 @@ bool LaunchPlannedMatVecRelu2Pack(
 bool LaunchPlannedPackedInputMatVec(
     const DeviceNvfp4Matrix& input_pack,
     const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
     const DeviceMoeLaunchPlan* launch_plan,
     std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
@@ -2360,10 +2377,12 @@ bool LaunchPlannedPackedInputMatVec(
       input_pack.block_scales_data(),
       input_pack.device_tensor_scale_ptr(),
       input_expert_tensor_scales,
+      input_dq_scales,
       launch_plan->num_non_exiting_ctas(),
-      launch_plan->cta_expert_ids(),
-      launch_plan->cta_row_starts(),
-      launch_plan->cta_valid_rows(),
+      launch_plan->cta_idx_xy_to_batch_idx(),
+      launch_plan->cta_idx_xy_to_mn_limit(),
+      launch_plan->expert_first_token_offsets(),
+      static_cast<int>(launch_plan->selected_token_tile()),
       weights,
       output_rows_per_expert,
       output);
@@ -2739,22 +2758,18 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
             params.routed_up_device,
             params.routed_expert_intermediate_size,
             params.gemm1_output_bf16) ||
-        !LaunchComputeExpertActivationScalesBf16(
-            params.gemm1_output_bf16,
-            params.launch_plan->expert_first_token_offsets(),
-            params.n_routed_experts,
-            params.routed_expert_intermediate_size,
-            activation_output_scale) ||
         !PackDeviceRowMajorBf16ToNvfp4PerExpert(
             params.gemm1_output_bf16,
             params.launch_plan->padded_row_capacity(),
             params.routed_expert_intermediate_size,
             params.launch_plan->expert_first_token_offsets(),
             params.n_routed_experts,
+            nullptr,
             activation_output_scale,
             gemm1_output) ||
         !LaunchPlannedPackedInputMatVec(
             *gemm1_output,
+            nullptr,
             activation_output_scale,
             params.launch_plan,
             selection_count,
@@ -2771,6 +2786,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
               ? LaunchPlannedPackedInputMatVec(
                     *params.fc1_grouped_pack,
                     fc1_input_expert_scales,
+                    nullptr,
                     params.launch_plan,
                     selection_count,
                     params.routed_up_device,
@@ -2816,7 +2832,8 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     if (!(use_packed_fc2
               ? LaunchPlannedPackedInputMatVec(
                     *gemm1_output,
-                    activation_output_scale,
+                    params.fc2_expert_activation_scales,
+                    nullptr,
                     params.launch_plan,
                     selection_count,
                     params.routed_down_device,

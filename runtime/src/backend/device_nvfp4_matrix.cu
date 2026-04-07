@@ -320,6 +320,7 @@ __global__ void PackAndSwizzleRowMajorBf16ToNvfp4PerExpertKernel(
     const int* expert_first_token_offsets,
     int n_experts,
     const float* expert_tensor_scales,
+    float* output_dequant_scales,
     std::uint8_t* packed,
     std::uint8_t* block_scales,
     std::uint8_t* matmul_scales) {
@@ -358,6 +359,9 @@ __global__ void PackAndSwizzleRowMajorBf16ToNvfp4PerExpertKernel(
   if (static_cast<int>(row) >= total_active_rows) {
     block_scales[block_index] = 0u;
     matmul_scales[destination_offset] = 0u;
+    if (output_dequant_scales != nullptr) {
+      output_dequant_scales[block_index] = 0.0f;
+    }
     for (std::size_t i = 0; i < (kBlockWidth / 2u); ++i) {
       packed[packed_offset + i] = 0u;
     }
@@ -392,6 +396,9 @@ __global__ void PackAndSwizzleRowMajorBf16ToNvfp4PerExpertKernel(
   matmul_scales[destination_offset] = block_scale_fp8;
 
   const float scale = tensor_scale * block_scale;
+  if (output_dequant_scales != nullptr) {
+    output_dequant_scales[block_index] = scale;
+  }
   for (std::size_t i = 0; i < kBlockWidth; i += 2) {
     const float lhs_value = __bfloat162float(source[input_offset + i]);
     const float rhs_value = __bfloat162float(source[input_offset + i + 1]);
@@ -845,6 +852,7 @@ bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
     const int* expert_first_token_offsets,
     std::size_t n_experts,
     const float* expert_tensor_scales,
+    float* output_dequant_scales,
     DeviceNvfp4Matrix* output) {
   if (source == nullptr ||
       expert_first_token_offsets == nullptr ||
@@ -870,7 +878,12 @@ bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
       !CheckCuda(cudaMemset(
           const_cast<std::uint8_t*>(output->matmul_block_scales_data()),
           0,
-          output->matmul_block_scales_nbytes()))) {
+          output->matmul_block_scales_nbytes())) ||
+      (output_dequant_scales != nullptr &&
+       !CheckCuda(cudaMemset(
+           output_dequant_scales,
+           0,
+           rows * (cols / kBlockWidth) * sizeof(float))))) {
     return false;
   }
 
@@ -898,6 +911,7 @@ bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
       expert_first_token_offsets,
       static_cast<int>(n_experts),
       expert_tensor_scales,
+      output_dequant_scales,
       const_cast<std::uint8_t*>(output->packed_data()),
       const_cast<std::uint8_t*>(output->block_scales_data()),
       const_cast<std::uint8_t*>(output->matmul_block_scales_data()));

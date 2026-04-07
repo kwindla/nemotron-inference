@@ -81,6 +81,7 @@ bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
     const int* expert_first_token_offsets,
     std::size_t n_experts,
     const float* expert_tensor_scales,
+    float* output_dequant_scales,
     DeviceNvfp4Matrix* output);
 
 bool GatherDeviceNvfp4Rows(

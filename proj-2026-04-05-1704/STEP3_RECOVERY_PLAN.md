@@ -124,6 +124,33 @@ Interpretation:
 - the gain is still modest, which confirms the next real win must come from
   the grouped FC1/FC2 math core itself
 
+The next routed-stage contract cutover is now also landed:
+
+- `gemm1_output_scale` / `activation_output_scale` are now real per-row /
+  per-block routed dequant scales on the active path, written directly by the
+  BF16->NVFP4 packer
+- the active FC2 consumer now decodes from those routed dequant scales
+  directly, instead of reconstructing scale from `expert tensor scale + encoded
+  block scales`
+- the active routed FC1 and FC2 consumers now derive token work from
+  `cta_idx_xy_to_batch_idx + cta_idx_xy_to_mn_limit + expert_first_token_offsets +
+  selected_token_tile`, rather than the older explicit
+  `cta_row_starts + cta_valid_rows` contract
+
+Focused TTFT on the same `prefix128 / tail4` gate after these cutovers is:
+
+- `cold_prefill_prefix128 = 126.178 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.652 ms`
+
+Interpretation:
+
+- the active routed path is now carrying and consuming a much more faithful
+  TRT-style grouped contract
+- the TTFT result is still effectively flat
+- that means the remaining gap is now squarely in the grouped FC1/FC2 kernel
+  body itself, not the routed metadata or FC1->FC2 scale handoff
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first
