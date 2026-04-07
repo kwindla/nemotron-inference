@@ -103,6 +103,82 @@ Packed live shapes observed on the real path:
 - `fc1_shape=(128, 1920, 168)`
 - `fc2_shape=(128, 2688, 120)`
 
+### Granular TRT-LLM Tactic Sweep
+
+Artifacts:
+
+- [trtllm_fused_moe_tactic_sweep_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trtllm_fused_moe_tactic_sweep_20260407.log)
+- [trtllm_fused_moe_tactic_boundary_sweep_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trtllm_fused_moe_tactic_boundary_sweep_20260407.log)
+
+The useful conclusion from the finer sweep is that the live CUTLASS fused-MoE
+path is not selecting tactics with one simple monotonic threshold table over
+`num_rows`. It uses a small shape-aware family with several islands.
+
+Observed rows and selected descriptors on the local Nano path:
+
+- `1`
+  - `gemm1=0`: `128x128x128`, `swap_ab=false`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `2..3`
+  - `gemm1=7`: `256x128x64`, `swap_ab=true`
+  - `gemm2=15`: `256x128x64`, `swap_ab=true`
+- `4..7`
+  - `gemm1=5`: `128x128x64`, `swap_ab=true`
+  - `gemm2=15`: `256x128x64`, `swap_ab=true`
+- `8`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `9..15`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=12`: `128x128x128`, `swap_ab=true`
+- `16`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=15`: `256x128x64`, `swap_ab=true`
+- `24..31`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `32..112`
+  - `gemm1=0`: `128x128x128`, `swap_ab=false`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `120..127`
+  - `gemm1=4`: `128x128x128`, `swap_ab=true`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `128..192`
+  - `gemm1=5`: `128x128x64`, `swap_ab=true`
+  - `gemm2=12`: `128x128x128`, `swap_ab=true`
+- `200..248`
+  - `gemm1=4`: `128x128x128`, `swap_ab=true`
+  - `gemm2=12`: `128x128x128`, `swap_ab=true`
+- `256`
+  - `gemm1=5`: `128x128x64`, `swap_ab=true`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `320`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=12`: `128x128x128`, `swap_ab=true`
+- `384`
+  - `gemm1=5`: `128x128x64`, `swap_ab=true`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+- `448..511`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=12`: `128x128x128`, `swap_ab=true`
+- `512..992`
+  - `gemm1=5`: `128x128x64`, `swap_ab=true`
+  - `gemm2=12`: `128x128x128`, `swap_ab=true`
+- `1024..4607`
+  - `gemm1=1`: `128x128x64`, `swap_ab=false`
+  - `gemm2=13`: `128x128x64`, `swap_ab=true`
+
+Interpretation:
+
+- the real target is a small TRT-like tactic family, not one fixed routed
+  grouped kernel
+- `gemm2` mostly alternates between `128x128x64` and `128x128x128`, with the
+  `256x128x64` tile appearing only in the very small-row regime
+- `gemm1` changes both `tile_k` and `swap_ab`, and its selection is not a
+  simple increasing threshold over `num_rows`
+- for the native rewrite, a lookup-table or regime-table selector is a better
+  fit than a naive monotonic threshold rule
+
 ## vLLM Notes
 
 The local vLLM baseline runbook is in

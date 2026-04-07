@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <type_traits>
 
 #include "nemotron/device_nvfp4_matrix.h"
 #include "fused_decode_common.cuh"
@@ -24,6 +25,8 @@ constexpr int kPlannedWmmaTileM = 16;
 constexpr int kPlannedWmmaTileN = 16;
 constexpr int kPlannedWmmaTileK = 16;
 constexpr int kPlannedWmmaWarpsPerBlock = 8;
+constexpr int kRoutedLargeOutputTile = 256;
+constexpr int kRoutedThreadsPerBlock = 256;
 constexpr int kContiguousSmallOutputTile = 32;
 constexpr int kContiguousMediumOutputTile = 64;
 constexpr int kContiguousLargeOutputTile = 128;
@@ -35,6 +38,22 @@ constexpr float kNvfp4MinTensorScale = 1.0f / 1024.0f;
 constexpr std::size_t kNvfp4ScaleBlockTile = 4u;
 
 static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
+
+enum class RoutedGemm1Profile {
+  kLegacy,
+  kP0_128x128x128_SwapFalse,
+  kP1_128x128x64_SwapFalse,
+  kP4_128x128x128_SwapTrue,
+  kP5_128x128x64_SwapTrue,
+  kP7_256x128x64_SwapTrue,
+};
+
+enum class RoutedGemm2Profile {
+  kLegacy,
+  kP12_128x128x128_SwapTrue,
+  kP13_128x128x64_SwapTrue,
+  kP15_256x128x64_SwapTrue,
+};
 
 bool CheckCuda(cudaError_t status) {
   return status == cudaSuccess;
@@ -139,6 +158,79 @@ int SelectContiguousOutputTile(std::size_t output_rows, std::size_t input_row_co
     return kContiguousMediumOutputTile;
   }
   return kContiguousSmallOutputTile;
+}
+
+RoutedGemm1Profile SelectRoutedGemm1Profile(std::size_t num_rows) {
+  if (num_rows == 1u) {
+    return RoutedGemm1Profile::kP0_128x128x128_SwapFalse;
+  }
+  if (num_rows >= 2u && num_rows <= 3u) {
+    return RoutedGemm1Profile::kP7_256x128x64_SwapTrue;
+  }
+  if (num_rows >= 4u && num_rows <= 7u) {
+    return RoutedGemm1Profile::kP5_128x128x64_SwapTrue;
+  }
+  if (num_rows == 8u || (num_rows >= 9u && num_rows <= 15u) || num_rows == 16u ||
+      (num_rows >= 24u && num_rows <= 31u) || num_rows == 320u ||
+      (num_rows >= 448u && num_rows <= 511u) || num_rows >= 1024u) {
+    return RoutedGemm1Profile::kP1_128x128x64_SwapFalse;
+  }
+  if (num_rows >= 32u && num_rows <= 112u) {
+    return RoutedGemm1Profile::kP0_128x128x128_SwapFalse;
+  }
+  if ((num_rows >= 120u && num_rows <= 127u) ||
+      (num_rows >= 200u && num_rows <= 248u)) {
+    return RoutedGemm1Profile::kP4_128x128x128_SwapTrue;
+  }
+  if ((num_rows >= 128u && num_rows <= 192u) || num_rows == 256u ||
+      num_rows == 384u || (num_rows >= 512u && num_rows <= 992u)) {
+    return RoutedGemm1Profile::kP5_128x128x64_SwapTrue;
+  }
+  return RoutedGemm1Profile::kLegacy;
+}
+
+RoutedGemm2Profile SelectRoutedGemm2Profile(std::size_t num_rows) {
+  if (num_rows >= 2u && num_rows <= 7u) {
+    return RoutedGemm2Profile::kP15_256x128x64_SwapTrue;
+  }
+  if (num_rows == 16u) {
+    return RoutedGemm2Profile::kP15_256x128x64_SwapTrue;
+  }
+  if (num_rows == 1u || num_rows == 8u || (num_rows >= 24u && num_rows <= 127u) ||
+      num_rows == 256u || num_rows == 384u || num_rows >= 1024u) {
+    return RoutedGemm2Profile::kP13_128x128x64_SwapTrue;
+  }
+  if ((num_rows >= 9u && num_rows <= 15u) || (num_rows >= 128u && num_rows <= 248u) ||
+      num_rows == 320u || (num_rows >= 448u && num_rows <= 992u)) {
+    return RoutedGemm2Profile::kP12_128x128x128_SwapTrue;
+  }
+  return RoutedGemm2Profile::kLegacy;
+}
+
+int RoutedOutputTile(RoutedGemm1Profile profile) {
+  switch (profile) {
+    case RoutedGemm1Profile::kP7_256x128x64_SwapTrue:
+      return kRoutedLargeOutputTile;
+    case RoutedGemm1Profile::kLegacy:
+    case RoutedGemm1Profile::kP0_128x128x128_SwapFalse:
+    case RoutedGemm1Profile::kP1_128x128x64_SwapFalse:
+    case RoutedGemm1Profile::kP4_128x128x128_SwapTrue:
+    case RoutedGemm1Profile::kP5_128x128x64_SwapTrue:
+      return kPlannedOutputTile;
+  }
+  return kPlannedOutputTile;
+}
+
+int RoutedOutputTile(RoutedGemm2Profile profile) {
+  switch (profile) {
+    case RoutedGemm2Profile::kP15_256x128x64_SwapTrue:
+      return kRoutedLargeOutputTile;
+    case RoutedGemm2Profile::kLegacy:
+    case RoutedGemm2Profile::kP12_128x128x128_SwapTrue:
+    case RoutedGemm2Profile::kP13_128x128x64_SwapTrue:
+      return kPlannedOutputTile;
+  }
+  return kPlannedOutputTile;
 }
 
 __global__ void ZeroBufferKernel(float* data, std::size_t count) {
@@ -376,6 +468,52 @@ __global__ void MaxBitsToTensorScalesKernel(
     tensor_scale = ClampNvfp4TensorScale(max_abs / kNvfp4ActivationMaxFinite);
   }
   output_scales[index] = tensor_scale;
+}
+
+__device__ __forceinline__ float DecodeNvfp4WeightElement(
+    const FusedNvfp4WeightView& weight,
+    std::size_t output_row,
+    std::size_t col) {
+  const std::size_t pairs_per_row = weight.input_cols / 2u;
+  const std::size_t blocks_per_row =
+      weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t pair_index = col / 2u;
+  const std::size_t block = col / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset = output_row * pairs_per_row;
+  const std::size_t scale_row_offset = output_row * blocks_per_row;
+  const float tensor_scale = *weight.tensor_scale_data;
+  const float block_scale =
+      fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
+      tensor_scale;
+  const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
+  const std::uint8_t nibble =
+      (col & 1u) == 0u ? (packed & 0x0Fu) : ((packed >> 4u) & 0x0Fu);
+  return fused_decode::DecodeFp4(nibble) * block_scale;
+}
+
+__device__ __forceinline__ float DecodeGroupedPackedInputElement(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_dq_scales,
+    float input_tensor_scale,
+    std::size_t cols,
+    std::size_t input_row,
+    std::size_t col) {
+  const std::size_t pairs_per_row = cols / 2u;
+  const std::size_t blocks_per_row = cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t pair_index = col / 2u;
+  const std::size_t block = col / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset = input_row * pairs_per_row;
+  const std::size_t scale_row_offset = input_row * blocks_per_row;
+  const float block_scale =
+      input_dq_scales != nullptr
+          ? input_dq_scales[scale_row_offset + block]
+          : fused_decode::DecodeFp8(input_block_scales[scale_row_offset + block]) *
+                input_tensor_scale;
+  const std::uint8_t packed = packed_input[packed_row_offset + pair_index];
+  const std::uint8_t nibble =
+      (col & 1u) == 0u ? (packed & 0x0Fu) : ((packed >> 4u) & 0x0Fu);
+  return fused_decode::DecodeFp4(nibble) * block_scale;
 }
 
 __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
@@ -1064,6 +1202,348 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRelu2PackKernel(
     const std::uint8_t rhs = fused_decode::EncodeFp4(activated[pair * 2 + 1] / pack_scale);
     output_packed[packed_row_offset + static_cast<std::size_t>(pair)] =
         static_cast<std::uint8_t>((lhs & 0x0Fu) | ((rhs & 0x0Fu) << 4u));
+  }
+}
+
+template <typename OutputType, int kOutputTile, int kMacroTileK>
+__global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_tensor_scale_data,
+    const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
+    const int* cta_count,
+    const int* cta_batch_indices,
+    const int* cta_m_limits,
+    const int* expert_first_token_offsets,
+    int token_tile_dim,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    OutputType* output) {
+  constexpr int kWarpSubTiles = kOutputTile / (kPlannedWmmaWarpsPerBlock * kPlannedWmmaTileN);
+  static_assert(kWarpSubTiles >= 1);
+  __shared__ __nv_bfloat16 a_tile[kPlannedWmmaTileM][kMacroTileK];
+  __shared__ __nv_bfloat16 b_tile[kOutputTile][kMacroTileK];
+  __shared__ float c_tile_storage[kPlannedWmmaTileM * kOutputTile];
+  auto* c_tile = reinterpret_cast<float (*)[kOutputTile]>(c_tile_storage);
+
+  const int cta_index = static_cast<int>(blockIdx.y);
+  const int exact_cta_count = cta_count[0];
+  if (cta_index >= exact_cta_count ||
+      packed_input == nullptr ||
+      input_block_scales == nullptr ||
+      (input_tensor_scale_data == nullptr && input_dq_scales == nullptr) ||
+      output == nullptr) {
+    return;
+  }
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int expert_index = cta_batch_indices[cta_index];
+  const int batch_row_begin = expert_first_token_offsets[expert_index];
+  const int batch_cta_begin = batch_row_begin / token_tile_dim;
+  const int row_start = batch_row_begin + (cta_index - batch_cta_begin) * token_tile_dim;
+  const int m_limit = cta_m_limits[cta_index];
+  const int valid_rows = max(0, min(m_limit - row_start, token_tile_dim));
+  const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
+  if (expert_index < 0 ||
+      valid_rows <= 0 ||
+      static_cast<std::size_t>(output_row_base) >= output_rows_per_expert ||
+      warp_id >= kPlannedWmmaWarpsPerBlock) {
+    return;
+  }
+
+  const FusedNvfp4WeightView weight = weights[expert_index];
+  const int output_rows_this_tile = static_cast<int>(
+      min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
+          static_cast<std::size_t>(kOutputTile)));
+  const float input_tensor_scale =
+      input_dq_scales == nullptr
+          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
+                                                   : *input_tensor_scale_data)
+          : 1.0f;
+
+  wmma::fragment<
+      wmma::accumulator,
+      kPlannedWmmaTileM,
+      kPlannedWmmaTileN,
+      kPlannedWmmaTileK,
+      float>
+      c_frags[kWarpSubTiles];
+  for (int i = 0; i < kWarpSubTiles; ++i) {
+    wmma::fill_fragment(c_frags[i], 0.0f);
+  }
+
+  for (std::size_t k_base = 0; k_base < weight.input_cols;
+       k_base += static_cast<std::size_t>(kMacroTileK)) {
+    const int macro_k = static_cast<int>(
+        min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
+    for (int linear_index = tid;
+         linear_index < (kPlannedWmmaTileM * macro_k);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_token = linear_index / macro_k;
+      const int tile_k = linear_index % macro_k;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_token < valid_rows) {
+        value = __float2bfloat16(DecodeGroupedPackedInputElement(
+            packed_input,
+            input_block_scales,
+            input_dq_scales,
+            input_tensor_scale,
+            weight.input_cols,
+            static_cast<std::size_t>(row_start + tile_token),
+            k_base + static_cast<std::size_t>(tile_k)));
+      }
+      a_tile[tile_token][tile_k] = value;
+    }
+    for (int linear_index = tid;
+         linear_index < (macro_k * kOutputTile);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_k = linear_index / kOutputTile;
+      const int tile_output_row = linear_index % kOutputTile;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_output_row < output_rows_this_tile) {
+        value = __float2bfloat16(DecodeNvfp4WeightElement(
+            weight,
+            static_cast<std::size_t>(output_row_base + tile_output_row),
+            k_base + static_cast<std::size_t>(tile_k)));
+      }
+      b_tile[tile_output_row][tile_k] = value;
+    }
+    __syncthreads();
+
+    wmma::fragment<
+        wmma::matrix_a,
+        kPlannedWmmaTileM,
+        kPlannedWmmaTileN,
+        kPlannedWmmaTileK,
+        __nv_bfloat16,
+        wmma::row_major>
+        a_frag;
+    for (int tile_k_base = 0; tile_k_base < macro_k; tile_k_base += kPlannedWmmaTileK) {
+      wmma::load_matrix_sync(a_frag, &a_tile[0][tile_k_base], kMacroTileK);
+      for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+        const int warp_col =
+            warp_id * kPlannedWmmaTileN + subtile * kPlannedWmmaWarpsPerBlock * kPlannedWmmaTileN;
+        if (warp_col < output_rows_this_tile) {
+          wmma::fragment<
+              wmma::matrix_b,
+              kPlannedWmmaTileM,
+              kPlannedWmmaTileN,
+              kPlannedWmmaTileK,
+              __nv_bfloat16,
+              wmma::col_major>
+              b_frag;
+          wmma::load_matrix_sync(b_frag, &b_tile[warp_col][tile_k_base], kMacroTileK);
+          wmma::mma_sync(c_frags[subtile], a_frag, b_frag, c_frags[subtile]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+    const int warp_col =
+        warp_id * kPlannedWmmaTileN + subtile * kPlannedWmmaWarpsPerBlock * kPlannedWmmaTileN;
+    if (warp_col < output_rows_this_tile) {
+      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+        wmma::store_matrix_sync(
+            &c_tile[0][warp_col], c_frags[subtile], kOutputTile, wmma::mem_row_major);
+      } else {
+        wmma::store_matrix_sync(
+            &c_tile[0][warp_col],
+            c_frags[subtile],
+            kOutputTile,
+            wmma::mem_row_major);
+      }
+    }
+  }
+  __syncthreads();
+  for (int linear_index = tid;
+       linear_index < (valid_rows * output_rows_this_tile);
+       linear_index += static_cast<int>(blockDim.x)) {
+    const int tile_token = linear_index / output_rows_this_tile;
+    const int tile_output_row = linear_index % output_rows_this_tile;
+    const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+    const std::size_t output_row = static_cast<std::size_t>(output_row_base + tile_output_row);
+    if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+      output[input_row * output_rows_per_expert + output_row] =
+          __float2bfloat16(c_tile[tile_token][tile_output_row]);
+    } else {
+      output[input_row * output_rows_per_expert + output_row] =
+          c_tile[tile_token][tile_output_row];
+    }
+  }
+}
+
+template <typename OutputType, int kOutputTile, int kMacroTileK>
+__global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_tensor_scale_data,
+    const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
+    const int* cta_count,
+    const int* cta_batch_indices,
+    const int* cta_m_limits,
+    const int* expert_first_token_offsets,
+    int token_tile_dim,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    OutputType* output) {
+  constexpr int kWarpSubTiles = kOutputTile / (kPlannedWmmaWarpsPerBlock * kPlannedWmmaTileN);
+  static_assert(kWarpSubTiles >= 1);
+  __shared__ __nv_bfloat16 a_tile[kOutputTile][kMacroTileK];
+  __shared__ __nv_bfloat16 b_tile[kPlannedWmmaTileM][kMacroTileK];
+  __shared__ float c_tile_storage[kOutputTile * kPlannedWmmaTileM];
+  auto* c_tile = reinterpret_cast<float (*)[kPlannedWmmaTileM]>(c_tile_storage);
+
+  const int cta_index = static_cast<int>(blockIdx.y);
+  const int exact_cta_count = cta_count[0];
+  if (cta_index >= exact_cta_count ||
+      packed_input == nullptr ||
+      input_block_scales == nullptr ||
+      (input_tensor_scale_data == nullptr && input_dq_scales == nullptr) ||
+      output == nullptr) {
+    return;
+  }
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int expert_index = cta_batch_indices[cta_index];
+  const int batch_row_begin = expert_first_token_offsets[expert_index];
+  const int batch_cta_begin = batch_row_begin / token_tile_dim;
+  const int row_start = batch_row_begin + (cta_index - batch_cta_begin) * token_tile_dim;
+  const int m_limit = cta_m_limits[cta_index];
+  const int valid_rows = max(0, min(m_limit - row_start, token_tile_dim));
+  const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
+  if (expert_index < 0 ||
+      valid_rows <= 0 ||
+      static_cast<std::size_t>(output_row_base) >= output_rows_per_expert ||
+      warp_id >= kPlannedWmmaWarpsPerBlock) {
+    return;
+  }
+
+  const FusedNvfp4WeightView weight = weights[expert_index];
+  const int output_rows_this_tile = static_cast<int>(
+      min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
+          static_cast<std::size_t>(kOutputTile)));
+  const float input_tensor_scale =
+      input_dq_scales == nullptr
+          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
+                                                   : *input_tensor_scale_data)
+          : 1.0f;
+
+  wmma::fragment<
+      wmma::accumulator,
+      kPlannedWmmaTileM,
+      kPlannedWmmaTileN,
+      kPlannedWmmaTileK,
+      float>
+      c_frags[kWarpSubTiles];
+  for (int i = 0; i < kWarpSubTiles; ++i) {
+    wmma::fill_fragment(c_frags[i], 0.0f);
+  }
+
+  for (std::size_t k_base = 0; k_base < weight.input_cols;
+       k_base += static_cast<std::size_t>(kMacroTileK)) {
+    const int macro_k = static_cast<int>(
+        min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
+    for (int linear_index = tid;
+         linear_index < (kOutputTile * macro_k);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_index / macro_k;
+      const int tile_k = linear_index % macro_k;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_output_row < output_rows_this_tile) {
+        value = __float2bfloat16(DecodeNvfp4WeightElement(
+            weight,
+            static_cast<std::size_t>(output_row_base + tile_output_row),
+            k_base + static_cast<std::size_t>(tile_k)));
+      }
+      a_tile[tile_output_row][tile_k] = value;
+    }
+    for (int linear_index = tid;
+         linear_index < (macro_k * kPlannedWmmaTileM);
+         linear_index += static_cast<int>(blockDim.x)) {
+      const int tile_k = linear_index / kPlannedWmmaTileM;
+      const int tile_token = linear_index % kPlannedWmmaTileM;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (tile_token < valid_rows) {
+        value = __float2bfloat16(DecodeGroupedPackedInputElement(
+            packed_input,
+            input_block_scales,
+            input_dq_scales,
+            input_tensor_scale,
+            weight.input_cols,
+            static_cast<std::size_t>(row_start + tile_token),
+            k_base + static_cast<std::size_t>(tile_k)));
+      }
+      b_tile[tile_token][tile_k] = value;
+    }
+    __syncthreads();
+
+    for (int tile_k_base = 0; tile_k_base < macro_k; tile_k_base += kPlannedWmmaTileK) {
+      for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+        const int warp_row =
+            warp_id * kPlannedWmmaTileN + subtile * kPlannedWmmaWarpsPerBlock * kPlannedWmmaTileN;
+        if (warp_row < output_rows_this_tile) {
+          wmma::fragment<
+              wmma::matrix_a,
+              kPlannedWmmaTileM,
+              kPlannedWmmaTileN,
+              kPlannedWmmaTileK,
+              __nv_bfloat16,
+              wmma::row_major>
+              a_frag;
+          wmma::fragment<
+              wmma::matrix_b,
+              kPlannedWmmaTileM,
+              kPlannedWmmaTileN,
+              kPlannedWmmaTileK,
+              __nv_bfloat16,
+              wmma::col_major>
+              b_frag;
+          wmma::load_matrix_sync(a_frag, &a_tile[warp_row][tile_k_base], kMacroTileK);
+          wmma::load_matrix_sync(b_frag, &b_tile[0][tile_k_base], kMacroTileK);
+          wmma::mma_sync(c_frags[subtile], a_frag, b_frag, c_frags[subtile]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+    const int warp_row =
+        warp_id * kPlannedWmmaTileN + subtile * kPlannedWmmaWarpsPerBlock * kPlannedWmmaTileN;
+    if (warp_row < output_rows_this_tile) {
+      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+        wmma::store_matrix_sync(
+            &c_tile[warp_row][0], c_frags[subtile], kPlannedWmmaTileM, wmma::mem_row_major);
+      } else {
+        wmma::store_matrix_sync(
+            &c_tile[warp_row][0],
+            c_frags[subtile],
+            kPlannedWmmaTileM,
+            wmma::mem_row_major);
+      }
+    }
+  }
+  __syncthreads();
+  for (int linear_index = tid;
+       linear_index < (output_rows_this_tile * valid_rows);
+       linear_index += static_cast<int>(blockDim.x)) {
+    const int tile_output_row = linear_index / valid_rows;
+    const int tile_token = linear_index % valid_rows;
+    const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+    const std::size_t output_row = static_cast<std::size_t>(output_row_base + tile_output_row);
+    if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+      output[input_row * output_rows_per_expert + output_row] =
+          __float2bfloat16(c_tile[tile_output_row][tile_token]);
+    } else {
+      output[input_row * output_rows_per_expert + output_row] =
+          c_tile[tile_output_row][tile_token];
+    }
   }
 }
 
@@ -2507,6 +2987,7 @@ bool LaunchPlannedPackedInputMatVec(
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
     const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t dispatch_rows,
     std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
@@ -2530,6 +3011,78 @@ bool LaunchPlannedPackedInputMatVec(
       *current_cta_capacity > launch_plan->cta_capacity()) {
     return false;
   }
+  const auto launch_profile = [&](RoutedGemm2Profile profile) -> bool {
+    const int output_tile = RoutedOutputTile(profile);
+    const std::size_t output_row_tile_count =
+        (output_rows_per_expert + static_cast<std::size_t>(output_tile) - 1u) /
+        static_cast<std::size_t>(output_tile);
+    if (output_row_tile_count == 0) {
+      return false;
+    }
+    const dim3 block(kRoutedThreadsPerBlock);
+    const dim3 grid(
+        static_cast<unsigned int>(output_row_tile_count),
+        static_cast<unsigned int>(*current_cta_capacity));
+    switch (profile) {
+      case RoutedGemm2Profile::kP12_128x128x128_SwapTrue:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<float, 128, 128><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm2Profile::kP13_128x128x64_SwapTrue:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<float, 128, 64><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm2Profile::kP15_256x128x64_SwapTrue:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<float, 256, 64><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm2Profile::kLegacy:
+        break;
+    }
+    return false;
+  };
+
+  const RoutedGemm2Profile profile = SelectRoutedGemm2Profile(dispatch_rows);
+  if (profile != RoutedGemm2Profile::kLegacy && launch_profile(profile)) {
+    return true;
+  }
+
   const std::size_t output_row_tile_count =
       (output_rows_per_expert + static_cast<std::size_t>(kPlannedOutputTile) - 1u) /
       static_cast<std::size_t>(kPlannedOutputTile);
@@ -2562,6 +3115,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
     const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t dispatch_rows,
     std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
@@ -2585,6 +3139,110 @@ bool LaunchPlannedPackedInputMatVecBf16(
       *current_cta_capacity > launch_plan->cta_capacity()) {
     return false;
   }
+  const auto launch_profile = [&](RoutedGemm1Profile profile) -> bool {
+    const int output_tile = RoutedOutputTile(profile);
+    const std::size_t output_row_tile_count =
+        (output_rows_per_expert + static_cast<std::size_t>(output_tile) - 1u) /
+        static_cast<std::size_t>(output_tile);
+    if (output_row_tile_count == 0) {
+      return false;
+    }
+    const dim3 block(kRoutedThreadsPerBlock);
+    const dim3 grid(
+        static_cast<unsigned int>(output_row_tile_count),
+        static_cast<unsigned int>(*current_cta_capacity));
+    switch (profile) {
+      case RoutedGemm1Profile::kP0_128x128x128_SwapFalse:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse<__nv_bfloat16, 128, 128><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm1Profile::kP1_128x128x64_SwapFalse:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse<__nv_bfloat16, 128, 64><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm1Profile::kP4_128x128x128_SwapTrue:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<__nv_bfloat16, 128, 128><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm1Profile::kP5_128x128x64_SwapTrue:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<__nv_bfloat16, 128, 64><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm1Profile::kP7_256x128x64_SwapTrue:
+        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<__nv_bfloat16, 256, 64><<<grid, block>>>(
+            input_pack.packed_data(),
+            input_pack.block_scales_data(),
+            input_pack.device_tensor_scale_ptr(),
+            input_expert_tensor_scales,
+            input_dq_scales,
+            launch_plan->num_non_exiting_ctas(),
+            launch_plan->cta_idx_xy_to_batch_idx(),
+            launch_plan->cta_idx_xy_to_mn_limit(),
+            launch_plan->expert_first_token_offsets(),
+            static_cast<int>(launch_plan->selected_token_tile()),
+            weights,
+            output_rows_per_expert,
+            output);
+        return CheckCuda(cudaGetLastError());
+      case RoutedGemm1Profile::kLegacy:
+        break;
+    }
+    return false;
+  };
+
+  const RoutedGemm1Profile profile = SelectRoutedGemm1Profile(dispatch_rows);
+  if (profile != RoutedGemm1Profile::kLegacy && launch_profile(profile)) {
+    return true;
+  }
+
   const std::size_t output_row_tile_count =
       (output_rows_per_expert + static_cast<std::size_t>(kPlannedOutputTile) - 1u) /
       static_cast<std::size_t>(kPlannedOutputTile);
@@ -2993,6 +3651,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                     nullptr,
                     nullptr,
                     params.launch_plan,
+                    params.token_count,
                     selection_count,
                     params.routed_up_device,
                     params.routed_expert_intermediate_size,
@@ -3018,6 +3677,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
             nullptr,
             activation_output_scale,
             params.launch_plan,
+            params.token_count,
             selection_count,
             params.routed_down_device,
             params.hidden_size,
@@ -3034,6 +3694,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                     fc1_input_expert_scales,
                     nullptr,
                     params.launch_plan,
+                    params.token_count,
                     selection_count,
                     params.routed_up_device,
                     params.routed_expert_intermediate_size,
@@ -3081,6 +3742,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                     params.fc2_expert_activation_scales,
                     nullptr,
                     params.launch_plan,
+                    params.token_count,
                     selection_count,
                     params.routed_down_device,
                     params.hidden_size,

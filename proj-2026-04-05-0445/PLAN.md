@@ -383,6 +383,276 @@ Interpretation:
 - The next remaining jump is the grouped math core itself: replace the current
   WMMA row-tile micro-fragment consumer with a fuller TRT-like grouped GEMM
   micro-fragment kernel for routed FC1 and FC2.
+- TRT runtime trace update (`2026-04-07`):
+  - the real local `TRT-LLM` NemotronH serve path is using the CUTLASS
+    fused-MoE custom op selected through `trtllm::fused_moe::gemm1` /
+    `trtllm::fused_moe::gemm2`, not the `trtllmGenFp8BlockScaleMoe` runner
+  - observed real-path tactic IDs from
+    `artifacts/benchmarks/trtllm_fused_moe_tactics_20260407.log`:
+    - warmup max-context `(4607, 1344)`: `gemm1=1`, `gemm2=13`
+    - decode-like `(1, 1344)`: `gemm1=0`, `gemm2=13`
+    - `prefix4` `(4, 1344)`: `gemm1=5`, `gemm2=15`
+    - `prefix128` `(128, 1344)`: `gemm1=4`, `gemm2=12`
+    - `prefix4096` `(4096, 1344)`: `gemm1=1`, `gemm2=13`
+  - packed routed shapes on the real path are:
+    - `input_shape=(tokens, 1344)`
+    - `fc1_shape=(128, 1920, 168)`
+    - `fc2_shape=(128, 2688, 120)`
+    - `top_k=6`
+    - `act_dtype=torch.uint8`, `weight_dtype=torch.int64`,
+      `output_dtype=torch.bfloat16`
+  - implication:
+    - the native target is not one universal TRT-like grouped kernel
+    - it is a shape-aware routed grouped-kernel family over the packed
+      low-precision contract
+    - the immediate specialization buckets are now clear:
+      `M=1`, `M=4`, `M=128`, and `M=4096`
+  - actual CUTLASS tactic descriptors from the live `FusedMoeRunner` path:
+    - `prefix4`
+      - `gemm1=5`: TMA Warp Specialized, `tile=128x128x64`,
+        `cluster=1x1x1`, `swap_ab=true`, `epilogue_fusion=0`
+      - `gemm2=15`: TMA Warp Specialized, `tile=256x128x64`,
+        `cluster=1x1x1`, `swap_ab=true`, `epilogue_fusion=1`
+    - `prefix128`
+      - `gemm1=4`: TMA Warp Specialized, `tile=128x128x128`,
+        `cluster=1x1x1`, `swap_ab=true`, `epilogue_fusion=0`
+      - `gemm2=13`: TMA Warp Specialized, `tile=128x128x64`,
+        `cluster=1x1x1`, `swap_ab=true`, `epilogue_fusion=1`
+    - `prefix4096`
+      - `gemm1=1`: TMA Warp Specialized, `tile=128x128x64`,
+        `cluster=1x1x1`, `swap_ab=false`, `epilogue_fusion=0`
+      - `gemm2=13`: TMA Warp Specialized, `tile=128x128x64`,
+        `cluster=1x1x1`, `swap_ab=true`, `epilogue_fusion=1`
+- implication for the native rewrite:
+  - `gemm2` is nearly stable across `128` and `4096`, but `prefix4` wants a
+    larger `256x128x64` tile
+  - `gemm1` changes both `tile_k` and `swap_ab` across regimes
+  - the next native grouped-kernel step should therefore mirror TRT with a
+    small family of shape-selected routed FC1/FC2 kernels, not one fixed
+    grouped body
+- granular tactic-sweep update (`2026-04-07`):
+  - artifacts:
+    - `artifacts/benchmarks/trtllm_fused_moe_tactic_sweep_20260407.log`
+    - `artifacts/benchmarks/trtllm_fused_moe_tactic_boundary_sweep_20260407.log`
+  - the live CUTLASS fused-MoE path is not using a simple monotonic threshold
+    over `num_rows`
+  - observed islands from the finer sweep:
+    - `1`: `g1=0 128x128x128 swap_ab=false`, `g2=13 128x128x64`
+    - `2..3`: `g1=7 256x128x64 swap_ab=true`, `g2=15 256x128x64`
+    - `4..7`: `g1=5 128x128x64 swap_ab=true`, `g2=15 256x128x64`
+    - `8`: `g1=1 128x128x64 swap_ab=false`, `g2=13 128x128x64`
+    - `9..15`: `g1=1 128x128x64 swap_ab=false`, `g2=12 128x128x128`
+    - `16`: `g1=1 128x128x64 swap_ab=false`, `g2=15 256x128x64`
+    - `24..31`: `g1=1 128x128x64 swap_ab=false`, `g2=13 128x128x64`
+    - `32..112`: `g1=0 128x128x128 swap_ab=false`, `g2=13 128x128x64`
+    - `120..127`: `g1=4 128x128x128 swap_ab=true`, `g2=13 128x128x64`
+    - `128..192`: `g1=5 128x128x64 swap_ab=true`, `g2=12 128x128x128`
+    - `200..248`: `g1=4 128x128x128 swap_ab=true`, `g2=12 128x128x128`
+    - `256`: `g1=5 128x128x64 swap_ab=true`, `g2=13 128x128x64`
+    - `320`: `g1=1 128x128x64 swap_ab=false`, `g2=12 128x128x128`
+    - `384`: `g1=5 128x128x64 swap_ab=true`, `g2=13 128x128x64`
+    - `448..511`: `g1=1 128x128x64 swap_ab=false`, `g2=12 128x128x128`
+    - `512..992`: `g1=5 128x128x64 swap_ab=true`, `g2=12 128x128x128`
+    - `1024..4607`: `g1=1 128x128x64 swap_ab=false`, `g2=13 128x128x64`
+- implication:
+    - the native routed grouped-kernel selector should be implemented as a
+      small explicit regime table, not a guessed single-threshold policy
+    - `gemm1` and `gemm2` need independent regime selection
+    - the first native family should target the stable islands we already know
+      we care about operationally: `1`, `4..7`, `32..112`, `120..248`,
+      `512..992`, `1024+`
+
+### Sub-Plan: From-Scratch Routed Grouped GEMM Family
+
+Yes. We should now return directly to the grouped-GEMM internal kernel rewrite.
+The contract is good enough, the live TRT tactic family is traced, and the
+remaining routed gap is now inside the math body rather than in metadata or
+staging.
+
+The goal of this sub-plan is not to copy CUTLASS or import TRT-LLM source
+verbatim. The goal is to reproduce the TRT routed stage shape in our own
+specialized runtime:
+
+1. explicit routed grouped metadata
+2. from-scratch grouped `PermuteGemm1` family
+3. TRT-style `gemm1_output -> gemm1_output_scale -> activation_output_scale`
+   handoff
+4. from-scratch grouped `Gemm2` family
+5. existing finalize path
+
+#### Locked Inputs
+
+- Keep the current active packed routed contract:
+  - `permuted_idx_to_token_idx`
+  - `total_num_padded_tokens`
+  - `num_non_exiting_ctas`
+  - `cta_idx_xy_to_batch_idx`
+  - `cta_idx_xy_to_mn_limit`
+  - packed FC1 input
+  - BF16 `gemm1_output`
+  - routed `gemm1_output_scale`
+  - routed `activation_output_scale`
+  - packed FC2 input
+- Keep one runtime path only.
+- Keep behavioral reuse equivalence as the correctness bar.
+- Do not reintroduce cuBLASLt or a second generic expert path.
+
+#### Implementation Order
+
+1. Freeze the routed dispatcher around an explicit TRT-like regime table.
+   - No heuristic threshold guesses in the first cut.
+   - Dispatch `gemm1` and `gemm2` independently.
+   - Encode the traced TRT regimes directly.
+
+2. Implement the common grouped-kernel substrate once.
+   - CTA work unit:
+     one grouped GEMM tile identified by `cta_idx_xy_to_batch_idx` and
+     `cta_idx_xy_to_mn_limit`.
+   - Common per-CTA state:
+     expert id, padded batch row range, packed-token base, output `N` tile,
+     and `valid_m/valid_n` limits.
+   - Common math policy:
+     FP32 accumulate, BF16 output, packed low-precision operands.
+   - Common variants:
+     `tile_k=64`, `tile_k=128`, `swap_ab=false`, `swap_ab=true`.
+
+3. Implement the design-center FC1 family first.
+   - First kernel:
+     TRT `gemm1=5`, `128x128x64`, `swap_ab=true`.
+     This directly covers the current `prefix128` design center and several
+     other stable islands.
+   - Second kernel:
+     TRT `gemm1=1`, `128x128x64`, `swap_ab=false`.
+     This covers the `1024+` large-prefill regime and several smaller islands.
+   - Third kernel:
+     TRT `gemm1=4/0`, `128x128x128`, with both `swap_ab=true` and
+     `swap_ab=false`.
+     This covers the medium `32..112` and `120..248` islands.
+   - Fourth kernel:
+     TRT `gemm1=7`, `256x128x64`, `swap_ab=true`, for the `2..3` tiny regime.
+
+4. Keep activation and scale production as a separate stage boundary, but make
+   it TRT-shaped.
+   - Consume BF16 `gemm1_output` in grouped padded order.
+   - Produce `gemm1_output_scale`.
+   - Apply `ReLU^2`.
+   - Produce `activation_output_scale`.
+   - Pack directly into grouped FC2 input.
+   - Do not materialize an alternate long-lived FP32 routed seam.
+
+5. Implement the design-center FC2 family second.
+   - First kernel:
+     TRT `gemm2=12`, `128x128x128`, `swap_ab=true`.
+     This covers the current `prefix128` design center and the broader
+     `128..248` and `512..992` islands.
+   - Second kernel:
+     TRT `gemm2=13`, `128x128x64`, `swap_ab=true`.
+     This covers `32..127`, `256`, `384`, and `1024+`.
+   - Third kernel:
+     TRT `gemm2=15`, `256x128x64`, `swap_ab=true`, for `2..16`.
+
+6. Wire the routed stage to the explicit regime table in priority order.
+   - Priority A:
+     `prefix128` path:
+     FC1 `5`, FC2 `12`.
+   - Priority B:
+     `prefix4096` path:
+     FC1 `1`, FC2 `13`.
+
+#### Progress Update (`2026-04-07`)
+
+- landed the first correctness-clean grouped-body rewrite in
+  `runtime/src/backend/fused_moe_prefill.cu`
+  - active routed FC1/FC2 kernels now dispatch through the traced TRT regime
+    table
+  - the grouped kernel body now matches TRT operand layout semantics instead of
+    treating both operands as row-major:
+    - `swap_ab=false`: activations as `A` row-major, weights as `B`
+      column-major
+    - `swap_ab=true`: weights as `A` row-major, activations as `B`
+      column-major, with the transposed output scatter
+  - focused validation stayed green:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+- artifacts:
+  - `artifacts/benchmarks/ttft_20260407_trt_layout_grouped_body_prefix128_tail4.stdout.txt`
+  - `artifacts/benchmarks/ttft_20260407_trt_layout_grouped_body_prefix4096_tail4.stdout.txt`
+- measured outcome:
+  - `cold_prefill_prefix128 = 126.168 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix = 54.304 ms`
+  - `cold_prefill_prefix4096 = 2488.473 ms`
+  - `cached_global_root_prefix4096_tail4 hot-prefix = 96.850 ms`
+- conclusion:
+  - matching TRT metadata plus operand-layout semantics is necessary, but not
+    sufficient
+  - the remaining routed gap is now inside the mainloop microarchitecture:
+    per-element NVFP4 decode, shared-memory tile fill/staging, and the lack of
+    a TRT-like TMA/block-scaled mainloop
+  - the next rewrite should therefore target the profile-specific inner loop,
+    not more contract churn
+   - Priority C:
+     tiny/tail path:
+     FC1 `5` or `7`, FC2 `15`.
+   - Priority D:
+     medium odd islands:
+     FC1 `0/4`, FC2 `13/12`.
+
+7. Remove the current WMMA row-tile routed consumers as each regime becomes
+   covered by the new grouped family.
+   - Do not keep the old routed body alive as a parallel long-term
+     implementation.
+
+#### Initial Native Regime Table
+
+- `rows=1`
+  - FC1: profile `0`, `128x128x128`, `swap_ab=false`
+  - FC2: profile `13`, `128x128x64`, `swap_ab=true`
+- `rows=2..3`
+  - FC1: profile `7`, `256x128x64`, `swap_ab=true`
+  - FC2: profile `15`, `256x128x64`, `swap_ab=true`
+- `rows=4..7`
+  - FC1: profile `5`, `128x128x64`, `swap_ab=true`
+  - FC2: profile `15`, `256x128x64`, `swap_ab=true`
+- `rows=32..112`
+  - FC1: profile `0`, `128x128x128`, `swap_ab=false`
+  - FC2: profile `13`, `128x128x64`, `swap_ab=true`
+- `rows=120..127`
+  - FC1: profile `4`, `128x128x128`, `swap_ab=true`
+  - FC2: profile `13`, `128x128x64`, `swap_ab=true`
+- `rows=128..192`
+  - FC1: profile `5`, `128x128x64`, `swap_ab=true`
+  - FC2: profile `12`, `128x128x128`, `swap_ab=true`
+- `rows=200..248`
+  - FC1: profile `4`, `128x128x128`, `swap_ab=true`
+  - FC2: profile `12`, `128x128x128`, `swap_ab=true`
+- `rows=256`
+  - FC1: profile `5`, `128x128x64`, `swap_ab=true`
+  - FC2: profile `13`, `128x128x64`, `swap_ab=true`
+- `rows=512..992`
+  - FC1: profile `5`, `128x128x64`, `swap_ab=true`
+  - FC2: profile `12`, `128x128x128`, `swap_ab=true`
+- `rows=1024+`
+  - FC1: profile `1`, `128x128x64`, `swap_ab=false`
+  - FC2: profile `13`, `128x128x64`, `swap_ab=true`
+
+#### Stop Conditions And Gates
+
+- After each new regime lands:
+  - `device_nvfp4_matrix_test`
+  - `moe_launch_plan_device_test`
+  - `fused_moe_prefill_test`
+  - `multi_turn_prefix_reuse_test`
+- Stage gates:
+  - after Priority A, `cold_prefill_prefix128` must improve over the current
+    routed grouped baseline
+  - after Priority B, `cold_prefill_prefix4096` routed share must drop
+    materially in profile
+  - after Priority C, `cached_committed_head_prefix128_tail4` must not regress
+    behaviorally
+- Exit this sub-plan when routed expert math is no longer the dominant cold
+  prefill bucket. At that point move shared experts onto the same kernel family,
+  then return to long-prefix Mamba.
 
 ## Goal
 
