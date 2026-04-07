@@ -317,6 +317,90 @@ Interpretation:
     - the next native rewrite should target the grouped MMA mainloop proper,
       not more contract cleanup
 
+- full TRT mainloop alignment plan (`2026-04-07`):
+  - canonical plan:
+    `proj-2026-04-05-0445/PLAN.md`,
+    section `Full TRT Mainloop Alignment Plan`
+  - objective:
+    match the traced local TRT routed mainloop as faithfully as possible in
+    native custom code, not just the routed metadata and tile-selection layer
+  - immediate work:
+    - freeze the current routed external contract
+    - recover the remaining TRT internal mainloop facts with targeted tracing
+      and profiling
+    - build a native producer/consumer grouped-kernel substrate
+    - port the traced routed tactic family onto that substrate
+  - current blockers:
+    - missing internal pipeline facts such as stage count and
+      producer/consumer warp-role split
+    - no native TMA/warp-specialized substrate yet
+    - partial epilogue recovery only
+    - some internal tile/swizzle details still inferred rather than observed
+    - irregular traced tactic family requires a real profile family, not one
+      universal kernel
+
+- targeted TRT routed `nsys` profile (`2026-04-07`):
+  - artifacts:
+    - `artifacts/profiles/trtllm_mainloop_20260407/nsys_prefix128.nsys-rep`
+    - `artifacts/profiles/trtllm_mainloop_20260407/nsys_prefix128.cuda_gpu_kern_sum.csv`
+    - `artifacts/profiles/trtllm_mainloop_20260407/nsys_prefix128.cuda_gpu_trace.csv`
+  - recovered facts:
+    - the live routed GEMMs are
+      `cutlass::gemm::kernel::GemmUniversal<...MainloopSm120ArrayTmaWarpSpecializedBlockScaled...>`
+    - live grouped GEMM launches use `BlockX=384`
+    - TRT helper stages are separate kernels:
+      - `computeStridesTmaWarpSpecializedKernel<...>` with `BlockX=128`
+      - `doActivationKernel<...>` with `BlockX=256`
+    - the live routed SM120 path is block-scaled FP4 grouped GEMM
+      (`cutlass::float_e2m1_t` operands), not BF16 WMMA
+  - implication:
+    - native helper-stage alignment is now materially closer
+    - the remaining routed gap is specifically the true FP4/TMA grouped
+      mainloop body
+
+- routed activation-pack helper alignment (`2026-04-07`):
+  - active native change:
+    - replace the generic BF16 `PackDeviceRowMajorBf16ToNvfp4PerExpert(...)`
+      boundary with a routed, padded, programmatic-launch activation pack
+      kernel in `runtime/src/backend/fused_moe_prefill.cu`
+    - rows-per-CTA policy matches TRT helper behavior:
+      `kProcessRows = 1 / 2 / 4`
+  - focused validation:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+  - artifact:
+    - `artifacts/benchmarks/ttft_20260407_routed_activation_pack_prefix128_tail4.stdout.txt`
+  - result:
+    - `cold_prefill_prefix128 = 126.004 ms`
+    - `cached_committed_head_prefix128_tail4 hot-prefix = 54.410 ms`
+    - `cached_global_root_prefix128_tail4 hot-prefix = 54.373 ms`
+  - conclusion:
+    - keep the routed activation-pack helper alignment
+    - helper-stage structure is no longer the main routed gap
+
+- grouped routed CTA-shape alignment (`2026-04-07`):
+  - active native change:
+    - move the active grouped routed FC1/FC2 kernels to a TRT-like `384`
+      thread CTA
+    - keep eight consumer warps on the WMMA tile and use the extra four warps
+      on the staging side
+  - focused validation:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+  - artifact:
+    - `artifacts/benchmarks/ttft_20260407_grouped_384cta_prefix128_tail4.stdout.txt`
+  - result:
+    - `cold_prefill_prefix128 = 125.839 ms`
+    - `cached_committed_head_prefix128_tail4 hot-prefix = 54.766 ms`
+    - `cached_global_root_prefix128_tail4 hot-prefix = 54.540 ms`
+  - conclusion:
+    - keep the larger grouped CTA shape
+    - this improves cold prefill slightly and keeps reuse correctness green
+    - hot-prefix remains flat, so the next bottleneck is the true FP4/TMA
+      mainloop rather than CTA size alone
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first

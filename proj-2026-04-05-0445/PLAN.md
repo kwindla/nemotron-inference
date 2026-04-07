@@ -619,6 +619,222 @@ specialized runtime:
       keeping reuse correctness green
     - the remaining routed gap is now deeper in the grouped MMA mainloop than
       simple nibble/scale decode overhead
+
+#### Full TRT Mainloop Alignment Plan
+
+The next target is full routed-mainloop fidelity to the traced local
+`TRT-LLM` path. That means matching the routed grouped kernel family in every
+material regard that we can recover from trace, source, and profiler data,
+while still implementing it as native custom code in this runtime.
+
+The intended routed end state is:
+
+1. exact traced regime-table dispatch
+2. exact TRT-like grouped packed operand contracts
+3. exact TRT-like grouped kernel family for FC1 and FC2
+4. exact TRT-like producer/consumer mainloop structure
+5. exact TRT-like epilogue and output-scale boundaries
+
+What "full alignment" means here:
+
+- match tile shape
+- match `swap_ab`
+- match grouped batch semantics
+- match packed operand interpretation
+- match warp-specialized execution structure
+- match staged mainloop depth
+- match output / epilogue behavior
+
+What remains out of scope for this step:
+
+- shared expert rewrite
+- Mamba rewrite
+- attention rewrite
+- importing TRT generic infrastructure or CUTLASS code generation into the
+  production runtime
+
+#### Implementation Plan
+
+1. Freeze the current routed external contract.
+   - Keep:
+     `permuted_idx_to_token_idx`,
+     `total_num_padded_tokens`,
+     `num_non_exiting_ctas`,
+     `cta_idx_xy_to_batch_idx`,
+     `cta_idx_xy_to_mn_limit`,
+     `expert_first_token_offsets`,
+     `gemm1_output_scale`,
+     `activation_output_scale`.
+   - Keep the traced regime table as the source of truth.
+   - Do not replace it with heuristic thresholds.
+
+2. Recover the missing TRT internal mainloop facts.
+   - Run more TRT traces only where information is still missing.
+   - For each routed tactic family, recover:
+     - exact kernel descriptor
+     - exact output / epilogue mode
+     - actual kernel name if observable
+     - stage-count / pipeline-depth clues
+     - any observable launch-shape or shared-memory facts
+   - If trace logs are insufficient, run targeted `ncu` on TRT for:
+     `prefix4`, `prefix128`, and `prefix4096`.
+
+3. Build one native warp-specialized grouped-kernel substrate.
+   - One producer/consumer pipeline substrate for routed FC1/FC2.
+   - Inputs:
+     packed low-precision activations, packed low-precision weights, TRT-style
+     grouped CTA metadata.
+   - Outputs:
+     BF16 `gemm1_output` or BF16/FP32 `gemm2_output` at the current routed
+     stage boundaries.
+   - Required features:
+     - profile-specific `tile_m / tile_n / tile_k`
+     - profile-specific `swap_ab`
+     - profile-specific epilogue mode
+     - staged double- or triple-buffered mainloop
+     - no scalar per-element decode inside the MMA hot loop
+
+4. Implement the traced routed tactic family directly.
+   - FC1 kernels:
+     - `128x128x64 swap_ab=true`
+     - `128x128x64 swap_ab=false`
+     - `128x128x128 swap_ab=true`
+     - `128x128x128 swap_ab=false`
+     - `256x128x64 swap_ab=true`
+   - FC2 kernels:
+     - `128x128x64 swap_ab=true`
+     - `128x128x128 swap_ab=true`
+     - `256x128x64 swap_ab=true`
+
+5. Match TRT stage boundaries exactly.
+   - FC1 writes BF16 `gemm1_output`.
+   - `gemm1_output_scale` and `activation_output_scale` are produced at the
+     same logical boundary as TRT.
+   - FC2 consumes the packed activated contract directly.
+   - Keep finalize unchanged until the routed kernel family is complete.
+
+6. Replace the current grouped WMMA body profile-by-profile.
+   - Land profiles in this order:
+     - FC1 profile `5`, FC2 profile `12`
+     - FC1 profile `1`, FC2 profile `13`
+     - FC1 profile `4/0`, FC2 profile `13/12`
+     - FC1 profile `7`, FC2 profile `15`
+   - Once a profile is covered and validated, retire its use of the current
+     grouped WMMA body.
+   - Fallback should remain only for unimplemented traced profiles.
+
+7. Remove the legacy grouped and row-tile bodies after full traced coverage.
+   - After all traced tactic islands are covered by the new family, delete:
+     - the current grouped WMMA body
+     - then the old legacy row-tile routed fallback
+
+#### Blockers To Full TRT Alignment
+
+1. Missing internal pipeline facts.
+   - We know tile shapes, `swap_ab`, and epilogue flags.
+   - We do not yet directly know:
+     - stage count
+     - producer/consumer warp-role split
+     - shared-memory swizzle/layout details
+     - exact async transport pattern
+
+2. No native TMA/warp-specialized substrate yet.
+   - Our current grouped kernels are still synchronous WMMA kernels with
+     explicit shared-memory staging and full CTA barriers.
+   - TRT is selecting `TMA Warp Specialized` tactics.
+
+3. Epilogue behavior is only partially recovered.
+   - We know `gemm2` often selects `epilogue_fusion=1`.
+   - We have not yet fully reconstructed what remains inside that fused
+     epilogue versus what happens as separate native work.
+
+4. Some internal layout details are still inferred rather than observed.
+   - Packed live shapes are known.
+   - CTA metadata is known.
+   - Exact internal tile/swizzle details for the selected tactics are not yet
+     fully recovered.
+
+5. The traced tactic family is irregular.
+   - TRT is not using one monotonic threshold policy.
+   - Full fidelity requires a real profile family, not one universal kernel.
+
+#### Additional TRT Ground Truth (`2026-04-07`)
+
+Targeted local `nsys` on the traced TRT `prefix128` routed path adds several
+mainloop facts beyond the earlier tactic descriptors:
+
+- the real routed GEMMs are `cutlass::gemm::kernel::GemmUniversal<...>`
+  instantiations over `MainloopSm120ArrayTmaWarpSpecializedBlockScaled`
+- the live FC1/FC2 hot kernels launch with `BlockX=384`
+- TRT also launches separate helper kernels around the grouped GEMMs:
+  - `computeStridesTmaWarpSpecializedKernel<...>` with `BlockX=128`
+  - `doActivationKernel<...>` with `BlockX=256`
+- the live SM120 routed path is block-scaled FP4 grouped GEMM, not BF16 WMMA:
+  - operands are `cutlass::float_e2m1_t`
+  - the MMA atom is `SM120_16x8x64_TN_VS`
+  - FC1/FC2 epilogues are distinct fused callback families
+
+That makes the remaining native gap very concrete:
+
+- helper-stage structure is now materially closer to TRT
+- regime-table selection is now materially closer to TRT
+- CTA shape is now materially closer to TRT
+- the remaining miss is the hot loop itself:
+  - no native TMA mainloop
+  - no native FP4xFP4 MMA path
+  - no native CUTLASS-like producer/consumer pipeline
+
+#### Current Routed Status (`2026-04-07`)
+
+The active grouped routed FC1/FC2 kernels now use the traced larger CTA shape:
+
+- `BlockX=384`
+- eight consumer warps on the WMMA tile
+- four extra staging warps in the same CTA
+
+This is not full TRT fidelity yet, but it is a useful intermediate step because
+the live TRT traces showed the grouped routed kernels launching at `384`
+threads, not `256`.
+
+Focused gate after the CTA-shape change:
+
+- artifact:
+  `artifacts/benchmarks/ttft_20260407_grouped_384cta_prefix128_tail4.stdout.txt`
+- result:
+  - `cold_prefill_prefix128 = 125.839 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 54.766 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix = 54.540 ms`
+- focused validation:
+  - `fused_moe_prefill_test`
+  - `moe_launch_plan_device_test`
+  - `multi_turn_prefix_reuse_test`
+
+Conclusion:
+
+- keep the larger grouped CTA shape
+- do not spend more time on grouped metadata or helper-stage cleanup
+- next rewrite must target the true FP4/TMA-style grouped mainloop body
+
+#### How To Unblock This
+
+1. Add one more round of targeted TRT tracing / profiling.
+2. Recover the missing per-profile pipeline facts.
+3. Implement the native producer/consumer grouped substrate.
+4. Port the traced tactic family onto that substrate.
+5. Delete the current grouped WMMA body only after traced coverage is complete.
+
+#### Acceptance Criteria
+
+- `fused_moe_prefill_test`
+- `moe_launch_plan_device_test`
+- `multi_turn_prefix_reuse_test`
+- no regression in behavioral reuse equivalence
+- routed profile dispatch matches the traced TRT family for covered regimes
+- cold TTFT continues improving on:
+  - `prefix128`
+  - `prefix4096`
+- routed experts stop dominating the cold-prefill profile
+
    - Priority C:
      tiny/tail path:
      FC1 `5` or `7`, FC2 `15`.
