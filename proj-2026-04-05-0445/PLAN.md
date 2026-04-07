@@ -9,6 +9,152 @@ was written before the attention rewrite landed. The attention-first plan in
 `ATTENTION_PLAN.md` is now complete. The fresh post-attention profile is saved
 in `post_attention_root_cause.md`.
 
+As of `2026-04-06`, this file is again the canonical optimization plan.
+The later project directory `proj-2026-04-05-1704` now serves as the execution
+log / artifact bundle for the recovery work:
+
+- `proj-2026-04-05-1704/STEP3_RECOVERY_PLAN.md`
+- `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md`
+
+## Canonical Update (2026-04-06)
+
+### Current Objective
+
+The target is no longer just "recover the old native baseline." The target is:
+
+1. beat local `vLLM` cold prefill
+2. beat local `TRT-LLM` PyTorch cold prefill
+3. do it on one active runtime path, with device-only execution and behavioral
+   reuse equivalence preserved
+
+### Competition Surface
+
+Use the direct exact-token prefill profile surface from
+`proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md` as the race metric.
+
+Current measured times on the local Nano checkpoint / RTX 5090:
+
+| runtime | prefix4 | prefix128 | prefix4096 |
+|---|---:|---:|---:|
+| native runtime | `54.016 ms` | `127.698 ms` | `2503.116 ms` |
+| vLLM | `48.011 ms` | `40.396 ms` | `82.938 ms` |
+| TRT-LLM | `35.922 ms` | `38.407 ms` | `66.789 ms` |
+
+That means the current external targets to beat are:
+
+- `prefix4 < 35.922 ms`
+- `prefix128 < 38.407 ms`
+- `prefix4096 < 66.789 ms`
+
+### Current Root Cause
+
+The current cross-codebase profiles now make the work order much clearer than
+the older internal-only `1024` trace:
+
+- `prefix4`: native is still split between routed expert custom math and
+  shared expert WMMA
+- `prefix128`: native is still dominated by routed expert custom math
+- `prefix4096`: native is dominated by routed expert custom math and then by
+  Mamba prefill
+
+By contrast, both `vLLM` and `TRT-LLM` spend these regions mostly in grouped
+`CUTLASS` / `FP4` GEMM kernels with much smaller glue overhead, and their
+long-prefix Mamba cost is much lower.
+
+### Locked Contract Addendum
+
+In addition to the original contract below, the active fast path is now locked
+to these constraints:
+
+- one active runtime path
+- device-only runtime contract
+- no hot-path `DtoH`
+- behavioral reuse equivalence is the correctness bar, not bitwise identity
+
+### Current Execution Order
+
+This is the active order of operations for the optimization work:
+
+1. finish the routed MoE transition to grouped `FP4xFP4` tensor-core math
+2. move shared experts onto the same stronger kernel family
+3. then attack long-prefix Mamba
+4. only then spend time on attention polish or smaller cleanup
+
+The immediate implementation gap is now very specific:
+
+- the runtime already has device launch-plan infrastructure
+- the runtime already has preallocated `DeviceNvfp4Matrix` work buffers
+- but the active fused prefill path still uses a BF16/FP32-oriented routed
+  kernel shape instead of the intended grouped `FP4xFP4` contract from step `3`
+
+So the next code changes should start from the packed-activation / grouped-GEMM
+boundary, not from more row-kernel scheduling tweaks.
+
+### Immediate Prototype Finding
+
+The first benchmark-only packed-activation prototype is now in
+`benchmarks/nano_moe_prefill/nano_routed_up_bench.cpp`.
+
+At the design-center `prefix128` case:
+
+- `launch_plan_wmma_bf16_transposed_m16n32k16`: about `1.509 ms`
+- `launch_plan_wmma_packed_input_transposed_m16n32k16`: about `2.193 ms`
+- max diff vs baseline: about `2.318`
+
+At `prefix4096`:
+
+- `launch_plan_wmma_bf16_transposed_m16n32k16`: about `27.216 ms`
+- `launch_plan_wmma_packed_input_transposed_m16n32k16`: about `42.512 ms`
+- max diff vs baseline: about `2.318`
+
+Interpretation:
+
+- the existing `DeviceNvfp4Matrix` activation contract is not a direct
+  substitute for the current BF16 routed-up kernel
+- simply feeding packed activations into the current WMMA tile is slower and
+  materially changes numerics
+- the next grouped `FP4xFP4` step therefore needs a better packed-activation
+  contract and a math core designed for it, not just a storage-format swap
+
+### Contract Progress Update
+
+That next packed-activation contract is now partially landed on the active
+runtime side:
+
+- routed prefill launch-plan rows are expert-major and `128`-row aligned
+- routed reduction now correctly maps `selection_to_sorted` through
+  `sorted_to_permuted_indices`, which restored behavioral reuse equivalence
+  after the padded-layout switch
+- the static MoE workspace now carries a prefill `normalized_pack` source
+  buffer plus grouped NVFP4 pack storage
+- FC1 now packs normalized activations once and then permutes packed rows into
+  grouped padded order, instead of gathering FP32 rows and repacking them
+- the grouped packed-row helper preserves the source tensor scale and zeroes
+  padded rows
+- the active packed path now no longer spends time computing the dead
+  per-expert activation-scale metadata that the current consumer does not use
+
+What is still missing is the remaining TRT output-side contract:
+
+- FC2 still starts from FP32 scratch plus a neutral grouped repack, not from a
+  TRT-like `gemm1_output_scale` / activation-output-scale contract
+- the next step is to move routed `gemm1` / `gemm2` onto the same grouped FP4
+  activation contract end to end, not just on the FC1 source side
+
+Focused validation is currently green:
+
+- `device_nvfp4_matrix_test`
+- `moe_launch_plan_device_test`
+- `fused_moe_prefill_test`
+- `multi_turn_prefix_reuse_test`
+
+Focused TTFT on the design-center `prefix128 / tail4` case after removing the
+dead expert-scale kernels from the packed path is:
+
+- `cold_prefill_prefix128 = 125.663 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.480 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.246 ms`
+
 ## Goal
 
 Optimize the remaining dominant prefill work for Nemotron 3 Nano NVFP4 on the
@@ -82,6 +228,8 @@ Reference artifact: `post_attention_root_cause.md`
 - `<=4` concurrent requests, optimize `1` first.
 - `64k` retained context is required, but the main optimization target remains
   the routed prefill path, not arbitrary full-context all-at-once operation.
+- behavioral reuse equivalence is required for prefix-cache correctness
+- no second runtime path should be introduced just to chase these wins
 
 ## Architecture Decision
 
@@ -273,10 +421,10 @@ attention prefill latency.
 
 | # | Step | Status | Notes |
 |---|------|--------|-------|
-| 0 | Freeze the post-attention baseline and root-cause profile | done | `1024` cold TTFT `440.312 ms`, `4096` cold TTFT `1369.694 ms`, attention now about `6%` of GPU kernel time |
-| 1 | Lock the revised optimization contract | done | Baseline frozen below |
-| 2 | Decide routed-expert input format and packing strategy | done | FP4×FP4 on tensor cores; quantize activations once per layer, grouped GEMM for all experts |
-| 3 | Grouped FP4×FP4 tensor core MoE kernel | pending | Scaffold using scalar Nvfp4RowMajorDot was reverted — production kernel must use MMA |
-| 4 | Reduce routed dispatch/finalize and allocator churn | pending | |
-| 5 | Optimize Mamba prefill | pending | |
-| 6 | Re-profile and choose the next default workstream | pending | |
+| 0 | Freeze the post-attention baseline and root-cause profile | done | Historical baseline frozen; newer external race targets now live above and in `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md` |
+| 1 | Lock the revised optimization contract | done | One runtime path, device-only execution, behavioral reuse equivalence |
+| 2 | Decide routed-expert input format and packing strategy | done | `FP4xFP4` on tensor cores; quantize activations once per layer; grouped GEMM for all experts |
+| 3 | Grouped `FP4xFP4` tensor core MoE kernel | in progress | Device launch plan, padded row layout, and partial BF16 WMMA path exist; the remaining gap is moving the active routed path onto the intended packed-activation grouped-`FP4xFP4` contract |
+| 4 | Shared-expert alignment | pending | Shared experts still distort short-prefix cold prefill and need the same stronger math family |
+| 5 | Optimize Mamba prefill | pending | Still the second blocker at `prefix4096` after routed MoE |
+| 6 | Re-profile and choose the next default workstream | pending | Final race phase only after routed MoE, shared, and long-prefix Mamba move materially |

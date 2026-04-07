@@ -8,6 +8,8 @@
 
 namespace nemotron {
 
+class DeviceNvfp4Matrix;
+
 struct FusedMoePrefillParams {
   std::size_t token_count = 0;
   std::size_t hidden_size = 0;
@@ -23,10 +25,15 @@ struct FusedMoePrefillParams {
   const float* selected_weights = nullptr;
   const float* input = nullptr;  // Reserved for future fused epilog variants.
   const float* normalized = nullptr;
+  const DeviceNvfp4Matrix* normalized_pack = nullptr;  // TRT-like prepacked FC1 source activations.
   DeviceExpertRouting* routing = nullptr;
   DeviceMoeLaunchPlan* launch_plan = nullptr;
   float* routed_gather_scratch = nullptr;  // padded_row_capacity x hidden_size
+  float* fc1_expert_activation_scales = nullptr;  // n_routed_experts
+  DeviceNvfp4Matrix* fc1_grouped_pack = nullptr;  // Optional TRT-like grouped FC1 input contract.
   float* routed_up_scratch = nullptr;      // padded_row_capacity x routed_expert_intermediate_size
+  float* fc2_expert_activation_scales = nullptr;  // n_routed_experts
+  DeviceNvfp4Matrix* fc2_grouped_pack = nullptr;  // Optional TRT-like grouped FC2 input contract.
   float* shared_up_scratch = nullptr;      // token_count x shared_expert_intermediate_size
   float* output = nullptr;  // Receives routed + shared expert contributions.
   float* routed_output = nullptr;  // Optional.

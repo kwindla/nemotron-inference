@@ -57,8 +57,11 @@ struct MoePrefillWorkspace {
   std::unique_ptr<DeviceMoeLaunchPlan> fused_prefill_launch_plan;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_fc1_activation_scales;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_fc2_activation_scales;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
+  std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_normalized_pack;
   std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_gather_pack;
   std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_expert_up_pack;
   std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_shared_up_pack;

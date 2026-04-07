@@ -16,6 +16,28 @@ The contract work is now good enough to treat as fixed for this phase:
 - device-only runtime contract
 - no hot-path DtoH
 - behavioral reuse equivalence restored on the committed-head reuse path
+- TRT-style grouped padded FC1/FC2 activation-pack production now exists in the
+  static MoE workspace via custom per-expert NVFP4 packing code
+
+Latest checkpoint:
+
+- FC1 now consumes a TRT-like packed source contract: normalized activations
+  are packed once and permuted in packed form into grouped padded rows
+- the active packed path no longer computes the dead per-expert activation
+  scales that its current consumer ignores
+- focused gates are green again:
+  `device_nvfp4_matrix_test`, `moe_launch_plan_device_test`,
+  `fused_moe_prefill_test`, `multi_turn_prefix_reuse_test`
+- focused TTFT on `prefix128 / tail4` is now:
+  `cold_prefill_prefix128 = 125.663 ms`,
+  `cached_committed_head_prefix128_tail4 hot-prefix = 54.480 ms`,
+  `cached_global_root_prefix128_tail4 hot-prefix = 54.246 ms`
+
+Interpretation:
+
+- the FC1 contract shift is now stable and slightly positive
+- the next missing TRT piece is FC2 / Gemm1-output scale handling, not more
+  FC1 gather-side work
 
 That means the priority is no longer "prove the contract." The priority is:
 
@@ -27,6 +49,219 @@ Everything else is secondary until cold prefill is back under control.
 
 External benchmark commands, artifacts, and cross-runtime profiling notes now
 live in `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md`.
+
+Canonical optimization planning now lives in
+`proj-2026-04-05-0445/PLAN.md`. This file should be treated as the detailed
+recovery log and artifact-backed execution record for that plan.
+
+This recovery plan should also be read as the continuation of the earlier
+optimization contract in `proj-2026-04-05-0445/PLAN.md`, especially:
+
+- `Prior Art` and `Locked Contract`
+- step `2`, which locked `FP4xFP4` tensor-core math with one activation
+  quantization step per layer
+- step `3`, which set the intended end state as grouped `FP4xFP4` MoE math,
+  not scalar row-wise dot products
+
+## External Race Plan
+
+The next objective is no longer just "recover the old baseline." It is:
+
+1. beat local `vLLM` cold prefill
+2. beat local `TRT-LLM` PyTorch cold prefill
+3. do it without adding a second runtime path or weakening reuse correctness
+
+### Competition Target
+
+Use the direct exact-token prefill profiling surface from
+`EXTERNAL_BASELINES_NOTES.md` as the primary cold-prefill race metric.
+
+The implementation direction for beating those numbers is still anchored by the
+earlier optimization decisions in `proj-2026-04-05-0445/PLAN.md`: grouped
+`FP4xFP4` tensor-core MoE, explicit launch/runtime structure, and no return to
+host-orchestrated per-expert execution.
+
+Current measured times on the local Nano checkpoint / RTX 5090:
+
+| runtime | prefix4 | prefix128 | prefix4096 |
+|---|---:|---:|---:|
+| native runtime | `54.016 ms` | `127.698 ms` | `2503.116 ms` |
+| vLLM | `48.011 ms` | `40.396 ms` | `82.938 ms` |
+| TRT-LLM | `35.922 ms` | `38.407 ms` | `66.789 ms` |
+
+To beat both external baselines, native runtime must get under:
+
+- `prefix4 < 35.922 ms`
+- `prefix128 < 38.407 ms`
+- `prefix4096 < 66.789 ms`
+
+Current gap versus the stronger external comparator:
+
+- `prefix4`: native is about `1.50x` slower than TRT-LLM
+- `prefix128`: native is about `3.32x` slower than TRT-LLM
+- `prefix4096`: native is about `37.48x` slower than TRT-LLM
+
+### What The Current Profiles Say
+
+The external profile comparison makes the work order clearer than the older
+internal-only analysis:
+
+- `prefix4`: native still spends most of prefill in routed expert custom math
+  plus shared expert WMMA
+- `prefix128`: native is dominated by routed expert custom math
+- `prefix4096`: native is dominated by routed expert custom math and then by
+  Mamba prefill
+
+By contrast, both `vLLM` and `TRT-LLM` spend the same region mostly in grouped
+CUTLASS / FP4 GEMM kernels, with much smaller glue overhead and much smaller
+Mamba cost at long prefix.
+
+That means:
+
+- the routed expert math core is still the first blocker
+- the shared expert path is still worth fixing early, especially for `prefix4`
+- the long-prefix `4096` race cannot be won without a serious Mamba prefill
+  improvement after routed MoE
+- attention is not the first optimization target
+
+### Execution Order
+
+#### Phase 1. Routed MoE Parity
+
+Goal:
+
+- make routed MoE look structurally like the external baselines:
+  grouped/tiled FP4 GEMM, not a custom row kernel
+
+This phase is the direct continuation of
+`proj-2026-04-05-0445/PLAN.md` step `3` (`Grouped FP4xFP4 tensor core MoE
+kernel`). The earlier project already settled the architectural argument. The
+remaining work is to actually land that end state in the current runtime and
+make it beat the external baselines on RTX 5090.
+
+Required work:
+
+- replace the remaining custom routed-expert math core with a TRT-LLM-like
+  grouped GEMM implementation over the current device launch plan
+- keep one runtime path and the existing device-only contract
+- remove or fold standalone row-oriented staging where possible:
+  - explicit row expansion
+  - explicit scatter-style row handling
+  - explicit quantize-dequantize passes that only exist to feed the current
+    custom row kernels
+
+Stage gate:
+
+- routed-expert kernels are no longer the dominant majority bucket at
+  `prefix128`
+- native `prefix128 < 70 ms`
+- native `prefix4 < 45 ms`
+
+Why this gate:
+
+- if routed MoE still dominates after the first rewrite, we are still not close
+  enough to the external execution shape
+- `prefix128` is the design-center case where routed MoE should pay off first
+
+#### Phase 2. Shared Expert Alignment
+
+Goal:
+
+- move shared experts onto a kernel family that is competitive with the grouped
+  external paths instead of leaving short-prefix prefill exposed to a large
+  standalone shared-expert cost
+
+Required work:
+
+- keep the current deterministic tile selection idea if it still helps
+- but treat shared-up/shared-down as first-class math-core work, not as a late
+  cleanup item
+- reuse the same specialized SM120 execution principles as the routed path
+
+Stage gate:
+
+- shared-expert kernels are no longer one of the top two buckets at `prefix4`
+- native `prefix4 < 40 ms`
+- native `prefix128 < 50 ms`
+
+Why this gate:
+
+- `prefix4` is where shared expert still matters most after routed work
+- winning `prefix4` and `prefix128` requires both routed and shared paths to be
+  competitive
+
+#### Phase 3. Long-Prefix Mamba Recovery
+
+Goal:
+
+- collapse the long-prefix Mamba gap that currently blocks `prefix4096`
+
+Required work:
+
+- compare our `MambaSsdPrefillFixedKernel` path directly against the chunk-scan
+  style work visible in `vLLM` / `TRT-LLM`
+- determine whether the right move is:
+  - chunked scan / chunked state progression
+  - larger-tile scan structure
+  - better state layout / memory traffic
+  - a more fused prefill step boundary
+
+Stage gate:
+
+- native `prefix4096 < 250 ms`
+- Mamba prefill is below `10%` of the `prefix4096` GPU-kernel mix
+
+Why this gate:
+
+- we do not need final victory at this phase
+- but if `4096` is still in the hundreds of milliseconds, we are nowhere near
+  the external frontier
+
+#### Phase 4. Final Race Tuning
+
+Goal:
+
+- close the remaining gap to the best external direct-prefill numbers
+
+Expected remaining work:
+
+- attention polish only if it has become one of the top remaining buckets
+- launch-shape cleanup
+- short-prefix under-fill handling
+- small residual routing/finalize overhead
+
+Final gate:
+
+- native exact-token cold prefill beats both external baselines at `4`, `128`,
+  and `4096`
+- no regression on behaviorally exact reuse
+- no material regression in hot-prefix TTFT or single-request decode throughput
+
+### Rules For This Race
+
+1. Optimize against the external direct-prefill numbers first, not only against
+   our historical baselines.
+2. Treat `prefix128` as the design-center optimization case.
+3. Do not claim progress from short-prefix wins if `prefix4096` remains blocked
+   by Mamba.
+4. Do not spend time on attention while routed MoE or Mamba is still the
+   dominant gap.
+5. After each landed phase, rerun:
+   - native direct/profile comparison
+   - the `4 / 128 / 4096` native TTFT surface
+   - `multi_turn_prefix_reuse_test`
+
+### Practical Interpretation
+
+The path to beating `vLLM` and `TRT-LLM` is:
+
+1. make routed MoE look like grouped GEMM
+2. make shared MoE stop distorting short-prefix cold prefill
+3. make long-prefix Mamba look more like the external chunk-scan cost profile
+4. only then spend time on smaller polish items
+
+Anything that does not move one of those three fronts is probably not on the
+critical path.
 
 ## Specialization Assumptions
 

@@ -10,6 +10,7 @@ namespace nemotron {
 
 constexpr std::size_t kMoeLaunchPlanTokenTile = 8;
 constexpr std::size_t kMoeLaunchPlanOutputTile = 8;
+constexpr std::size_t kMoeLaunchPlanExpertRowAlignment = 128;
 
 class DeviceMoeLaunchPlan {
  public:
@@ -49,6 +50,7 @@ class DeviceMoeLaunchPlan {
 
   int* cta_count() const;
   int* total_padded_rows() const;
+  int* expert_first_token_offsets() const;
   int* cta_expert_ids() const;
   int* cta_row_starts() const;
   int* cta_valid_rows() const;

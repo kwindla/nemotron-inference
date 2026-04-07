@@ -11,6 +11,7 @@ namespace nemotron {
 struct DeviceMoeLaunchPlan::Impl {
   int* cta_count = nullptr;
   int* total_padded_rows = nullptr;
+  int* expert_first_token_offsets = nullptr;
   int* cta_expert_ids = nullptr;
   int* cta_row_starts = nullptr;
   int* cta_valid_rows = nullptr;
@@ -66,6 +67,9 @@ struct DeviceMoeLaunchPlan::Impl {
     if (total_padded_rows != nullptr) {
       cudaFree(total_padded_rows);
     }
+    if (expert_first_token_offsets != nullptr) {
+      cudaFree(expert_first_token_offsets);
+    }
     if (cta_count != nullptr) {
       cudaFree(cta_count);
     }
@@ -112,12 +116,12 @@ std::optional<std::size_t> CheckedAdd(std::size_t lhs, std::size_t rhs) {
 __global__ void BuildLaunchPlanKernel(
     const int* expert_offsets,
     const int* sorted_token_indices,
-    const int* active_expert_count,
-    const int* active_expert_ids,
+    int n_experts,
     int current_cta_capacity,
     int current_padded_row_capacity,
     int* cta_count,
     int* total_padded_rows,
+    int* expert_first_token_offsets,
     int* cta_expert_ids,
     int* cta_row_starts,
     int* cta_valid_rows,
@@ -129,27 +133,32 @@ __global__ void BuildLaunchPlanKernel(
     return;
   }
 
+  const auto align_rows = [](int value) {
+    const int alignment = static_cast<int>(kMoeLaunchPlanExpertRowAlignment);
+    return value <= 0 ? 0 : ((value + alignment - 1) / alignment) * alignment;
+  };
+
   for (int sorted_index = 0; sorted_index < active_selection_count; ++sorted_index) {
     sorted_to_permuted_indices[sorted_index] = -1;
   }
   for (int padded_index = 0; padded_index < current_padded_row_capacity; ++padded_index) {
     permuted_token_indices[padded_index] = -1;
   }
-  const int active_count = *active_expert_count;
   int write_index = 0;
   int padded_rows = 0;
-  for (int active_index = 0; active_index < active_count; ++active_index) {
-    const int expert_index = active_expert_ids[active_index];
-    if (expert_index < 0) {
-      continue;
-    }
+  for (int expert_index = 0; expert_index < n_experts; ++expert_index) {
+    expert_first_token_offsets[expert_index] = padded_rows;
     const int begin = expert_offsets[expert_index];
     const int end = expert_offsets[expert_index + 1];
+    const int rows_for_expert = end - begin;
+    int local_row_start = 0;
     for (int row_start = begin; row_start < end;
-         row_start += static_cast<int>(kMoeLaunchPlanTokenTile)) {
+         row_start += static_cast<int>(kMoeLaunchPlanTokenTile),
+         local_row_start += static_cast<int>(kMoeLaunchPlanTokenTile)) {
       if (write_index >= current_cta_capacity) {
         *cta_count = current_cta_capacity + 1;
         *total_padded_rows = padded_rows;
+        expert_first_token_offsets[n_experts] = padded_rows;
         return;
       }
       const int remaining_rows = end - row_start;
@@ -158,15 +167,16 @@ __global__ void BuildLaunchPlanKernel(
               ? remaining_rows
               : static_cast<int>(kMoeLaunchPlanTokenTile);
       cta_expert_ids[write_index] = expert_index;
-      cta_row_starts[write_index] = row_start;
+      cta_row_starts[write_index] = padded_rows + local_row_start;
       cta_valid_rows[write_index] = valid_rows;
+      const int cta_row_end = local_row_start + static_cast<int>(kMoeLaunchPlanTokenTile);
       cta_m_limits[write_index] =
-          static_cast<int>(write_index * static_cast<int>(kMoeLaunchPlanTokenTile)) + valid_rows;
-      const int padded_base =
-          static_cast<int>(write_index * static_cast<int>(kMoeLaunchPlanTokenTile));
+          padded_rows + (cta_row_end < rows_for_expert ? cta_row_end : rows_for_expert);
+      const int padded_base = padded_rows + local_row_start;
       if ((padded_base + static_cast<int>(kMoeLaunchPlanTokenTile)) > current_padded_row_capacity) {
         *cta_count = current_cta_capacity + 1;
         *total_padded_rows = padded_rows;
+        expert_first_token_offsets[n_experts] = padded_rows;
         return;
       }
       for (int token_offset = 0; token_offset < static_cast<int>(kMoeLaunchPlanTokenTile); ++token_offset) {
@@ -177,9 +187,10 @@ __global__ void BuildLaunchPlanKernel(
         }
       }
       ++write_index;
-      padded_rows += static_cast<int>(kMoeLaunchPlanTokenTile);
     }
+    padded_rows += align_rows(rows_for_expert);
   }
+  expert_first_token_offsets[n_experts] = padded_rows;
   *cta_count = write_index;
   *total_padded_rows = padded_rows;
 }
@@ -285,6 +296,7 @@ std::optional<std::size_t> DeviceMoeLaunchPlan::Bytes(
 
   return add_bytes(sizeof(int)) &&
                  add_bytes(sizeof(int)) &&
+                 add_bytes(CheckedMul(n_experts + 1u, sizeof(int))) &&
                  add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
                  add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
                  add_bytes(CheckedMul(*cta_capacity, sizeof(int))) &&
@@ -305,11 +317,17 @@ std::optional<std::size_t> DeviceMoeLaunchPlan::Bytes(
 std::optional<std::size_t> DeviceMoeLaunchPlan::PaddedRowCapacity(
     std::size_t n_experts,
     std::size_t selection_count) {
-  const auto cta_capacity = CtaCapacity(n_experts, selection_count);
-  if (!cta_capacity.has_value()) {
+  if (n_experts == 0 || selection_count == 0) {
     return std::nullopt;
   }
-  return CheckedMul(*cta_capacity, kMoeLaunchPlanTokenTile);
+  const std::size_t max_active_experts =
+      selection_count < n_experts ? selection_count : n_experts;
+  const auto padding_slack =
+      CheckedMul(max_active_experts, kMoeLaunchPlanExpertRowAlignment - 1u);
+  if (!padding_slack.has_value()) {
+    return std::nullopt;
+  }
+  return CheckedAdd(selection_count, *padding_slack);
 }
 
 std::unique_ptr<DeviceMoeLaunchPlan> DeviceMoeLaunchPlan::Create(
@@ -347,6 +365,9 @@ std::unique_ptr<DeviceMoeLaunchPlan> DeviceMoeLaunchPlan::Create(
       !AllocateDeviceBuffer(
           reinterpret_cast<void**>(&impl->total_padded_rows),
           sizeof(int)) ||
+      !AllocateDeviceBuffer(
+          reinterpret_cast<void**>(&impl->expert_first_token_offsets),
+          (n_experts + 1u) * sizeof(int)) ||
       !AllocateDeviceBuffer(
           reinterpret_cast<void**>(&impl->cta_expert_ids),
           *cta_capacity * sizeof(int)) ||
@@ -402,6 +423,7 @@ bool DeviceMoeLaunchPlan::valid() const {
   return impl_ != nullptr &&
          impl_->cta_count != nullptr &&
          impl_->total_padded_rows != nullptr &&
+         impl_->expert_first_token_offsets != nullptr &&
          impl_->cta_expert_ids != nullptr &&
          impl_->cta_row_starts != nullptr &&
          impl_->cta_valid_rows != nullptr &&
@@ -458,6 +480,10 @@ int* DeviceMoeLaunchPlan::cta_count() const {
 
 int* DeviceMoeLaunchPlan::total_padded_rows() const {
   return impl_ != nullptr ? impl_->total_padded_rows : nullptr;
+}
+
+int* DeviceMoeLaunchPlan::expert_first_token_offsets() const {
+  return impl_ != nullptr ? impl_->expert_first_token_offsets : nullptr;
 }
 
 int* DeviceMoeLaunchPlan::cta_expert_ids() const {
@@ -517,6 +543,7 @@ bool BuildDeviceMoeLaunchPlan(
       plan->selection_count() < active_selection_count ||
       plan->cta_count() == nullptr ||
       plan->total_padded_rows() == nullptr ||
+      plan->expert_first_token_offsets() == nullptr ||
       plan->cta_expert_ids() == nullptr ||
       plan->cta_row_starts() == nullptr ||
       plan->cta_valid_rows() == nullptr ||
@@ -524,9 +551,7 @@ bool BuildDeviceMoeLaunchPlan(
       plan->permuted_token_indices() == nullptr ||
       plan->sorted_to_permuted_indices() == nullptr ||
       routing.expert_offsets() == nullptr ||
-      routing.sorted_token_indices() == nullptr ||
-      routing.active_expert_count() == nullptr ||
-      routing.active_expert_ids() == nullptr) {
+      routing.sorted_token_indices() == nullptr) {
     return false;
   }
 
@@ -547,12 +572,12 @@ bool BuildDeviceMoeLaunchPlan(
   BuildLaunchPlanKernel<<<1, 1>>>(
       routing.expert_offsets(),
       routing.sorted_token_indices(),
-      routing.active_expert_count(),
-      routing.active_expert_ids(),
+      static_cast<int>(plan->n_experts()),
       static_cast<int>(*current_cta_capacity),
       static_cast<int>(*current_padded_row_capacity),
       plan->cta_count(),
       plan->total_padded_rows(),
+      plan->expert_first_token_offsets(),
       plan->cta_expert_ids(),
       plan->cta_row_starts(),
       plan->cta_valid_rows(),

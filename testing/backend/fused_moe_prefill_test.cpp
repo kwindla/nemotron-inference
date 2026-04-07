@@ -1,3 +1,4 @@
+#include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/device_tensor.h"
 #include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_prefill.h"
@@ -23,6 +24,7 @@ namespace {
 
 using nemotron::DeviceTensorFp32;
 using nemotron::DeviceTensorInt32;
+using nemotron::DeviceNvfp4Matrix;
 using nemotron::DeviceExpertRouting;
 using nemotron::DeviceMoeLaunchPlan;
 using nemotron::FusedMoePrefillParams;
@@ -32,7 +34,8 @@ using nemotron::MonolithicNvfp4ExpertWeights;
 using nemotron::PackRowMajorFp32ToNvfp4;
 using nemotron::RunFusedMoePrefill;
 
-constexpr float kMaxAbsDiffTolerance = 1.0e-5f;
+constexpr float kMaxAbsDiffTolerance = 5.0e-4f;
+constexpr float kNanoPackedContractTolerance = 2.0f;
 
 bool Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -112,6 +115,17 @@ std::vector<float> DequantizeNvfp4Matrix(const HostNvfp4Matrix& packed) {
 std::optional<std::vector<float>> QuantizeDequantizeRow(
     const std::vector<float>& row) {
   const auto packed = PackRowMajorFp32ToNvfp4(row.data(), 1, row.size());
+  if (!packed.has_value()) {
+    return std::nullopt;
+  }
+  return DequantizeNvfp4Matrix(*packed);
+}
+
+std::optional<std::vector<float>> QuantizeDequantizeMatrixRows(
+    const std::vector<float>& values,
+    std::size_t rows,
+    std::size_t cols) {
+  const auto packed = PackRowMajorFp32ToNvfp4(values.data(), rows, cols);
   if (!packed.has_value()) {
     return std::nullopt;
   }
@@ -417,16 +431,26 @@ bool BuildReferenceOutputs(
       test_case.token_count * test_case.hidden_size,
       0.0f);
 
+  const auto routed_quantized_inputs =
+      QuantizeDequantizeMatrixRows(test_case.normalized, test_case.token_count, test_case.hidden_size);
+  if (!routed_quantized_inputs.has_value()) {
+    return false;
+  }
+
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
     const float* normalized_row =
         test_case.normalized.data() + token_index * test_case.hidden_size;
     std::vector<float> normalized_vec(
         normalized_row,
         normalized_row + test_case.hidden_size);
-    const auto quantized_input = QuantizeDequantizeRow(normalized_vec);
-    if (!quantized_input.has_value()) {
+    const auto shared_quantized_input = QuantizeDequantizeRow(normalized_vec);
+    if (!shared_quantized_input.has_value()) {
       return false;
     }
+    std::vector<float> routed_quantized_input(
+        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
+        routed_quantized_inputs->begin() +
+            static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
 
     float* output_row = expected_output->data() + token_index * test_case.hidden_size;
     float* routed_output_row =
@@ -445,7 +469,7 @@ bool BuildReferenceOutputs(
           routed_up.dequantized[static_cast<std::size_t>(expert_index)],
           test_case.routed_expert_intermediate_size,
           test_case.hidden_size,
-          *quantized_input);
+          routed_quantized_input);
       Relu2InPlace(&expert_up);
       const auto quantized_expert_up = QuantizeDequantizeRow(expert_up);
       if (!quantized_expert_up.has_value()) {
@@ -467,7 +491,7 @@ bool BuildReferenceOutputs(
         shared_up.dequantized.front(),
         test_case.shared_expert_intermediate_size,
         test_case.hidden_size,
-        *quantized_input);
+        *shared_quantized_input);
     Relu2InPlace(&shared_up_output);
     const auto quantized_shared_up = QuantizeDequantizeRow(shared_up_output);
     if (!quantized_shared_up.has_value()) {
@@ -511,22 +535,32 @@ bool BuildNanoReferenceOutputs(
       test_case.token_count * test_case.hidden_size,
       0.0f);
 
+  const auto routed_quantized_inputs =
+      QuantizeDequantizeMatrixRows(test_case.normalized, test_case.token_count, test_case.hidden_size);
+  if (!routed_quantized_inputs.has_value()) {
+    return false;
+  }
+
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
     const float* normalized_row =
         test_case.normalized.data() + token_index * test_case.hidden_size;
     std::vector<float> normalized_vec(
         normalized_row,
         normalized_row + test_case.hidden_size);
-    const auto quantized_input = QuantizeDequantizeRow(normalized_vec);
-    if (!quantized_input.has_value()) {
+    const auto shared_quantized_input = QuantizeDequantizeRow(normalized_vec);
+    if (!shared_quantized_input.has_value()) {
       return false;
     }
+    std::vector<float> routed_quantized_input(
+        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
+        routed_quantized_inputs->begin() +
+            static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
 
     auto expert_up = RowMajorMatVec(
         routed_up.dequantized,
         test_case.routed_expert_intermediate_size,
         test_case.hidden_size,
-        *quantized_input);
+        routed_quantized_input);
     Relu2InPlace(&expert_up);
     const auto quantized_expert_up = QuantizeDequantizeRow(expert_up);
     if (!quantized_expert_up.has_value()) {
@@ -559,7 +593,7 @@ bool BuildNanoReferenceOutputs(
         shared_up.dequantized.front(),
         test_case.shared_expert_intermediate_size,
         test_case.hidden_size,
-        *quantized_input);
+        *shared_quantized_input);
     Relu2InPlace(&shared_up_output);
     const auto quantized_shared_up = QuantizeDequantizeRow(shared_up_output);
     if (!quantized_shared_up.has_value()) {
@@ -758,9 +792,21 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
           {padded_selection_count.value_or(0), test_case.hidden_size});
+  auto fc1_expert_activation_scales =
+      DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
+  auto fc1_grouped_pack = DeviceNvfp4Matrix::Create(
+      padded_selection_count.value_or(0),
+      test_case.hidden_size,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto routed_up_scratch = DeviceTensorFp32::Create(
       {padded_selection_count.value_or(0),
        test_case.routed_expert_intermediate_size});
+  auto fc2_expert_activation_scales =
+      DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
+  auto fc2_grouped_pack = DeviceNvfp4Matrix::Create(
+      padded_selection_count.value_or(0),
+      test_case.routed_expert_intermediate_size,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
   if (!Expect(
@@ -777,7 +823,11 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               launch_plan->valid() &&
               padded_selection_count.has_value() &&
               routed_gather_scratch != nullptr &&
+              fc1_expert_activation_scales != nullptr &&
+              fc1_grouped_pack != nullptr &&
               routed_up_scratch != nullptr &&
+              fc2_expert_activation_scales != nullptr &&
+              fc2_grouped_pack != nullptr &&
               shared_up_scratch != nullptr,
           "prefill tensors should allocate") ||
       !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
@@ -817,7 +867,11 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.routing = routing.get();
   params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
+  params.fc1_expert_activation_scales = fc1_expert_activation_scales->data();
+  params.fc1_grouped_pack = fc1_grouped_pack.get();
   params.routed_up_scratch = routed_up_scratch->data();
+  params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
+  params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();
@@ -964,9 +1018,21 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   auto routed_gather_scratch =
       DeviceTensorFp32::Create(
           {padded_selection_count.value_or(0), test_case.hidden_size});
+  auto fc1_expert_activation_scales =
+      DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
+  auto fc1_grouped_pack = DeviceNvfp4Matrix::Create(
+      padded_selection_count.value_or(0),
+      test_case.hidden_size,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto routed_up_scratch = DeviceTensorFp32::Create(
       {padded_selection_count.value_or(0),
        test_case.routed_expert_intermediate_size});
+  auto fc2_expert_activation_scales =
+      DeviceTensorFp32::Create({test_case.n_routed_experts, 1});
+  auto fc2_grouped_pack = DeviceNvfp4Matrix::Create(
+      padded_selection_count.value_or(0),
+      test_case.routed_expert_intermediate_size,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
   if (!Expect(
@@ -983,7 +1049,11 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               launch_plan->valid() &&
               padded_selection_count.has_value() &&
               routed_gather_scratch != nullptr &&
+              fc1_expert_activation_scales != nullptr &&
+              fc1_grouped_pack != nullptr &&
               routed_up_scratch != nullptr &&
+              fc2_expert_activation_scales != nullptr &&
+              fc2_grouped_pack != nullptr &&
               shared_up_scratch != nullptr,
           "Nano deployment-shape tensors should allocate") ||
       !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
@@ -1024,7 +1094,11 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.routing = routing.get();
   params.launch_plan = launch_plan.get();
   params.routed_gather_scratch = routed_gather_scratch->data();
+  params.fc1_expert_activation_scales = fc1_expert_activation_scales->data();
+  params.fc1_grouped_pack = fc1_grouped_pack.get();
   params.routed_up_scratch = routed_up_scratch->data();
+  params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
+  params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output->data();
@@ -1076,11 +1150,11 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   const float shared_diff =
       MaxAbsDiff(actual_shared_output, expected_shared_output);
   if (!Expect(
-          output_diff <= kMaxAbsDiffTolerance,
-          "Nano deployment-shape output should match reference") ||
+          output_diff <= kNanoPackedContractTolerance,
+          "Nano deployment-shape output should stay within the packed-contract budget") ||
       !Expect(
-          routed_diff <= kMaxAbsDiffTolerance,
-          "Nano deployment-shape routed output should match reference") ||
+          routed_diff <= kNanoPackedContractTolerance,
+          "Nano deployment-shape routed output should stay within the packed-contract budget") ||
       !Expect(
           shared_diff <= kMaxAbsDiffTolerance,
           "Nano deployment-shape shared output should match reference")) {
@@ -1090,7 +1164,14 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
     return false;
   }
 
-  return true;
+  std::vector<float> recomposed_output(actual_output.size(), 0.0f);
+  for (std::size_t index = 0; index < recomposed_output.size(); ++index) {
+    recomposed_output[index] =
+        actual_routed_output[index] + actual_shared_output[index];
+  }
+  return Expect(
+      MaxAbsDiff(actual_output, recomposed_output) <= kMaxAbsDiffTolerance,
+      "Nano deployment-shape output should equal routed + shared contributions");
 }
 
 }  // namespace

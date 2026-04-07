@@ -13,9 +13,12 @@ namespace {
 
 using nemotron::DeviceNvfp4Matrix;
 using nemotron::DeviceTensorFp32;
+using nemotron::DeviceTensorInt32;
+using nemotron::GatherDeviceNvfp4Rows;
 using nemotron::Nvfp4PackOptions;
 using nemotron::Nvfp4ScaleLayout;
 using nemotron::PackDeviceRowMajorFp32ToNvfp4;
+using nemotron::PackDeviceRowMajorFp32ToNvfp4PerExpert;
 using nemotron::PackRowMajorFp32ToNvfp4;
 using nemotron::SwizzleRowMajorNvfp4ScalesForExecution;
 
@@ -501,6 +504,177 @@ bool test_device_nvfp4_matrix_fixed_tensor_scale_restores_batch_invariance() {
              "with a fixed tensor scale, the first-row block scale should be batch invariant");
 }
 
+bool test_device_nvfp4_matrix_per_expert_pack_keeps_grouped_rows_split_stable() {
+  auto source = DeviceTensorFp32::Create({384, 16});
+  auto expert_offsets = DeviceTensorInt32::Create({3});
+  auto expert_scales = DeviceTensorFp32::Create({2, 1});
+  if (!source || !source->valid() ||
+      !expert_offsets || !expert_offsets->valid() ||
+      !expert_scales || !expert_scales->valid()) {
+    std::cout << "device_nvfp4_matrix_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  std::vector<float> host_values(384 * 16, 0.0f);
+  for (std::size_t col = 0; col < 16; ++col) {
+    const float sign = (col % 2 == 0) ? 1.0f : -1.0f;
+    const float value = sign * (0.25f + (0.03125f * static_cast<float>(col % 5)));
+    host_values[col] = value;
+    host_values[(128 * 16) + col] = value;
+  }
+  const std::vector<int> host_offsets = {0, 128, 256};
+  const std::vector<float> host_scales = {0.25f, 2.0f};
+  if (!expect(source->CopyFromHost(host_values.data(), host_values.size()),
+              "grouped source upload should succeed") ||
+      !expect(expert_offsets->CopyFromHost(host_offsets.data(), host_offsets.size()),
+              "expert offsets upload should succeed") ||
+      !expect(expert_scales->CopyFromHost(host_scales.data(), host_scales.size()),
+              "expert scales upload should succeed")) {
+    return false;
+  }
+
+  auto packed = DeviceNvfp4Matrix::Create(384, 16, Nvfp4ScaleLayout::kSwizzled128x4);
+  if (!expect(packed != nullptr && packed->valid(),
+              "per-expert packed matrix should allocate")) {
+    return false;
+  }
+  if (!expect(
+          PackDeviceRowMajorFp32ToNvfp4PerExpert(
+              source->data(),
+              384,
+              16,
+              expert_offsets->data(),
+              2,
+              expert_scales->data(),
+              packed.get()),
+          "per-expert grouped pack should succeed")) {
+    return false;
+  }
+
+  std::vector<std::uint8_t> packed_bytes;
+  std::vector<std::uint8_t> block_scales;
+  float tensor_scale = 0.0f;
+  if (!expect(packed->CopyPackedToHost(&packed_bytes),
+              "per-expert packed bytes should copy back") ||
+      !expect(packed->CopyBlockScalesToHost(&block_scales),
+              "per-expert block scales should copy back") ||
+      !expect(packed->CopyTensorScaleToHost(&tensor_scale),
+              "per-expert tensor scale should copy back")) {
+    return false;
+  }
+
+  Nvfp4PackOptions first_options;
+  first_options.fixed_tensor_scale = 1.0f;
+  Nvfp4PackOptions second_options;
+  second_options.fixed_tensor_scale = 1.0f;
+  const auto first_row = PackRowMajorFp32ToNvfp4(host_values.data(), 1, 16, first_options);
+  const auto second_row = PackRowMajorFp32ToNvfp4(host_values.data() + (128 * 16), 1, 16, second_options);
+  if (!expect(first_row.has_value() && second_row.has_value(),
+              "host row packers should succeed for per-expert validation")) {
+    return false;
+  }
+
+  return expect(
+             tensor_scale == 1.0f,
+             "grouped per-expert pack should keep the matrix tensor scale neutral") &&
+         expect(
+             slice_bytes(packed_bytes, 0, 8) == first_row->packed,
+             "expert 0 row should match the neutral-scale host packer") &&
+         expect(
+             slice_bytes(packed_bytes, 128 * 8, 8) == second_row->packed,
+             "expert 1 row should match the neutral-scale host packer") &&
+         expect(
+             slice_bytes(block_scales, 0, 1) == first_row->block_scales,
+             "expert 0 block scale should match the neutral-scale host packer") &&
+         expect(
+             slice_bytes(block_scales, 128, 1) == second_row->block_scales,
+             "expert 1 block scale should match the neutral-scale host packer") &&
+         expect(
+             slice_bytes(packed_bytes, 256 * 8, 8) == std::vector<std::uint8_t>(8, 0u),
+             "rows beyond the active grouped span should stay zeroed") &&
+         expect(
+             slice_bytes(block_scales, 256, 1) == std::vector<std::uint8_t>(1, 0u),
+             "inactive grouped rows should keep zero block scales");
+}
+
+bool test_device_nvfp4_matrix_gathers_packed_rows_and_preserves_tensor_scale() {
+  constexpr std::size_t kSourceRows = 128;
+  auto source_tensor = DeviceTensorFp32::Create({kSourceRows, 16});
+  auto gather_indices = DeviceTensorInt32::Create({6});
+  if (!source_tensor || !source_tensor->valid() ||
+      !gather_indices || !gather_indices->valid()) {
+    std::cout << "device_nvfp4_matrix_test: SKIP (no CUDA device available)\n";
+    return true;
+  }
+
+  std::vector<float> host_values(kSourceRows * 16, 0.0f);
+  for (std::size_t row = 0; row < 4; ++row) {
+    for (std::size_t col = 0; col < 16; ++col) {
+      const float sign = ((row + col) % 2 == 0) ? 1.0f : -1.0f;
+      host_values[row * 16 + col] = sign * (0.125f + 0.03125f * static_cast<float>(row + col));
+    }
+  }
+  const std::vector<int> host_indices = {3, 1, -1, 0, 2, -1};
+  if (!expect(source_tensor->CopyFromHost(host_values.data(), host_values.size()),
+              "source tensor upload should succeed") ||
+      !expect(gather_indices->CopyFromHost(host_indices.data(), host_indices.size()),
+              "gather indices upload should succeed")) {
+    return false;
+  }
+
+  Nvfp4PackOptions pack_options;
+  pack_options.fixed_tensor_scale = 2.0f;
+  auto source_pack = DeviceNvfp4Matrix::Create(kSourceRows, 16, Nvfp4ScaleLayout::kSwizzled128x4);
+  auto gathered_pack = DeviceNvfp4Matrix::Create(6, 16, Nvfp4ScaleLayout::kSwizzled128x4);
+  if (!expect(source_pack != nullptr && source_pack->valid(),
+              "source pack should allocate") ||
+      !expect(source_pack->PackInto(*source_tensor, pack_options),
+              "source pack should succeed") ||
+      !expect(gathered_pack != nullptr && gathered_pack->valid(),
+              "gathered pack should allocate") ||
+      !expect(GatherDeviceNvfp4Rows(*source_pack, gather_indices->data(), 6, gathered_pack.get()),
+              "packed row gather should succeed")) {
+    return false;
+  }
+
+  std::vector<std::uint8_t> source_packed_bytes;
+  std::vector<std::uint8_t> source_block_scales;
+  std::vector<std::uint8_t> gathered_packed_bytes;
+  std::vector<std::uint8_t> gathered_block_scales;
+  float source_tensor_scale = 0.0f;
+  float gathered_tensor_scale = 0.0f;
+  if (!expect(source_pack->CopyPackedToHost(&source_packed_bytes),
+              "source packed bytes should copy back") ||
+      !expect(source_pack->CopyBlockScalesToHost(&source_block_scales),
+              "source block scales should copy back") ||
+      !expect(gathered_pack->CopyPackedToHost(&gathered_packed_bytes),
+              "gathered packed bytes should copy back") ||
+      !expect(gathered_pack->CopyBlockScalesToHost(&gathered_block_scales),
+              "gathered block scales should copy back") ||
+      !expect(source_pack->CopyTensorScaleToHost(&source_tensor_scale),
+              "source tensor scale should copy back") ||
+      !expect(gathered_pack->CopyTensorScaleToHost(&gathered_tensor_scale),
+              "gathered tensor scale should copy back")) {
+    return false;
+  }
+
+  return expect(
+             gathered_tensor_scale == source_tensor_scale,
+             "gathered pack should preserve the source tensor scale") &&
+         expect(
+             slice_bytes(gathered_packed_bytes, 0, 8) == slice_bytes(source_packed_bytes, 3 * 8, 8),
+             "gathered row 0 should copy source row 3 packed bytes") &&
+         expect(
+             slice_bytes(gathered_block_scales, 0, 1) == slice_bytes(source_block_scales, 3, 1),
+             "gathered row 0 should copy source row 3 block scales") &&
+         expect(
+             slice_bytes(gathered_packed_bytes, 2 * 8, 8) == std::vector<std::uint8_t>(8, 0u),
+             "invalid gathered rows should keep zero packed bytes") &&
+         expect(
+             slice_bytes(gathered_block_scales, 2, 1) == std::vector<std::uint8_t>(1, 0u),
+             "invalid gathered rows should keep zero block scales");
+}
+
 }  // namespace
 
 int main() {
@@ -511,7 +685,9 @@ int main() {
       !test_device_nvfp4_matrix_exposes_swizzled_execution_scales() ||
       !test_device_nvfp4_matrix_uses_8x4_execution_scales_for_small_m() ||
       !test_device_nvfp4_matrix_default_pack_is_batch_dependent() ||
-      !test_device_nvfp4_matrix_fixed_tensor_scale_restores_batch_invariance()) {
+      !test_device_nvfp4_matrix_fixed_tensor_scale_restores_batch_invariance() ||
+      !test_device_nvfp4_matrix_per_expert_pack_keeps_grouped_rows_split_stable() ||
+      !test_device_nvfp4_matrix_gathers_packed_rows_and_preserves_tensor_scale()) {
     return 1;
   }
   std::cout << "device_nvfp4_matrix_test: PASS\n";

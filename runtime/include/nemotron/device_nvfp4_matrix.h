@@ -65,6 +65,21 @@ std::unique_ptr<DeviceNvfp4Matrix> PackDeviceRowMajorFp32ToNvfp4(
     const DeviceTensorFp32& source,
     const Nvfp4PackOptions& options = {});
 
+bool PackDeviceRowMajorFp32ToNvfp4PerExpert(
+    const float* source,
+    std::size_t rows,
+    std::size_t cols,
+    const int* expert_first_token_offsets,
+    std::size_t n_experts,
+    const float* expert_tensor_scales,
+    DeviceNvfp4Matrix* output);
+
+bool GatherDeviceNvfp4Rows(
+    const DeviceNvfp4Matrix& source,
+    const int* source_row_indices,
+    std::size_t row_count,
+    DeviceNvfp4Matrix* output);
+
 bool MultiplyDeviceTensorScales(
     const float* activation_tensor_scale_device,
     const float* weight_tensor_scale_device,

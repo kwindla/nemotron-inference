@@ -227,6 +227,8 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(token_capacity, config.hidden_size, sizeof(float))) &&
                  add_bytes(
                      MatrixBytes(*padded_selection_capacity, config.hidden_size, sizeof(float))) &&
+                 add_bytes(MatrixBytes(config.num_experts, 1, sizeof(float))) &&
+                 add_bytes(MatrixBytes(config.num_experts, 1, sizeof(float))) &&
                  add_bytes(MatrixBytes(
                      *padded_selection_capacity,
                      config.routed_expert_intermediate_size,
@@ -286,11 +288,20 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       DeviceTensorFp32::Create({token_capacity, config.hidden_size});
   workspace->fused_prefill_gather_scratch =
       DeviceTensorFp32::Create({*padded_selection_capacity, config.hidden_size});
+  workspace->fused_prefill_fc1_activation_scales =
+      DeviceTensorFp32::Create({config.num_experts, 1});
+  workspace->fused_prefill_fc2_activation_scales =
+      DeviceTensorFp32::Create({config.num_experts, 1});
   workspace->fused_prefill_expert_up_scratch =
       DeviceTensorFp32::Create(
           {*padded_selection_capacity, config.routed_expert_intermediate_size});
   workspace->fused_prefill_shared_up_scratch =
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
+  workspace->fused_prefill_normalized_pack =
+      DeviceNvfp4Matrix::Create(
+          token_capacity,
+          config.hidden_size,
+          pack_scale_layout);
   workspace->fused_prefill_gather_pack =
       DeviceNvfp4Matrix::Create(
           *padded_selection_capacity,
@@ -348,6 +359,14 @@ bool MoePrefillWorkspace::valid() const {
              *padded_selection_capacity,
              config.hidden_size) &&
          TensorMatchesShape(
+             fused_prefill_fc1_activation_scales.get(),
+             config.num_experts,
+             1) &&
+         TensorMatchesShape(
+             fused_prefill_fc2_activation_scales.get(),
+             config.num_experts,
+             1) &&
+         TensorMatchesShape(
              fused_prefill_expert_up_scratch.get(),
              *padded_selection_capacity,
              config.routed_expert_intermediate_size) &&
@@ -355,6 +374,10 @@ bool MoePrefillWorkspace::valid() const {
              fused_prefill_shared_up_scratch.get(),
              token_capacity_value,
              config.shared_expert_intermediate_size) &&
+         fused_prefill_normalized_pack != nullptr &&
+         fused_prefill_normalized_pack->valid() &&
+         fused_prefill_normalized_pack->rows() >= token_capacity_value &&
+         fused_prefill_normalized_pack->cols() == config.hidden_size &&
          fused_prefill_gather_pack != nullptr &&
          fused_prefill_gather_pack->valid() &&
          fused_prefill_gather_pack->rows() >= *padded_selection_capacity &&
