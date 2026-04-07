@@ -74,6 +74,15 @@ bool PackDeviceRowMajorFp32ToNvfp4PerExpert(
     const float* expert_tensor_scales,
     DeviceNvfp4Matrix* output);
 
+bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
+    const __nv_bfloat16* source,
+    std::size_t rows,
+    std::size_t cols,
+    const int* expert_first_token_offsets,
+    std::size_t n_experts,
+    const float* expert_tensor_scales,
+    DeviceNvfp4Matrix* output);
+
 bool GatherDeviceNvfp4Rows(
     const DeviceNvfp4Matrix& source,
     const int* source_row_indices,

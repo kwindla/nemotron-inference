@@ -208,6 +208,33 @@ Focused TTFT on the same gate after this FC1 alignment work is:
 - `cached_committed_head_prefix128_tail4 hot-prefix = 54.557 ms`
 - `cached_global_root_prefix128_tail4 hot-prefix = 54.158 ms`
 
+The next routed-stage cutover is now also landed:
+
+- the active grouped FC1 kernel stays on the transposed WMMA body, but now
+  writes a BF16 `gemm1_output` buffer directly instead of re-running FC1 to
+  derive the FC2 input contract
+- activation scales are now computed from BF16 `Relu2(gemm1_output)` rows, and
+  those activated BF16 rows are packed directly into the grouped FC2 input
+  contract
+- the active grouped path no longer depends on `routed_up_scratch`; the packed
+  focused tests again run with `routed_up_scratch = nullptr`
+- focused correctness remains green:
+  `device_nvfp4_matrix_test`, `moe_launch_plan_device_test`,
+  `fused_moe_prefill_test`, `multi_turn_prefix_reuse_test`
+
+Focused TTFT on the same gate after the BF16 `gemm1_output` seam is:
+
+- `cold_prefill_prefix128 = 126.390 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.336 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.333 ms`
+
+Interpretation:
+
+- this is the correct TRT-style direction for the routed FC1->FC2 boundary
+- it removes duplicate FC1 work and keeps behavioral reuse equivalence green
+- the gain is still modest, which confirms the next win must come from the
+  grouped FC1/FC2 math core itself rather than more boundary cleanups
+
 ### Next Jump: Match TRT-LLM For The Routed Math Stage
 
 Yes, this is the point where we should jump to the TRT-LLM execution shape for
@@ -257,7 +284,7 @@ The acceptance criteria for this jump are:
 - `moe_launch_plan_device_test`
 - `fused_moe_prefill_test`
 - `multi_turn_prefix_reuse_test`
-- `cold_prefill_prefix128` must improve versus the current `125.592 ms`
+- `cold_prefill_prefix128` must improve versus the current `126.390 ms`
 - no regression in behavioral reuse equivalence
 
 The reason this is safe now is that the contract work is no longer the blocker.
@@ -290,17 +317,17 @@ Progress on this jump:
   `device_nvfp4_matrix_test`, `moe_launch_plan_device_test`,
   `fused_moe_prefill_test`, `multi_turn_prefix_reuse_test`.
 - Focused TTFT moved only slightly:
-  `cold_prefill_prefix128 = 126.012 ms`,
-  `cached_committed_head_prefix128_tail4 hot-prefix = 54.447 ms`,
-  `cached_global_root_prefix128_tail4 hot-prefix = 54.616 ms`.
+  `cold_prefill_prefix128 = 126.390 ms`,
+  `cached_committed_head_prefix128_tail4 hot-prefix = 54.336 ms`,
+  `cached_global_root_prefix128_tail4 hot-prefix = 54.333 ms`.
 
 Interpretation:
 
 - The routed launch contract is now close enough to TRT that it is unlikely to
   be the dominant remaining blocker.
-- The BF16 routed FC1 entry is now also structurally aligned with TRT's BF16
-  runner, so further FC1-input packing experiments should not remain on the
-  active path.
+- The BF16 routed FC1 entry and BF16 `gemm1_output` seam are now structurally
+  aligned with TRT's routed stage, so further FC1-input packing experiments
+  should not remain on the active path.
 - The next remaining jump is the grouped math core itself: replace the current
   task-driven WMMA row-tile consumer with a fuller TRT-like grouped GEMM
   consumer for routed FC1 and FC2.

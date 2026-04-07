@@ -310,6 +310,103 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4PerExpertKernel(
   }
 }
 
+__global__ void PackAndSwizzleRowMajorBf16ToNvfp4PerExpertKernel(
+    const __nv_bfloat16* source,
+    std::size_t rows,
+    std::size_t cols,
+    std::size_t padded_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    const int* expert_first_token_offsets,
+    int n_experts,
+    const float* expert_tensor_scales,
+    std::uint8_t* packed,
+    std::uint8_t* block_scales,
+    std::uint8_t* matmul_scales) {
+  auto find_expert_for_row = [expert_first_token_offsets, n_experts](std::size_t row) {
+    for (int expert_index = 0; expert_index < n_experts; ++expert_index) {
+      const int begin = expert_first_token_offsets[expert_index];
+      const int end = expert_first_token_offsets[expert_index + 1];
+      if (static_cast<int>(row) >= begin && static_cast<int>(row) < end) {
+        return expert_index;
+      }
+    }
+    return -1;
+  };
+
+  const std::size_t blocks_per_row = cols / kBlockWidth;
+  const std::size_t swizzled_index =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
+  if (swizzled_index >= total_scale_entries) {
+    return;
+  }
+
+  const std::size_t row = swizzled_index / padded_blocks_per_row;
+  const std::size_t block = swizzled_index % padded_blocks_per_row;
+  const std::size_t destination_offset =
+      ExecutionScaleOffset(row, block, padded_blocks_per_row, scale_layout);
+
+  if (row >= rows || block >= blocks_per_row) {
+    matmul_scales[destination_offset] = 0u;
+    return;
+  }
+
+  const int total_active_rows = expert_first_token_offsets[n_experts];
+  const std::size_t block_index = row * blocks_per_row + block;
+  const std::size_t packed_offset = row * (cols / 2u) + (block * (kBlockWidth / 2u));
+  if (static_cast<int>(row) >= total_active_rows) {
+    block_scales[block_index] = 0u;
+    matmul_scales[destination_offset] = 0u;
+    for (std::size_t i = 0; i < (kBlockWidth / 2u); ++i) {
+      packed[packed_offset + i] = 0u;
+    }
+    return;
+  }
+
+  float tensor_scale = 1.0f;
+  if (expert_tensor_scales != nullptr) {
+    const int expert_index = find_expert_for_row(row);
+    if (expert_index >= 0) {
+      tensor_scale = expert_tensor_scales[expert_index];
+    }
+  }
+
+  const std::size_t input_offset = row * cols + (block * kBlockWidth);
+  float block_max_abs = 0.0f;
+  for (std::size_t i = 0; i < kBlockWidth; ++i) {
+    const float value = __bfloat162float(source[input_offset + i]);
+    const float activated = value > 0.0f ? value * value : 0.0f;
+    if (activated > block_max_abs) {
+      block_max_abs = activated;
+    }
+  }
+
+  float block_scale = 1.0f;
+  if (block_max_abs > 0.0f) {
+    block_scale = ClampScale(block_max_abs / (kFp4MaxFinite * tensor_scale));
+  }
+  const std::uint8_t block_scale_fp8 = static_cast<std::uint8_t>(
+      __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
+  block_scales[block_index] = block_scale_fp8;
+  matmul_scales[destination_offset] = block_scale_fp8;
+
+  const float scale = tensor_scale * block_scale;
+  for (std::size_t i = 0; i < kBlockWidth; i += 2) {
+    const float lhs_value = __bfloat162float(source[input_offset + i]);
+    const float rhs_value = __bfloat162float(source[input_offset + i + 1]);
+    const float lhs = (lhs_value > 0.0f ? lhs_value * lhs_value : 0.0f) / scale;
+    const float rhs = (rhs_value > 0.0f ? rhs_value * rhs_value : 0.0f) / scale;
+    const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
+                                     __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
+                                 0x0fu;
+    const std::uint8_t rhs_fp4 = static_cast<std::uint8_t>(
+                                     __nv_cvt_float_to_fp4(rhs, __NV_E2M1, cudaRoundNearest)) &
+                                 0x0fu;
+    packed[packed_offset + (i / 2u)] = static_cast<std::uint8_t>(lhs_fp4 | (rhs_fp4 << 4));
+  }
+}
+
 __global__ void GatherPackedRowsKernel(
     const std::uint8_t* source_packed,
     std::size_t source_rows,
@@ -726,6 +823,72 @@ bool PackDeviceRowMajorFp32ToNvfp4PerExpert(
   const dim3 block(256);
   const dim3 grid(static_cast<unsigned int>((total_scale_entries + block.x - 1u) / block.x));
   PackAndSwizzleRowMajorFp32ToNvfp4PerExpertKernel<<<grid, block>>>(
+      source,
+      rows,
+      cols,
+      padded_rows,
+      padded_blocks_per_row,
+      output->scale_layout(),
+      expert_first_token_offsets,
+      static_cast<int>(n_experts),
+      expert_tensor_scales,
+      const_cast<std::uint8_t*>(output->packed_data()),
+      const_cast<std::uint8_t*>(output->block_scales_data()),
+      const_cast<std::uint8_t*>(output->matmul_block_scales_data()));
+  return CheckCuda(cudaGetLastError());
+}
+
+bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
+    const __nv_bfloat16* source,
+    std::size_t rows,
+    std::size_t cols,
+    const int* expert_first_token_offsets,
+    std::size_t n_experts,
+    const float* expert_tensor_scales,
+    DeviceNvfp4Matrix* output) {
+  if (source == nullptr ||
+      expert_first_token_offsets == nullptr ||
+      n_experts == 0 ||
+      output == nullptr ||
+      !output->valid() ||
+      rows == 0 ||
+      cols == 0 ||
+      cols % kBlockWidth != 0 ||
+      rows > output->rows() ||
+      cols != output->cols()) {
+    return false;
+  }
+
+  if (!CheckCuda(cudaMemset(
+          const_cast<std::uint8_t*>(output->packed_data()),
+          0,
+          output->packed_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<std::uint8_t*>(output->block_scales_data()),
+          0,
+          output->block_scales_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<std::uint8_t*>(output->matmul_block_scales_data()),
+          0,
+          output->matmul_block_scales_nbytes()))) {
+    return false;
+  }
+
+  const float one = 1.0f;
+  if (!CheckCuda(cudaMemcpy(
+          const_cast<std::uint8_t*>(output->tensor_scale_data()),
+          &one,
+          sizeof(one),
+          cudaMemcpyHostToDevice))) {
+    return false;
+  }
+
+  const std::size_t padded_rows = RoundUp(output->rows(), RowTile(output->scale_layout()));
+  const std::size_t padded_blocks_per_row = RoundUp(cols / kBlockWidth, kScaleBlockTile);
+  const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
+  const dim3 block(256);
+  const dim3 grid(static_cast<unsigned int>((total_scale_entries + block.x - 1u) / block.x));
+  PackAndSwizzleRowMajorBf16ToNvfp4PerExpertKernel<<<grid, block>>>(
       source,
       rows,
       cols,

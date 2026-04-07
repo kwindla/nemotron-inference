@@ -8,17 +8,27 @@
 
 namespace nemotron {
 
-constexpr std::size_t kMoeLaunchPlanTokenTile = 16;
+constexpr std::size_t kMoeLaunchPlanMinTokenTile = 8;
+constexpr std::size_t kMoeLaunchPlanMaxTokenTile = 16;
+constexpr std::size_t kMoeLaunchPlanTokenTile = kMoeLaunchPlanMaxTokenTile;
 constexpr std::size_t kMoeLaunchPlanOutputTile = 8;
 // Match TRT-style routed batching: expert segments are padded only to the token tile.
 // The NVFP4 128x4 swizzle is handled inside DeviceNvfp4Matrix's global packed layout.
-constexpr std::size_t kMoeLaunchPlanExpertRowAlignment = kMoeLaunchPlanTokenTile;
+constexpr std::size_t kMoeLaunchPlanExpertRowAlignment = kMoeLaunchPlanMaxTokenTile;
+
+std::size_t SelectMoeLaunchPlanTokenTile(
+    std::size_t n_experts,
+    std::size_t active_selection_count);
 
 class DeviceMoeLaunchPlan {
  public:
   static std::optional<std::size_t> CtaCapacity(
       std::size_t n_experts,
       std::size_t selection_count);
+  static std::optional<std::size_t> CtaCapacity(
+      std::size_t n_experts,
+      std::size_t selection_count,
+      std::size_t token_tile);
   static std::optional<std::size_t> TaskCapacity(
       std::size_t n_experts,
       std::size_t selection_count,
@@ -26,6 +36,10 @@ class DeviceMoeLaunchPlan {
   static std::optional<std::size_t> PaddedRowCapacity(
       std::size_t n_experts,
       std::size_t selection_count);
+  static std::optional<std::size_t> PaddedRowCapacity(
+      std::size_t n_experts,
+      std::size_t selection_count,
+      std::size_t expert_row_alignment);
   static std::optional<std::size_t> Bytes(
       std::size_t n_experts,
       std::size_t selection_count,
@@ -47,6 +61,7 @@ class DeviceMoeLaunchPlan {
   std::size_t selection_count() const;
   std::size_t cta_capacity() const;
   std::size_t padded_row_capacity() const;
+  std::size_t selected_token_tile() const;
   std::size_t max_output_rows_per_expert() const;
   std::size_t task_capacity() const;
 
@@ -78,6 +93,11 @@ class DeviceMoeLaunchPlan {
   explicit DeviceMoeLaunchPlan(std::unique_ptr<Impl> impl);
 
   std::unique_ptr<Impl> impl_;
+
+  friend bool BuildDeviceMoeLaunchPlan(
+      const DeviceExpertRouting& routing,
+      std::size_t active_selection_count,
+      DeviceMoeLaunchPlan* plan);
 };
 
 bool BuildDeviceMoeLaunchPlan(

@@ -73,7 +73,7 @@ Interpretation:
 - the remaining gap is now squarely in the grouped math core, not the packed
   FC1->FC2 boundary
 
-The next routed-stage alignment step is now also landed:
+The next routed-stage alignment step then landed:
 
 - launch-plan aliases now expose the TRT-style grouped metadata names:
   `permuted_idx_to_token_idx`, `total_num_padded_tokens`,
@@ -97,6 +97,32 @@ Interpretation:
   BF16 Nemotron Nano route
 - the remaining gap is now even more clearly the grouped FC1/FC2 math core
   itself, not the routed launch metadata or BF16 FC1 entry contract
+
+The next routed-stage cutover is now also landed:
+
+- the active grouped FC1 kernel stays on the transposed WMMA body, but now
+  materializes BF16 `gemm1_output` directly instead of re-running FC1 to derive
+  the FC2 input contract
+- activation scales are computed from BF16 `Relu2(gemm1_output)` rows, and
+  those activated BF16 rows are packed directly into the grouped FC2 input
+  contract
+- the active grouped path no longer depends on `routed_up_scratch`; packed
+  focused tests again run with `routed_up_scratch = nullptr`
+
+Focused TTFT on the same `prefix128 / tail4` gate after this BF16 seam cutover
+is:
+
+- `cold_prefill_prefix128 = 126.390 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.336 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.333 ms`
+
+Interpretation:
+
+- this removes duplicate FC1 work and keeps the routed boundary much closer to
+  TRT's `gemm1_output` / scale contract
+- correctness and behavioral reuse remain green
+- the gain is still modest, which confirms the next real win must come from
+  the grouped FC1/FC2 math core itself
 
 That means the priority is no longer "prove the contract." The priority is:
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cuda_bf16.h>
 
 #include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_decode.h"
@@ -32,6 +33,7 @@ struct FusedMoePrefillParams {
   float* fc1_expert_activation_scales = nullptr;  // Optional legacy FC1 input tensor scales.
   DeviceNvfp4Matrix* fc1_grouped_pack = nullptr;  // Optional legacy packed FC1 input contract.
   float* routed_up_scratch = nullptr;      // Optional fallback-only FP32 FC1->FC2 boundary.
+  __nv_bfloat16* gemm1_output_bf16 = nullptr;  // TRT-style BF16 Gemm1 output buffer.
   float* fc2_expert_activation_scales = nullptr;  // Legacy alias for post-activation FC1 output scales.
   DeviceNvfp4Matrix* fc2_grouped_pack = nullptr;  // Legacy alias for packed routed FC2 input contract.
   DeviceNvfp4Matrix* gemm1_output = nullptr;  // TRT-style routed Gemm1 output contract, post-activation for ReLU2.

@@ -232,6 +232,10 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(
                      *padded_selection_capacity,
                      config.routed_expert_intermediate_size,
+                     sizeof(__nv_bfloat16))) &&
+                 add_bytes(MatrixBytes(
+                     *padded_selection_capacity,
+                     config.routed_expert_intermediate_size,
                      sizeof(float))) &&
                  add_bytes(MatrixBytes(
                      token_capacity,
@@ -292,6 +296,9 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       DeviceTensorFp32::Create({config.num_experts, 1});
   workspace->fused_prefill_fc2_activation_scales =
       DeviceTensorFp32::Create({config.num_experts, 1});
+  workspace->fused_prefill_gemm1_output_bf16 =
+      DeviceTensorBf16::Create(
+          {*padded_selection_capacity, config.routed_expert_intermediate_size});
   workspace->fused_prefill_expert_up_scratch =
       DeviceTensorFp32::Create(
           {*padded_selection_capacity, config.routed_expert_intermediate_size});
@@ -366,6 +373,10 @@ bool MoePrefillWorkspace::valid() const {
              fused_prefill_fc2_activation_scales.get(),
              config.num_experts,
              1) &&
+         TensorMatchesShape(
+             fused_prefill_gemm1_output_bf16.get(),
+             *padded_selection_capacity,
+             config.routed_expert_intermediate_size) &&
          TensorMatchesShape(
              fused_prefill_expert_up_scratch.get(),
              *padded_selection_capacity,

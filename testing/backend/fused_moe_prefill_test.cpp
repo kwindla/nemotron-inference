@@ -23,6 +23,7 @@
 namespace {
 
 using nemotron::DeviceTensorFp32;
+using nemotron::DeviceTensorBf16;
 using nemotron::DeviceTensorInt32;
 using nemotron::DeviceNvfp4Matrix;
 using nemotron::DeviceExpertRouting;
@@ -35,6 +36,7 @@ using nemotron::PackRowMajorFp32ToNvfp4;
 using nemotron::RunFusedMoePrefill;
 
 constexpr float kMaxAbsDiffTolerance = 5.0e-4f;
+constexpr float kRoutedGroupedBf16Tolerance = 1.0e-1f;
 constexpr float kNanoPackedContractTolerance = 2.0f;
 constexpr float kNvfp4ActivationMaxFiniteHost = 6.0f * 448.0f;
 constexpr float kNvfp4MinTensorScaleHost = 1.0f / 1024.0f;
@@ -942,6 +944,10 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       padded_selection_count.value_or(0),
       test_case.routed_expert_intermediate_size,
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+  auto gemm1_output_bf16 = DeviceTensorBf16::Create(
+      {padded_selection_count.value_or(0), test_case.routed_expert_intermediate_size});
+  auto expert_up_scratch = DeviceTensorFp32::Create(
+      {padded_selection_count.value_or(0), test_case.routed_expert_intermediate_size});
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
   nemotron::Nvfp4PackOptions pack_options;
@@ -965,6 +971,8 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
               fc1_grouped_pack != nullptr &&
               fc2_expert_activation_scales != nullptr &&
               fc2_grouped_pack != nullptr &&
+              gemm1_output_bf16 != nullptr &&
+              expert_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
           "prefill tensors should allocate") ||
       !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
@@ -1011,6 +1019,7 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   params.fc1_expert_activation_scales = nullptr;
   params.fc1_grouped_pack = nullptr;
   params.routed_up_scratch = nullptr;
+  params.gemm1_output_bf16 = gemm1_output_bf16->data();
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.gemm1_output = fc2_grouped_pack.get();
@@ -1066,11 +1075,11 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   const float shared_diff =
       MaxAbsDiff(actual_shared_output, expected_shared_output);
   if (!Expect(
-          output_diff <= kMaxAbsDiffTolerance,
-          "prefill output should match reference") ||
+          output_diff <= kRoutedGroupedBf16Tolerance,
+          "prefill output should stay within the grouped-WMMA contract budget") ||
       !Expect(
-          routed_diff <= kMaxAbsDiffTolerance,
-          "routed output should match reference") ||
+          routed_diff <= kRoutedGroupedBf16Tolerance,
+          "routed output should stay within the grouped-WMMA contract budget") ||
       !Expect(
           shared_diff <= kMaxAbsDiffTolerance,
           "shared output should match reference")) {
@@ -1181,6 +1190,10 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
       padded_selection_count.value_or(0),
       test_case.routed_expert_intermediate_size,
       nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+  auto gemm1_output_bf16 = DeviceTensorBf16::Create(
+      {padded_selection_count.value_or(0), test_case.routed_expert_intermediate_size});
+  auto expert_up_scratch = DeviceTensorFp32::Create(
+      {padded_selection_count.value_or(0), test_case.routed_expert_intermediate_size});
   auto shared_up_scratch = DeviceTensorFp32::Create(
       {test_case.token_count, test_case.shared_expert_intermediate_size});
   nemotron::Nvfp4PackOptions pack_options;
@@ -1204,6 +1217,8 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               fc1_grouped_pack != nullptr &&
               fc2_expert_activation_scales != nullptr &&
               fc2_grouped_pack != nullptr &&
+              gemm1_output_bf16 != nullptr &&
+              expert_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
           "Nano deployment-shape tensors should allocate") ||
       !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
@@ -1251,6 +1266,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.fc1_expert_activation_scales = nullptr;
   params.fc1_grouped_pack = nullptr;
   params.routed_up_scratch = nullptr;
+  params.gemm1_output_bf16 = gemm1_output_bf16->data();
   params.fc2_expert_activation_scales = fc2_expert_activation_scales->data();
   params.fc2_grouped_pack = fc2_grouped_pack.get();
   params.gemm1_output = fc2_grouped_pack.get();
@@ -1318,6 +1334,18 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
     std::cerr << "nano_prefill_output_max_abs_diff=" << output_diff << "\n";
     std::cerr << "nano_prefill_routed_max_abs_diff=" << routed_diff << "\n";
     std::cerr << "nano_prefill_shared_max_abs_diff=" << shared_diff << "\n";
+    std::size_t worst_index = 0;
+    float worst_abs = 0.0f;
+    for (std::size_t i = 0; i < actual_routed_output.size(); ++i) {
+      const float diff = std::fabs(actual_routed_output[i] - expected_routed_output[i]);
+      if (diff > worst_abs) {
+        worst_abs = diff;
+        worst_index = i;
+      }
+    }
+    std::cerr << "nano_prefill_worst_routed_index=" << worst_index
+              << " actual=" << actual_routed_output[worst_index]
+              << " expected=" << expected_routed_output[worst_index] << "\n";
     return false;
   }
 

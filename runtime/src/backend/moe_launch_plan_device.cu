@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -27,6 +28,7 @@ struct DeviceMoeLaunchPlan::Impl {
   std::size_t selection_count = 0;
   std::size_t cta_capacity = 0;
   std::size_t padded_row_capacity = 0;
+  std::size_t selected_token_tile = kMoeLaunchPlanMaxTokenTile;
   std::size_t max_output_rows_per_expert = 0;
   std::size_t task_capacity = 0;
 
@@ -113,10 +115,54 @@ std::optional<std::size_t> CheckedAdd(std::size_t lhs, std::size_t rhs) {
   return lhs + rhs;
 }
 
+std::size_t NextPowerOfTwo(std::size_t value) {
+  if (value <= 1) {
+    return 1;
+  }
+  std::size_t next = 1;
+  while (next < value) {
+    next <<= 1u;
+  }
+  return next;
+}
+
+std::optional<std::size_t> CtaCapacityForTile(
+    std::size_t n_experts,
+    std::size_t selection_count,
+    std::size_t token_tile) {
+  if (n_experts == 0 ||
+      n_experts > kMaxDeviceExpertRoutingExperts ||
+      selection_count == 0 ||
+      token_tile == 0) {
+    return std::nullopt;
+  }
+  const std::size_t initial_filled = selection_count < n_experts ? selection_count : n_experts;
+  const std::size_t remaining = selection_count - initial_filled;
+  return CheckedAdd(initial_filled, remaining / token_tile);
+}
+
+std::optional<std::size_t> PaddedRowCapacityForAlignment(
+    std::size_t n_experts,
+    std::size_t selection_count,
+    std::size_t expert_row_alignment) {
+  if (n_experts == 0 || selection_count == 0 || expert_row_alignment == 0) {
+    return std::nullopt;
+  }
+  const std::size_t max_active_experts =
+      selection_count < n_experts ? selection_count : n_experts;
+  const auto padding_slack =
+      CheckedMul(max_active_experts, expert_row_alignment - 1u);
+  if (!padding_slack.has_value()) {
+    return std::nullopt;
+  }
+  return CheckedAdd(selection_count, *padding_slack);
+}
+
 __global__ void BuildLaunchPlanKernel(
     const int* expert_offsets,
     const int* sorted_token_indices,
     int n_experts,
+    int token_tile_dim,
     int current_cta_capacity,
     int current_padded_row_capacity,
     int* cta_count,
@@ -133,8 +179,8 @@ __global__ void BuildLaunchPlanKernel(
     return;
   }
 
-  const auto align_rows = [](int value) {
-    const int alignment = static_cast<int>(kMoeLaunchPlanExpertRowAlignment);
+  const auto align_rows = [token_tile_dim](int value) {
+    const int alignment = token_tile_dim;
     return value <= 0 ? 0 : ((value + alignment - 1) / alignment) * alignment;
   };
 
@@ -153,8 +199,8 @@ __global__ void BuildLaunchPlanKernel(
     const int rows_for_expert = end - begin;
     int local_row_start = 0;
     for (int row_start = begin; row_start < end;
-         row_start += static_cast<int>(kMoeLaunchPlanTokenTile),
-         local_row_start += static_cast<int>(kMoeLaunchPlanTokenTile)) {
+         row_start += token_tile_dim,
+         local_row_start += token_tile_dim) {
       if (write_index >= current_cta_capacity) {
         *cta_count = current_cta_capacity + 1;
         *total_padded_rows = padded_rows;
@@ -162,24 +208,21 @@ __global__ void BuildLaunchPlanKernel(
         return;
       }
       const int remaining_rows = end - row_start;
-      const int valid_rows =
-          remaining_rows < static_cast<int>(kMoeLaunchPlanTokenTile)
-              ? remaining_rows
-              : static_cast<int>(kMoeLaunchPlanTokenTile);
+      const int valid_rows = remaining_rows < token_tile_dim ? remaining_rows : token_tile_dim;
       cta_expert_ids[write_index] = expert_index;
       cta_row_starts[write_index] = padded_rows + local_row_start;
       cta_valid_rows[write_index] = valid_rows;
-      const int cta_row_end = local_row_start + static_cast<int>(kMoeLaunchPlanTokenTile);
+      const int cta_row_end = local_row_start + token_tile_dim;
       cta_m_limits[write_index] =
           padded_rows + (cta_row_end < rows_for_expert ? cta_row_end : rows_for_expert);
       const int padded_base = padded_rows + local_row_start;
-      if ((padded_base + static_cast<int>(kMoeLaunchPlanTokenTile)) > current_padded_row_capacity) {
+      if ((padded_base + token_tile_dim) > current_padded_row_capacity) {
         *cta_count = current_cta_capacity + 1;
         *total_padded_rows = padded_rows;
         expert_first_token_offsets[n_experts] = padded_rows;
         return;
       }
-      for (int token_offset = 0; token_offset < static_cast<int>(kMoeLaunchPlanTokenTile); ++token_offset) {
+      for (int token_offset = 0; token_offset < token_tile_dim; ++token_offset) {
         if (token_offset < valid_rows) {
           const int sorted_index = row_start + token_offset;
           permuted_token_indices[padded_base + token_offset] = sorted_token_indices[sorted_index];
@@ -232,17 +275,33 @@ __global__ void BuildExactTaskMapKernel(
 
 }  // namespace
 
+std::size_t SelectMoeLaunchPlanTokenTile(
+    std::size_t n_experts,
+    std::size_t active_selection_count) {
+  if (n_experts == 0 || active_selection_count == 0) {
+    return kMoeLaunchPlanMaxTokenTile;
+  }
+  const float avg_tokens_per_expert =
+      static_cast<float>(active_selection_count) / static_cast<float>(n_experts);
+  const std::size_t rounded = NextPowerOfTwo(static_cast<std::size_t>(avg_tokens_per_expert));
+  return std::clamp(
+      rounded,
+      kMoeLaunchPlanMinTokenTile,
+      kMoeLaunchPlanMaxTokenTile);
+}
+
 std::optional<std::size_t> DeviceMoeLaunchPlan::CtaCapacity(
     std::size_t n_experts,
     std::size_t selection_count) {
-  if (n_experts == 0 ||
-      n_experts > kMaxDeviceExpertRoutingExperts ||
-      selection_count == 0) {
-    return std::nullopt;
-  }
-  const std::size_t initial_filled = selection_count < n_experts ? selection_count : n_experts;
-  const std::size_t remaining = selection_count - initial_filled;
-  return CheckedAdd(initial_filled, remaining / kMoeLaunchPlanTokenTile);
+  return CtaCapacityForTile(
+      n_experts, selection_count, kMoeLaunchPlanMinTokenTile);
+}
+
+std::optional<std::size_t> DeviceMoeLaunchPlan::CtaCapacity(
+    std::size_t n_experts,
+    std::size_t selection_count,
+    std::size_t token_tile) {
+  return CtaCapacityForTile(n_experts, selection_count, token_tile);
 }
 
 std::optional<std::size_t> DeviceMoeLaunchPlan::TaskCapacity(
@@ -317,17 +376,16 @@ std::optional<std::size_t> DeviceMoeLaunchPlan::Bytes(
 std::optional<std::size_t> DeviceMoeLaunchPlan::PaddedRowCapacity(
     std::size_t n_experts,
     std::size_t selection_count) {
-  if (n_experts == 0 || selection_count == 0) {
-    return std::nullopt;
-  }
-  const std::size_t max_active_experts =
-      selection_count < n_experts ? selection_count : n_experts;
-  const auto padding_slack =
-      CheckedMul(max_active_experts, kMoeLaunchPlanExpertRowAlignment - 1u);
-  if (!padding_slack.has_value()) {
-    return std::nullopt;
-  }
-  return CheckedAdd(selection_count, *padding_slack);
+  return PaddedRowCapacityForAlignment(
+      n_experts, selection_count, kMoeLaunchPlanExpertRowAlignment);
+}
+
+std::optional<std::size_t> DeviceMoeLaunchPlan::PaddedRowCapacity(
+    std::size_t n_experts,
+    std::size_t selection_count,
+    std::size_t expert_row_alignment) {
+  return PaddedRowCapacityForAlignment(
+      n_experts, selection_count, expert_row_alignment);
 }
 
 std::unique_ptr<DeviceMoeLaunchPlan> DeviceMoeLaunchPlan::Create(
@@ -466,6 +524,10 @@ std::size_t DeviceMoeLaunchPlan::padded_row_capacity() const {
   return impl_ != nullptr ? impl_->padded_row_capacity : 0;
 }
 
+std::size_t DeviceMoeLaunchPlan::selected_token_tile() const {
+  return impl_ != nullptr ? impl_->selected_token_tile : kMoeLaunchPlanMaxTokenTile;
+}
+
 std::size_t DeviceMoeLaunchPlan::max_output_rows_per_expert() const {
   return impl_ != nullptr ? impl_->max_output_rows_per_expert : 0;
 }
@@ -579,10 +641,12 @@ bool BuildDeviceMoeLaunchPlan(
     return false;
   }
 
+  const std::size_t token_tile_dim =
+      SelectMoeLaunchPlanTokenTile(plan->n_experts(), active_selection_count);
   const auto current_cta_capacity =
-      DeviceMoeLaunchPlan::CtaCapacity(plan->n_experts(), active_selection_count);
+      CtaCapacityForTile(plan->n_experts(), active_selection_count, token_tile_dim);
   const auto current_padded_row_capacity =
-      DeviceMoeLaunchPlan::PaddedRowCapacity(plan->n_experts(), active_selection_count);
+      PaddedRowCapacityForAlignment(plan->n_experts(), active_selection_count, token_tile_dim);
   if (!current_cta_capacity.has_value() ||
       !current_padded_row_capacity.has_value() ||
       *current_cta_capacity == 0 ||
@@ -592,11 +656,13 @@ bool BuildDeviceMoeLaunchPlan(
       *current_cta_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return false;
   }
+  plan->impl_->selected_token_tile = token_tile_dim;
 
   BuildLaunchPlanKernel<<<1, 1>>>(
       routing.expert_offsets(),
       routing.sorted_token_indices(),
       static_cast<int>(plan->n_experts()),
+      static_cast<int>(token_tile_dim),
       static_cast<int>(*current_cta_capacity),
       static_cast<int>(*current_padded_row_capacity),
       plan->cta_count(),

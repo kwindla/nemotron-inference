@@ -135,6 +135,7 @@ bool RunLaunchPlanCase(
     std::size_t top_k,
     const std::vector<int>& selected_indices_host,
     const std::vector<float>& selected_weights_host,
+    int expected_selected_token_tile,
     int expected_total_padded_rows,
     const std::vector<int>& expected_expert_first_token_offsets,
     const std::vector<int>& expected_expert_ids,
@@ -240,6 +241,9 @@ bool RunLaunchPlanCase(
   }
 
   return Expect(
+             static_cast<int>(launch_plan->selected_token_tile()) == expected_selected_token_tile,
+             "selected_token_tile should match expected") &&
+         Expect(
              cta_count.size() == 1 &&
                  cta_count[0] == static_cast<int>(expected_expert_ids.size()),
              "cta_count should match expected") &&
@@ -374,8 +378,8 @@ bool RunExactTaskMapCase() {
   };
   const std::vector<int> expected_task_row_starts = {
       0, 0, 0,
+      8, 8, 8,
       16, 16, 16,
-      32, 32, 32,
   };
   const std::vector<int> expected_task_valid_rows = {
       3, 3, 3,
@@ -437,21 +441,21 @@ int main() {
   };
   const std::vector<float> small_selected_weights(small_selected_indices.size(), 1.0f);
   const std::vector<int> small_expected_expert_ids = {1, 3, 4};
-  const std::vector<int> small_expected_row_starts = {0, 16, 32};
+  const std::vector<int> small_expected_row_starts = {0, 8, 16};
   const std::vector<int> small_expected_valid_rows = {3, 3, 2};
-  const std::vector<int> small_expected_m_limits = {3, 19, 34};
-  std::vector<int> small_expected_permuted_token_indices(48, -1);
+  const std::vector<int> small_expected_m_limits = {3, 11, 18};
+  std::vector<int> small_expected_permuted_token_indices(24, -1);
   small_expected_permuted_token_indices[0] = 0;
   small_expected_permuted_token_indices[1] = 1;
   small_expected_permuted_token_indices[2] = 3;
-  small_expected_permuted_token_indices[16] = 0;
-  small_expected_permuted_token_indices[17] = 1;
-  small_expected_permuted_token_indices[18] = 2;
-  small_expected_permuted_token_indices[32] = 2;
-  small_expected_permuted_token_indices[33] = 3;
-  const std::vector<int> small_expected_expert_first_token_offsets = {0, 0, 16, 16, 32, 48};
+  small_expected_permuted_token_indices[8] = 0;
+  small_expected_permuted_token_indices[9] = 1;
+  small_expected_permuted_token_indices[10] = 2;
+  small_expected_permuted_token_indices[16] = 2;
+  small_expected_permuted_token_indices[17] = 3;
+  const std::vector<int> small_expected_expert_first_token_offsets = {0, 0, 8, 8, 16, 24};
   const std::vector<int> small_expected_sorted_to_permuted_indices = {
-      0, 1, 2, 16, 17, 18, 32, 33,
+      0, 1, 2, 8, 9, 10, 16, 17,
   };
 
   std::vector<int> multi_tile_selected_indices;
@@ -468,11 +472,11 @@ int main() {
   }
   multi_tile_selected_indices.push_back(1);
   multi_tile_selected_weights.push_back(1.0f);
-  const std::vector<int> multi_tile_expected_expert_ids = {0, 1, 2};
-  const std::vector<int> multi_tile_expected_row_starts = {0, 16, 32};
-  const std::vector<int> multi_tile_expected_valid_rows = {9, 1, 10};
-  const std::vector<int> multi_tile_expected_m_limits = {9, 17, 42};
-  std::vector<int> multi_tile_expected_permuted_token_indices(48, -1);
+  const std::vector<int> multi_tile_expected_expert_ids = {0, 0, 1, 2, 2};
+  const std::vector<int> multi_tile_expected_row_starts = {0, 8, 16, 24, 32};
+  const std::vector<int> multi_tile_expected_valid_rows = {8, 1, 1, 8, 2};
+  const std::vector<int> multi_tile_expected_m_limits = {8, 9, 17, 32, 34};
+  std::vector<int> multi_tile_expected_permuted_token_indices(40, -1);
   multi_tile_expected_permuted_token_indices[0] = 0;
   multi_tile_expected_permuted_token_indices[1] = 0;
   multi_tile_expected_permuted_token_indices[2] = 0;
@@ -483,21 +487,21 @@ int main() {
   multi_tile_expected_permuted_token_indices[7] = 1;
   multi_tile_expected_permuted_token_indices[8] = 2;
   multi_tile_expected_permuted_token_indices[16] = 4;
-  multi_tile_expected_permuted_token_indices[32] = 2;
-  multi_tile_expected_permuted_token_indices[33] = 2;
-  multi_tile_expected_permuted_token_indices[34] = 2;
-  multi_tile_expected_permuted_token_indices[35] = 3;
-  multi_tile_expected_permuted_token_indices[36] = 3;
-  multi_tile_expected_permuted_token_indices[37] = 3;
-  multi_tile_expected_permuted_token_indices[38] = 3;
-  multi_tile_expected_permuted_token_indices[39] = 4;
-  multi_tile_expected_permuted_token_indices[40] = 4;
-  multi_tile_expected_permuted_token_indices[41] = 4;
-  const std::vector<int> multi_tile_expected_expert_first_token_offsets = {0, 16, 32, 48, 48};
+  multi_tile_expected_permuted_token_indices[24] = 2;
+  multi_tile_expected_permuted_token_indices[25] = 2;
+  multi_tile_expected_permuted_token_indices[26] = 2;
+  multi_tile_expected_permuted_token_indices[27] = 3;
+  multi_tile_expected_permuted_token_indices[28] = 3;
+  multi_tile_expected_permuted_token_indices[29] = 3;
+  multi_tile_expected_permuted_token_indices[30] = 3;
+  multi_tile_expected_permuted_token_indices[31] = 4;
+  multi_tile_expected_permuted_token_indices[32] = 4;
+  multi_tile_expected_permuted_token_indices[33] = 4;
+  const std::vector<int> multi_tile_expected_expert_first_token_offsets = {0, 16, 24, 40, 40};
   const std::vector<int> multi_tile_expected_sorted_to_permuted_indices = {
       0, 1, 2, 3, 4, 5, 6, 7,
-      8, 16, 32, 33, 34, 35, 36, 37,
-      38, 39, 40, 41,
+      8, 16, 24, 25, 26, 27, 28, 29,
+      30, 31, 32, 33,
   };
 
   if (!RunLaunchPlanValidationCase() ||
@@ -508,7 +512,8 @@ int main() {
           2,
           small_selected_indices,
           small_selected_weights,
-          48,
+          8,
+          24,
           small_expected_expert_first_token_offsets,
           small_expected_expert_ids,
           small_expected_row_starts,
@@ -522,7 +527,8 @@ int main() {
           4,
           multi_tile_selected_indices,
           multi_tile_selected_weights,
-          48,
+          8,
+          40,
           multi_tile_expected_expert_first_token_offsets,
           multi_tile_expected_expert_ids,
           multi_tile_expected_row_starts,
