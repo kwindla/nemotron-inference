@@ -735,6 +735,20 @@ specialized runtime:
     - pull the remaining lane-to-row/col projection math and profile-specific
       tile mapping behind the same local bridge
 
+- Bridge expansion: transpose store projection (`2026-04-07`):
+  - the swap-true traced `k64` routed kernel now also routes its final
+    lane-to-output projection through `nvfp4_bridge`
+  - with this step, the active traced `k64` grouped kernels use the local
+    bridge for:
+    - packed tile copy/layout
+    - fragment load/clear
+    - grouped MMA
+    - row-major store
+    - transpose-style store
+  - correctness remained green:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+
 #### Full TRT Mainloop Alignment Plan
 
 The next target is full routed-mainloop fidelity to the traced local

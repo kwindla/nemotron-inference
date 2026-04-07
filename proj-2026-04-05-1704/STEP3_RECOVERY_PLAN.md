@@ -557,6 +557,15 @@ Interpretation:
     - move the remaining lane-projection and profile tile-mapping math behind
       the same local bridge boundary
 
+- Bridge expansion: transpose store projection (`2026-04-07`):
+  - the swap-true traced `k64` routed kernel now also uses `nvfp4_bridge` for
+    the final lane-to-output projection
+  - that leaves the active traced `k64` grouped kernels almost entirely behind
+    the local bridge boundary
+  - correctness rechecked after this cutover:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first

@@ -143,6 +143,20 @@ __device__ __forceinline__ void StoreFragmentC_RowMajor16x8(
     std::size_t output_rows_per_expert,
     OutputType* output);
 
+template <typename OutputType>
+__device__ __forceinline__ void StoreFragmentC_Transpose16x8(
+    float alpha,
+    const CFragment64& accum,
+    int lane_id,
+    int output_row_base,
+    int m_base,
+    int token_base,
+    int valid_rows,
+    int output_rows_this_tile,
+    std::size_t row_start,
+    std::size_t output_rows_per_expert,
+    OutputType* output);
+
 }  // namespace nvfp4_bridge
 
 constexpr int kGroupedTokenTile = static_cast<int>(kMoeLaunchPlanTokenTile);
@@ -1410,6 +1424,66 @@ __device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_RowMajor16x8(
       output_row_base,
       output_rows_per_expert,
       output);
+}
+
+template <typename OutputType>
+__device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_Transpose16x8(
+    float alpha,
+    const CFragment64& accum,
+    int lane_id,
+    int output_row_base,
+    int m_base,
+    int token_base,
+    int valid_rows,
+    int output_rows_this_tile,
+    std::size_t row_start,
+    std::size_t output_rows_per_expert,
+    OutputType* output) {
+  if (token_base >= valid_rows) {
+    return;
+  }
+  const int row_group = (lane_id >> 3) * 4;
+  const int row0 = m_base + row_group + 0;
+  const int row1 = m_base + row_group + 2;
+  const int row2 = m_base + row_group + 1;
+  const int row3 = m_base + row_group + 3;
+  const std::size_t input_row = row_start + static_cast<std::size_t>(token_base);
+  if (row0 < output_rows_this_tile) {
+    if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
+          __float2bfloat16(accum.regs[0] * alpha);
+    } else {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
+          accum.regs[0] * alpha;
+    }
+  }
+  if (row1 < output_rows_this_tile) {
+    if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
+          __float2bfloat16(accum.regs[1] * alpha);
+    } else {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
+          accum.regs[1] * alpha;
+    }
+  }
+  if (row2 < output_rows_this_tile) {
+    if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
+          __float2bfloat16(accum.regs[2] * alpha);
+    } else {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
+          accum.regs[2] * alpha;
+    }
+  }
+  if (row3 < output_rows_this_tile) {
+    if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
+          __float2bfloat16(accum.regs[3] * alpha);
+    } else {
+      output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
+          accum.regs[3] * alpha;
+    }
+  }
 }
 
 __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
@@ -2805,7 +2879,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
 
   if (warp_id < kGroupedConsumerWarpsPerBlock) {
     const int token_col = lane_id & 7;
-    const int row_group = (lane_id >> 3) * 4;
 #pragma unroll
     for (int row_subtile = 0; row_subtile < kWarpRowSubTiles; ++row_subtile) {
       const int m_base =
@@ -2816,50 +2889,18 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
 #pragma unroll
       for (int token_subtile = 0; token_subtile < kTokenSubTiles; ++token_subtile) {
         const int token_base = token_subtile * kFp4MmaTileN + token_col;
-        if (token_base >= valid_rows) {
-          continue;
-        }
-        const int row0 = m_base + row_group + 0;
-        const int row1 = m_base + row_group + 2;
-        const int row2 = m_base + row_group + 1;
-        const int row3 = m_base + row_group + 3;
-        const std::size_t input_row = static_cast<std::size_t>(row_start + token_base);
-        if (row0 < output_rows_this_tile) {
-          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
-                __float2bfloat16(accum[row_subtile][token_subtile].regs[0] * output_alpha);
-          } else {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
-                accum[row_subtile][token_subtile].regs[0] * output_alpha;
-          }
-        }
-        if (row1 < output_rows_this_tile) {
-          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
-                __float2bfloat16(accum[row_subtile][token_subtile].regs[1] * output_alpha);
-          } else {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
-                accum[row_subtile][token_subtile].regs[1] * output_alpha;
-          }
-        }
-        if (row2 < output_rows_this_tile) {
-          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
-                __float2bfloat16(accum[row_subtile][token_subtile].regs[2] * output_alpha);
-          } else {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
-                accum[row_subtile][token_subtile].regs[2] * output_alpha;
-          }
-        }
-        if (row3 < output_rows_this_tile) {
-          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
-                __float2bfloat16(accum[row_subtile][token_subtile].regs[3] * output_alpha);
-          } else {
-            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
-                accum[row_subtile][token_subtile].regs[3] * output_alpha;
-          }
-        }
+        nvfp4_bridge::StoreFragmentC_Transpose16x8(
+            output_alpha,
+            accum[row_subtile][token_subtile],
+            lane_id,
+            output_row_base,
+            m_base,
+            token_base,
+            valid_rows,
+            output_rows_this_tile,
+            static_cast<std::size_t>(row_start),
+            output_rows_per_expert,
+            output);
       }
     }
   }
