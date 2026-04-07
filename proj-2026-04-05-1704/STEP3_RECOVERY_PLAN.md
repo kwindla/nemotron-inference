@@ -3641,3 +3641,188 @@ That note is the source of truth for:
 - apples-to-apples throughput work status
 - vLLM prefix-caching investigation status
 - cross-codebase prefill profiling status
+
+Current investigation rule for TRT/CUTLASS internals:
+
+1. use source once to form the first implementation
+2. if that first implementation fails a real gate, stop guessing
+3. add the smallest compile-time or runtime probe that answers the exact open
+   question definitively
+4. rerun inference, record the answer here and in the canonical plan, then
+   implement from that fact
+
+Dynamic-selection questions stay in traces/logging:
+
+- tactic id
+- tile shape
+- `swap_ab`
+- `BlockX`
+- regime boundaries
+
+Template/layout questions now require compile-time or source-backed probes:
+
+- `SmemLayoutAtomSFA`
+- `SmemLayoutAtomSFB`
+- `SmemCopyAtomSFA`
+- `SmemCopyAtomSFB`
+- `PipelineStages`
+- fragment/copy coord maps
+
+Latest routed FP4 bridge status on the native path:
+
+- repo runtime is now on `C++20`
+- direct inclusion of the TRT/deep-gemm `cute/atom/copy_atom.hpp` stack still fails in this TU, even under `C++20`
+- a narrow local `Copy_Atom` / `TiledCopy` bridge now compiles for the two traced smem->reg load ops we need first:
+  - `SM75_U16x8_LDSM_T` for routed `A`
+  - `SM75_U32x2_LDSM_N` for routed `B`
+- a narrow local `UniversalCopy`-based scale-copy bridge for `SFA/SFB` now also compiles and is wired into the local FP4 fragment loaders
+- enabling traced `P5` on the full local `A/B/SFA/SFB` bridge is still not behaviorally reuse-equivalent:
+  - `global-root restored prompt boundary: argmax mismatch (cold=1010 restored=1584 max_abs_diff=13.8164)`
+- correcting the local operand copy atoms to the exact SM120 blockscaled builder choice
+  (`SM75_U32x4_LDSM_N` for both `A` and `B`) leaves that same `P5` mismatch unchanged
+- the branch is restored to the known-good BF16 grouped fallback for `P5`
+- the next exactness target is deeper than `A/B/SFA/SFB` coordinate retile or copy-atom choice alone: the remaining mismatch is likely in shared-memory layout / swizzle and staging details of the FP4 mainloop
+- traced `P5` bridge retry update:
+  - the traced `P5` tiled-MMA bridge is now compiled into the experimental FP4 `k64` kernels
+  - re-enabling `P5` on that bridge still fails before the final cold-vs-restored comparison
+  - widening the local copy-view coord scratch by an order of magnitude does not remove the failure
+  - `compute-sanitizer` still reports:
+    `Invalid __local__ write of size 16 bytes`
+    in `Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64<__nv_bfloat16, 128>`
+  - implication:
+    the next blocker is no longer the copy-view coord buffers; it is the traced
+    per-thread fragment / accumulator / local-storage contract of the `P5`
+    FP4 mainloop
+  - branch state after this check:
+    `P5` restored to the known-good BF16 grouped fallback,
+    `fused_moe_prefill_test: PASS`,
+    `multi_turn_prefix_reuse_test: PASS`
+- traced `P5` full-tile retry update:
+  - the real traced `P5` tiled MMA is `128x32x64`
+  - the `B` copy-view row coordinates span `0..31`
+  - our experimental `P5` FP4 kernel was still staging only `16` logical `B`
+    rows and driving `N` with manual `n_base` subtiles
+  - switching the experimental kernel to a staged `N=32` tile removes the
+    earlier local-buffer mismatch, but `compute-sanitizer` still reports:
+    `Invalid __shared__ read of size 1 bytes`
+    in `Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64<__nv_bfloat16, 128>`
+  - implication:
+    the next blocker is more specific than “shared-memory swizzle” in the
+    abstract; the active `BFragment64` / `CFragment64` decomposition does not
+    faithfully represent TRT's full traced `P5` fragment contract
+  - branch policy after this check:
+    `P5` stays on the known-good BF16 grouped fallback until the full traced
+    `P5` fragment shape replaces the manual `n_base` path
+- traced `P5` fragment-rank rewrite update:
+  - local CUTE probes now pin down the traced `P5` per-thread fragment ranks:
+    - `partition_A rank=(32,4,1)`
+    - `partition_B rank=(16,2,1)`
+    - `partition_C rank=(4,4,2)`
+  - that directly maps the dormant experimental `P5` FP4 kernel to the traced
+    full-tile fragment model:
+    - `A[4]`
+    - `B[2]`
+    - `C[4][2]`
+  - the old manual `n_base` / token-subtile decomposition is now removed from
+    the experimental `P5` kernel body in the runtime source
+  - the safe branch state remains the same because routed dispatch still keeps
+    `P5` on the known-good grouped BF16 fallback:
+    - `fused_moe_prefill_test: PASS`
+    - `multi_turn_prefix_reuse_test: PASS`
+  - implication:
+    the next `P5` blocker is no longer fragment-rank inference; it is the
+    exact traced scale/layout/materialization semantics needed to make that
+    full-tile fragment kernel behaviorally reuse-equivalent before re-enabling
+    `P5`
+- traced CUTLASS collective source correction:
+  - the earlier reference to
+    `sm120_mma_array_tma_blockwise_scaling.hpp` was not the right collective
+    for the live TRT routed path
+  - the relevant source is
+    `sm120_blockscaled_mma_array_tma.hpp`, which matches the traced SM120
+    block-scaled array collective used by the live fused-MoE kernels
+  - that collective:
+    - loads `A/B/SFA/SFB` into shared memory
+    - partitions `A/B` into operand fragments with `partition_fragment_A/B`
+    - partitions scales into fragment-shaped tensors with
+      `partition_fragment_SFA/SFB`
+    - copies operand and scale fragments into registers
+    - calls
+      `cute::gemm(tiled_mma, make_zip_tensor(tCrA, tCrSFA), make_zip_tensor(tCrB, tCrSFB), accum)`
+  - implication:
+    our dormant experimental `P5` kernel should be brought into line with that
+    zipped `(operand, scale)` fragment contract instead of the generic
+    `tmp_accum + post-rescale` model
+- traced `P5` zipped-fragment loader retry:
+  - the dormant traced `P5` loaders now reuse the existing single-fragment
+    tiled loaders for both `A` and `B`
+  - that means the experimental `P5` path now gets its scale fragments through
+    the same `PartitionScaleA/B + retile_D(copy_view)` bridge as the generic
+    local FP4 fragment path, instead of the older guessed row-index shortcuts
+  - result when `P5` was temporarily re-enabled on the traced FP4 kernel:
+    - `fused_moe_prefill_test: PASS`
+    - `multi_turn_prefix_reuse_test: FAIL`
+    - failure:
+      `global-root restored prompt boundary: argmax mismatch (cold=1041 restored=1584 max_abs_diff=10.9062)`
+  - interpretation:
+    - this is still not behaviorally reuse-equivalent
+    - but it is a real improvement over the earlier `max_abs_diff=13.8164`
+    - the remaining `P5` mismatch is now most plausibly in the shared-memory
+      scale layout / swizzle and staging model, not the fragment-side
+      `SFA/SFB` partition logic alone
+  - branch state after the retry:
+    - `P5` restored to the known-good grouped BF16 fallback
+    - `fused_moe_prefill_test: PASS`
+    - `multi_turn_prefix_reuse_test: PASS`
+- next concrete `P5` plan:
+  - success goal:
+    make traced routed `P5` (`gemm1=5`, `128x128x64`, `swap_ab=true`) pass
+    both `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test`
+  - next definitive probes:
+    - dump the exact compile-time builder choices for the traced `P5` tactic:
+      `SmemLayoutAtomSFA`, `SmemLayoutAtomSFB`,
+      `SmemCopyAtomSFA`, `SmemCopyAtomSFB`, `PipelineStages`
+    - dump a small per-thread coordinate map for:
+      `tCsSFA`, `tCrSFA_copy_view`, `tCsSFB`, `tCrSFB_copy_view`
+  - definitive standalone probe result:
+    - builder-only host probe:
+      [trt_p5_runtime_layout_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p5_runtime_layout_dump.cu)
+    - exact output:
+      - `Stages=4`
+      - `cosize(SmemLayoutSFA)=4096`
+      - `cosize(SmemLayoutSFB)=4096`
+      - `size(tCrSFA)=256`, `cosize(tCrSFA)=16`
+      - `size(tCrSFB)=1024`, `cosize(tCrSFB)=64`
+      - `tCsSFA.layout: ((_1,((_16,_4),_2)),_1,_2,_4):((_0,((_0,_1),_8)),_0,_512,_1024)`
+      - `tCrSFA_copy_view.layout: ((_1,(_16,_8)),_1,_2):((_0,(_0,_1)),_0,_8)`
+      - `tCsSFB.layout: ((_1,((_16,_4),_2)),_4,_2,_4):((_0,((_0,_1),_128)),_4,_512,_1024)`
+      - `tCrSFB_copy_view.layout: ((_1,(_16,_4,_2)),_4,_2):((_0,(_0,_1,_16)),_4,_32)`
+    - implication:
+      the traced `P5` scale path is definitively not compatible with the old
+      `scale_words[row] + scale[1]` abstraction
+  - next implementation step after those probes:
+    replace the dormant `P5` scale staging with exact `SmemLayoutSFA/SFB`
+    shared storage and the exact `tCsSFA/tCrSFA_copy_view` +
+    `tCsSFB/tCrSFB_copy_view` path above, then re-enable only `P5` on the
+    traced FP4 kernel and rerun the two correctness gates
+  - `P5` exact scale-smem rewrite outcome:
+    - the dormant traced `P5` kernel now stages scale bytes through exact
+      `SmemLayoutSFA/SFB` shared tensors instead of row-packed scale words
+    - `P5` is re-enabled on the active routed FP4 path
+    - validation:
+      - `fused_moe_prefill_test: PASS`
+      - `multi_turn_prefix_reuse_test: PASS`
+      - `compute-sanitizer --tool memcheck ./testing/fused_moe_prefill_test`
+        reports `0 errors`
+    - focused TTFT artifact:
+      [ttft_20260407_p5_exact_scale_smem_prefix128_tail4.stdout.txt](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/ttft_20260407_p5_exact_scale_smem_prefix128_tail4.stdout.txt)
+    - focused TTFT:
+      - `cold_prefill_prefix128 = 107.552 ms`
+      - `cached_committed_head_prefix128_tail4 hot-prefix = 48.483 ms`
+      - `cached_global_root_prefix128_tail4 hot-prefix = 48.650 ms`
+    - conclusion:
+      the exact traced `SFA/SFB` shared-memory staging path was the missing
+      piece for `P5`
+    - next step:
+      use the now-working `P5` scale-smem bridge as the template for the next
+      traced FP4 regimes, starting with `P12` / `P13`
