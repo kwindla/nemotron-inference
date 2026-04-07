@@ -591,6 +591,34 @@ specialized runtime:
     a TRT-like TMA/block-scaled mainloop
   - the next rewrite should therefore target the profile-specific inner loop,
     not more contract churn
+  - fallback for currently untraced islands remains the legacy WMMA
+    row-tile routed kernels in `runtime/src/backend/fused_moe_prefill.cu`
+- grouped-body blockwise decode cutover (`2026-04-07`):
+  - active file:
+    `runtime/src/backend/fused_moe_prefill.cu`
+  - change:
+    the active traced grouped FC1/FC2 kernels now decode and stage full
+    `16`-value NVFP4 blocks into shared memory instead of decoding one scalar
+    element at a time
+  - focused validation stayed green:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+  - artifacts:
+    - `artifacts/benchmarks/ttft_20260407_blockwise_grouped_body_prefix128_tail4.stdout.txt`
+    - `artifacts/benchmarks/ttft_20260407_blockwise_grouped_body_prefix4096_tail4.stdout.txt`
+  - measured outcome:
+    - `cold_prefill_prefix128 = 125.578 ms`
+    - `cached_global_root_prefix128_tail4 hot-prefix = 54.328 ms`
+    - `cold_prefill_prefix4096 = 2479.858 ms`
+    - `cached_global_root_prefix4096_tail4 hot-prefix = 96.994 ms`
+  - conclusion:
+    - the grouped mainloop was still paying obvious scalar decode/staging cost
+    - blockwise decode is worth keeping on the active path because it improves
+      cold prefill on both the design-center and long-prefix regimes while
+      keeping reuse correctness green
+    - the remaining routed gap is now deeper in the grouped MMA mainloop than
+      simple nibble/scale decode overhead
    - Priority C:
      tiny/tail path:
      FC1 `5` or `7`, FC2 `15`.

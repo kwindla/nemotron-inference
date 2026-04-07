@@ -516,6 +516,63 @@ __device__ __forceinline__ float DecodeGroupedPackedInputElement(
   return fused_decode::DecodeFp4(nibble) * block_scale;
 }
 
+__device__ __forceinline__ void ZeroBf16Block16(__nv_bfloat16* output) {
+#pragma unroll
+  for (int i = 0; i < static_cast<int>(fused_decode::kNvfp4BlockWidth); ++i) {
+    output[i] = __float2bfloat16(0.0f);
+  }
+}
+
+__device__ __forceinline__ void DecodePackedNvfp4BlockToBf16(
+    const std::uint8_t* packed_block,
+    float block_scale,
+    __nv_bfloat16* output) {
+#pragma unroll
+  for (int pair = 0; pair < 8; ++pair) {
+    const std::uint8_t packed = packed_block[pair];
+    output[pair * 2] =
+        __float2bfloat16(fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale);
+    output[pair * 2 + 1] =
+        __float2bfloat16(fused_decode::DecodeFp4((packed >> 4u) & 0x0Fu) * block_scale);
+  }
+}
+
+__device__ __forceinline__ void DecodeNvfp4WeightBlockBf16(
+    const FusedNvfp4WeightView& weight,
+    std::size_t output_row,
+    std::size_t block_index,
+    __nv_bfloat16* output) {
+  const std::size_t blocks_per_row =
+      weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset =
+      output_row * (weight.input_cols / 2u) + block_index * (fused_decode::kNvfp4BlockWidth / 2u);
+  const std::size_t scale_row_offset = output_row * blocks_per_row + block_index;
+  const float block_scale =
+      fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset]) *
+      (*weight.tensor_scale_data);
+  DecodePackedNvfp4BlockToBf16(weight.packed_data + packed_row_offset, block_scale, output);
+}
+
+__device__ __forceinline__ void DecodeGroupedPackedInputBlockBf16(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_dq_scales,
+    float input_tensor_scale,
+    std::size_t cols,
+    std::size_t input_row,
+    std::size_t block_index,
+    __nv_bfloat16* output) {
+  const std::size_t blocks_per_row = cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_offset =
+      input_row * (cols / 2u) + block_index * (fused_decode::kNvfp4BlockWidth / 2u);
+  const std::size_t scale_row_offset = input_row * blocks_per_row + block_index;
+  const float block_scale =
+      input_dq_scales != nullptr
+          ? input_dq_scales[scale_row_offset]
+          : fused_decode::DecodeFp8(input_block_scales[scale_row_offset]) * input_tensor_scale;
+  DecodePackedNvfp4BlockToBf16(packed_input + packed_row_offset, block_scale, output);
+}
+
 __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
     const float* input,
     const int* expert_offsets,
@@ -1278,37 +1335,50 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
        k_base += static_cast<std::size_t>(kMacroTileK)) {
     const int macro_k = static_cast<int>(
         min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
-    for (int linear_index = tid;
-         linear_index < (kPlannedWmmaTileM * macro_k);
-         linear_index += static_cast<int>(blockDim.x)) {
-      const int tile_token = linear_index / macro_k;
-      const int tile_k = linear_index % macro_k;
-      __nv_bfloat16 value = __float2bfloat16(0.0f);
+    const int macro_blocks = macro_k / static_cast<int>(fused_decode::kNvfp4BlockWidth);
+    const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
+    for (int linear_block = tid;
+         linear_block < (kPlannedWmmaTileM * macro_blocks);
+         linear_block += static_cast<int>(blockDim.x)) {
+      const int tile_token = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &a_tile[tile_token][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       if (tile_token < valid_rows) {
-        value = __float2bfloat16(DecodeGroupedPackedInputElement(
+        DecodeGroupedPackedInputBlockBf16(
             packed_input,
             input_block_scales,
             input_dq_scales,
             input_tensor_scale,
             weight.input_cols,
             static_cast<std::size_t>(row_start + tile_token),
-            k_base + static_cast<std::size_t>(tile_k)));
+            block_base + static_cast<std::size_t>(tile_block),
+            dst);
+      } else {
+        ZeroBf16Block16(dst);
       }
-      a_tile[tile_token][tile_k] = value;
     }
-    for (int linear_index = tid;
-         linear_index < (macro_k * kOutputTile);
-         linear_index += static_cast<int>(blockDim.x)) {
-      const int tile_k = linear_index / kOutputTile;
-      const int tile_output_row = linear_index % kOutputTile;
-      __nv_bfloat16 value = __float2bfloat16(0.0f);
-      if (tile_output_row < output_rows_this_tile) {
-        value = __float2bfloat16(DecodeNvfp4WeightElement(
-            weight,
-            static_cast<std::size_t>(output_row_base + tile_output_row),
-            k_base + static_cast<std::size_t>(tile_k)));
-      }
-      b_tile[tile_output_row][tile_k] = value;
+    for (int linear_block = tid;
+         linear_block < (output_rows_this_tile * macro_blocks);
+         linear_block += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &b_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      DecodeNvfp4WeightBlockBf16(
+          weight,
+          static_cast<std::size_t>(output_row_base + tile_output_row),
+          block_base + static_cast<std::size_t>(tile_block),
+          dst);
+    }
+    for (int linear_block = tid + output_rows_this_tile * macro_blocks;
+         linear_block < (kOutputTile * macro_blocks);
+         linear_block += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &b_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      ZeroBf16Block16(dst);
     }
     __syncthreads();
 
@@ -1449,37 +1519,50 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
        k_base += static_cast<std::size_t>(kMacroTileK)) {
     const int macro_k = static_cast<int>(
         min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
-    for (int linear_index = tid;
-         linear_index < (kOutputTile * macro_k);
-         linear_index += static_cast<int>(blockDim.x)) {
-      const int tile_output_row = linear_index / macro_k;
-      const int tile_k = linear_index % macro_k;
-      __nv_bfloat16 value = __float2bfloat16(0.0f);
-      if (tile_output_row < output_rows_this_tile) {
-        value = __float2bfloat16(DecodeNvfp4WeightElement(
-            weight,
-            static_cast<std::size_t>(output_row_base + tile_output_row),
-            k_base + static_cast<std::size_t>(tile_k)));
-      }
-      a_tile[tile_output_row][tile_k] = value;
+    const int macro_blocks = macro_k / static_cast<int>(fused_decode::kNvfp4BlockWidth);
+    const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
+    for (int linear_block = tid;
+         linear_block < (output_rows_this_tile * macro_blocks);
+         linear_block += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &a_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      DecodeNvfp4WeightBlockBf16(
+          weight,
+          static_cast<std::size_t>(output_row_base + tile_output_row),
+          block_base + static_cast<std::size_t>(tile_block),
+          dst);
     }
-    for (int linear_index = tid;
-         linear_index < (macro_k * kPlannedWmmaTileM);
-         linear_index += static_cast<int>(blockDim.x)) {
-      const int tile_k = linear_index / kPlannedWmmaTileM;
-      const int tile_token = linear_index % kPlannedWmmaTileM;
-      __nv_bfloat16 value = __float2bfloat16(0.0f);
+    for (int linear_block = tid + output_rows_this_tile * macro_blocks;
+         linear_block < (kOutputTile * macro_blocks);
+         linear_block += static_cast<int>(blockDim.x)) {
+      const int tile_output_row = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &a_tile[tile_output_row][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      ZeroBf16Block16(dst);
+    }
+    for (int linear_block = tid;
+         linear_block < (kPlannedWmmaTileM * macro_blocks);
+         linear_block += static_cast<int>(blockDim.x)) {
+      const int tile_token = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &b_tile[tile_token][tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       if (tile_token < valid_rows) {
-        value = __float2bfloat16(DecodeGroupedPackedInputElement(
+        DecodeGroupedPackedInputBlockBf16(
             packed_input,
             input_block_scales,
             input_dq_scales,
             input_tensor_scale,
             weight.input_cols,
             static_cast<std::size_t>(row_start + tile_token),
-            k_base + static_cast<std::size_t>(tile_k)));
+            block_base + static_cast<std::size_t>(tile_block),
+            dst);
+      } else {
+        ZeroBf16Block16(dst);
       }
-      b_tile[tile_token][tile_k] = value;
     }
     __syncthreads();
 

@@ -288,6 +288,34 @@ Interpretation:
     - the next bottleneck is the grouped mainloop itself: scalar NVFP4 decode,
       shared-memory staging, and the lack of TRT-like TMA/block-scaled
       transport into the MMA pipeline
+    - fallback for untraced tactic islands remains the legacy WMMA row-tile
+      routed path in `runtime/src/backend/fused_moe_prefill.cu`
+- grouped-body blockwise decode cutover (`2026-04-07`):
+  - active file:
+    `runtime/src/backend/fused_moe_prefill.cu`
+  - change:
+    the active traced grouped routed kernels now stage complete `16`-value
+    NVFP4 blocks into shared memory, instead of repeatedly decoding individual
+    FP4 elements and reloading the same block scale for each element
+  - focused validation:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+  - artifacts:
+    - `artifacts/benchmarks/ttft_20260407_blockwise_grouped_body_prefix128_tail4.stdout.txt`
+    - `artifacts/benchmarks/ttft_20260407_blockwise_grouped_body_prefix4096_tail4.stdout.txt`
+  - result:
+    - `cold_prefill_prefix128 = 125.578 ms`
+    - `cached_global_root_prefix128_tail4 hot-prefix = 54.328 ms`
+    - `cold_prefill_prefix4096 = 2479.858 ms`
+    - `cached_global_root_prefix4096_tail4 hot-prefix = 96.994 ms`
+  - conclusion:
+    - blockwise decode is worth retaining: it improves cold prefill at both
+      `prefix128` and `prefix4096` while keeping reuse correctness green
+    - hot-prefix TTFT is effectively flat, which means the remaining routed
+      gap is now deeper than scalar FP4 decode alone
+    - the next native rewrite should target the grouped MMA mainloop proper,
+      not more contract cleanup
 
 That means the priority is no longer "prove the contract." The priority is:
 
