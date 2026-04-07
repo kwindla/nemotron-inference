@@ -495,10 +495,28 @@ Interpretation:
   - we also do not need the full CUTLASS runtime stack
   - but the next exact mainloop step does need the header-level CUTE/CUTLASS
     substrate
+  - to reduce local compatibility scaffolding and stay closer to TRT/CUTE
+    directly, the runtime build is now moving from C++17/CUDA17 to
+    C++20/CUDA20 before the next fragment/copy rewrite
   - the local machine already has a usable header tree at:
     `.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include`
   - for long-term build stability, we should pin or vendor the exact header
     snapshot once the CUTE-driven mainloop path is the active implementation
+
+- C++20 probe result and next bridge step (`2026-04-07`):
+  - the runtime now builds as `C++20` / `CUDA20`
+  - the narrow SM120 MMA-op import from local CUTE works and keeps both
+    correctness gates green
+  - the broader upstream fragment/copy header stack still does not drop in
+    cleanly, even under `C++20`; the failed surface included:
+    - `cute/algorithm/copy.hpp`
+    - `cute/algorithm/prefetch.hpp`
+    - `cutlass/cuda_host_adapter.hpp`
+  - implication:
+    - do not try to import the whole fragment/copy stack directly into this TU
+    - instead, build a very narrow local bridge around the exact
+      fragment/copy pieces we need while keeping the upstream SM120 blockscaled
+      FP4 MMA op as the math ground truth
 
 That means the priority is no longer "prove the contract." The priority is:
 

@@ -1,5 +1,13 @@
 find_package(CUDAToolkit REQUIRED)
 
+find_path(
+  NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR
+  cute/atom/mma_atom.hpp
+  PATHS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include
+  NO_DEFAULT_PATH
+)
+
 set(NEMOTRON_CUDNN_FRONTEND_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cudnn-frontend/include")
 find_path(
   NEMOTRON_CUDNN_INCLUDE_DIR
@@ -170,6 +178,19 @@ target_include_directories(
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+if(NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nemotron_runtime_backend
+    PRIVATE
+      ${NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+  target_compile_definitions(
+    nemotron_runtime_backend
+    PRIVATE
+      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
+  )
+endif()
 
 if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   target_include_directories(

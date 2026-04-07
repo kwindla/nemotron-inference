@@ -5,8 +5,13 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <type_traits>
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+#include <cute/arch/mma_sm120.hpp>
+#endif
 
 #include "nemotron/device_nvfp4_matrix.h"
 #include "fused_decode_common.cuh"
@@ -15,6 +20,24 @@ namespace nemotron {
 namespace {
 
 namespace wmma = nvcuda::wmma;
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+namespace cute = ::cute;
+
+namespace nvfp4_cute {
+
+using ElementAB = cute::float_e2m1_t;
+using ElementSFCompute = cute::float_ue4m3_t;
+static constexpr int kScaleVecSize = 16;
+
+using MmaOp = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
+    ElementAB,
+    ElementAB,
+    float,
+    ElementSFCompute,
+    kScaleVecSize>;
+}  // namespace nvfp4_cute
+#endif
 
 constexpr int kGroupedTokenTile = static_cast<int>(kMoeLaunchPlanTokenTile);
 // Match TRT-LLM's grouped routed shape more closely: tileTokensDim=16 and an
@@ -843,6 +866,9 @@ __device__ __forceinline__ void Sm120BlockScaledFp4Mma(
     std::uint32_t sfa,
     std::uint32_t sfb) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  nvfp4_cute::MmaOp::fma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, d0, d1, d2, d3, sfa, sfb);
+#else
   static constexpr std::uint16_t kBidA = 0;
   static constexpr std::uint16_t kTidA = 0;
   static constexpr std::uint16_t kBidB = 0;
@@ -862,6 +888,7 @@ __device__ __forceinline__ void Sm120BlockScaledFp4Mma(
         "r"(b0), "r"(b1),
         "r"(sfa), "h"(kBidA), "h"(kTidA),
         "r"(sfb), "h"(kBidB), "h"(kTidB));
+#endif
 #endif
 }
 

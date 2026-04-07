@@ -671,10 +671,28 @@ specialized runtime:
   - we also do not need the full CUTLASS runtime stack
   - but the next exact mainloop step does need the header-level CUTE/CUTLASS
     substrate
+  - to make that integration more faithful and avoid writing unnecessary local
+    compatibility wrappers, the runtime build is now moving from C++17/CUDA17
+    to C++20/CUDA20 before the next fragment/copy rewrite
   - the local machine already has a usable header tree at:
     `.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include`
   - for long-term build stability, we should pin or vendor the exact header
     snapshot once the CUTE-driven mainloop path is the active implementation
+
+- C++20 probe result and bridge decision (`2026-04-07`):
+  - the runtime now builds as `C++20` / `CUDA20`
+  - the narrow SM120 MMA-op import from local CUTE works and the branch stays
+    green
+  - but the broader upstream fragment/copy header stack is still not a clean
+    drop-in even under C++20:
+    - `cute/algorithm/copy.hpp`
+    - `cute/algorithm/prefetch.hpp`
+    - `cutlass/cuda_host_adapter.hpp`
+  - so the next exact step is:
+    - keep using the upstream SM120 blockscaled FP4 MMA op as ground truth
+    - build a very narrow local bridge for the exact fragment/copy pieces we
+      need
+    - avoid importing the broader CUTLASS host/runtime surface into this TU
 
 #### Full TRT Mainloop Alignment Plan
 
