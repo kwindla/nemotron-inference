@@ -538,6 +538,25 @@ Interpretation:
       needed by the dominant traced profiles
     - do not import the broader host/runtime helper stack into the active TU
 
+- Bridge expansion: packed tile copy/layout (`2026-04-07`):
+  - the active traced `k64` routed kernels now also use `nvfp4_bridge` for the
+    packed tile copy side, not just the fragment side
+  - covered bridge operations now include:
+    - activation row copy
+    - weight row copy
+    - zero-row fill
+    - fragment load
+    - fragment clear
+    - grouped MMA
+    - fragment store
+  - result:
+    - the active grouped kernels no longer reach directly into the raw packed
+      row/scale copy helpers
+    - both correctness gates remained green after the cutover
+  - next bridge target:
+    - move the remaining lane-projection and profile tile-mapping math behind
+      the same local bridge boundary
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first

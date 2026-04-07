@@ -68,6 +68,47 @@ struct CFragment64 {
 };
 
 template <int kRowsPerTile>
+struct PackedTile64 {
+  std::uint8_t* packed_rows;
+  std::uint32_t* scale_words;
+};
+
+template <int kRowsPerTile>
+__device__ __forceinline__ PackedTile64<kRowsPerTile> MakePackedTile64(
+    std::uint8_t* packed_rows,
+    std::uint32_t* scale_words);
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void ZeroRow(
+    const PackedTile64<kRowsPerTile>& tile,
+    int row);
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void CopyWeightRow64(
+    const PackedTile64<kRowsPerTile>& tile,
+    const std::uint8_t* packed_data,
+    std::size_t packed_row_bytes,
+    std::size_t source_row,
+    std::size_t packed_byte_offset,
+    const std::uint8_t* matmul_scales,
+    std::size_t block_base,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    int row);
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void CopyActivationRow64(
+    const PackedTile64<kRowsPerTile>& tile,
+    const std::uint8_t* packed_data,
+    std::size_t packed_row_bytes,
+    std::size_t source_row,
+    std::size_t packed_byte_offset,
+    const std::uint8_t* block_scales,
+    std::size_t block_base,
+    std::size_t blocks_per_row,
+    int row);
+
+template <int kRowsPerTile>
 __device__ __forceinline__ AFragment64 LoadFragmentA_RowMajor16x64(
     const std::uint8_t* packed_rows,
     const std::uint32_t* scale_words,
@@ -1207,6 +1248,71 @@ __device__ __forceinline__ void StoreFp4AccumulatorTileRowMajor16x8(
            (output_row_base + static_cast<std::size_t>(col_base))] =
         __float2bfloat16(c3 * alpha);
   }
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ nvfp4_bridge::PackedTile64<kRowsPerTile>
+nvfp4_bridge::MakePackedTile64(
+    std::uint8_t* packed_rows,
+    std::uint32_t* scale_words) {
+  return PackedTile64<kRowsPerTile>{packed_rows, scale_words};
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void nvfp4_bridge::ZeroRow(
+    const PackedTile64<kRowsPerTile>& tile,
+    int row) {
+  ZeroPackedTileRows<kRowsPerTile>(tile.packed_rows, tile.scale_words, row);
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void nvfp4_bridge::CopyWeightRow64(
+    const PackedTile64<kRowsPerTile>& tile,
+    const std::uint8_t* packed_data,
+    std::size_t packed_row_bytes,
+    std::size_t source_row,
+    std::size_t packed_byte_offset,
+    const std::uint8_t* matmul_scales,
+    std::size_t block_base,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    int row) {
+  CopyPackedTileRow64<kRowsPerTile>(
+      packed_data,
+      packed_row_bytes,
+      source_row,
+      packed_byte_offset,
+      matmul_scales,
+      block_base,
+      padded_blocks_per_row,
+      scale_layout,
+      tile.packed_rows,
+      tile.scale_words,
+      row);
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void nvfp4_bridge::CopyActivationRow64(
+    const PackedTile64<kRowsPerTile>& tile,
+    const std::uint8_t* packed_data,
+    std::size_t packed_row_bytes,
+    std::size_t source_row,
+    std::size_t packed_byte_offset,
+    const std::uint8_t* block_scales,
+    std::size_t block_base,
+    std::size_t blocks_per_row,
+    int row) {
+  CopyPackedTileRow64FromRowMajorScales<kRowsPerTile>(
+      packed_data,
+      packed_row_bytes,
+      source_row,
+      packed_byte_offset,
+      block_scales,
+      block_base,
+      blocks_per_row,
+      tile.packed_rows,
+      tile.scale_words,
+      row);
 }
 
 template <int kRowsPerTile>
@@ -2434,6 +2540,10 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
   __shared__ std::uint32_t a_scale_words[kPlannedWmmaTileM];
   __shared__ std::uint8_t b_packed[kOutputTile][64 / 2];
   __shared__ std::uint32_t b_scale_words[kOutputTile];
+  const auto a_tile_view =
+      nvfp4_bridge::MakePackedTile64<kPlannedWmmaTileM>(&a_packed[0][0], a_scale_words);
+  const auto b_tile_view =
+      nvfp4_bridge::MakePackedTile64<kOutputTile>(&b_packed[0][0], b_scale_words);
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -2486,7 +2596,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
 
     for (int row = tid; row < kPlannedWmmaTileM; row += blockDim.x) {
       if (row < valid_rows) {
-        CopyPackedTileRow64FromRowMajorScales<kPlannedWmmaTileM>(
+        nvfp4_bridge::CopyActivationRow64(
+            a_tile_view,
             packed_input,
             packed_row_bytes,
             static_cast<std::size_t>(row_start + row),
@@ -2494,16 +2605,15 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
             input_block_scales,
             block_base,
             blocks_per_row,
-            &a_packed[0][0],
-            a_scale_words,
             row);
       } else {
-        ZeroPackedTileRows<kPlannedWmmaTileM>(&a_packed[0][0], a_scale_words, row);
+        nvfp4_bridge::ZeroRow(a_tile_view, row);
       }
     }
     for (int row = tid; row < kOutputTile; row += blockDim.x) {
       if (row < output_rows_this_tile) {
-        CopyPackedTileRow64<kOutputTile>(
+        nvfp4_bridge::CopyWeightRow64(
+            b_tile_view,
             weight.packed_data,
             packed_row_bytes,
             static_cast<std::size_t>(output_row_base + row),
@@ -2512,11 +2622,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
             block_base,
             padded_blocks_per_row,
             Nvfp4ScaleLayout::kSwizzled128x4,
-            &b_packed[0][0],
-            b_scale_words,
             row);
       } else {
-        ZeroPackedTileRows<kOutputTile>(&b_packed[0][0], b_scale_words, row);
+        nvfp4_bridge::ZeroRow(b_tile_view, row);
       }
     }
     __syncthreads();
@@ -2581,6 +2689,10 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
   __shared__ std::uint32_t a_scale_words[kOutputTile];
   __shared__ std::uint8_t b_packed[kPlannedWmmaTileM][64 / 2];
   __shared__ std::uint32_t b_scale_words[kPlannedWmmaTileM];
+  const auto a_tile_view =
+      nvfp4_bridge::MakePackedTile64<kOutputTile>(&a_packed[0][0], a_scale_words);
+  const auto b_tile_view =
+      nvfp4_bridge::MakePackedTile64<kPlannedWmmaTileM>(&b_packed[0][0], b_scale_words);
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -2636,7 +2748,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
 
     for (int row = tid; row < kOutputTile; row += blockDim.x) {
       if (row < output_rows_this_tile) {
-        CopyPackedTileRow64<kOutputTile>(
+        nvfp4_bridge::CopyWeightRow64(
+            a_tile_view,
             weight.packed_data,
             packed_row_bytes,
             static_cast<std::size_t>(output_row_base + row),
@@ -2645,16 +2758,15 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
             block_base,
             padded_blocks_per_row,
             Nvfp4ScaleLayout::kSwizzled128x4,
-            &a_packed[0][0],
-            a_scale_words,
             row);
       } else {
-        ZeroPackedTileRows<kOutputTile>(&a_packed[0][0], a_scale_words, row);
+        nvfp4_bridge::ZeroRow(a_tile_view, row);
       }
     }
     for (int row = tid; row < kPlannedWmmaTileM; row += blockDim.x) {
       if (row < valid_rows) {
-        CopyPackedTileRow64FromRowMajorScales<kPlannedWmmaTileM>(
+        nvfp4_bridge::CopyActivationRow64(
+            b_tile_view,
             packed_input,
             packed_row_bytes,
             static_cast<std::size_t>(row_start + row),
@@ -2662,11 +2774,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
             input_block_scales,
             block_base,
             blocks_per_row,
-            &b_packed[0][0],
-            b_scale_words,
             row);
       } else {
-        ZeroPackedTileRows<kPlannedWmmaTileM>(&b_packed[0][0], b_scale_words, row);
+        nvfp4_bridge::ZeroRow(b_tile_view, row);
       }
     }
     __syncthreads();

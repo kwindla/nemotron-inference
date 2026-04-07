@@ -715,6 +715,26 @@ specialized runtime:
     - avoid importing `cute/algorithm/copy.hpp` / host adapter machinery into
       the runtime TU
 
+- Bridge expansion: packed tile copy/layout (`2026-04-07`):
+  - the active traced `k64` routed kernels now also route their packed
+    row/scale tile movement through `nvfp4_bridge`
+  - current local bridge surface now covers:
+    - packed activation row copy
+    - packed weight row copy
+    - zero-row handling
+    - fragment load
+    - fragment clear
+    - grouped MMA
+    - fragment store
+  - that means the active grouped kernels no longer call the raw packed
+    row/scale copy helpers directly
+  - correctness stayed green after this widening:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+  - immediate next bridge target:
+    - pull the remaining lane-to-row/col projection math and profile-specific
+      tile mapping behind the same local bridge
+
 #### Full TRT Mainloop Alignment Plan
 
 The next target is full routed-mainloop fidelity to the traced local
