@@ -694,6 +694,27 @@ specialized runtime:
       need
     - avoid importing the broader CUTLASS host/runtime surface into this TU
 
+- Narrow local bridge checkpoint (`2026-04-07`):
+  - the active traced `k64` FP4 routed kernels now use a local `nvfp4_bridge`
+    fragment layer instead of open-coded raw register tuples
+  - the bridge currently wraps only the exact pieces we need:
+    - `A/B` fragment load
+    - `C` fragment clear
+    - grouped MMA call
+    - `C` fragment store
+  - the bridge still delegates the math op itself to the upstream SM120
+    blockscaled FP4 MMA definition, so the math ground truth remains the traced
+    TRT/CUTE path
+  - this keeps both correctness gates green:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+  - next bridge expansion:
+    - move more of the traced fragment/copy layout logic behind this local
+      bridge
+    - keep the include surface narrow
+    - avoid importing `cute/algorithm/copy.hpp` / host adapter machinery into
+      the runtime TU
+
 #### Full TRT Mainloop Alignment Plan
 
 The next target is full routed-mainloop fidelity to the traced local

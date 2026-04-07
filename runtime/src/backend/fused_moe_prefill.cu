@@ -39,6 +39,71 @@ using MmaOp = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
 }  // namespace nvfp4_cute
 #endif
 
+namespace nvfp4_bridge {
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+using ARegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::ARegisters>;
+using BRegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::BRegisters>;
+using CRegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::CRegisters>;
+using SFRegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::SFARegisters>;
+#else
+using ARegister = std::uint32_t;
+using BRegister = std::uint32_t;
+using CRegister = float;
+using SFRegister = std::uint32_t;
+#endif
+
+struct AFragment64 {
+  ARegister regs[4];
+  SFRegister scale[1];
+};
+
+struct BFragment64 {
+  BRegister regs[2];
+  SFRegister scale[1];
+};
+
+struct CFragment64 {
+  CRegister regs[4];
+};
+
+template <int kRowsPerTile>
+__device__ __forceinline__ AFragment64 LoadFragmentA_RowMajor16x64(
+    const std::uint8_t* packed_rows,
+    const std::uint32_t* scale_words,
+    int row_base,
+    int lane_id);
+
+template <int kRowsPerTile>
+__device__ __forceinline__ BFragment64 LoadFragmentB_ColMajor64x8(
+    const std::uint8_t* packed_rows,
+    const std::uint32_t* scale_words,
+    int lane_id,
+    int n_base);
+
+__device__ __forceinline__ void Clear(CFragment64& fragment);
+
+__device__ __forceinline__ void Gemm(
+    CFragment64& accum,
+    const AFragment64& a,
+    const BFragment64& b);
+
+template <int kRowsPerTile, typename OutputType>
+__device__ __forceinline__ void StoreFragmentC_RowMajor16x8(
+    float alpha,
+    const CFragment64& accum,
+    int lane_id,
+    int col_base,
+    int row_base,
+    int valid_rows,
+    int valid_cols,
+    std::size_t row_start,
+    std::size_t output_row_base,
+    std::size_t output_rows_per_expert,
+    OutputType* output);
+
+}  // namespace nvfp4_bridge
+
 constexpr int kGroupedTokenTile = static_cast<int>(kMoeLaunchPlanTokenTile);
 // Match TRT-LLM's grouped routed shape more closely: tileTokensDim=16 and an
 // epilogue/output tile of 128 rows per CTA when transposeMmaOutput=true.
@@ -1142,6 +1207,103 @@ __device__ __forceinline__ void StoreFp4AccumulatorTileRowMajor16x8(
            (output_row_base + static_cast<std::size_t>(col_base))] =
         __float2bfloat16(c3 * alpha);
   }
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ nvfp4_bridge::AFragment64
+nvfp4_bridge::LoadFragmentA_RowMajor16x64(
+    const std::uint8_t* packed_rows,
+    const std::uint32_t* scale_words,
+    int row_base,
+    int lane_id) {
+  AFragment64 fragment{};
+  LoadFp4ARegistersRowMajor16x64<kRowsPerTile>(
+      packed_rows + static_cast<std::size_t>(row_base) * (64 / 2),
+      scale_words + static_cast<std::size_t>(row_base),
+      lane_id,
+      fragment.regs[0],
+      fragment.regs[1],
+      fragment.regs[2],
+      fragment.regs[3],
+      fragment.scale[0]);
+  ApplySm120Fp4ShiftA(fragment.regs[0], fragment.regs[1], fragment.regs[2], fragment.regs[3]);
+  return fragment;
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ nvfp4_bridge::BFragment64
+nvfp4_bridge::LoadFragmentB_ColMajor64x8(
+    const std::uint8_t* packed_rows,
+    const std::uint32_t* scale_words,
+    int lane_id,
+    int n_base) {
+  BFragment64 fragment{};
+  LoadFp4BRegistersColMajor64x8<kRowsPerTile>(
+      packed_rows,
+      scale_words,
+      lane_id,
+      n_base,
+      fragment.regs[0],
+      fragment.regs[1],
+      fragment.scale[0]);
+  ApplySm120Fp4ShiftB(fragment.regs[0], fragment.regs[1]);
+  return fragment;
+}
+
+__device__ __forceinline__ void nvfp4_bridge::Clear(CFragment64& fragment) {
+  fragment.regs[0] = 0.0f;
+  fragment.regs[1] = 0.0f;
+  fragment.regs[2] = 0.0f;
+  fragment.regs[3] = 0.0f;
+}
+
+__device__ __forceinline__ void nvfp4_bridge::Gemm(
+    CFragment64& accum,
+    const AFragment64& a,
+    const BFragment64& b) {
+  Sm120BlockScaledFp4Mma(
+      accum.regs[0],
+      accum.regs[1],
+      accum.regs[2],
+      accum.regs[3],
+      a.regs[0],
+      a.regs[1],
+      a.regs[2],
+      a.regs[3],
+      b.regs[0],
+      b.regs[1],
+      static_cast<std::uint32_t>(a.scale[0]),
+      static_cast<std::uint32_t>(b.scale[0]));
+}
+
+template <int kRowsPerTile, typename OutputType>
+__device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_RowMajor16x8(
+    float alpha,
+    const CFragment64& accum,
+    int lane_id,
+    int col_base,
+    int row_base,
+    int valid_rows,
+    int valid_cols,
+    std::size_t row_start,
+    std::size_t output_row_base,
+    std::size_t output_rows_per_expert,
+    OutputType* output) {
+  StoreFp4AccumulatorTileRowMajor16x8<kRowsPerTile>(
+      alpha,
+      accum.regs[0],
+      accum.regs[1],
+      accum.regs[2],
+      accum.regs[3],
+      lane_id,
+      col_base,
+      row_base,
+      valid_rows,
+      valid_cols,
+      row_start,
+      output_row_base,
+      output_rows_per_expert,
+      output);
 }
 
 __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
@@ -2310,14 +2472,11 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
           : 1.0f;
   const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
 
-  float accum[kWarpSubTiles][4];
+  nvfp4_bridge::CFragment64 accum[kWarpSubTiles];
   if (warp_id < kGroupedConsumerWarpsPerBlock) {
 #pragma unroll
     for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
-      accum[subtile][0] = 0.0f;
-      accum[subtile][1] = 0.0f;
-      accum[subtile][2] = 0.0f;
-      accum[subtile][3] = 0.0f;
+      nvfp4_bridge::Clear(accum[subtile]);
     }
   }
 
@@ -2363,21 +2522,17 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
     __syncthreads();
 
     if (warp_id < kGroupedConsumerWarpsPerBlock) {
-      std::uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, sfa = 0;
-      LoadFp4ARegistersRowMajor16x64<kPlannedWmmaTileM>(
-          &a_packed[0][0], a_scale_words, lane_id, a0, a1, a2, a3, sfa);
-      ApplySm120Fp4ShiftA(a0, a1, a2, a3);
+      const auto a_fragment =
+          nvfp4_bridge::LoadFragmentA_RowMajor16x64<kPlannedWmmaTileM>(
+              &a_packed[0][0], a_scale_words, 0, lane_id);
 #pragma unroll
       for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
         const int n_base = warp_id * kFp4MmaTileN + subtile * kGroupedConsumerWarpsPerBlock * kFp4MmaTileN;
         if (n_base < output_rows_this_tile) {
-          std::uint32_t b0 = 0, b1 = 0, sfb = 0;
-          LoadFp4BRegistersColMajor64x8<kOutputTile>(
-              &b_packed[0][0], b_scale_words, lane_id, n_base, b0, b1, sfb);
-          ApplySm120Fp4ShiftB(b0, b1);
-          Sm120BlockScaledFp4Mma(
-              accum[subtile][0], accum[subtile][1], accum[subtile][2], accum[subtile][3],
-              a0, a1, a2, a3, b0, b1, sfa, sfb);
+          const auto b_fragment =
+              nvfp4_bridge::LoadFragmentB_ColMajor64x8<kOutputTile>(
+                  &b_packed[0][0], b_scale_words, lane_id, n_base);
+          nvfp4_bridge::Gemm(accum[subtile], a_fragment, b_fragment);
         }
       }
     }
@@ -2389,12 +2544,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
 #pragma unroll
     for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
       const int n_base = warp_id * kFp4MmaTileN + subtile * kGroupedConsumerWarpsPerBlock * kFp4MmaTileN;
-      StoreFp4AccumulatorTileRowMajor16x8<kPlannedWmmaTileM>(
+      nvfp4_bridge::StoreFragmentC_RowMajor16x8<kPlannedWmmaTileM>(
           output_alpha,
-          accum[subtile][0],
-          accum[subtile][1],
-          accum[subtile][2],
-          accum[subtile][3],
+          accum[subtile],
           lane_id,
           n_base + col_in_subtile,
           0,
@@ -2467,16 +2619,13 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
           : 1.0f;
   const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
 
-  float accum[kWarpRowSubTiles][kTokenSubTiles][4];
+  nvfp4_bridge::CFragment64 accum[kWarpRowSubTiles][kTokenSubTiles];
   if (warp_id < kGroupedConsumerWarpsPerBlock) {
 #pragma unroll
     for (int row_subtile = 0; row_subtile < kWarpRowSubTiles; ++row_subtile) {
 #pragma unroll
       for (int token_subtile = 0; token_subtile < kTokenSubTiles; ++token_subtile) {
-        accum[row_subtile][token_subtile][0] = 0.0f;
-        accum[row_subtile][token_subtile][1] = 0.0f;
-        accum[row_subtile][token_subtile][2] = 0.0f;
-        accum[row_subtile][token_subtile][3] = 0.0f;
+        nvfp4_bridge::Clear(accum[row_subtile][token_subtile]);
       }
     }
   }
@@ -2528,23 +2677,15 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
         const int m_base =
             warp_id * kPlannedWmmaTileM + row_subtile * kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileM;
         if (m_base < output_rows_this_tile) {
-          std::uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, sfa = 0;
-          LoadFp4ARegistersRowMajor16x64<kOutputTile>(
-              &a_packed[m_base][0], &a_scale_words[m_base], lane_id, a0, a1, a2, a3, sfa);
-          ApplySm120Fp4ShiftA(a0, a1, a2, a3);
+          const auto a_fragment = nvfp4_bridge::LoadFragmentA_RowMajor16x64<kOutputTile>(
+              &a_packed[0][0], a_scale_words, m_base, lane_id);
 #pragma unroll
           for (int token_subtile = 0; token_subtile < kTokenSubTiles; ++token_subtile) {
             const int n_base = token_subtile * kFp4MmaTileN;
-            std::uint32_t b0 = 0, b1 = 0, sfb = 0;
-            LoadFp4BRegistersColMajor64x8<kPlannedWmmaTileM>(
-                &b_packed[0][0], b_scale_words, lane_id, n_base, b0, b1, sfb);
-            ApplySm120Fp4ShiftB(b0, b1);
-            Sm120BlockScaledFp4Mma(
-                accum[row_subtile][token_subtile][0],
-                accum[row_subtile][token_subtile][1],
-                accum[row_subtile][token_subtile][2],
-                accum[row_subtile][token_subtile][3],
-                a0, a1, a2, a3, b0, b1, sfa, sfb);
+            const auto b_fragment =
+                nvfp4_bridge::LoadFragmentB_ColMajor64x8<kPlannedWmmaTileM>(
+                    &b_packed[0][0], b_scale_words, lane_id, n_base);
+            nvfp4_bridge::Gemm(accum[row_subtile][token_subtile], a_fragment, b_fragment);
           }
         }
       }
@@ -2576,37 +2717,37 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
         if (row0 < output_rows_this_tile) {
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
-                __float2bfloat16(accum[row_subtile][token_subtile][0] * output_alpha);
+                __float2bfloat16(accum[row_subtile][token_subtile].regs[0] * output_alpha);
           } else {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
-                accum[row_subtile][token_subtile][0] * output_alpha;
+                accum[row_subtile][token_subtile].regs[0] * output_alpha;
           }
         }
         if (row1 < output_rows_this_tile) {
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
-                __float2bfloat16(accum[row_subtile][token_subtile][1] * output_alpha);
+                __float2bfloat16(accum[row_subtile][token_subtile].regs[1] * output_alpha);
           } else {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
-                accum[row_subtile][token_subtile][1] * output_alpha;
+                accum[row_subtile][token_subtile].regs[1] * output_alpha;
           }
         }
         if (row2 < output_rows_this_tile) {
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
-                __float2bfloat16(accum[row_subtile][token_subtile][2] * output_alpha);
+                __float2bfloat16(accum[row_subtile][token_subtile].regs[2] * output_alpha);
           } else {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
-                accum[row_subtile][token_subtile][2] * output_alpha;
+                accum[row_subtile][token_subtile].regs[2] * output_alpha;
           }
         }
         if (row3 < output_rows_this_tile) {
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
-                __float2bfloat16(accum[row_subtile][token_subtile][3] * output_alpha);
+                __float2bfloat16(accum[row_subtile][token_subtile].regs[3] * output_alpha);
           } else {
             output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
-                accum[row_subtile][token_subtile][3] * output_alpha;
+                accum[row_subtile][token_subtile].regs[3] * output_alpha;
           }
         }
       }

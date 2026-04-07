@@ -518,6 +518,26 @@ Interpretation:
       fragment/copy pieces we need while keeping the upstream SM120 blockscaled
       FP4 MMA op as the math ground truth
 
+- Narrow local bridge checkpoint (`2026-04-07`):
+  - the active traced `k64` FP4 routed kernels now run through a local
+    fragment wrapper layer instead of hand-managed raw register tuples
+  - current bridge surface:
+    - `LoadFragmentA_RowMajor16x64`
+    - `LoadFragmentB_ColMajor64x8`
+    - `Clear`
+    - `Gemm`
+    - `StoreFragmentC_RowMajor16x8`
+  - this is intentionally narrow: it keeps the TU on the safe side of the
+    upstream CUTE/CUTLASS include boundary while still binding the math op to
+    the same SM120 MMA definition we traced from TRT
+  - correctness rechecked after the bridge cutover:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+  - immediate next step:
+    - widen the local bridge only around the exact fragment/copy/layout pieces
+      needed by the dominant traced profiles
+    - do not import the broader host/runtime helper stack into the active TU
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first
