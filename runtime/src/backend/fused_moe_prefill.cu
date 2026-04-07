@@ -187,7 +187,7 @@ __device__ float ClampNvfp4TensorScale(float value) {
   return value;
 }
 
-[[maybe_unused]] __global__ void ComputeExpertActivationScalesKernel(
+__global__ void ComputeExpertActivationScalesKernel(
     const float* input,
     const int* expert_first_token_offsets,
     std::size_t n_experts,
@@ -466,6 +466,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
     const std::uint8_t* packed_input,
     const std::uint8_t* input_block_scales,
     const float* input_tensor_scale_data,
+    const float* input_expert_tensor_scales,
     const int* cta_count,
     const int* cta_expert_ids,
     const int* cta_row_starts,
@@ -508,7 +509,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
           ? (output_rows_per_expert - static_cast<std::size_t>(output_row_base))
           : static_cast<std::size_t>(kPlannedOutputTile));
   const float weight_tensor_scale = *weight.tensor_scale_data;
-  const float input_tensor_scale = *input_tensor_scale_data;
+  const float input_tensor_scale =
+      input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
+                                            : *input_tensor_scale_data;
 
   wmma::fragment<
       wmma::accumulator,
@@ -919,7 +922,7 @@ bool LaunchGatherRows(
   return CheckCuda(cudaGetLastError());
 }
 
-[[maybe_unused]] bool LaunchComputeExpertActivationScales(
+bool LaunchComputeExpertActivationScales(
     const float* input,
     const int* expert_first_token_offsets,
     std::size_t n_experts,
@@ -1112,6 +1115,7 @@ bool LaunchPlannedMatVec(
 
 bool LaunchPlannedPackedInputMatVec(
     const DeviceNvfp4Matrix& input_pack,
+    const float* input_expert_tensor_scales,
     const DeviceMoeLaunchPlan* launch_plan,
     std::size_t active_selection_count,
     const FusedNvfp4WeightView* weights,
@@ -1147,6 +1151,7 @@ bool LaunchPlannedPackedInputMatVec(
       input_pack.packed_data(),
       input_pack.block_scales_data(),
       input_pack.device_tensor_scale_ptr(),
+      input_expert_tensor_scales,
       launch_plan->cta_count(),
       launch_plan->cta_expert_ids(),
       launch_plan->cta_row_starts(),
@@ -1359,9 +1364,13 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  if (!(use_packed_fc1
+  if (!LaunchZeroBuffer(
+          params.routed_up_scratch,
+          *current_padded_row_capacity * params.routed_expert_intermediate_size) ||
+      !(use_packed_fc1
             ? LaunchPlannedPackedInputMatVec(
                   *params.fc1_grouped_pack,
+                  nullptr,
                   params.launch_plan,
                   selection_count,
                   params.routed_up_device,
@@ -1373,15 +1382,19 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                   selection_count,
                   params.routed_up_device,
                   params.routed_expert_intermediate_size,
-                  params.routed_up_scratch))) {
-    return false;
-  }
-
-  if (!LaunchRelu2Rows(
+                  params.routed_up_scratch)) ||
+      !LaunchRelu2Rows(
           params.routed_up_scratch,
           params.launch_plan->total_padded_rows(),
           params.launch_plan->padded_row_capacity(),
           params.routed_expert_intermediate_size) ||
+      (params.fc2_expert_activation_scales != nullptr &&
+       !LaunchComputeExpertActivationScales(
+           params.routed_up_scratch,
+           params.launch_plan->expert_first_token_offsets(),
+           params.n_routed_experts,
+           params.routed_expert_intermediate_size,
+           params.fc2_expert_activation_scales)) ||
       (params.fc2_grouped_pack != nullptr &&
        !PackDeviceRowMajorFp32ToNvfp4PerExpert(
            params.routed_up_scratch,
@@ -1389,7 +1402,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
            params.routed_expert_intermediate_size,
            params.launch_plan->expert_first_token_offsets(),
            params.n_routed_experts,
-           nullptr,
+           params.fc2_expert_activation_scales,
            params.fc2_grouped_pack)) ||
       (params.fc2_grouped_pack == nullptr &&
        !LaunchQuantizeDequantizeRows(
@@ -1400,10 +1413,12 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     return false;
   }
 
-  const bool use_packed_fc2 = params.fc2_grouped_pack != nullptr;
+  const bool use_packed_fc2 =
+      params.fc2_grouped_pack != nullptr && params.fc2_expert_activation_scales != nullptr;
   if (!(use_packed_fc2
             ? LaunchPlannedPackedInputMatVec(
                   *params.fc2_grouped_pack,
+                  params.fc2_expert_activation_scales,
                   params.launch_plan,
                   selection_count,
                   params.routed_down_device,

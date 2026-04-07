@@ -229,6 +229,17 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4PerExpertKernel(
     std::uint8_t* packed,
     std::uint8_t* block_scales,
     std::uint8_t* matmul_scales) {
+  auto find_expert_for_row = [expert_first_token_offsets, n_experts](std::size_t row) {
+    for (int expert_index = 0; expert_index < n_experts; ++expert_index) {
+      const int begin = expert_first_token_offsets[expert_index];
+      const int end = expert_first_token_offsets[expert_index + 1];
+      if (static_cast<int>(row) >= begin && static_cast<int>(row) < end) {
+        return expert_index;
+      }
+    }
+    return -1;
+  };
+
   const std::size_t blocks_per_row = cols / kBlockWidth;
   const std::size_t swizzled_index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
   const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
@@ -258,8 +269,13 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4PerExpertKernel(
     return;
   }
 
-  (void) expert_tensor_scales;
-  const float tensor_scale = 1.0f;
+  float tensor_scale = 1.0f;
+  if (expert_tensor_scales != nullptr) {
+    const int expert_index = find_expert_for_row(row);
+    if (expert_index >= 0) {
+      tensor_scale = expert_tensor_scales[expert_index];
+    }
+  }
 
   const std::size_t input_offset = row * cols + (block * kBlockWidth);
   float block_max_abs = 0.0f;

@@ -39,6 +39,28 @@ Interpretation:
 - the next missing TRT piece is FC2 / Gemm1-output scale handling, not more
   FC1 gather-side work
 
+Current in-progress follow-up:
+
+- grouped per-expert packing now again honors expert tensor scales
+- routed-down packed input now consumes that FC2 expert-scale contract
+- focused gates remain green:
+  `device_nvfp4_matrix_test`, `moe_launch_plan_device_test`,
+  `fused_moe_prefill_test`, `multi_turn_prefix_reuse_test`
+
+Focused TTFT on the same `prefix128 / tail4` gate after that FC2 step is:
+
+- `cold_prefill_prefix128 = 126.679 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.423 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.766 ms`
+
+Interpretation:
+
+- the FC2 expert-scale contract work is correct
+- by itself it is roughly performance-neutral
+- the remaining gap is now the bigger TRT contract jump: stop materializing
+  FP32 `routed_up_scratch` as the long-lived boundary and instead produce the
+  Gemm1 output / activation scale contract directly for Gemm2
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first

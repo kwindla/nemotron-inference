@@ -36,6 +36,8 @@ using nemotron::RunFusedMoePrefill;
 
 constexpr float kMaxAbsDiffTolerance = 5.0e-4f;
 constexpr float kNanoPackedContractTolerance = 2.0f;
+constexpr float kNvfp4ActivationMaxFiniteHost = 6.0f * 448.0f;
+constexpr float kNvfp4MinTensorScaleHost = 1.0f / 1024.0f;
 
 bool Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -130,6 +132,50 @@ std::optional<std::vector<float>> QuantizeDequantizeMatrixRows(
     return std::nullopt;
   }
   return DequantizeNvfp4Matrix(*packed);
+}
+
+float ClampNvfp4TensorScaleHost(float value) {
+  if (!std::isfinite(value) || value < kNvfp4MinTensorScaleHost) {
+    return kNvfp4MinTensorScaleHost;
+  }
+  return value;
+}
+
+std::optional<std::vector<float>> QuantizeDequantizeRowWithFixedTensorScale(
+    const std::vector<float>& row,
+    float tensor_scale) {
+  nemotron::Nvfp4PackOptions options;
+  options.fixed_tensor_scale = tensor_scale;
+  const auto packed = PackRowMajorFp32ToNvfp4(row.data(), 1, row.size(), options);
+  if (!packed.has_value()) {
+    return std::nullopt;
+  }
+  return DequantizeNvfp4Matrix(*packed);
+}
+
+std::vector<float> ComputeExpertTensorScalesHost(
+    const std::vector<std::vector<float>>& row_values_by_selection,
+    const std::vector<int>& expert_ids,
+    std::size_t n_routed_experts) {
+  std::vector<float> scales(n_routed_experts, 1.0f);
+  std::vector<float> maxima(n_routed_experts, 0.0f);
+  for (std::size_t selection_index = 0; selection_index < row_values_by_selection.size(); ++selection_index) {
+    const int expert_index = expert_ids[selection_index];
+    if (expert_index < 0 || static_cast<std::size_t>(expert_index) >= n_routed_experts) {
+      continue;
+    }
+    for (float value : row_values_by_selection[selection_index]) {
+      maxima[static_cast<std::size_t>(expert_index)] =
+          std::max(maxima[static_cast<std::size_t>(expert_index)], std::fabs(value));
+    }
+  }
+  for (std::size_t expert_index = 0; expert_index < n_routed_experts; ++expert_index) {
+    if (maxima[expert_index] > kNvfp4ActivationMaxFiniteHost) {
+      scales[expert_index] =
+          ClampNvfp4TensorScaleHost(maxima[expert_index] / kNvfp4ActivationMaxFiniteHost);
+    }
+  }
+  return scales;
 }
 
 template <typename T>
@@ -437,6 +483,38 @@ bool BuildReferenceOutputs(
     return false;
   }
 
+  std::vector<std::vector<float>> routed_up_outputs(
+      test_case.token_count * test_case.top_k,
+      std::vector<float>{});
+  std::vector<int> routed_expert_ids(test_case.token_count * test_case.top_k, -1);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    std::vector<float> routed_quantized_input(
+        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
+        routed_quantized_inputs->begin() +
+            static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
+
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const std::size_t selection_index = token_index * test_case.top_k + slot;
+      const int expert_index = test_case.topk_ids[selection_index];
+      if (expert_index < 0) {
+        continue;
+      }
+      routed_expert_ids[selection_index] = expert_index;
+      routed_up_outputs[selection_index] = RowMajorMatVec(
+          routed_up.dequantized[static_cast<std::size_t>(expert_index)],
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          routed_quantized_input);
+      Relu2InPlace(&routed_up_outputs[selection_index]);
+    }
+  }
+
+  const std::vector<float> fc2_expert_scales = ComputeExpertTensorScalesHost(
+      routed_up_outputs,
+      routed_expert_ids,
+      test_case.n_routed_experts);
+
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
     const float* normalized_row =
         test_case.normalized.data() + token_index * test_case.hidden_size;
@@ -447,10 +525,6 @@ bool BuildReferenceOutputs(
     if (!shared_quantized_input.has_value()) {
       return false;
     }
-    std::vector<float> routed_quantized_input(
-        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
-        routed_quantized_inputs->begin() +
-            static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
 
     float* output_row = expected_output->data() + token_index * test_case.hidden_size;
     float* routed_output_row =
@@ -460,18 +534,14 @@ bool BuildReferenceOutputs(
 
     for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
       const std::size_t selection_index = token_index * test_case.top_k + slot;
-      const int expert_index = test_case.topk_ids[selection_index];
+      const int expert_index = routed_expert_ids[selection_index];
       if (expert_index < 0) {
         continue;
       }
 
-      auto expert_up = RowMajorMatVec(
-          routed_up.dequantized[static_cast<std::size_t>(expert_index)],
-          test_case.routed_expert_intermediate_size,
-          test_case.hidden_size,
-          routed_quantized_input);
-      Relu2InPlace(&expert_up);
-      const auto quantized_expert_up = QuantizeDequantizeRow(expert_up);
+      const auto quantized_expert_up = QuantizeDequantizeRowWithFixedTensorScale(
+          routed_up_outputs[selection_index],
+          fc2_expert_scales[static_cast<std::size_t>(expert_index)]);
       if (!quantized_expert_up.has_value()) {
         return false;
       }
@@ -541,6 +611,37 @@ bool BuildNanoReferenceOutputs(
     return false;
   }
 
+  std::vector<std::vector<float>> routed_up_outputs(
+      test_case.token_count * test_case.top_k,
+      std::vector<float>{});
+  std::vector<int> routed_expert_ids(test_case.token_count * test_case.top_k, -1);
+
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    std::vector<float> routed_quantized_input(
+        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
+        routed_quantized_inputs->begin() +
+            static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const std::size_t selection_index = token_index * test_case.top_k + slot;
+      const int expert_index = test_case.topk_ids[selection_index];
+      if (expert_index < 0) {
+        continue;
+      }
+      routed_expert_ids[selection_index] = expert_index;
+      routed_up_outputs[selection_index] = RowMajorMatVec(
+          routed_up.dequantized,
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          routed_quantized_input);
+      Relu2InPlace(&routed_up_outputs[selection_index]);
+    }
+  }
+
+  const std::vector<float> fc2_expert_scales = ComputeExpertTensorScalesHost(
+      routed_up_outputs,
+      routed_expert_ids,
+      test_case.n_routed_experts);
+
   for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
     const float* normalized_row =
         test_case.normalized.data() + token_index * test_case.hidden_size;
@@ -551,42 +652,34 @@ bool BuildNanoReferenceOutputs(
     if (!shared_quantized_input.has_value()) {
       return false;
     }
-    std::vector<float> routed_quantized_input(
-        routed_quantized_inputs->begin() + static_cast<std::ptrdiff_t>(token_index * test_case.hidden_size),
-        routed_quantized_inputs->begin() +
-            static_cast<std::ptrdiff_t>((token_index + 1) * test_case.hidden_size));
-
-    auto expert_up = RowMajorMatVec(
-        routed_up.dequantized,
-        test_case.routed_expert_intermediate_size,
-        test_case.hidden_size,
-        routed_quantized_input);
-    Relu2InPlace(&expert_up);
-    const auto quantized_expert_up = QuantizeDequantizeRow(expert_up);
-    if (!quantized_expert_up.has_value()) {
-      return false;
-    }
-    const auto expert_down = RowMajorMatVec(
-        routed_down.dequantized,
-        test_case.hidden_size,
-        test_case.routed_expert_intermediate_size,
-        *quantized_expert_up);
-
-    float routed_scale = 0.0f;
-    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
-      routed_scale += test_case.topk_weights[token_index * test_case.top_k + slot];
-    }
-
     float* output_row = expected_output->data() + token_index * test_case.hidden_size;
     float* routed_output_row =
         expected_routed_output->data() + token_index * test_case.hidden_size;
     float* shared_output_row =
         expected_shared_output->data() + token_index * test_case.hidden_size;
 
-    for (std::size_t dim = 0; dim < test_case.hidden_size; ++dim) {
-      const float weighted = routed_scale * expert_down[dim];
-      output_row[dim] += weighted;
-      routed_output_row[dim] = weighted;
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const std::size_t selection_index = token_index * test_case.top_k + slot;
+      const int expert_index = routed_expert_ids[selection_index];
+      if (expert_index < 0) {
+        continue;
+      }
+      const auto quantized_expert_up = QuantizeDequantizeRowWithFixedTensorScale(
+          routed_up_outputs[selection_index],
+          fc2_expert_scales[static_cast<std::size_t>(expert_index)]);
+      if (!quantized_expert_up.has_value()) {
+        return false;
+      }
+      const auto expert_down = RowMajorMatVec(
+          routed_down.dequantized,
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          *quantized_expert_up);
+      for (std::size_t dim = 0; dim < test_case.hidden_size; ++dim) {
+        const float weighted = test_case.topk_weights[selection_index] * expert_down[dim];
+        output_row[dim] += weighted;
+        routed_output_row[dim] += weighted;
+      }
     }
 
     auto shared_up_output = RowMajorMatVec(

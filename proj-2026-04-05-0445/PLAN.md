@@ -155,6 +155,27 @@ dead expert-scale kernels from the packed path is:
 - `cached_committed_head_prefix128_tail4 hot-prefix = 54.480 ms`
 - `cached_global_root_prefix128_tail4 hot-prefix = 54.246 ms`
 
+The next FC2/output-scale step is now also landed in the working tree:
+
+- grouped per-expert packing again honors expert tensor scales
+- routed-down packed input now consumes those FC2 expert scales instead of
+  treating FC2 input as a neutral matrix contract
+- focused correctness remains green
+
+Focused TTFT on the same gate with that FC2 expert-scale contract is:
+
+- `cold_prefill_prefix128 = 126.679 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.423 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.766 ms`
+
+Interpretation:
+
+- carrying FC2 expert-scale metadata is necessary contract work
+- by itself, it is roughly performance-neutral on the current gate
+- the next missing TRT piece is to stop routing through FP32 `routed_up_scratch`
+  at all and instead produce the Gemm1 output / activation scale contract
+  directly for Gemm2 consumption
+
 ## Goal
 
 Optimize the remaining dominant prefill work for Nemotron 3 Nano NVFP4 on the

@@ -504,7 +504,7 @@ bool test_device_nvfp4_matrix_fixed_tensor_scale_restores_batch_invariance() {
              "with a fixed tensor scale, the first-row block scale should be batch invariant");
 }
 
-bool test_device_nvfp4_matrix_per_expert_pack_keeps_grouped_rows_split_stable() {
+bool test_device_nvfp4_matrix_per_expert_pack_honors_grouped_tensor_scales() {
   auto source = DeviceTensorFp32::Create({384, 16});
   auto expert_offsets = DeviceTensorInt32::Create({3});
   auto expert_scales = DeviceTensorFp32::Create({2, 1});
@@ -564,9 +564,9 @@ bool test_device_nvfp4_matrix_per_expert_pack_keeps_grouped_rows_split_stable() 
   }
 
   Nvfp4PackOptions first_options;
-  first_options.fixed_tensor_scale = 1.0f;
+  first_options.fixed_tensor_scale = host_scales[0];
   Nvfp4PackOptions second_options;
-  second_options.fixed_tensor_scale = 1.0f;
+  second_options.fixed_tensor_scale = host_scales[1];
   const auto first_row = PackRowMajorFp32ToNvfp4(host_values.data(), 1, 16, first_options);
   const auto second_row = PackRowMajorFp32ToNvfp4(host_values.data() + (128 * 16), 1, 16, second_options);
   if (!expect(first_row.has_value() && second_row.has_value(),
@@ -579,16 +579,16 @@ bool test_device_nvfp4_matrix_per_expert_pack_keeps_grouped_rows_split_stable() 
              "grouped per-expert pack should keep the matrix tensor scale neutral") &&
          expect(
              slice_bytes(packed_bytes, 0, 8) == first_row->packed,
-             "expert 0 row should match the neutral-scale host packer") &&
+             "expert 0 row should match the fixed-scale host packer") &&
          expect(
              slice_bytes(packed_bytes, 128 * 8, 8) == second_row->packed,
-             "expert 1 row should match the neutral-scale host packer") &&
+             "expert 1 row should match the fixed-scale host packer") &&
          expect(
              slice_bytes(block_scales, 0, 1) == first_row->block_scales,
-             "expert 0 block scale should match the neutral-scale host packer") &&
+             "expert 0 block scale should match the fixed-scale host packer") &&
          expect(
              slice_bytes(block_scales, 128, 1) == second_row->block_scales,
-             "expert 1 block scale should match the neutral-scale host packer") &&
+             "expert 1 block scale should match the fixed-scale host packer") &&
          expect(
              slice_bytes(packed_bytes, 256 * 8, 8) == std::vector<std::uint8_t>(8, 0u),
              "rows beyond the active grouped span should stay zeroed") &&
@@ -686,7 +686,7 @@ int main() {
       !test_device_nvfp4_matrix_uses_8x4_execution_scales_for_small_m() ||
       !test_device_nvfp4_matrix_default_pack_is_batch_dependent() ||
       !test_device_nvfp4_matrix_fixed_tensor_scale_restores_batch_invariance() ||
-      !test_device_nvfp4_matrix_per_expert_pack_keeps_grouped_rows_split_stable() ||
+      !test_device_nvfp4_matrix_per_expert_pack_honors_grouped_tensor_scales() ||
       !test_device_nvfp4_matrix_gathers_packed_rows_and_preserves_tensor_scale()) {
     return 1;
   }
