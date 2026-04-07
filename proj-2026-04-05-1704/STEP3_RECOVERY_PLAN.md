@@ -143,11 +143,26 @@ Focused TTFT on the same `prefix128 / tail4` gate after these cutovers is:
 - `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`
 - `cached_global_root_prefix128_tail4 hot-prefix = 54.652 ms`
 
+The next routed-stage cutover is now in place too:
+
+- normalized activations are packed once into the static prefill source pack
+- routed FC1 gathers packed rows with `permuted_idx_to_token_idx` into the
+  grouped FC1 input pack
+- the active FC1 consumer now runs from packed routed input directly into BF16
+  `gemm1_output`, instead of going through the FP32 gather path first
+
+Focused TTFT on the same gate after that cutover is:
+
+- `cold_prefill_prefix128 = 125.623 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.224 ms`
+
 Interpretation:
 
 - the active routed path is now carrying and consuming a much more faithful
   TRT-style grouped contract
-- the TTFT result is still effectively flat
+- the TTFT result is still close to flat even after moving FC1 onto packed
+  routed input
 - that means the remaining gap is now squarely in the grouped FC1/FC2 kernel
   body itself, not the routed metadata or FC1->FC2 scale handoff
 

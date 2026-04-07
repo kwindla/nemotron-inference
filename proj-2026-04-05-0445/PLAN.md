@@ -360,6 +360,16 @@ Interpretation:
   should not remain on the active path.
 - The routed dequant-scale contract and grouped batch/limit metadata are now
   active too, so the next remaining mismatch is the grouped math core itself.
+- The first grouped-body cutover is now active too:
+  - normalized activations are packed once into the static prefill source pack
+  - routed FC1 gathers packed rows with `permuted_idx_to_token_idx` into the
+    grouped FC1 input pack
+  - the active FC1 consumer now runs from that packed routed input directly
+    into BF16 `gemm1_output`
+- Focused TTFT on the same gate after the packed-FC1-body cutover is:
+  `cold_prefill_prefix128 = 125.623 ms`,
+  `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`,
+  `cached_global_root_prefix128_tail4 hot-prefix = 54.224 ms`.
 - The next remaining jump is the grouped math core itself: replace the current
   task-driven WMMA row-tile consumer with a fuller TRT-like grouped GEMM
   consumer for routed FC1 and FC2.

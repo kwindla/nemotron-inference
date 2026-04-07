@@ -1217,6 +1217,8 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   DeviceMoeLaunchPlan* launch_plan = ResolveFusedPrefillLaunchPlan();
   DeviceTensorFp32* routed_output_scratch = ResolveFusedPrefillRoutedOutputScratch();
   DeviceTensorFp32* gather_scratch = ResolveFusedPrefillGatherScratch();
+  DeviceNvfp4Matrix* normalized_pack = ResolveFusedPrefillNormalizedPack();
+  DeviceNvfp4Matrix* gather_pack = ResolveFusedPrefillGatherPack();
   DeviceTensorBf16* gemm1_output_bf16 =
       direct_moe_execution_state.workspace != nullptr &&
               direct_moe_execution_state.workspace->fused_prefill_gemm1_output_bf16 != nullptr &&
@@ -1251,6 +1253,14 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       launch_plan->selection_count() < selection_count ||
       !routing->valid() ||
       routing->selection_count() < selection_count ||
+      normalized_pack == nullptr ||
+      !normalized_pack->valid() ||
+      normalized_pack->rows() < token_count ||
+      normalized_pack->cols() != config.hidden_size ||
+      gather_pack == nullptr ||
+      !gather_pack->valid() ||
+      gather_pack->rows() < *padded_selection_count ||
+      gather_pack->cols() != config.hidden_size ||
       routed_output_scratch == nullptr ||
       !routed_output_scratch->valid() ||
       routed_output_shape.size() != 2 ||
@@ -1278,6 +1288,10 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       shared_up_shape.size() != 2 ||
       shared_up_shape[0] < token_count ||
       shared_up_shape[1] != config.shared_expert_intermediate_size) {
+    return false;
+  }
+
+  if (!normalized_pack->PackInto(normalized, RuntimeMoeNvfp4PackOptions())) {
     return false;
   }
 
@@ -1315,9 +1329,11 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.selected_weights = topk_weights;
   params.input = input.data();
   params.normalized = normalized.data();
+  params.normalized_pack = normalized_pack;
   params.routing = routing;
   params.launch_plan = launch_plan;
   params.routed_gather_scratch = gather_scratch->data();
+  params.fc1_grouped_pack = gather_pack;
   params.routed_up_scratch = expert_up_scratch->data();
   params.gemm1_output_bf16 = gemm1_output_bf16->data();
   auto* expert_up_pack = ResolveFusedPrefillExpertUpPack();
