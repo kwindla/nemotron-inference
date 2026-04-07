@@ -620,6 +620,62 @@ specialized runtime:
     - the remaining routed gap is now deeper in the grouped MMA mainloop than
       simple nibble/scale decode overhead
 
+- exact SM120 atom debug pass (`2026-04-07`):
+  - we recovered and checked the low-level atom mappings directly against the
+    CUTE traits used by TRT
+  - confirmed:
+    - `A/SFA/SFB` mappings match the custom implementation
+    - `B` and `C` needed corrections:
+      - `BLayout`: low/high `n` rows are driven by `lane & 3` and
+        `lane & 3 + 4`, while the `k` phase is `lane >> 2`
+      - `CLayout`: `col = lane & 7`,
+        `row_group = (lane >> 3) * 4`, row order `{0, 2, 1, 3}`
+  - important result:
+    those fixes were necessary but still not sufficient to make the traced FP4
+    activation-side regimes behaviorally reuse-equivalent
+  - current active safety policy:
+    - keep `P5`, `P7`, `P13`, and `P15` on the known-good grouped BF16 fallback
+    - only keep traced FP4 consumers active where
+      `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` both stay
+      green
+  - next exact step:
+    stop hand-maintaining the FP4 activation-side fragment transport and
+    replace it with an exact CUTE-driven fragment path using
+    `MMA_Atom` / `thrfrg_A` / `thrfrg_B` / `thrfrg_C` or the equivalent
+    `make_tiled_copy_A/B` substrate before re-enabling those traced FP4
+    profiles
+
+- SM120 FP4 shift pass and real rebuild result (`2026-04-07`):
+  - from the local CUTLASS/CUTE SM120 blockscaled mainloop, we recovered one
+    additional required detail:
+    the consumer path explicitly applies `fp4_shift_A/B` before the blockscaled
+    FP4 MMA
+  - we copied that behavior into the custom k64 FP4 grouped kernels
+  - important result after a real rebuild:
+    - `fp4_shift_A/B` is necessary
+    - but it is still not sufficient to make the traced k64 activation-side
+      regimes (`P5`, `P7`, `P13`, `P15`) behaviorally reuse-equivalent
+  - after confirming that on fresh binaries, we restored the documented safety
+    policy:
+    - keep `P5`, `P7`, `P13`, and `P15` on the known-good grouped BF16 fallback
+    - only keep the traced FP4 consumer active where both
+      `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` stay green
+  - implication:
+    - the next implementation step is not another hand-written register fix
+    - it is the full CUTE-driven fragment/copy path for A/B/SFA/SFB, using the
+      local CUTLASS/CUTE source as ground truth
+    - no additional TRT tactic tracing is required before that code step
+
+- CUTLASS/CUTE dependency note (`2026-04-07`):
+  - we do not need more TRT traces before the next rewrite
+  - we also do not need the full CUTLASS runtime stack
+  - but the next exact mainloop step does need the header-level CUTE/CUTLASS
+    substrate
+  - the local machine already has a usable header tree at:
+    `.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include`
+  - for long-term build stability, we should pin or vendor the exact header
+    snapshot once the CUTE-driven mainloop path is the active implementation
+
 #### Full TRT Mainloop Alignment Plan
 
 The next target is full routed-mainloop fidelity to the traced local

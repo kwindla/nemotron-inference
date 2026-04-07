@@ -33,6 +33,7 @@ constexpr int kGroupedThreadsPerBlock = 384;
 constexpr int kGroupedConsumerWarpsPerBlock = 8;
 constexpr int kGroupedProducerWarpsPerBlock =
     (kGroupedThreadsPerBlock / 32) - kGroupedConsumerWarpsPerBlock;
+constexpr int kFp4MmaTileN = 8;
 constexpr int kRoutedLargeOutputTile = 256;
 constexpr int kRoutedThreadsPerBlock = kGroupedThreadsPerBlock;
 constexpr int kContiguousSmallOutputTile = 32;
@@ -756,6 +757,364 @@ __device__ __forceinline__ void DecodeGroupedPackedInputBlockBf16(
           ? input_dq_scales[scale_row_offset]
           : fused_decode::DecodeFp8(input_block_scales[scale_row_offset]) * input_tensor_scale;
   DecodePackedNvfp4BlockToBf16(packed_input + packed_row_offset, block_scale, output);
+}
+
+__device__ __forceinline__ std::uint8_t LoadPackedFp4Nibble(
+    const std::uint8_t* packed_row,
+    int col) {
+  const std::uint8_t packed = packed_row[col >> 1];
+  return static_cast<std::uint8_t>(((col & 1) == 0) ? (packed & 0x0Fu) : ((packed >> 4u) & 0x0Fu));
+}
+
+__device__ __forceinline__ std::uint32_t PackFp4Register8(
+    std::uint8_t v0,
+    std::uint8_t v1,
+    std::uint8_t v2,
+    std::uint8_t v3,
+    std::uint8_t v4,
+    std::uint8_t v5,
+    std::uint8_t v6,
+    std::uint8_t v7) {
+  std::uint32_t reg = static_cast<std::uint32_t>(v0 & 0x0Fu);
+  reg |= static_cast<std::uint32_t>(v1 & 0x0Fu) << 4u;
+  reg |= static_cast<std::uint32_t>(v2 & 0x0Fu) << 8u;
+  reg |= static_cast<std::uint32_t>(v3 & 0x0Fu) << 12u;
+  reg |= static_cast<std::uint32_t>(v4 & 0x0Fu) << 16u;
+  reg |= static_cast<std::uint32_t>(v5 & 0x0Fu) << 20u;
+  reg |= static_cast<std::uint32_t>(v6 & 0x0Fu) << 24u;
+  reg |= static_cast<std::uint32_t>(v7 & 0x0Fu) << 28u;
+  return reg;
+}
+
+__device__ __forceinline__ std::uint32_t PackScaleWord4(
+    std::uint8_t s0,
+    std::uint8_t s1,
+    std::uint8_t s2,
+    std::uint8_t s3) {
+  std::uint32_t reg = static_cast<std::uint32_t>(s0);
+  reg |= static_cast<std::uint32_t>(s1) << 8u;
+  reg |= static_cast<std::uint32_t>(s2) << 16u;
+  reg |= static_cast<std::uint32_t>(s3) << 24u;
+  return reg;
+}
+
+__device__ __forceinline__ void ApplySm120Fp4ShiftA(
+    std::uint32_t& a0,
+    std::uint32_t& a1,
+    std::uint32_t& a2,
+    std::uint32_t& a3) {
+  a0 <<= 2u;
+  a1 <<= 2u;
+  a2 <<= 2u;
+  a3 <<= 2u;
+}
+
+__device__ __forceinline__ void ApplySm120Fp4ShiftB(
+    std::uint32_t& b0,
+    std::uint32_t& b1) {
+  b0 <<= 2u;
+  b1 <<= 2u;
+}
+
+__device__ __forceinline__ std::uint32_t LoadExecutionScaleWord(
+    const std::uint8_t* scale_bytes,
+    std::size_t row,
+    std::size_t block_base,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout) {
+  return PackScaleWord4(
+      scale_bytes[ExecutionScaleOffset(row, block_base + 0u, padded_blocks_per_row, scale_layout)],
+      scale_bytes[ExecutionScaleOffset(row, block_base + 1u, padded_blocks_per_row, scale_layout)],
+      scale_bytes[ExecutionScaleOffset(row, block_base + 2u, padded_blocks_per_row, scale_layout)],
+      scale_bytes[ExecutionScaleOffset(row, block_base + 3u, padded_blocks_per_row, scale_layout)]);
+}
+
+__device__ __forceinline__ void Sm120BlockScaledFp4Mma(
+    float& d0,
+    float& d1,
+    float& d2,
+    float& d3,
+    std::uint32_t a0,
+    std::uint32_t a1,
+    std::uint32_t a2,
+    std::uint32_t a3,
+    std::uint32_t b0,
+    std::uint32_t b1,
+    std::uint32_t sfa,
+    std::uint32_t sfb) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static constexpr std::uint16_t kBidA = 0;
+  static constexpr std::uint16_t kTidA = 0;
+  static constexpr std::uint16_t kBidB = 0;
+  static constexpr std::uint16_t kTidB = 0;
+  asm volatile(
+      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+      "{%0, %1, %2, %3},"
+      "{%4, %5, %6, %7},"
+      "{%8, %9},"
+      "{%0, %1, %2, %3},"
+      "{%10},"
+      "{%11, %12},"
+      "{%13},"
+      "{%14, %15};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+        "r"(b0), "r"(b1),
+        "r"(sfa), "h"(kBidA), "h"(kTidA),
+        "r"(sfb), "h"(kBidB), "h"(kTidB));
+#endif
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void ZeroPackedTileRows(
+    std::uint8_t* packed_rows,
+    std::uint32_t* scale_words,
+    int row) {
+  if (row >= kRowsPerTile) {
+    return;
+  }
+#pragma unroll
+  for (int byte_index = 0; byte_index < (64 / 2); ++byte_index) {
+    packed_rows[row * (64 / 2) + byte_index] = 0u;
+  }
+  scale_words[row] = 0u;
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void CopyPackedTileRow64(
+    const std::uint8_t* packed_data,
+    std::size_t packed_row_bytes,
+    std::size_t source_row,
+    std::size_t packed_byte_offset,
+    const std::uint8_t* matmul_scales,
+    std::size_t block_base,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    std::uint8_t* packed_rows,
+    std::uint32_t* scale_words,
+    int row) {
+  if (row >= kRowsPerTile) {
+    return;
+  }
+  const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
+  std::uint8_t* dst = packed_rows + row * (64 / 2);
+#pragma unroll
+  for (int byte_index = 0; byte_index < (64 / 2); ++byte_index) {
+    dst[byte_index] = packed_data[src_offset + static_cast<std::size_t>(byte_index)];
+  }
+  scale_words[row] = LoadExecutionScaleWord(
+      matmul_scales,
+      source_row,
+      block_base,
+      padded_blocks_per_row,
+      scale_layout);
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void CopyPackedTileRow64FromRowMajorScales(
+    const std::uint8_t* packed_data,
+    std::size_t packed_row_bytes,
+    std::size_t source_row,
+    std::size_t packed_byte_offset,
+    const std::uint8_t* block_scales,
+    std::size_t block_base,
+    std::size_t blocks_per_row,
+    std::uint8_t* packed_rows,
+    std::uint32_t* scale_words,
+    int row) {
+  if (row >= kRowsPerTile) {
+    return;
+  }
+  const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
+  std::uint8_t* dst = packed_rows + row * (64 / 2);
+#pragma unroll
+  for (int byte_index = 0; byte_index < (64 / 2); ++byte_index) {
+    dst[byte_index] = packed_data[src_offset + static_cast<std::size_t>(byte_index)];
+  }
+  const std::size_t scale_offset = source_row * blocks_per_row + block_base;
+  scale_words[row] = PackScaleWord4(
+      block_scales[scale_offset + 0u],
+      block_scales[scale_offset + 1u],
+      block_scales[scale_offset + 2u],
+      block_scales[scale_offset + 3u]);
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void LoadFp4ARegistersRowMajor16x64(
+    const std::uint8_t* packed_rows,
+    const std::uint32_t* scale_words,
+    int lane_id,
+    std::uint32_t& a0,
+    std::uint32_t& a1,
+    std::uint32_t& a2,
+    std::uint32_t& a3,
+    std::uint32_t& sfa) {
+  const int col_base = lane_id >> 2;
+  const int row_pair_base = (lane_id & 3) * 2;
+  const std::uint8_t* row0 = packed_rows + row_pair_base * (64 / 2);
+  const std::uint8_t* row1 = packed_rows + (row_pair_base + 1) * (64 / 2);
+  const std::uint8_t* row8 = packed_rows + (row_pair_base + 8) * (64 / 2);
+  const std::uint8_t* row9 = packed_rows + (row_pair_base + 9) * (64 / 2);
+  a0 = PackFp4Register8(
+      LoadPackedFp4Nibble(row0, col_base + 0),
+      LoadPackedFp4Nibble(row0, col_base + 16),
+      LoadPackedFp4Nibble(row0, col_base + 32),
+      LoadPackedFp4Nibble(row0, col_base + 48),
+      LoadPackedFp4Nibble(row1, col_base + 0),
+      LoadPackedFp4Nibble(row1, col_base + 16),
+      LoadPackedFp4Nibble(row1, col_base + 32),
+      LoadPackedFp4Nibble(row1, col_base + 48));
+  a1 = PackFp4Register8(
+      LoadPackedFp4Nibble(row0, col_base + 8),
+      LoadPackedFp4Nibble(row0, col_base + 24),
+      LoadPackedFp4Nibble(row0, col_base + 40),
+      LoadPackedFp4Nibble(row0, col_base + 56),
+      LoadPackedFp4Nibble(row1, col_base + 8),
+      LoadPackedFp4Nibble(row1, col_base + 24),
+      LoadPackedFp4Nibble(row1, col_base + 40),
+      LoadPackedFp4Nibble(row1, col_base + 56));
+  a2 = PackFp4Register8(
+      LoadPackedFp4Nibble(row8, col_base + 0),
+      LoadPackedFp4Nibble(row8, col_base + 16),
+      LoadPackedFp4Nibble(row8, col_base + 32),
+      LoadPackedFp4Nibble(row8, col_base + 48),
+      LoadPackedFp4Nibble(row9, col_base + 0),
+      LoadPackedFp4Nibble(row9, col_base + 16),
+      LoadPackedFp4Nibble(row9, col_base + 32),
+      LoadPackedFp4Nibble(row9, col_base + 48));
+  a3 = PackFp4Register8(
+      LoadPackedFp4Nibble(row8, col_base + 8),
+      LoadPackedFp4Nibble(row8, col_base + 24),
+      LoadPackedFp4Nibble(row8, col_base + 40),
+      LoadPackedFp4Nibble(row8, col_base + 56),
+      LoadPackedFp4Nibble(row9, col_base + 8),
+      LoadPackedFp4Nibble(row9, col_base + 24),
+      LoadPackedFp4Nibble(row9, col_base + 40),
+      LoadPackedFp4Nibble(row9, col_base + 56));
+  const int scale_row = (lane_id >> 2) + ((lane_id & 1) ? 8 : 0);
+  sfa = scale_words[scale_row];
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void LoadFp4BRegistersColMajor64x8(
+    const std::uint8_t* packed_rows,
+    const std::uint32_t* scale_words,
+    int lane_id,
+    int n_base,
+    std::uint32_t& b0,
+    std::uint32_t& b1,
+    std::uint32_t& sfb) {
+  const int row_group = lane_id & 3;
+  const int k_base = lane_id >> 2;
+  const std::uint8_t* row0 = packed_rows + (n_base + row_group) * (64 / 2);
+  const std::uint8_t* row4 = packed_rows + (n_base + row_group + 4) * (64 / 2);
+  b0 = PackFp4Register8(
+      LoadPackedFp4Nibble(row0, k_base + 0),
+      LoadPackedFp4Nibble(row0, k_base + 8),
+      LoadPackedFp4Nibble(row0, k_base + 16),
+      LoadPackedFp4Nibble(row0, k_base + 24),
+      LoadPackedFp4Nibble(row0, k_base + 32),
+      LoadPackedFp4Nibble(row0, k_base + 40),
+      LoadPackedFp4Nibble(row0, k_base + 48),
+      LoadPackedFp4Nibble(row0, k_base + 56));
+  b1 = PackFp4Register8(
+      LoadPackedFp4Nibble(row4, k_base + 0),
+      LoadPackedFp4Nibble(row4, k_base + 8),
+      LoadPackedFp4Nibble(row4, k_base + 16),
+      LoadPackedFp4Nibble(row4, k_base + 24),
+      LoadPackedFp4Nibble(row4, k_base + 32),
+      LoadPackedFp4Nibble(row4, k_base + 40),
+      LoadPackedFp4Nibble(row4, k_base + 48),
+      LoadPackedFp4Nibble(row4, k_base + 56));
+  sfb = scale_words[n_base + (lane_id >> 2)];
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void StoreFp4AccumulatorTileRowMajor16x8(
+    float alpha,
+    const float c0,
+    const float c1,
+    const float c2,
+    const float c3,
+    int lane_id,
+    int col_base,
+    int row_base,
+    int valid_rows,
+    int valid_cols,
+    std::size_t row_start,
+    std::size_t output_row_base,
+    std::size_t output_rows_per_expert,
+    float* output) {
+  if (col_base >= valid_cols) {
+    return;
+  }
+  const int row_group = (lane_id >> 3) * 4;
+  const int row0 = row_group + 0;
+  const int row1 = row_group + 2;
+  const int row2 = row_group + 1;
+  const int row3 = row_group + 3;
+  if (row0 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row0)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] = c0 * alpha;
+  }
+  if (row1 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row1)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] = c1 * alpha;
+  }
+  if (row2 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row2)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] = c2 * alpha;
+  }
+  if (row3 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row3)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] = c3 * alpha;
+  }
+}
+
+template <int kRowsPerTile>
+__device__ __forceinline__ void StoreFp4AccumulatorTileRowMajor16x8(
+    float alpha,
+    const float c0,
+    const float c1,
+    const float c2,
+    const float c3,
+    int lane_id,
+    int col_base,
+    int row_base,
+    int valid_rows,
+    int valid_cols,
+    std::size_t row_start,
+    std::size_t output_row_base,
+    std::size_t output_rows_per_expert,
+    __nv_bfloat16* output) {
+  if (col_base >= valid_cols) {
+    return;
+  }
+  const int row_group = (lane_id >> 3) * 4;
+  const int row0 = row_group + 0;
+  const int row1 = row_group + 2;
+  const int row2 = row_group + 1;
+  const int row3 = row_group + 3;
+  if (row0 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row0)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] =
+        __float2bfloat16(c0 * alpha);
+  }
+  if (row1 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row1)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] =
+        __float2bfloat16(c1 * alpha);
+  }
+  if (row2 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row2)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] =
+        __float2bfloat16(c2 * alpha);
+  }
+  if (row3 < valid_rows) {
+    output[(row_start + static_cast<std::size_t>(row3)) * output_rows_per_expert +
+           (output_row_base + static_cast<std::size_t>(col_base))] =
+        __float2bfloat16(c3 * alpha);
+  }
 }
 
 __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
@@ -1862,6 +2221,368 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
     } else {
       output[input_row * output_rows_per_expert + output_row] =
           c_tile[tile_output_row][tile_token];
+    }
+  }
+}
+
+template <typename OutputType, int kOutputTile>
+__global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_tensor_scale_data,
+    const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
+    const int* cta_count,
+    const int* cta_batch_indices,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    OutputType* output) {
+  static_assert(kOutputTile % (kGroupedConsumerWarpsPerBlock * kFp4MmaTileN) == 0);
+  constexpr int kWarpSubTiles = kOutputTile / (kGroupedConsumerWarpsPerBlock * kFp4MmaTileN);
+  __shared__ std::uint8_t a_packed[kPlannedWmmaTileM][64 / 2];
+  __shared__ std::uint32_t a_scale_words[kPlannedWmmaTileM];
+  __shared__ std::uint8_t b_packed[kOutputTile][64 / 2];
+  __shared__ std::uint32_t b_scale_words[kOutputTile];
+
+  const int cta_index = static_cast<int>(blockIdx.y);
+  const int exact_cta_count = cta_count[0];
+  if (cta_index >= exact_cta_count ||
+      packed_input == nullptr ||
+      input_block_scales == nullptr ||
+      (input_tensor_scale_data == nullptr && input_dq_scales == nullptr) ||
+      output == nullptr) {
+    return;
+  }
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int lane_id = tid & 31;
+  const int expert_index = cta_batch_indices[cta_index];
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
+  const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
+  if (expert_index < 0 ||
+      valid_rows <= 0 ||
+      static_cast<std::size_t>(output_row_base) >= output_rows_per_expert) {
+    return;
+  }
+
+  const FusedNvfp4WeightView weight = weights[expert_index];
+  const std::size_t packed_row_bytes = weight.input_cols / 2u;
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
+  const int output_rows_this_tile = static_cast<int>(
+      min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
+          static_cast<std::size_t>(kOutputTile)));
+  const float input_tensor_scale =
+      input_dq_scales == nullptr
+          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
+                                                   : *input_tensor_scale_data)
+          : 1.0f;
+  const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
+
+  float accum[kWarpSubTiles][4];
+  if (warp_id < kGroupedConsumerWarpsPerBlock) {
+#pragma unroll
+    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+      accum[subtile][0] = 0.0f;
+      accum[subtile][1] = 0.0f;
+      accum[subtile][2] = 0.0f;
+      accum[subtile][3] = 0.0f;
+    }
+  }
+
+  for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += 64u) {
+    const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
+    const std::size_t packed_byte_offset = k_base / 2u;
+
+    for (int row = tid; row < kPlannedWmmaTileM; row += blockDim.x) {
+      if (row < valid_rows) {
+        CopyPackedTileRow64FromRowMajorScales<kPlannedWmmaTileM>(
+            packed_input,
+            packed_row_bytes,
+            static_cast<std::size_t>(row_start + row),
+            packed_byte_offset,
+            input_block_scales,
+            block_base,
+            blocks_per_row,
+            &a_packed[0][0],
+            a_scale_words,
+            row);
+      } else {
+        ZeroPackedTileRows<kPlannedWmmaTileM>(&a_packed[0][0], a_scale_words, row);
+      }
+    }
+    for (int row = tid; row < kOutputTile; row += blockDim.x) {
+      if (row < output_rows_this_tile) {
+        CopyPackedTileRow64<kOutputTile>(
+            weight.packed_data,
+            packed_row_bytes,
+            static_cast<std::size_t>(output_row_base + row),
+            packed_byte_offset,
+            weight.matmul_block_scales_data,
+            block_base,
+            padded_blocks_per_row,
+            Nvfp4ScaleLayout::kSwizzled128x4,
+            &b_packed[0][0],
+            b_scale_words,
+            row);
+      } else {
+        ZeroPackedTileRows<kOutputTile>(&b_packed[0][0], b_scale_words, row);
+      }
+    }
+    __syncthreads();
+
+    if (warp_id < kGroupedConsumerWarpsPerBlock) {
+      std::uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, sfa = 0;
+      LoadFp4ARegistersRowMajor16x64<kPlannedWmmaTileM>(
+          &a_packed[0][0], a_scale_words, lane_id, a0, a1, a2, a3, sfa);
+      ApplySm120Fp4ShiftA(a0, a1, a2, a3);
+#pragma unroll
+      for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+        const int n_base = warp_id * kFp4MmaTileN + subtile * kGroupedConsumerWarpsPerBlock * kFp4MmaTileN;
+        if (n_base < output_rows_this_tile) {
+          std::uint32_t b0 = 0, b1 = 0, sfb = 0;
+          LoadFp4BRegistersColMajor64x8<kOutputTile>(
+              &b_packed[0][0], b_scale_words, lane_id, n_base, b0, b1, sfb);
+          ApplySm120Fp4ShiftB(b0, b1);
+          Sm120BlockScaledFp4Mma(
+              accum[subtile][0], accum[subtile][1], accum[subtile][2], accum[subtile][3],
+              a0, a1, a2, a3, b0, b1, sfa, sfb);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (warp_id < kGroupedConsumerWarpsPerBlock) {
+    const int col_in_subtile = lane_id & 7;
+#pragma unroll
+    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+      const int n_base = warp_id * kFp4MmaTileN + subtile * kGroupedConsumerWarpsPerBlock * kFp4MmaTileN;
+      StoreFp4AccumulatorTileRowMajor16x8<kPlannedWmmaTileM>(
+          output_alpha,
+          accum[subtile][0],
+          accum[subtile][1],
+          accum[subtile][2],
+          accum[subtile][3],
+          lane_id,
+          n_base + col_in_subtile,
+          0,
+          valid_rows,
+          output_rows_this_tile,
+          static_cast<std::size_t>(row_start),
+          static_cast<std::size_t>(output_row_base),
+          output_rows_per_expert,
+          output);
+    }
+  }
+}
+
+template <typename OutputType, int kOutputTile>
+__global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_tensor_scale_data,
+    const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
+    const int* cta_count,
+    const int* cta_batch_indices,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    OutputType* output) {
+  static_assert(kOutputTile % (kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileM) == 0);
+  constexpr int kWarpRowSubTiles = kOutputTile / (kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileM);
+  constexpr int kTokenSubTiles = kPlannedWmmaTileM / kFp4MmaTileN;
+  __shared__ std::uint8_t a_packed[kOutputTile][64 / 2];
+  __shared__ std::uint32_t a_scale_words[kOutputTile];
+  __shared__ std::uint8_t b_packed[kPlannedWmmaTileM][64 / 2];
+  __shared__ std::uint32_t b_scale_words[kPlannedWmmaTileM];
+
+  const int cta_index = static_cast<int>(blockIdx.y);
+  const int exact_cta_count = cta_count[0];
+  if (cta_index >= exact_cta_count ||
+      packed_input == nullptr ||
+      input_block_scales == nullptr ||
+      (input_tensor_scale_data == nullptr && input_dq_scales == nullptr) ||
+      output == nullptr) {
+    return;
+  }
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int lane_id = tid & 31;
+  const int expert_index = cta_batch_indices[cta_index];
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
+  const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
+  if (expert_index < 0 ||
+      valid_rows <= 0 ||
+      static_cast<std::size_t>(output_row_base) >= output_rows_per_expert) {
+    return;
+  }
+
+  const FusedNvfp4WeightView weight = weights[expert_index];
+  const std::size_t packed_row_bytes = weight.input_cols / 2u;
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
+  const int output_rows_this_tile = static_cast<int>(
+      min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
+          static_cast<std::size_t>(kOutputTile)));
+  const float input_tensor_scale =
+      input_dq_scales == nullptr
+          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
+                                                   : *input_tensor_scale_data)
+          : 1.0f;
+  const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
+
+  float accum[kWarpRowSubTiles][kTokenSubTiles][4];
+  if (warp_id < kGroupedConsumerWarpsPerBlock) {
+#pragma unroll
+    for (int row_subtile = 0; row_subtile < kWarpRowSubTiles; ++row_subtile) {
+#pragma unroll
+      for (int token_subtile = 0; token_subtile < kTokenSubTiles; ++token_subtile) {
+        accum[row_subtile][token_subtile][0] = 0.0f;
+        accum[row_subtile][token_subtile][1] = 0.0f;
+        accum[row_subtile][token_subtile][2] = 0.0f;
+        accum[row_subtile][token_subtile][3] = 0.0f;
+      }
+    }
+  }
+
+  for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += 64u) {
+    const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
+    const std::size_t packed_byte_offset = k_base / 2u;
+
+    for (int row = tid; row < kOutputTile; row += blockDim.x) {
+      if (row < output_rows_this_tile) {
+        CopyPackedTileRow64<kOutputTile>(
+            weight.packed_data,
+            packed_row_bytes,
+            static_cast<std::size_t>(output_row_base + row),
+            packed_byte_offset,
+            weight.matmul_block_scales_data,
+            block_base,
+            padded_blocks_per_row,
+            Nvfp4ScaleLayout::kSwizzled128x4,
+            &a_packed[0][0],
+            a_scale_words,
+            row);
+      } else {
+        ZeroPackedTileRows<kOutputTile>(&a_packed[0][0], a_scale_words, row);
+      }
+    }
+    for (int row = tid; row < kPlannedWmmaTileM; row += blockDim.x) {
+      if (row < valid_rows) {
+        CopyPackedTileRow64FromRowMajorScales<kPlannedWmmaTileM>(
+            packed_input,
+            packed_row_bytes,
+            static_cast<std::size_t>(row_start + row),
+            packed_byte_offset,
+            input_block_scales,
+            block_base,
+            blocks_per_row,
+            &b_packed[0][0],
+            b_scale_words,
+            row);
+      } else {
+        ZeroPackedTileRows<kPlannedWmmaTileM>(&b_packed[0][0], b_scale_words, row);
+      }
+    }
+    __syncthreads();
+
+    if (warp_id < kGroupedConsumerWarpsPerBlock) {
+#pragma unroll
+      for (int row_subtile = 0; row_subtile < kWarpRowSubTiles; ++row_subtile) {
+        const int m_base =
+            warp_id * kPlannedWmmaTileM + row_subtile * kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileM;
+        if (m_base < output_rows_this_tile) {
+          std::uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, sfa = 0;
+          LoadFp4ARegistersRowMajor16x64<kOutputTile>(
+              &a_packed[m_base][0], &a_scale_words[m_base], lane_id, a0, a1, a2, a3, sfa);
+          ApplySm120Fp4ShiftA(a0, a1, a2, a3);
+#pragma unroll
+          for (int token_subtile = 0; token_subtile < kTokenSubTiles; ++token_subtile) {
+            const int n_base = token_subtile * kFp4MmaTileN;
+            std::uint32_t b0 = 0, b1 = 0, sfb = 0;
+            LoadFp4BRegistersColMajor64x8<kPlannedWmmaTileM>(
+                &b_packed[0][0], b_scale_words, lane_id, n_base, b0, b1, sfb);
+            ApplySm120Fp4ShiftB(b0, b1);
+            Sm120BlockScaledFp4Mma(
+                accum[row_subtile][token_subtile][0],
+                accum[row_subtile][token_subtile][1],
+                accum[row_subtile][token_subtile][2],
+                accum[row_subtile][token_subtile][3],
+                a0, a1, a2, a3, b0, b1, sfa, sfb);
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (warp_id < kGroupedConsumerWarpsPerBlock) {
+    const int token_col = lane_id & 7;
+    const int row_group = (lane_id >> 3) * 4;
+#pragma unroll
+    for (int row_subtile = 0; row_subtile < kWarpRowSubTiles; ++row_subtile) {
+      const int m_base =
+          warp_id * kPlannedWmmaTileM + row_subtile * kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileM;
+      if (m_base >= output_rows_this_tile) {
+        continue;
+      }
+#pragma unroll
+      for (int token_subtile = 0; token_subtile < kTokenSubTiles; ++token_subtile) {
+        const int token_base = token_subtile * kFp4MmaTileN + token_col;
+        if (token_base >= valid_rows) {
+          continue;
+        }
+        const int row0 = m_base + row_group + 0;
+        const int row1 = m_base + row_group + 2;
+        const int row2 = m_base + row_group + 1;
+        const int row3 = m_base + row_group + 3;
+        const std::size_t input_row = static_cast<std::size_t>(row_start + token_base);
+        if (row0 < output_rows_this_tile) {
+          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
+                __float2bfloat16(accum[row_subtile][token_subtile][0] * output_alpha);
+          } else {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row0)] =
+                accum[row_subtile][token_subtile][0] * output_alpha;
+          }
+        }
+        if (row1 < output_rows_this_tile) {
+          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
+                __float2bfloat16(accum[row_subtile][token_subtile][1] * output_alpha);
+          } else {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row1)] =
+                accum[row_subtile][token_subtile][1] * output_alpha;
+          }
+        }
+        if (row2 < output_rows_this_tile) {
+          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
+                __float2bfloat16(accum[row_subtile][token_subtile][2] * output_alpha);
+          } else {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row2)] =
+                accum[row_subtile][token_subtile][2] * output_alpha;
+          }
+        }
+        if (row3 < output_rows_this_tile) {
+          if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
+                __float2bfloat16(accum[row_subtile][token_subtile][3] * output_alpha);
+          } else {
+            output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
+                accum[row_subtile][token_subtile][3] * output_alpha;
+          }
+        }
+      }
     }
   }
 }
@@ -3558,7 +4279,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             output);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm1Profile::kP1_128x128x64_SwapFalse:
-        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse<__nv_bfloat16, 128, 64><<<grid, block>>>(
+        Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64<__nv_bfloat16, 128><<<grid, block>>>(
             input_pack.packed_data(),
             input_pack.block_scales_data(),
             input_pack.device_tensor_scale_ptr(),
