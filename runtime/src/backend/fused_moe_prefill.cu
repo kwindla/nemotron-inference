@@ -16,12 +16,14 @@ namespace {
 namespace wmma = nvcuda::wmma;
 
 constexpr int kGroupedTokenTile = static_cast<int>(kMoeLaunchPlanTokenTile);
-constexpr int kPlannedOutputTile = 32;
-constexpr int kPlannedThreadsPerBlock = 64;
+// Match TRT-LLM's grouped routed shape more closely: tileTokensDim=16 and an
+// epilogue/output tile of 128 rows per CTA when transposeMmaOutput=true.
+constexpr int kPlannedOutputTile = 128;
+constexpr int kPlannedThreadsPerBlock = 256;
 constexpr int kPlannedWmmaTileM = 16;
 constexpr int kPlannedWmmaTileN = 16;
 constexpr int kPlannedWmmaTileK = 16;
-constexpr int kPlannedWmmaWarpsPerBlock = 2;
+constexpr int kPlannedWmmaWarpsPerBlock = 8;
 constexpr int kContiguousSmallOutputTile = 32;
 constexpr int kContiguousMediumOutputTile = 64;
 constexpr int kContiguousLargeOutputTile = 128;

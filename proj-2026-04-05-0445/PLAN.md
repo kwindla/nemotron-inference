@@ -370,9 +370,19 @@ Interpretation:
   `cold_prefill_prefix128 = 125.623 ms`,
   `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`,
   `cached_global_root_prefix128_tail4 hot-prefix = 54.224 ms`.
+- The next grouped-body step is now active too:
+  - routed FC1/FC2 WMMA consumers use a TRT-like `tileTokensDim=16`,
+    `transposeMmaOutput=true`, `epilogueTileM=128` execution shape
+  - in our implementation that means `kPlannedOutputTile = 128`,
+    `kPlannedThreadsPerBlock = 256`, and `8` warps per CTA on the routed
+    grouped path
+- Focused TTFT on the same gate after the larger grouped tile cutover is:
+  `cold_prefill_prefix128 = 125.324 ms`,
+  `cached_committed_head_prefix128_tail4 hot-prefix = 54.358 ms`,
+  `cached_global_root_prefix128_tail4 hot-prefix = 54.597 ms`.
 - The next remaining jump is the grouped math core itself: replace the current
-  task-driven WMMA row-tile consumer with a fuller TRT-like grouped GEMM
-  consumer for routed FC1 and FC2.
+  WMMA row-tile micro-fragment consumer with a fuller TRT-like grouped GEMM
+  micro-fragment kernel for routed FC1 and FC2.
 
 ## Goal
 

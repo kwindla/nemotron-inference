@@ -157,12 +157,29 @@ Focused TTFT on the same gate after that cutover is:
 - `cached_committed_head_prefix128_tail4 hot-prefix = 54.361 ms`
 - `cached_global_root_prefix128_tail4 hot-prefix = 54.224 ms`
 
+The next grouped-body step is now active too:
+
+- routed FC1/FC2 WMMA consumers use a TRT-like `tileTokensDim=16`,
+  `transposeMmaOutput=true`, `epilogueTileM=128` execution shape
+- in our implementation that is `kPlannedOutputTile = 128`,
+  `kPlannedThreadsPerBlock = 256`, and `8` warps per CTA for the routed
+  grouped path
+
+Focused TTFT on the same gate after the larger grouped tile cutover is:
+
+- `cold_prefill_prefix128 = 125.324 ms`
+- `cached_committed_head_prefix128_tail4 hot-prefix = 54.358 ms`
+- `cached_global_root_prefix128_tail4 hot-prefix = 54.597 ms`
+
 Interpretation:
 
 - the active routed path is now carrying and consuming a much more faithful
   TRT-style grouped contract
 - the TTFT result is still close to flat even after moving FC1 onto packed
   routed input
+- the larger grouped tile does help cold prefill a bit, which is evidence that
+  we are finally moving the active bottleneck inside the kernel body rather than
+  just rearranging contracts
 - that means the remaining gap is now squarely in the grouped FC1/FC2 kernel
   body itself, not the routed metadata or FC1->FC2 scale handoff
 
