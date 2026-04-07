@@ -749,6 +749,29 @@ specialized runtime:
     - `fused_moe_prefill_test`
     - `multi_turn_prefix_reuse_test`
 
+- Exact CUTE TV-layout bridge step (`2026-04-07`):
+  - the local bridge now derives `A/B/C` thread-value coordinates and `SFA/SFB`
+    row selection from `MMA_Atom` / `MMA_Traits` TV layouts instead of relying
+    only on the earlier hand-derived lane formulas
+  - this keeps the safe BF16-dispatch state green:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+  - retry result for activating `P5` on the FP4 bridge:
+    - still not behaviorally reuse-equivalent
+    - first retry failed at prompt-boundary argmax matching
+    - second retry with the exact TV-layout bridge failed even earlier in
+      full-model execution (`single_token_forward_model: layer 1 kind=2
+      execution failed`)
+  - implication:
+    - the remaining gap is deeper than the TV-layout mapping alone
+    - the next exact source-of-truth layer is the smem-to-register retile/copy
+      path used by TRT
+  - `copy_atom.hpp` probe result:
+    - including `cute/atom/copy_atom.hpp` and touching `make_tiled_copy_A/B`
+      still drags the same broader problematic header surface into this TU
+    - so the next move should be to port the exact retile logic we need from
+      `copy_atom.hpp` locally, not include that header directly
+
 #### Full TRT Mainloop Alignment Plan
 
 The next target is full routed-mainloop fidelity to the traced local

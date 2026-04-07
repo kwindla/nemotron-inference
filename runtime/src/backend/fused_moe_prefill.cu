@@ -11,6 +11,8 @@
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 #include <cute/arch/mma_sm120.hpp>
+#include <cute/atom/mma_traits_sm120.hpp>
+#include <cute/atom/mma_atom.hpp>
 #endif
 
 #include "nemotron/device_nvfp4_matrix.h"
@@ -46,6 +48,8 @@ using ARegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::ARegisters>;
 using BRegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::BRegisters>;
 using CRegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::CRegisters>;
 using SFRegister = std::remove_extent_t<typename nvfp4_cute::MmaOp::SFARegisters>;
+using Atom = cute::MMA_Atom<nvfp4_cute::MmaOp>;
+using SingleAtomTiledMma = cute::TiledMMA<Atom, cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>>;
 #else
 using ARegister = std::uint32_t;
 using BRegister = std::uint32_t;
@@ -66,6 +70,123 @@ struct BFragment64 {
 struct CFragment64 {
   CRegister regs[4];
 };
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+CUTE_HOST_DEVICE constexpr auto GetSingleAtomTiledMma() {
+  return SingleAtomTiledMma{};
+}
+
+template <class Coord>
+CUTE_HOST_DEVICE constexpr int CoordGet0(Coord const& coord) {
+  if constexpr (cute::is_tuple<Coord>::value) {
+    return static_cast<int>(cute::get<0>(coord));
+  } else {
+    return static_cast<int>(coord);
+  }
+}
+
+template <class Coord>
+CUTE_HOST_DEVICE constexpr int CoordGet1(Coord const& coord) {
+  if constexpr (cute::is_tuple<Coord>::value) {
+    return static_cast<int>(cute::get<1>(coord));
+  } else {
+    return 0;
+  }
+}
+
+template <class SFATensor, class AtomT, class TiledThr, class TiledPerm>
+CUTE_HOST_DEVICE constexpr auto ThrfrgSFA(
+    SFATensor&& sfatensor,
+    cute::TiledMMA<AtomT, TiledThr, TiledPerm>& mma) {
+  auto permutation_mnk = TiledPerm{};
+  auto t_tile = cute::make_tile(cute::get<0>(permutation_mnk), cute::_1{});
+  auto tiled_sfa = cute::logical_divide(sfatensor, t_tile);
+
+  using AtomShape_MNK = typename AtomT::Shape_MNK;
+  auto atom_tile =
+      cute::make_tile(cute::make_layout(cute::size<0>(AtomShape_MNK{})), cute::make_layout(cute::_1{}));
+  auto tiled_atom_sfa = cute::zipped_divide(tiled_sfa, atom_tile);
+  using AtomLayoutSFA_TV = typename cute::MMA_Traits<nvfp4_cute::MmaOp>::SFALayout;
+  auto tv_atom_sfa = tiled_atom_sfa.compose(AtomLayoutSFA_TV{}, cute::_);
+
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+  auto thr_tile = cute::make_tile(
+      cute::_,
+      cute::make_tile(cute::make_layout(cute::size<1>(thr_layout_vmnk)),
+          cute::make_layout(cute::size<3>(thr_layout_vmnk))));
+  return cute::zipped_divide(tv_atom_sfa, thr_tile);
+}
+
+template <class SFBTensor, class AtomT, class TiledThr, class TiledPerm>
+CUTE_HOST_DEVICE constexpr auto ThrfrgSFB(
+    SFBTensor&& sfbtensor,
+    cute::TiledMMA<AtomT, TiledThr, TiledPerm>& mma) {
+  auto permutation_mnk = TiledPerm{};
+  auto t_tile = cute::make_tile(cute::get<1>(permutation_mnk), cute::_1{});
+  auto tiled_sfb = cute::logical_divide(sfbtensor, t_tile);
+
+  using AtomShape_MNK = typename AtomT::Shape_MNK;
+  auto atom_tile =
+      cute::make_tile(cute::make_layout(cute::size<1>(AtomShape_MNK{})), cute::make_layout(cute::_1{}));
+  auto tiled_atom_sfb = cute::zipped_divide(tiled_sfb, atom_tile);
+  using AtomLayoutSFB_TV = typename cute::MMA_Traits<nvfp4_cute::MmaOp>::SFBLayout;
+  auto tv_atom_sfb = tiled_atom_sfb.compose(AtomLayoutSFB_TV{}, cute::_);
+
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+  auto thr_tile = cute::make_tile(
+      cute::_,
+      cute::make_tile(cute::make_layout(cute::size<2>(thr_layout_vmnk)),
+          cute::make_layout(cute::size<3>(thr_layout_vmnk))));
+  return cute::zipped_divide(tv_atom_sfb, thr_tile);
+}
+
+CUTE_HOST_DEVICE constexpr auto GetLayoutATV() {
+  auto mma = GetSingleAtomTiledMma();
+  return mma.get_layoutA_TV();
+}
+
+CUTE_HOST_DEVICE constexpr auto GetLayoutBTV() {
+  auto mma = GetSingleAtomTiledMma();
+  return mma.get_layoutB_TV();
+}
+
+CUTE_HOST_DEVICE constexpr auto GetLayoutCTV() {
+  auto mma = GetSingleAtomTiledMma();
+  return mma.get_layoutC_TV();
+}
+
+CUTE_HOST_DEVICE constexpr auto GetLayoutSFATV() {
+  auto mma = GetSingleAtomTiledMma();
+  auto ref_a = cute::make_layout(cute::make_shape(cute::size<0>(typename Atom::Shape_MNK{}), cute::_1{}));
+  auto thr_tensor = ThrfrgSFA(ref_a, mma);
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+  auto atile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(cute::make_shape(cute::size<1>(thr_layout_vmnk), cute::size<2>(thr_layout_vmnk)),
+              cute::make_stride(cute::Int<1>{}, cute::Int<0>{})),
+          cute::_));
+  auto tv_sfa = thr_tensor.compose(atile, cute::_);
+  auto thridx_2_thrid = cute::right_inverse(thr_layout_vmnk);
+  return tv_sfa.compose(thridx_2_thrid, cute::_);
+}
+
+CUTE_HOST_DEVICE constexpr auto GetLayoutSFBTV() {
+  auto mma = GetSingleAtomTiledMma();
+  auto ref_b = cute::make_layout(cute::make_shape(cute::size<1>(typename Atom::Shape_MNK{}), cute::_1{}));
+  auto thr_tensor = ThrfrgSFB(ref_b, mma);
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+  auto btile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(cute::make_shape(cute::size<1>(thr_layout_vmnk), cute::size<2>(thr_layout_vmnk)),
+              cute::make_stride(cute::Int<0>{}, cute::Int<1>{})),
+          cute::_));
+  auto tv_sfb = thr_tensor.compose(btile, cute::_);
+  auto thridx_2_thrid = cute::right_inverse(thr_layout_vmnk);
+  return tv_sfb.compose(thridx_2_thrid, cute::_);
+}
+#endif
 
 template <int kRowsPerTile>
 struct PackedTile64 {
@@ -1337,6 +1458,28 @@ nvfp4_bridge::LoadFragmentA_RowMajor16x64(
     int row_base,
     int lane_id) {
   AFragment64 fragment{};
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr auto layout_a = GetLayoutATV();
+  constexpr auto layout_sfa = GetLayoutSFATV();
+#pragma unroll
+  for (int reg = 0; reg < 4; ++reg) {
+    std::uint32_t packed = 0;
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      const int val_idx = reg * 8 + elem;
+      auto coord = layout_a(lane_id, val_idx);
+      const int row = CoordGet0(coord);
+      const int col = CoordGet1(coord);
+      const std::uint8_t nibble =
+          LoadPackedFp4Nibble(packed_rows + static_cast<std::size_t>(row_base + row) * (64 / 2), col);
+      packed |= static_cast<std::uint32_t>(nibble) << (elem * 4);
+    }
+    fragment.regs[reg] = packed;
+  }
+  auto scale_coord = layout_sfa(lane_id, 0);
+  const int scale_row = CoordGet0(scale_coord);
+  fragment.scale[0] = scale_words[scale_row];
+#else
   LoadFp4ARegistersRowMajor16x64<kRowsPerTile>(
       packed_rows + static_cast<std::size_t>(row_base) * (64 / 2),
       scale_words + static_cast<std::size_t>(row_base),
@@ -1346,6 +1489,7 @@ nvfp4_bridge::LoadFragmentA_RowMajor16x64(
       fragment.regs[2],
       fragment.regs[3],
       fragment.scale[0]);
+#endif
   ApplySm120Fp4ShiftA(fragment.regs[0], fragment.regs[1], fragment.regs[2], fragment.regs[3]);
   return fragment;
 }
@@ -1358,6 +1502,28 @@ nvfp4_bridge::LoadFragmentB_ColMajor64x8(
     int lane_id,
     int n_base) {
   BFragment64 fragment{};
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr auto layout_b = GetLayoutBTV();
+  constexpr auto layout_sfb = GetLayoutSFBTV();
+#pragma unroll
+  for (int reg = 0; reg < 2; ++reg) {
+    std::uint32_t packed = 0;
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      const int val_idx = reg * 8 + elem;
+      auto coord = layout_b(lane_id, val_idx);
+      const int row = CoordGet0(coord);
+      const int col = CoordGet1(coord);
+      const std::uint8_t nibble =
+          LoadPackedFp4Nibble(packed_rows + static_cast<std::size_t>(n_base + row) * (64 / 2), col);
+      packed |= static_cast<std::uint32_t>(nibble) << (elem * 4);
+    }
+    fragment.regs[reg] = packed;
+  }
+  auto scale_coord = layout_sfb(lane_id, 0);
+  const int scale_row = CoordGet0(scale_coord);
+  fragment.scale[0] = scale_words[n_base + scale_row];
+#else
   LoadFp4BRegistersColMajor64x8<kRowsPerTile>(
       packed_rows,
       scale_words,
@@ -1366,6 +1532,7 @@ nvfp4_bridge::LoadFragmentB_ColMajor64x8(
       fragment.regs[0],
       fragment.regs[1],
       fragment.scale[0]);
+#endif
   ApplySm120Fp4ShiftB(fragment.regs[0], fragment.regs[1]);
   return fragment;
 }
@@ -1409,6 +1576,26 @@ __device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_RowMajor16x8(
     std::size_t output_row_base,
     std::size_t output_rows_per_expert,
     OutputType* output) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr auto layout_c = GetLayoutCTV();
+  const int n_tile_base = col_base - (lane_id & 7);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    auto coord = layout_c(lane_id, i);
+    const int row = row_base + CoordGet0(coord);
+    const int col = n_tile_base + CoordGet1(coord);
+    if (row < valid_rows && col < valid_cols) {
+      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+        output[(row_start + static_cast<std::size_t>(row)) * output_rows_per_expert +
+               (output_row_base + static_cast<std::size_t>(col))] =
+            __float2bfloat16(accum.regs[i] * alpha);
+      } else {
+        output[(row_start + static_cast<std::size_t>(row)) * output_rows_per_expert +
+               (output_row_base + static_cast<std::size_t>(col))] = accum.regs[i] * alpha;
+      }
+    }
+  }
+#else
   StoreFp4AccumulatorTileRowMajor16x8<kRowsPerTile>(
       alpha,
       accum.regs[0],
@@ -1424,6 +1611,7 @@ __device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_RowMajor16x8(
       output_row_base,
       output_rows_per_expert,
       output);
+#endif
 }
 
 template <typename OutputType>
@@ -1439,6 +1627,26 @@ __device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_Transpose16x8(
     std::size_t row_start,
     std::size_t output_rows_per_expert,
     OutputType* output) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr auto layout_c = GetLayoutCTV();
+  const int token_tile_base = token_base - (lane_id & 7);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    auto coord = layout_c(lane_id, i);
+    const int row = m_base + CoordGet0(coord);
+    const int token = token_tile_base + CoordGet1(coord);
+    if (token < valid_rows && row < output_rows_this_tile) {
+      const std::size_t input_row = row_start + static_cast<std::size_t>(token);
+      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+        output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row)] =
+            __float2bfloat16(accum.regs[i] * alpha);
+      } else {
+        output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row)] =
+            accum.regs[i] * alpha;
+      }
+    }
+  }
+#else
   if (token_base >= valid_rows) {
     return;
   }
@@ -1484,6 +1692,7 @@ __device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_Transpose16x8(
           accum.regs[3] * alpha;
     }
   }
+#endif
 }
 
 __global__ void Nvfp4GroupedExpertMatVecRowsKernel(

@@ -566,6 +566,27 @@ Interpretation:
     - `fused_moe_prefill_test`
     - `multi_turn_prefix_reuse_test`
 
+- Exact CUTE TV-layout bridge step (`2026-04-07`):
+  - the local bridge now derives `A/B/C` TV coordinates and `SFA/SFB` row
+    selection from `MMA_Atom` / `MMA_Traits` layouts directly
+  - safe BF16-dispatch state remains green:
+    - `fused_moe_prefill_test`
+    - `multi_turn_prefix_reuse_test`
+  - `P5` activation retry status:
+    - retry 1 on the older inferred bridge still failed behavioral reuse
+      (`global-root restored prompt boundary` mismatch)
+    - retry 2 on the exact TV-layout bridge failed even earlier at full-model
+      execution (`single_token_forward_model: layer 1 kind=2 execution failed`)
+  - interpretation:
+    - the missing piece is not just lane-to-fragment or scale-row mapping
+    - the remaining exact TRT gap is the smem-to-register retile/copy path
+  - `copy_atom.hpp` probe:
+    - direct inclusion still drags `cute/algorithm/copy.hpp`,
+      `cute/algorithm/prefetch.hpp`, and the broader CUDA/CUTLASS host surface
+      into this TU
+    - so we should port the exact retile logic we need locally instead of
+      importing `copy_atom.hpp` directly
+
 That means the priority is no longer "prove the contract." The priority is:
 
 1. optimize prefill first
