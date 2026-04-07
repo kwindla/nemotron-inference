@@ -1,0 +1,16 @@
+backend: pytorch
+max_batch_size: 1
+max_num_tokens: 4608
+max_seq_len: 4608
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+gpus_per_node: 1
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+  dtype: fp8
+  mamba_ssm_cache_dtype: float32
+moe_config:
+  backend: CUTLASS
+  max_num_tokens: 4608

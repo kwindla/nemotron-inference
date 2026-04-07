@@ -25,6 +25,9 @@ That means the priority is no longer "prove the contract." The priority is:
 
 Everything else is secondary until cold prefill is back under control.
 
+External benchmark commands, artifacts, and cross-runtime profiling notes now
+live in `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md`.
+
 ## Specialization Assumptions
 
 This plan is intentionally specialized for one concrete deployment target:
@@ -2768,3 +2771,90 @@ Interpretation:
 - routed experts are now clearly the dominant remaining cold-prefill bucket
 - the next step should return to routed small-`M` / short-tail efficiency from
   this stronger cold-prefill baseline
+## TRT-LLM Nano Serve Setup
+
+For local TRT-LLM comparison work on RTX 5090, prefer the PyTorch backend serve
+path over TensorRT engine build for NemotronH. In our local `1.3.0rc11`
+checkout, `NemotronHForCausalLM` is supported and benchmarkable through
+`trtllm-serve` / `trtllm-bench` on the PyTorch backend, while the older engine
+`MODEL_MAP` path still rejects NemotronH.
+
+Local files:
+- `proj-2026-04-05-1704/trtllm_nano_serve.yaml`
+- `proj-2026-04-05-1704/run_trtllm_nano_serve.sh`
+
+Current local Nano-on-5090 serve assumptions:
+- backend: `pytorch`
+- single GPU: `tensor_parallel_size=1`, `pipeline_parallel_size=1`
+- `moe_config.backend: CUTLASS`
+- `kv_cache_config.dtype: fp8`
+- `kv_cache_config.mamba_ssm_cache_dtype: float32`
+- chunked prefill enabled
+
+If we later prove that `float16` Mamba cache with stochastic rounding is stable
+enough on Nano, we can revisit that knob for memory/perf tradeoffs. The initial
+local target is a working, benchmarkable server path that stays close to the
+official cookbook structure while fitting RTX 5090 constraints.
+
+Local benchmark entry points:
+- `proj-2026-04-05-1704/trtllm_nano_ttft_random_tokens.py`
+- `proj-2026-04-05-1704/trtllm_nano_throughput_random_tokens.py`
+
+These wrappers:
+- launch the local `trtllm-serve` Nano server
+- wait for `/v1/models`
+- drive `benchmark_serving.py` against the OpenAI chat endpoint
+- use `prompt_token_ids` with random fixed-length token inputs to avoid
+  chat-template/tokenization drift
+- shut the server back down after each benchmark run
+
+Current local external baselines on RTX 5090:
+
+- TRT-LLM PyTorch serve artifacts:
+  - `artifacts/benchmarks/trtllm_serve_ttft_prefix4_out1_20260406_current.json`
+  - `artifacts/benchmarks/trtllm_serve_ttft_prefix128_out1_20260406_current.json`
+  - `artifacts/benchmarks/trtllm_serve_ttft_prefix4096_out1_20260406_current.json`
+  - `artifacts/benchmarks/trtllm_serve_throughput_prompt16_gen16_20260406_current.json`
+- TRT-LLM PyTorch serve results:
+  - TTFT median:
+    - `prefix4 -> 92.335 ms`
+    - `prefix128 -> 160.844 ms`
+    - `prefix4096 -> 375.780 ms`
+  - throughput (`prompt16/gen16`, non-streaming):
+    - `request_throughput = 12.640 req/s`
+    - `output_throughput = 179.073 tok/s`
+    - `total_token_throughput = 381.320 tok/s`
+    - `mean_tpot = 115.851 ms`
+- vLLM artifacts:
+  - `artifacts/benchmarks/vllm_ttft_20260406_clean_prefix1_4_128_4096.json`
+  - `artifacts/benchmarks/vllm_generate_throughput_16prompt_16gen_20260406_current.json`
+- vLLM results:
+  - TTFT median:
+    - `prefix4 -> 34.445 ms`
+    - `prefix128 -> 31.469 ms`
+    - `prefix4096 -> 78.328 ms`
+  - throughput (`prompt16/gen16`):
+    - `full_decode_tokens_per_second = 40.856 tok/s`
+
+Caveats:
+
+- The current vLLM setup still reports `num_cached_tokens = 0` on every
+  iteration, so its cache-hit/decode-side numbers are not trustworthy prefix
+  reuse comparisons yet.
+- The TRT-LLM throughput run is `--non-streaming`, so its TTFT field is the
+  upstream sentinel `-1000 ms`; use the dedicated one-token TTFT artifacts for
+  TTFT and the throughput artifact only for throughput / TPOT.
+- The TRT-LLM path that works locally for NemotronH is the PyTorch backend
+  serve path, not TensorRT engine build.
+
+External comparison work now has a dedicated execution log in:
+
+- `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md`
+
+That note is the source of truth for:
+
+- exact external benchmark commands
+- artifact paths
+- apples-to-apples throughput work status
+- vLLM prefix-caching investigation status
+- cross-codebase prefill profiling status

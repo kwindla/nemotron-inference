@@ -15,3 +15,7 @@ vllm-env/
 third_party/TensorRT-LLM/
 *.sqlite
 *.nsys-rep
+*.qdstrm
+*.qdrep
+*.sqlite-shm
+*.sqlite-wal
