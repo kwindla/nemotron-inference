@@ -3848,3 +3848,24 @@ Latest routed FP4 bridge status on the native path:
     - next target:
       `P12` exact `128x128x128` FC2 path for the `prefix128 / tail4`
       design-center regime
+  - `P12` exact scale-smem rollout:
+    - first source-based attempt reused the exact traced `P5/P13`
+      `SFA/SFB` bridge pattern as two `k64` subtiles per `128`-wide macro tile
+    - the first real activation cleared the correctness gates, so no extra
+      TRT/CUTLASS probe was needed
+    - validation:
+      - `fused_moe_prefill_test: PASS`
+      - `multi_turn_prefix_reuse_test: PASS`
+      - `compute-sanitizer --tool memcheck ./testing/fused_moe_prefill_test`
+        reports `0 errors`
+    - focused TTFT artifact:
+      [ttft_20260407_p12_exact_scale_smem_prefix128_tail4.stdout.txt](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/ttft_20260407_p12_exact_scale_smem_prefix128_tail4.stdout.txt)
+    - focused TTFT:
+      - `cold_prefill_prefix128 = 107.215 ms`
+      - `cached_committed_head_prefix128_tail4 hot-prefix = 48.424 ms`
+      - `cached_global_root_prefix128_tail4 hot-prefix = 48.460 ms`
+    - conclusion:
+      the exact traced scale-smem bridge pattern generalizes to `P12` without a
+      new probe
+    - next target:
+      `P15`, then a broader routed FP4 rerun/profile pass
