@@ -815,6 +815,43 @@ Conclusion:
 - do not spend more time on grouped metadata or helper-stage cleanup
 - next rewrite must target the true FP4/TMA-style grouped mainloop body
 
+#### Current Routed Status (`2026-04-07`, `computeStrides` Cutover)
+
+The active grouped routed FC1/FC2 kernels now consume precomputed CTA row
+metadata directly:
+
+- `cta_row_starts`
+- `cta_valid_rows`
+
+instead of recomputing token-row bounds from:
+
+- `cta_idx_xy_to_mn_limit`
+- `expert_first_token_offsets`
+- `selected_token_tile`
+
+This makes the launch-plan build act as the native analogue of TRT's
+`computeStrides...` helper for the active grouped consumers: hot CTAs now start
+from exact routed row spans rather than reconstructing them inside the mainloop.
+
+Focused gate after the cutover:
+
+- artifact:
+  `artifacts/benchmarks/ttft_20260407_compute_strides_cutover_prefix128_tail4.stdout.txt`
+- result:
+  - `cold_prefill_prefix128 = 125.510 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 54.530 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix = 54.470 ms`
+- focused validation:
+  - `fused_moe_prefill_test`
+  - `moe_launch_plan_device_test`
+  - `multi_turn_prefix_reuse_test`
+
+Conclusion:
+
+- keep the direct `cta_row_starts` / `cta_valid_rows` contract
+- the launch plan now serves as the native routed `computeStrides` stage
+- the remaining routed gap is still the grouped hot loop itself
+
 #### How To Unblock This
 
 1. Add one more round of targeted TRT tracing / profiling.

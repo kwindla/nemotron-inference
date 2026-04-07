@@ -398,6 +398,29 @@ Interpretation:
   - conclusion:
     - keep the larger grouped CTA shape
     - this improves cold prefill slightly and keeps reuse correctness green
+
+- routed `computeStrides` cutover (`2026-04-07`):
+  - active native change:
+    - make the active grouped routed FC1/FC2 kernels consume exact
+      `cta_row_starts` and `cta_valid_rows` from the launch plan
+    - stop recomputing routed row bounds inside the grouped hot kernels from
+      `cta_idx_xy_to_mn_limit`, `expert_first_token_offsets`, and
+      `selected_token_tile`
+  - focused validation:
+    - `fused_moe_prefill_test`
+    - `moe_launch_plan_device_test`
+    - `multi_turn_prefix_reuse_test`
+  - artifact:
+    - `artifacts/benchmarks/ttft_20260407_compute_strides_cutover_prefix128_tail4.stdout.txt`
+  - result:
+    - `cold_prefill_prefix128 = 125.510 ms`
+    - `cached_committed_head_prefix128_tail4 hot-prefix = 54.530 ms`
+    - `cached_global_root_prefix128_tail4 hot-prefix = 54.470 ms`
+  - conclusion:
+    - keep the direct `cta_row_starts` / `cta_valid_rows` grouped contract
+    - the launch plan now serves as the native analogue of TRT's
+      `computeStrides...` helper for the active grouped consumers
+    - the remaining routed gap is the grouped mainloop body, not row-span setup
     - hot-prefix remains flat, so the next bottleneck is the true FP4/TMA
       mainloop rather than CTA size alone
 

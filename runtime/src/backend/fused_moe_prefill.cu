@@ -1454,9 +1454,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
     const float* input_dq_scales,
     const int* cta_count,
     const int* cta_batch_indices,
-    const int* cta_m_limits,
-    const int* expert_first_token_offsets,
-    int token_tile_dim,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     OutputType* output) {
@@ -1482,11 +1481,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
   const int warp_id = tid / 32;
   const bool mma_warp = warp_id < kGroupedConsumerWarpsPerBlock;
   const int expert_index = cta_batch_indices[cta_index];
-  const int batch_row_begin = expert_first_token_offsets[expert_index];
-  const int batch_cta_begin = batch_row_begin / token_tile_dim;
-  const int row_start = batch_row_begin + (cta_index - batch_cta_begin) * token_tile_dim;
-  const int m_limit = cta_m_limits[cta_index];
-  const int valid_rows = max(0, min(m_limit - row_start, token_tile_dim));
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
   const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
   if (expert_index < 0 ||
       valid_rows <= 0 ||
@@ -1645,9 +1641,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
     const float* input_dq_scales,
     const int* cta_count,
     const int* cta_batch_indices,
-    const int* cta_m_limits,
-    const int* expert_first_token_offsets,
-    int token_tile_dim,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     OutputType* output) {
@@ -1673,11 +1668,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
   const int warp_id = tid / 32;
   const bool mma_warp = warp_id < kGroupedConsumerWarpsPerBlock;
   const int expert_index = cta_batch_indices[cta_index];
-  const int batch_row_begin = expert_first_token_offsets[expert_index];
-  const int batch_cta_begin = batch_row_begin / token_tile_dim;
-  const int row_start = batch_row_begin + (cta_index - batch_cta_begin) * token_tile_dim;
-  const int m_limit = cta_m_limits[cta_index];
-  const int valid_rows = max(0, min(m_limit - row_start, token_tile_dim));
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
   const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
   if (expert_index < 0 ||
       valid_rows <= 0 ||
@@ -3387,9 +3379,8 @@ bool LaunchPlannedPackedInputMatVec(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3403,9 +3394,8 @@ bool LaunchPlannedPackedInputMatVec(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3419,9 +3409,8 @@ bool LaunchPlannedPackedInputMatVec(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3515,9 +3504,8 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3531,9 +3519,8 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3547,9 +3534,8 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3563,9 +3549,8 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
@@ -3579,9 +3564,8 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_dq_scales,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_idx_xy_to_mn_limit(),
-            launch_plan->expert_first_token_offsets(),
-            static_cast<int>(launch_plan->selected_token_tile()),
+            launch_plan->cta_row_starts(),
+            launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
             output);
