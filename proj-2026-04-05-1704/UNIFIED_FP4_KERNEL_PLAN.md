@@ -81,9 +81,14 @@ These rules are mandatory for the rewrite:
 ## Latest Landing Status
 
 Current stable routed state:
-- `P5`, `P12`, and `P13` are now live on the unified swizzled FP4 kernel
-- `P15` remains on the already-proven exact FP4 kernel
+- `P5`, `P12`, `P13`, and `P15` are now live on the unified swizzled FP4 kernel body
+- `P15` keeps its proven `256`-thread launch policy for now, so kernel-body
+  unification is done before any TMA / warp-specialization launch work
 - the live `P5` trace hook remains available through `NEMOTRON_P5_SCALE_DEBUG`
+- the final `P15` landing also required fixing an always-on unified `P5`
+  scale-trace write past `g_p5_scale_trace` and pinning
+  `multi_turn_prefix_reuse_test` to run from `${CMAKE_BINARY_DIR}` under
+  `ctest`
 
 What resolved `P5`:
 - built the standalone
@@ -135,8 +140,11 @@ What this now proves:
 - the remaining cold-TTFT gap is no longer just a `P5` problem, because even
   the improved unified `P5` path is still well above the older
   `~120 ms prefix128` checkpoint range
-- the next optimization work should therefore treat unified `P5` as landed and
-  move on to the remaining routed FP4 kernels and broader prefill overhead
+- `P15` is now on the same unified kernel body, so the next optimization work
+  can target TMA / warp-specialized improvements once instead of carrying a
+  separate `P15` runtime implementation
+- the next optimization work should therefore treat unified `P5/P12/P13/P15`
+  as landed and move on to broader prefill overhead and transport/pipeline work
 
 ## What TRT-LLM Does
 

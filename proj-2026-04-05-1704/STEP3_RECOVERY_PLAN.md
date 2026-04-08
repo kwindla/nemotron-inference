@@ -4646,7 +4646,11 @@ Latest routed FP4 bridge status on the native path:
 
 ## Latest P15 Completion Result
 
-- the active routed FC2 `P15` path now stays on the live exact FP4 kernel
+- the active routed FC2 `P15` path now runs through the unified routed FP4
+  kernel body
+- the old dedicated runtime `P15` kernel body is fenced out of the build in
+  [fused_moe_prefill.cu](/home/khkramer/src/nemotron-inference/runtime/src/backend/fused_moe_prefill.cu)
+  as historical reference only
 - the completion proof came from extending
   [p15_swizzled_pipeline_test.cu](/home/khkramer/src/nemotron-inference/testing/backend/p15_swizzled_pipeline_test.cu)
   to the real remaining isolation cases:
@@ -4668,3 +4672,14 @@ Latest routed FP4 bridge status on the native path:
   - [p15_swizzled_pipeline_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/p15_swizzled_pipeline_test): `PASS`
   - [fused_moe_prefill_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/fused_moe_prefill_test): `PASS`
   - [multi_turn_prefix_reuse_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/multi_turn_prefix_reuse_test): `PASS`
+  - targeted `ctest` over those plus the 3 TTFT smoke cases: `6/6` passed
+  - `compute-sanitizer --tool memcheck fused_moe_prefill_test`: `0 errors`
+- current boundary:
+  - `P5`, `P12`, `P13`, and `P15` now share the unified routed FP4 kernel body
+  - `P15` still keeps its proven `256`-thread launch policy pending the later
+    TMA / warp-specialized rewrite
+- stabilization details:
+  - fixed an always-on unified `P5` scale-trace write past `g_p5_scale_trace`
+    that only surfaced under async multi-turn execution
+  - pinned `multi_turn_prefix_reuse_test` to `${CMAKE_BINARY_DIR}` under
+    `ctest`, matching the direct-pass runtime working directory

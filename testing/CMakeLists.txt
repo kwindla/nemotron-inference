@@ -670,6 +670,11 @@ target_compile_definitions(
 )
 
 nemotron_add_test(multi_turn_prefix_reuse_test)
+set_tests_properties(
+  multi_turn_prefix_reuse_test
+  PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
 
 add_executable(
   split_prefill_localization_test

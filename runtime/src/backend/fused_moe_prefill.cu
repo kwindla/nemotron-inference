@@ -1,5 +1,4 @@
 #include "nemotron/fused_moe_prefill.h"
-#include "nemotron/p15_scale_runtime_helpers.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -1554,6 +1553,8 @@ struct P5ScaleTrace {
 
 __device__ __managed__ P15ScaleTrace g_p15_scale_trace;
 __device__ __managed__ P5ScaleTrace g_p5_scale_trace;
+__device__ __managed__ int g_enable_p15_scale_trace = 0;
+__device__ __managed__ int g_enable_p5_scale_trace = 0;
 
 template <class ScaleAtomTensor>
 __device__ std::uint32_t PackP15ScaleFragmentWord(ScaleAtomTensor const& scale_atom) {
@@ -5723,7 +5724,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       }
 
       if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
-        if (cta_index == 0 &&
+        if (g_enable_p5_scale_trace != 0 &&
+            cta_index == 0 &&
             blockIdx.x == 0 &&
             block_base == 0 &&
             thread_id == 0) {
@@ -5763,7 +5765,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
           }
         }
       } else if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP15) {
-        if (cta_index == 0 &&
+        if (g_enable_p15_scale_trace != 0 &&
+            cta_index == 0 &&
             blockIdx.x == 0 &&
             block_base == 0 &&
             thread_id == 0) {
@@ -6032,6 +6035,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
   }
 }
 
+#if 0  // Deprecated: legacy dedicated P15 kernel body kept only as historical reference.
 template <typename OutputType>
 __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15(
     const std::uint8_t* packed_input,
@@ -6403,6 +6407,7 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
     }
   }
 }
+#endif
 
 template <typename OutputType>
 __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK128P12(
@@ -8498,10 +8503,13 @@ bool LaunchPlannedPackedInputMatVec(
             output);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm2Profile::kP15_256x128x64_SwapTrue:
-        if (std::getenv("NEMOTRON_P15_SCALE_DEBUG") != nullptr) {
+        g_enable_p15_scale_trace = std::getenv("NEMOTRON_P15_SCALE_DEBUG") != nullptr ? 1 : 0;
+        if (g_enable_p15_scale_trace != 0) {
           g_p15_scale_trace = {};
         }
-        Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15<float><<<grid, dim3(256)>>>(
+        Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
+            nvfp4_bridge::UnifiedRoutedFp4Profile::kP15,
+            float><<<grid, dim3(256)>>>(
             input_pack.packed_data(),
             input_pack.matmul_block_scales_data(),
             input_pack.scale_layout(),
@@ -8518,7 +8526,7 @@ bool LaunchPlannedPackedInputMatVec(
         if (!CheckCuda(cudaGetLastError())) {
           return false;
         }
-        if (std::getenv("NEMOTRON_P15_SCALE_DEBUG") != nullptr) {
+        if (g_enable_p15_scale_trace != 0) {
           if (!CheckCuda(cudaDeviceSynchronize())) {
             return false;
           }
@@ -8667,7 +8675,8 @@ bool LaunchPlannedPackedInputMatVecBf16(
             output);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm1Profile::kP5_128x128x64_SwapTrue:
-        if (std::getenv("NEMOTRON_P5_SCALE_DEBUG") != nullptr) {
+        g_enable_p5_scale_trace = std::getenv("NEMOTRON_P5_SCALE_DEBUG") != nullptr ? 1 : 0;
+        if (g_enable_p5_scale_trace != 0) {
           g_p5_scale_trace = {};
         }
         Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
@@ -8689,7 +8698,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
         if (!CheckCuda(cudaGetLastError())) {
           return false;
         }
-        if (std::getenv("NEMOTRON_P5_SCALE_DEBUG") != nullptr) {
+        if (g_enable_p5_scale_trace != 0) {
           if (!CheckCuda(cudaDeviceSynchronize())) {
             return false;
           }
