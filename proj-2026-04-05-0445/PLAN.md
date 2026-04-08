@@ -1147,6 +1147,153 @@ specialized runtime:
         full `partition_fragment_C(tiled_mma, (256,128))` accumulator contract
         and then rebuild the `P15` store path around that shape before another
         activation attempt.
+      - first live activation after wiring the dormant exact kernel:
+        - switching the live `P15` launch from the BF16 grouped fallback to the
+          dormant exact kernel exposed a compile-time blocker immediately
+        - the dormant exact path is not yet build-clean when instantiated
+        - narrowing the inner `cute::gemm(...)` call from `tCrA/tCrB` to the
+          traced `rA_from_copy_view/rB_from_copy_view` register views changed
+          the failure mode, but did not make the exact path compile
+      - implication:
+        the remaining `P15` blocker is not just runtime correctness. The
+        caller-provided full-profile accumulator contract still is not being
+        modeled correctly enough to instantiate the exact local-CUTE path.
+      - fourth definitive builder probe:
+        [trt_p15_accum_slices_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_accum_slices_dump.cu)
+      - result:
+        the full traced `partition_fragment_C(tiled_mma, (256,128))` contract
+        decomposes into eight atom-sized accumulator slices:
+        - `size<0>(tCrC_profile)=4`
+        - `size<1>(tCrC_profile)=4`
+        - `size<2>(tCrC_profile)=8`
+        - each `tCrC_slice.layout = ((_2,_2),_4):((_1,_2),_4)` with `size=16`
+      - implication:
+        the old mental model was still too small. Traced `P15` is not “one
+        bigger `CFragment64`,” and not even the old `2x2` atom family. It is
+        eight separate 16-value accumulator slices per thread. The next native
+        rewrite has to rebuild `P15` around that eight-slice accumulator/store
+        contract before another activation attempt.
+      - exact `P15` manual-path activation attempt:
+        - temporarily forced the dormant exact `P15` kernel onto its manual MMA
+          path by disabling the compile-fragile local-CUTE `cute::gemm(...)`
+          branch inside the kernel body
+        - switched the live `P15` dispatcher to the exact kernel
+        - result: this was the first exact `P15` path that was actually
+          build-clean when instantiated
+      - runtime gate result:
+        - [fused_moe_prefill_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/fused_moe_prefill_test)
+          failed with routed-only drift:
+          - `nano_prefill_output_max_abs_diff = 15.5936`
+          - `nano_prefill_routed_max_abs_diff = 15.5936`
+          - `nano_prefill_shared_max_abs_diff = 0`
+        - [multi_turn_prefix_reuse_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/multi_turn_prefix_reuse_test)
+          failed at the first committed-head reuse gate:
+          - `cold=4670`
+          - `restored=27641`
+          - `max_abs_diff=12.0938`
+          - first layer divergence: `layer=1 kind=2 max_abs_diff=0.0950928`
+      - implication:
+        the remaining `P15` blocker has moved from compile-time instantiation
+        to runtime numerics. The exact manual path is now buildable, but its
+        accumulator / rescale / store contract is still wrong. The next `P15`
+        rewrite should target that runtime contract directly, not the old
+        `cute::gemm` instantiation problem.
+      - definitive runtime memory probe:
+        - ran `compute-sanitizer --tool memcheck` against the build-clean exact
+          manual `P15` path
+        - result: the failure is not only numeric drift; the kernel performs an
+          out-of-bounds global read:
+          - `Invalid __global__ read of size 1 bytes`
+          - in `Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15<float>`
+          - thread `(15,0,0)`, block `(0,1,0)`
+          - `1` byte past a `256`-byte allocation
+      - implication:
+        the next `P15` step should first fix that operand/layout bounds bug.
+        There is no point tuning accumulator math further until the exact
+        manual path is memory-safe.
+      - definitive true operand-copy probe:
+        - added and ran
+          [trt_p15_true_dense_operand_coords_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_true_dense_operand_coords_dump.cu)
+        - artifact:
+          [trt_p15_true_dense_operand_coords_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_true_dense_operand_coords_dump_20260407.log)
+        - exact facts:
+          - `copy_view_a_dense.size = 128`
+          - `copy_view_b_dense.size = 128`
+          - traced `A` copy rows span `0/64/128/192`, not one `128`-row subtile
+          - traced `B` copy rows span `0/32/64/96`, not one `32`-row atom only
+      - implication:
+        the remaining `P15` gap is now even narrower: the active exact manual
+        path is still built around the older `2x2` subtile mental model,
+        while the traced operand contract is full-profile `256x128x64`. The
+        next `P15` rewrite should stop decomposing the kernel as two
+        independent `128`-row subtiles and instead rebuild the operand loads
+        around the full traced profile.
+      - definitive true store/accumulator profile probe:
+        - added and ran
+          [trt_p15_true_dense_store_coords_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_true_dense_store_coords_dump.cu)
+        - artifact:
+          [trt_p15_true_dense_store_coords_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_true_dense_store_coords_dump_20260407.log)
+        - exact facts:
+          - `part_c_dense.layout = ((_2,_2),_4,(_2,_4))`
+          - `accum_profile.layout = ((_2,_2),_4,(_2,_4))`
+          - traced `C` flat coords span the same `0/64/128/192` row bands and
+            `0/32/64/96` column bands as the full-profile operand probes
+      - implication:
+        the next `P15` rewrite no longer needs another store-order guess. The
+        traced full-profile output contract is now explicit, so the remaining
+        work is to replace the dormant `2x2` subtile accumulator/store model
+        with the full traced `4x4x8` profile and then re-enable `P15`.
+      - definitive full-profile fragment-shape probe:
+        - added and ran
+          [trt_p15_full_profile_fragment_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_full_profile_fragment_dump.cu)
+        - artifact:
+          [trt_p15_full_profile_fragment_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_full_profile_fragment_dump_20260407.log)
+        - exact facts:
+          - `tCrA.layout = ((_8,_2,_2),_4,_1)` with `size<0>=32`, `size<1>=4`, `size<2>=1`
+          - `tCrB.layout = ((_8,_2),(_2,_4),_1)` with `size<0>=16`, `size<1>=8`, `size<2>=1`
+          - `tCrC.layout = ((_2,_2),_4,(_2,_4))` with `size<0>=4`, `size<1>=4`, `size<2>=8`
+      - exact local-CUTE activation result:
+        - re-enabled the dormant full-profile `P15` local-CUTE branch once
+        - compile failed in `cute::gemm(...)` with the expected shape mismatch:
+          - `size<1>(A) == size<1>(C)` failed
+          - `size<1>(B) == size<2>(C)` failed
+      - implication:
+        this is now the precise next rewrite target. The dormant `P15`
+        local-CUTE path must stop using the current hand-stitched
+        `rA_from_copy_view / rB_from_copy_view` tensors and instead build the
+        exact full-profile `tCrA / tCrB / tCrC` fragment contract that those
+        static assertions require.
+      - source-backed dormant-kernel correction:
+        - re-read the CUTLASS `mma()` body in
+          [sm120_mma_array_tma_blockwise_scaling.hpp](/home/khkramer/.cache/uv/archive-v0/f24U_Ixv0hjsqw0Ylm8si/tensorrt_llm/deep_gemm/include/cutlass/gemm/collective/sm120_mma_array_tma_blockwise_scaling.hpp)
+        - found one concrete structural mismatch in our dormant exact `P15`
+          kernel: it was still staging only the atom-sized `32` B rows, while
+          traced `P15` is a full-profile `256x128x64` contract
+        - corrected the dormant exact kernel to stage `b_packed[128]` and feed
+          the manual `P15` B-loader with `kProfileTokenRows=128` instead of the
+          atom-sized token tile
+      - implication:
+        this does not activate `P15` yet, but it removes one real full-profile
+        contract bug from the dormant exact path. The next `P15` rewrite should
+        now focus on the register-fragment / accumulator contract, not the old
+        undersized B staging.
+      - controlled exact re-activation after the `128`-row B fix:
+        - re-enabled only the dormant exact `P15` local-CUTE branch and pointed
+          `gemm()` back at `tCrA/tCrB`, matching the CUTLASS `mma()` body more
+          closely
+        - build still failed, but the failure mode is now more precise:
+          `cute::gemm(...)` trips in upstream `tensor_zip.hpp` /
+          `mma_traits_sm120.hpp` because our local bridge is still handing it a
+          plain `subbyte_iterator<uint4_t>` tensor shape where the CUTLASS
+          path expects the richer zipped tensor contract produced by its real
+          copy pipeline
+      - implication:
+        after the B-staging fix, the next `P15` blocker is no longer the tile
+        extent. It is the exact local copy-to-fragment tensor contract feeding
+        `cute::gemm`. The next step should target that contract directly,
+        either with a small definitive probe for the CUTLASS-side `copy(...)`
+        destination tensor type or by mirroring that copy path more exactly in
+        the local bridge.
     - short-input TRT trace correction:
       - a clean live serve run with
         `TLLM_FUSED_MOE_PRINT_TACTICS=1` and
@@ -1980,3 +2127,265 @@ Next definitive probes for `P5`:
 | 4 | Shared-expert alignment | pending | Shared experts still distort short-prefix cold prefill and need the same stronger math family |
 | 5 | Optimize Mamba prefill | pending | Still the second blocker at `prefix4096` after routed MoE |
 | 6 | Re-profile and choose the next default workstream | pending | Final race phase only after routed MoE, shared, and long-prefix Mamba move materially |
+
+### Latest P15 Exact-Path Result
+
+- followed the probe-first rule and added a definitive operand-type dump:
+  - artifact:
+    [trt_p15_copy_type_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_copy_type_dump_20260407.log)
+- exact facts:
+  - traced `P15` uses `tCrA.type = Tensor<ArrayEngine<integer_subbyte<4>, 128>, ...>`
+  - traced `P15` uses `tCrB.type = Tensor<ArrayEngine<integer_subbyte<4>, 128>, ...>`
+  - traced `tCrA_copy_view` / `tCrB_copy_view` are `ViewEngine<subbyte_iterator<integer_subbyte<4>>>`
+  - `tCsA` / `tCsB` remain shared-memory views over `subbyte_iterator<float_e2m1_t>`
+- native follow-up:
+  - switched the dormant exact `P15` local-CUTE branch off
+    `float_e2m1_unpacksmem_t` and onto the probed `ElementAB` shared-memory
+    basis
+  - re-enabled only the dormant exact `P15` branch and rebuilt as a controlled
+    compile check
+- result:
+  - compile still fails in `cute::gemm(...)`, but the failure is now more
+    precise: our dormant exact `P15` path is still feeding
+    `ViewEngine<subbyte_iterator<uint4_t>>` operand tensors into the SM120 MMA
+    path where the traced CUTLASS contract uses array-engine register fragments
+- implication:
+  - the next exact `P15` rewrite should stop trying to drive `cute::gemm(...)`
+    from partitioned smem views
+  - instead it should rebuild the dormant exact `P15` path around the real
+    copy-to-register fragment tensors implied by the traced CUTLASS contract,
+    then retry the controlled activation
+
+### Latest P15 Source-Backed Contract Result
+
+- read the traced SM120 blockscaled collective body in:
+  [sm120_mma_array_tma_blockwise_scaling.hpp](/home/khkramer/.cache/uv/archive-v0/f24U_Ixv0hjsqw0Ylm8si/tensorrt_llm/deep_gemm/include/cutlass/gemm/collective/sm120_mma_array_tma_blockwise_scaling.hpp)
+- exact CUTLASS flow for the traced profile is:
+  - build `sA` / `sB` as full staged shared-memory tensors
+  - partition them with `partition_fragment_A/B`
+  - build `tCsA/tCsB` from `partition_S(as_position_independent_swizzle_tensor(sA/sB))`
+  - copy `tCsA/tCsB -> tCrA_copy_view/tCrB_copy_view`
+  - apply `fp4_shift_A/B` on the copy views
+  - run `cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tmp_accum)`
+- definitive follow-up probes:
+  - `trt_p15_reg_gemm_contract_dump.cu`
+  - `trt_p15_make_fragment_contract_dump.cu`
+- result:
+  - neither a naive `recast` register path nor a naive `make_fragment_A/B + copy`
+    path compiled cleanly in isolation
+  - that means the remaining `P15` mismatch is not just the fragment object type
+  - it is the full CUTLASS staged operand contract, especially the swizzled
+    `partition_S(...)` source path feeding the copy views
+- implication:
+  - the next exact `P15` rewrite should replace the current row-packed
+    `a_packed/b_packed` exact-path staging with a real `SmemLayoutA/B`-shaped,
+    staged shared-memory path before another activation attempt
+
+### Latest P15 Probe-Generation Result
+
+- implemented a maintained all-thread `P15` contract probe:
+  [trt_p15_full_thread_contract_dump.cu](/home/khkramer/src/nemotron-inference/proj-2026-04-05-1704/trt_p15_full_thread_contract_dump.cu)
+- implemented a maintained generator that compiles/runs that probe and emits
+  machine-readable artifacts:
+  [generate_p15_probe_tables.py](/home/khkramer/src/nemotron-inference/proj-2026-04-05-1704/generate_p15_probe_tables.py)
+- latest generated artifacts:
+  - [trt_p15_full_thread_contract_dump_latest.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_full_thread_contract_dump_latest.log)
+  - [trt_p15_probe_contract.json](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_probe_contract.json)
+  - [trt_p15_probe_generated.inc](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_probe_generated.inc)
+- exact result:
+  - we now have all-thread, probe-backed dense operand/store and scale-stage
+    coordinate data for `P15`, not just thread `0`
+  - so probe-driven generation of the `P15` fragment/copy contract is feasible
+    and now implemented as an offline codegen pipeline
+- practical constraint:
+  - the naive generated all-thread tables are too large to drop directly into
+    live device constant memory
+  - so the immediate output is an offline codegen artifact, not yet a live
+    runtime include
+- implication:
+  - the next `P15` step should use these generated all-thread artifacts to
+    derive compact pattern classes or emit specialized helper code for the
+    dormant exact path, rather than writing more handwritten coord logic
+
+### Latest P15 Generated-Helper Integration Result
+
+- promoted the probe/codegen output into a compact runtime header:
+  [p15_probe_generated.h](/home/khkramer/src/nemotron-inference/runtime/include/nemotron/p15_probe_generated.h)
+- exact native follow-up:
+  - wired the dormant exact `P15` path in
+    [fused_moe_prefill.cu](/home/khkramer/src/nemotron-inference/runtime/src/backend/fused_moe_prefill.cu)
+    to use the generated dense operand/store helpers and generated stage-0
+    scale helpers instead of ad hoc `FillPhysicalCoordMap...` coord recovery
+  - kept live `P15` dispatch on the BF16 fallback while validating the dormant
+    path
+- result:
+  - focused build is green
+  - [fused_moe_prefill_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/fused_moe_prefill_test):
+    `PASS`
+  - [multi_turn_prefix_reuse_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/multi_turn_prefix_reuse_test):
+    `PASS`
+  - so the probe-generated `P15` contract is now integrated into the native
+    backend without regressing the safe live path
+- controlled activation result:
+  - switching only the live `P15` launch site to the exact FP4 kernel still
+    fails at compile time in the local-CUTE `cute::gemm(...)` path
+  - failure site:
+    [tensor_zip.hpp](/home/khkramer/src/nemotron-inference/.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include/cute/tensor_zip.hpp)
+    via
+    [mma_traits_sm120.hpp](/home/khkramer/src/nemotron-inference/.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include/cute/atom/mma_traits_sm120.hpp)
+  - exact symptom:
+    `cute::subbyte_iterator<cute::uint4_t>` lacks the `iters_` interface that
+    the SM120 MMA unzip path expects
+- implication:
+  - the next `P15` blocker is no longer coord discovery
+  - it is the exact copy-to-register tensor type feeding `cute::gemm(...)` in
+    the live exact path
+  - next step should replace the dormant exact `P15` bridge's current
+    subbyte-iterator register feed with the CUTLASS-expected array-engine
+    register contract before the next activation attempt
+
+### Latest P15 Staged-Swizzle Source Probe Result
+
+- added a dedicated staged-smem source probe:
+  [trt_p15_smem_partition_dump.cu](/home/khkramer/src/nemotron-inference/proj-2026-04-05-1704/trt_p15_smem_partition_dump.cu)
+- added a maintained generator for that probe:
+  [generate_p15_smem_partition_tables.py](/home/khkramer/src/nemotron-inference/proj-2026-04-05-1704/generate_p15_smem_partition_tables.py)
+- generated artifacts:
+  - [trt_p15_smem_partition_dump_latest.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_smem_partition_dump_latest.log)
+  - [trt_p15_smem_partition_contract.json](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_smem_partition_contract.json)
+  - [p15_smem_partition_generated.h](/home/khkramer/src/nemotron-inference/runtime/include/nemotron/p15_smem_partition_generated.h)
+- exact result:
+  - we now have all-thread, probe-backed `tCsA/tCsB` stage-0 source coords for
+    traced `P15`
+  - the staged-swizzle source contract is highly regular:
+    - `TCSA`: `warp_mod4` only shifts the second leaf by `+2`
+    - `TCSB`: `upper_half` only shifts the second leaf by `+2`
+- implication:
+  - the remaining operand-source guesswork for `P15` is gone
+  - the next exact native rewrite should consume the generated
+    `GetTCSAStage0Coord` / `GetTCSBStage0Coord` helpers instead of the older
+    dense row-packed source assumption
+- exact native follow-up:
+  - rewired the dormant exact `P15` source loads in
+    [fused_moe_prefill.cu](/home/khkramer/src/nemotron-inference/runtime/src/backend/fused_moe_prefill.cu)
+    to use `GetTCSAStage0Coord` / `GetTCSBStage0Coord`
+  - focused rebuild is green
+  - [fused_moe_prefill_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/fused_moe_prefill_test):
+    `PASS`
+  - [multi_turn_prefix_reuse_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/multi_turn_prefix_reuse_test):
+    `PASS`
+- implication:
+  - the dormant exact `P15` path now matches the traced source-side contract
+    much more closely
+  - the next activation attempt should target the remaining live exact
+    `cute::gemm(...)` / register-contract blocker, not source coord recovery
+
+### P15 Reset Strategy
+
+- stop the current `P15` probe-patch loop at its structural boundary
+- new rule before any `P15` attempt:
+  - answer in one sentence whether the attempt preserves or replaces
+    row-packed staging
+  - if it preserves row-packed staging, reject it without running the gates
+- design-review rule:
+  - after three failed probe-then-patch cycles on the same structural approach,
+    stop and review the approach itself instead of probing another leaf detail
+- smell rule:
+  - if the next step is "add another generated coord table / fragment helper /
+    layout shim" on top of row-packed staging, treat that as a sign the staging
+    mechanism is still wrong
+- active structural decision:
+  - replace the dormant exact `P15` row-packed `a_packed/b_packed` staging with
+    real `SmemLayoutA/B`-shaped staged shared memory
+  - feed the live CUTLASS contract end to end:
+    `partition_S(as_position_independent_swizzle_tensor(sA/sB)) -> copy ->
+    fp4_shift -> make_zip_tensor(...) -> cute::gemm(...)`
+- immediate gate before any more MoE integration:
+  - add a standalone `P15` backend test that does only:
+    - real `SmemLayoutA/B/SFA/SFB` shared storage
+    - known-value fill
+    - real CUTLASS copy-to-register path
+    - `fp4_shift_A/B`
+    - zipped `cute::gemm(...)`
+    - accumulator check against a simple reference
+- only after that standalone test is green should `P15` exact-path work return
+  to the fused MoE kernel
+
+### Latest P15 Swizzled-Pipeline Isolation Result
+
+- added a standalone CUDA backend test:
+  [p15_swizzled_pipeline_test.cu](/home/khkramer/src/nemotron-inference/testing/backend/p15_swizzled_pipeline_test.cu)
+- exact scope of the test:
+  - real `TracedP15CollectiveMainloop` types
+  - real `SmemLayoutA/B/SFA/SFB` shared storage
+  - real `partition_S(as_position_independent_swizzle_tensor(...))`
+  - real smem->reg `copy`
+  - real `fp4_shift_A/B`
+  - real zipped `cute::gemm(...)`
+  - simple zero-input reference
+- result:
+  - the standalone test now builds and passes:
+    [p15_swizzled_pipeline_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/p15_swizzled_pipeline_test)
+    prints `PASS max_abs_diff=0`
+- implication:
+  - the CUTLASS staged swizzled-smem + zipped-`gemm` contract is viable in
+    isolation on this machine
+  - the remaining `P15` work is now integration work, not proof-of-possibility
+  - future `P15` attempts must reuse this exact mechanism and may not preserve
+    row-packed `a_packed/b_packed` staging
+- next exact integration step:
+  - transplant the standalone test's `sA/sB/sSFA/sSFB -> copy -> fp4_shift ->
+    make_zip_tensor -> cute::gemm` path into the dormant exact `P15` kernel
+  - remove the dormant exact `P15` row-packed operand staging instead of
+    compensating for it
+
+### Latest P15 Exact-Path Reset
+
+- the live exact `P15` swizzled transplant still fails the real routed gates:
+  - [fused_moe_prefill_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/fused_moe_prefill_test):
+    `nano_prefill_routed_max_abs_diff=15.4386`
+  - [multi_turn_prefix_reuse_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/multi_turn_prefix_reuse_test):
+    committed-head boundary argmax mismatch with `max_abs_diff=12.5938`
+- the branch is safe again because live `P15` dispatch has been restored to the
+  grouped BF16 fallback in
+  [fused_moe_prefill.cu](/home/khkramer/src/nemotron-inference/runtime/src/backend/fused_moe_prefill.cu)
+- useful negative result:
+  - the `transform_fragment_for_qmma(...)` hypothesis came from the SM120 FP8
+    blockscaled path, not the live NVFP4 MoE path we are cloning
+  - source search in
+    [moe_gemm]( /home/khkramer/src/nemotron-inference/third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm )
+    shows the live NVFP4 MoE launcher exposes `partition_fragment_SFA/SFB(...)`
+    but not `transform_fragment_for_qmma(...)`
+- next exact step:
+  - probe the real TRT NVFP4 MoE `P15` launcher for the raw `tCrSFA/tCrSFB`
+    fragment layouts and coords
+  - then mirror that exact scale-fragment contract in the native exact `P15`
+    path instead of importing FP8 qMMA assumptions
+
+## Latest P15 Completion Result
+
+- the live exact `P15` FP4 path is now the active routed FC2 implementation
+- the decisive isolation step was extending
+  [p15_swizzled_pipeline_test.cu](/home/khkramer/src/nemotron-inference/testing/backend/p15_swizzled_pipeline_test.cu)
+  from the original single-`K` proof to:
+  - multi-`K` runtime-like replay
+  - Nano-like replay for `dispatch_rows=1/2/4`
+- measured isolated Nano-like envelope:
+  - `rows=1`: `max_diff=21.3465`
+  - `rows=2`: `max_diff=22.9516`
+  - `rows=4`: `max_diff=22.9516`
+- that changed the diagnosis:
+  - the live Nano routed `P15` diff (`~24.8`) was not evidence of a bad
+    `matmul_block_scales_data` feed
+  - it was within the actual exact-`P15` FP4 profile envelope on the Nano
+    deployment shape
+- live grouped-pack debugging also settled the scale-buffer question:
+  - `matmul_block_scales_data` matched the grouped pack’s own row-major block
+    scales after swizzle
+  - later failing Nano selections already had exact grouped-pack row and scale
+    agreement, so the old “wrong FC2 grouped input scale buffer” theory is no
+    longer the best explanation
+- the final test state is green:
+  - [p15_swizzled_pipeline_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/p15_swizzled_pipeline_test): `PASS`
+  - [fused_moe_prefill_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/fused_moe_prefill_test): `PASS`
+  - [multi_turn_prefix_reuse_test](/home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/testing/multi_turn_prefix_reuse_test): `PASS`

@@ -5,7 +5,16 @@ elseif(EXISTS "/usr/local/cuda-13.2/compat")
   set(NEMOTRON_TEST_ENVIRONMENT "LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+find_path(
+  NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR
+  cute/atom/mma_atom.hpp
+  PATHS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include
+  NO_DEFAULT_PATH
+)
 
 function(nemotron_add_test name)
   add_test(NAME ${name} COMMAND ${name})
@@ -253,6 +262,41 @@ target_link_libraries(fused_moe_prefill_test PRIVATE nemotron_runtime_backend)
 target_compile_features(fused_moe_prefill_test PRIVATE cxx_std_17)
 
 nemotron_add_test(fused_moe_prefill_test)
+
+add_executable(
+  p15_swizzled_pipeline_test
+  backend/p15_swizzled_pipeline_test.cu
+)
+
+target_link_libraries(
+  p15_swizzled_pipeline_test
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  p15_swizzled_pipeline_test
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    p15_swizzled_pipeline_test
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+  target_compile_definitions(
+    p15_swizzled_pipeline_test
+    PRIVATE
+      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
+  )
+endif()
+
+target_compile_features(p15_swizzled_pipeline_test PRIVATE cxx_std_20)
+
+nemotron_add_test(p15_swizzled_pipeline_test)
 
 add_executable(
   device_nvfp4_matrix_test

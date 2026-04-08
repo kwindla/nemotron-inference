@@ -1,4 +1,5 @@
 #include "nemotron/fused_moe_prefill.h"
+#include "nemotron/p15_scale_runtime_helpers.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -256,6 +257,8 @@ using TracedP15SmemLayoutSFA = typename TracedP15CollectiveMainloop::SmemLayoutS
 using TracedP15SmemLayoutSFB = typename TracedP15CollectiveMainloop::SmemLayoutSFB;
 using TracedP15SmemCopyAtomA = typename TracedP15CollectiveMainloop::SmemCopyAtomA;
 using TracedP15SmemCopyAtomB = typename TracedP15CollectiveMainloop::SmemCopyAtomB;
+using TracedP15SmemCopyAtomSFA = typename TracedP15CollectiveMainloop::SmemCopyAtomSFA;
+using TracedP15SmemCopyAtomSFB = typename TracedP15CollectiveMainloop::SmemCopyAtomSFB;
 using TracedP15TensorStorage = typename TracedP15CollectiveMainloop::TensorStorage;
 // Definitive host-side probe facts from artifacts/tmp/trt_p15_runtime_layout_dump.cu:
 // - Stages == 6
@@ -1215,6 +1218,66 @@ enum class RoutedGemm2Profile {
   kP13_128x128x64_SwapTrue,
   kP15_256x128x64_SwapTrue,
 };
+
+struct P15ScaleTrace {
+  int valid = 0;
+  int row_start = -1;
+  int valid_rows = -1;
+  int output_row_base = -1;
+  int a_base_rows[4] = {-1, -1, -1, -1};
+  int b_base_rows[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  std::uint32_t a_source_words[4] = {0, 0, 0, 0};
+  std::uint32_t b_source_words[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  std::uint32_t a_fragment_words[4] = {0, 0, 0, 0};
+  std::uint32_t b_fragment_words[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+};
+
+__device__ __managed__ P15ScaleTrace g_p15_scale_trace;
+
+template <class ScaleAtomTensor>
+__device__ std::uint32_t PackP15ScaleFragmentWord(ScaleAtomTensor const& scale_atom) {
+  constexpr int kGroupSize = 16;
+  const auto raw0 = static_cast<std::uint8_t>(scale_atom(0).raw());
+  const auto raw1 = static_cast<std::uint8_t>(scale_atom(kGroupSize).raw());
+  const auto raw2 = static_cast<std::uint8_t>(scale_atom(2 * kGroupSize).raw());
+  const auto raw3 = static_cast<std::uint8_t>(scale_atom(3 * kGroupSize).raw());
+  return static_cast<std::uint32_t>(raw0) |
+         (static_cast<std::uint32_t>(raw1) << 8) |
+         (static_cast<std::uint32_t>(raw2) << 16) |
+         (static_cast<std::uint32_t>(raw3) << 24);
+}
+
+void PrintP15ScaleTrace() {
+  const auto& trace = g_p15_scale_trace;
+  if (trace.valid == 0) {
+    std::fprintf(stderr, "p15_scale_trace: invalid\n");
+    return;
+  }
+  std::fprintf(
+      stderr,
+      "p15_scale_trace: row_start=%d valid_rows=%d output_row_base=%d\n",
+      trace.row_start,
+      trace.valid_rows,
+      trace.output_row_base);
+  for (int i = 0; i < 4; ++i) {
+    std::fprintf(
+        stderr,
+        "p15_scale_trace: A m=%d base_row=%d source=0x%08x fragment=0x%08x\n",
+        i,
+        trace.a_base_rows[i],
+        trace.a_source_words[i],
+        trace.a_fragment_words[i]);
+  }
+  for (int i = 0; i < 8; ++i) {
+    std::fprintf(
+        stderr,
+        "p15_scale_trace: B n=%d base_row=%d source=0x%08x fragment=0x%08x\n",
+        i,
+        trace.b_base_rows[i],
+        trace.b_source_words[i],
+        trace.b_fragment_words[i]);
+  }
+}
 
 bool CheckCuda(cudaError_t status) {
   if (status != cudaSuccess && std::getenv("NEMOTRON_ROUTED_PROFILE_DEBUG") != nullptr) {
@@ -5199,6 +5262,7 @@ template <typename OutputType>
 __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15(
     const std::uint8_t* packed_input,
     const std::uint8_t* input_block_scales,
+    Nvfp4ScaleLayout input_scale_layout,
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
@@ -5216,14 +5280,22 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
   constexpr int kFp4ConsumerWarps = cute::size(nvfp4_bridge::TracedP15TiledMma{}) / 32;
   // Flat row-major staging remains only as the source buffer for swizzled P15 staging.
   __shared__ std::uint8_t a_packed[kOutputTile][64 / 2];
-  __shared__ std::uint8_t a_scale_smem[nvfp4_bridge::kTracedP15ScaleSmemCosizeA];
+  __shared__ alignas(1024) cute::array_aligned<
+      nvfp4_cute::ElementSFCompute,
+      nvfp4_bridge::kTracedP15ScaleSmemCosizeA>
+      a_scale_smem_storage;
   static_assert(kAtomTokenRows == 32);
   __shared__ std::uint8_t b_packed[kProfileTokenRows][64 / 2];
-  __shared__ std::uint8_t b_scale_smem[nvfp4_bridge::kTracedP15ScaleSmemCosizeB];
+  __shared__ alignas(1024) cute::array_aligned<
+      nvfp4_cute::ElementSFCompute,
+      nvfp4_bridge::kTracedP15ScaleSmemCosizeB>
+      b_scale_smem_storage;
   const auto a_tile_view =
       nvfp4_bridge::MakePackedTile64<kOutputTile>(&a_packed[0][0], nullptr);
   const auto b_tile_view =
       nvfp4_bridge::MakePackedTile64<kProfileTokenRows>(&b_packed[0][0], nullptr);
+  auto* a_scale_smem = a_scale_smem_storage.data();
+  auto* b_scale_smem = b_scale_smem_storage.data();
   // Additional swizzled smem for the CUTE copy pipeline (single-stage).
   using P15SmemAllocA = typename nvfp4_bridge::TracedP15TiledMma::ValTypeA;
   using P15SmemAllocB = typename nvfp4_bridge::TracedP15TiledMma::ValTypeB;
@@ -5292,9 +5364,13 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
 
     // Stage A/B data into flat row-major smem and fill scale smem.
     auto a_scale_tensor =
-        cute::make_tensor(cute::make_smem_ptr(&a_scale_smem[0]), nvfp4_bridge::TracedP15SmemLayoutSFA{});
+        cute::make_tensor(
+            cute::make_smem_ptr(a_scale_smem),
+            nvfp4_bridge::TracedP15SmemLayoutSFA{});
     auto b_scale_tensor =
-        cute::make_tensor(cute::make_smem_ptr(&b_scale_smem[0]), nvfp4_bridge::TracedP15SmemLayoutSFB{});
+        cute::make_tensor(
+            cute::make_smem_ptr(b_scale_smem),
+            nvfp4_bridge::TracedP15SmemLayoutSFB{});
     for (int row = tid; row < kOutputTile; row += blockDim.x) {
       if (row < output_rows_this_tile) {
         const std::size_t source_row = static_cast<std::size_t>(output_row_base + row);
@@ -5310,7 +5386,7 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
             block_base,
             padded_blocks_per_row,
             Nvfp4ScaleLayout::kSwizzled128x4);
-        nvfp4_bridge::StoreTracedP5ScaleWordK64(a_scale_tensor, a_sw, row);
+        p15_scale_runtime::store_scale_word_k64(a_scale_tensor, a_sw, row);
       } else {
         nvfp4_bridge::ZeroRow(a_tile_view, row);
         nvfp4_bridge::ZeroTracedP5ScaleRow(a_scale_tensor, row);
@@ -5325,13 +5401,13 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
         for (int byte_index = 0; byte_index < (64 / 2); ++byte_index) {
           dst[byte_index] = packed_input[src_offset + static_cast<std::size_t>(byte_index)];
         }
-        const std::size_t scale_offset = source_row * blocks_per_row + block_base;
-        const std::uint32_t b_sw = PackScaleWord4(
-            input_block_scales[scale_offset + 0u],
-            input_block_scales[scale_offset + 1u],
-            input_block_scales[scale_offset + 2u],
-            input_block_scales[scale_offset + 3u]);
-        nvfp4_bridge::StoreTracedP5ScaleWordK64(b_scale_tensor, b_sw, row);
+        const std::uint32_t b_sw = LoadExecutionScaleWord(
+            input_block_scales,
+            source_row,
+            block_base,
+            padded_blocks_per_row,
+            input_scale_layout);
+        p15_scale_runtime::store_scale_word_k64(b_scale_tensor, b_sw, row);
       } else {
         nvfp4_bridge::ZeroRow(b_tile_view, row);
         nvfp4_bridge::ZeroTracedP5ScaleRow(b_scale_tensor, row);
@@ -5376,15 +5452,22 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
         using P15SmemCopyAtomA = nvfp4_bridge::TracedP15SmemCopyAtomA;
         using P15SmemCopyAtomB = nvfp4_bridge::TracedP15SmemCopyAtomB;
         using P15MMAOp = typename P15TiledMma::MMA_Op;
-        using ElementSFCompute = nvfp4_cute::ElementSFCompute;
 
         // Swizzled smem tensors (using smem_swizzled_a/b from shared storage)
         auto sA_ = cute::make_tensor(
             cute::make_smem_ptr(smem_swizzled_a), P15SmemLayoutA{});
         auto sB_ = cute::make_tensor(
             cute::make_smem_ptr(smem_swizzled_b), P15SmemLayoutB{});
+        auto sSFA = cute::make_tensor(
+            cute::make_smem_ptr(a_scale_smem),
+            nvfp4_bridge::TracedP15SmemLayoutSFA{});
+        auto sSFB = cute::make_tensor(
+            cute::make_smem_ptr(b_scale_smem),
+            nvfp4_bridge::TracedP15SmemLayoutSFB{});
         auto sA = cute::as_position_independent_swizzle_tensor(sA_);
         auto sB = cute::as_position_independent_swizzle_tensor(sB_);
+        auto sScaleA = cute::as_position_independent_swizzle_tensor(sSFA);
+        auto sScaleB = cute::as_position_independent_swizzle_tensor(sSFB);
 
         P15TiledMma tiled_mma;
         const int thread_id = warp_id * 32 + lane_id;
@@ -5393,6 +5476,10 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
         // Register fragments from swizzled smem
         auto tCrA = thread_mma.partition_fragment_A(sA(cute::_, cute::_, cute::Int<0>{}));
         auto tCrB = thread_mma.partition_fragment_B(sB(cute::_, cute::_, cute::Int<0>{}));
+        auto tCrSFA = nvfp4_bridge::TracedP15CollectiveMainloop{}.partition_fragment_SFA(
+            sSFA(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+        auto tCrSFB = nvfp4_bridge::TracedP15CollectiveMainloop{}.partition_fragment_SFB(
+            sSFB(cute::_, cute::_, cute::Int<0>{}), thread_mma);
 
         // Copy atoms: smem -> register
         auto s2r_copy_A = cute::make_tiled_copy_A(P15SmemCopyAtomA{}, tiled_mma);
@@ -5405,15 +5492,37 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
         auto tCsB = s2r_thr_B.partition_S(sB);
         auto tCrB_cv = s2r_thr_B.retile_D(tCrB);
 
+        auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+        auto s2r_copy_SFA = cute::make_tiled_copy_impl(
+            nvfp4_bridge::TracedP15SmemCopyAtomSFA{},
+            nvfp4_bridge::GetTracedP15LayoutSFATV(tiled_mma),
+            cute::make_shape(cute::size<0>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+        auto s2r_thr_SFA = s2r_copy_SFA.get_thread_slice(thread_id);
+        auto tCsSFA = s2r_thr_SFA.partition_S(sScaleA);
+        auto tCrSFA_cv = s2r_thr_SFA.retile_D(tCrSFA);
+
+        auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+            nvfp4_bridge::TracedP15SmemCopyAtomSFB{},
+            nvfp4_bridge::GetTracedP15LayoutSFBTV(tiled_mma),
+            cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+        auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(thread_id);
+        auto tCsSFB = s2r_thr_SFB.partition_S(sScaleB);
+        auto tCrSFB_cv = s2r_thr_SFB.retile_D(tCrSFB);
+
         // Accumulator
         auto accum_tensor = cute::make_tensor(
             reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
             cute::partition_fragment_C(tiled_mma,
                 cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{})).layout());
+        auto dense_c = cute::make_identity_tensor(
+            cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}));
+        auto part_c = thread_mma.partition_C(dense_c);
 
         // Copy operands: smem -> register (stage 0)
         cute::copy(s2r_copy_A, tCsA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrA_cv);
         cute::copy(s2r_copy_B, tCsB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrB_cv);
+        cute::copy(tCsSFA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFA_cv);
+        cute::copy(tCsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_cv);
 
         // FP4 shift
         for (int k = 0; k < cute::size<2>(tCrA_cv); ++k) {
@@ -5421,10 +5530,47 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
           cute::fp4_shift_B(P15MMAOp{}, tCrB_cv(cute::_, cute::_, k));
         }
 
+        if (cta_index == 0 &&
+            blockIdx.x == 0 &&
+            block_base == 0 &&
+            thread_id == 0) {
+          g_p15_scale_trace.valid = 1;
+          g_p15_scale_trace.row_start = row_start;
+          g_p15_scale_trace.valid_rows = valid_rows;
+          g_p15_scale_trace.output_row_base = output_row_base;
+          constexpr int M_tiles = cute::size<1>(decltype(tCrA){});
+          constexpr int N_tiles = cute::size<1>(decltype(tCrB){});
+          for (int m = 0; m < M_tiles; ++m) {
+            auto c_atom_coords = part_c(cute::_, m, 0);
+            auto coord0 = c_atom_coords(0);
+            const int a_base_row = static_cast<int>(cute::get<0>(coord0));
+            g_p15_scale_trace.a_base_rows[m] = a_base_row;
+            g_p15_scale_trace.a_source_words[m] = LoadExecutionScaleWord(
+                weight.matmul_block_scales_data,
+                static_cast<std::size_t>(output_row_base + a_base_row),
+                block_base,
+                padded_blocks_per_row,
+                Nvfp4ScaleLayout::kSwizzled128x4);
+            g_p15_scale_trace.a_fragment_words[m] =
+                PackP15ScaleFragmentWord(tCrSFA(cute::_, m, 0));
+          }
+          for (int n = 0; n < N_tiles; ++n) {
+            auto c_atom_coords = part_c(cute::_, 0, n);
+            auto coord0 = c_atom_coords(0);
+            const int b_base_row = static_cast<int>(cute::get<1>(coord0));
+            g_p15_scale_trace.b_base_rows[n] = b_base_row;
+            g_p15_scale_trace.b_source_words[n] = LoadExecutionScaleWord(
+                input_block_scales,
+                static_cast<std::size_t>(row_start + b_base_row),
+                block_base,
+                padded_blocks_per_row,
+                input_scale_layout);
+            g_p15_scale_trace.b_fragment_words[n] =
+                PackP15ScaleFragmentWord(tCrSFB(cute::_, n, 0));
+          }
+        }
+
         // Atom-level zipped GEMM with real per-row scale words.
-        using SFAtomLayout = cute::Layout<
-            cute::Shape<cute::Shape<cute::_16, cute::_4>>,
-            cute::Stride<cute::Stride<cute::_0, cute::_1>>>;
         constexpr int M_tiles = cute::size<1>(decltype(tCrA){});
         constexpr int N_tiles = cute::size<1>(decltype(tCrB){});
         constexpr int K_blocks = cute::size<2>(decltype(tCrA){});
@@ -5436,15 +5582,8 @@ __global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp
               auto a_atom = tCrA(cute::_, m, k);
               auto b_atom = tCrB(cute::_, n, k);
               auto c_atom = accum_tensor(cute::_, m, n);
-
-              // Use identity scales for now to isolate the correctness issue.
-              // TODO: once the pipeline is fully proven, load real per-row scales.
-              auto sfa_reg = std::uint32_t{0x38383838u};
-              auto sfb_reg = std::uint32_t{0x38383838u};
-              auto sfa_atom = cute::make_tensor(
-                  reinterpret_cast<ElementSFCompute*>(&sfa_reg), SFAtomLayout{});
-              auto sfb_atom = cute::make_tensor(
-                  reinterpret_cast<ElementSFCompute*>(&sfb_reg), SFAtomLayout{});
+              auto sfa_atom = tCrSFA(cute::_, m, k);
+              auto sfb_atom = tCrSFB(cute::_, n, k);
 
               auto a_zipped = cute::make_zip_tensor(a_atom, sfa_atom);
               auto b_zipped = cute::make_zip_tensor(b_atom, sfb_atom);
@@ -7463,9 +7602,13 @@ bool LaunchPlannedPackedInputMatVec(
             output);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm2Profile::kP15_256x128x64_SwapTrue:
-        Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15<float><<<grid, block>>>(
+        if (std::getenv("NEMOTRON_P15_SCALE_DEBUG") != nullptr) {
+          g_p15_scale_trace = {};
+        }
+        Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15<float><<<grid, dim3(256)>>>(
             input_pack.packed_data(),
-            input_pack.block_scales_data(),
+            input_pack.matmul_block_scales_data(),
+            input_pack.scale_layout(),
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
@@ -7476,7 +7619,16 @@ bool LaunchPlannedPackedInputMatVec(
             weights,
             output_rows_per_expert,
             output);
-        return CheckCuda(cudaGetLastError());
+        if (!CheckCuda(cudaGetLastError())) {
+          return false;
+        }
+        if (std::getenv("NEMOTRON_P15_SCALE_DEBUG") != nullptr) {
+          if (!CheckCuda(cudaDeviceSynchronize())) {
+            return false;
+          }
+          PrintP15ScaleTrace();
+        }
+        return true;
       case RoutedGemm2Profile::kLegacy:
         break;
     }
@@ -8095,6 +8247,9 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
             gemm1_output,
             activation_output_scale
         ) ||
+        !LaunchZeroBuffer(
+            params.routed_gather_scratch,
+            params.launch_plan->padded_row_capacity() * params.hidden_size) ||
         !LaunchPlannedPackedInputMatVec(
             *gemm1_output,
             nullptr,
