@@ -8,6 +8,56 @@ Recover from the current custom-MoE-prefill regression, validate that the new
 device-side contract is still the right architectural direction, and then push
 past the best pre-refactor TTFT numbers.
 
+## Routed FP4 Update (2026-04-08)
+
+The unified swizzled `P5` path is now the default routed FC1 profile.
+
+What landed:
+- standalone
+  `testing/backend/p5_swizzled_pipeline_test.cu` now proves the `P5`
+  swizzled-smem + CUTE copy + atom-level zipped MMA path in isolation for the
+  real low-row shape and Nano-like `K=1344`
+- routed `P5` default dispatch now uses the unified swizzled FP4 kernel
+- the focused TTFT smoke cases are now registered in `ctest`
+
+Focused validation:
+- `fused_moe_prefill_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+- targeted `ctest` over:
+  - `fused_moe_prefill_test`
+  - `p5_swizzled_pipeline_test`
+  - `multi_turn_prefix_reuse_test`
+  - `nano_prefix_cache_ttft_prefix128_tail4_smoke`
+  - `nano_prefix_cache_ttft_prefix256_tail128_committed_smoke`
+  - `nano_prefix_cache_ttft_prefix256_tail128_global_root_smoke`
+  - result: `6/6` passed
+
+Current TTFT smoke results on the live default unified `P5` path:
+- `prefix128 / tail4`
+  - `cold_prefill_prefix128 = 161.579 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 63.801 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix = 63.917 ms`
+- `prefix256 / tail128`
+  - `cached_committed_head_prefix256_tail128 hot-prefix = 165.190 ms`
+  - `cached_global_root_prefix256_tail128 hot-prefix = 165.499 ms`
+
+Measured gain versus the previous default exact `P5` path:
+- `prefix128 / tail4`
+  - cold prefill: `256.344 -> 161.579 ms`
+  - committed-head hot-prefix: `73.566 -> 63.801 ms`
+  - global-root hot-prefix: `73.975 -> 63.917 ms`
+- `prefix256 / tail128`
+  - committed-head hot-prefix: `267.605 -> 165.190 ms`
+  - global-root hot-prefix: `263.181 -> 165.499 ms`
+
+Interpretation:
+- the old exact `P5` path was a major source of the current TTFT regression
+- the unified swizzled `P5` path is the right replacement and should remain
+  the live default
+- the remaining cold-TTFT gap versus older `~120 ms prefix128` checkpoints is
+  no longer just a `P5` issue, so the next step should shift to the remaining
+  routed FP4 kernels / broader prefill overhead
+
 ## Current Priority: Prefill Optimization
 
 The contract work is now good enough to treat as fixed for this phase:

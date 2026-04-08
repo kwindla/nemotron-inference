@@ -299,6 +299,41 @@ target_compile_features(p15_swizzled_pipeline_test PRIVATE cxx_std_20)
 nemotron_add_test(p15_swizzled_pipeline_test)
 
 add_executable(
+  p5_swizzled_pipeline_test
+  backend/p5_swizzled_pipeline_test.cu
+)
+
+target_link_libraries(
+  p5_swizzled_pipeline_test
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  p5_swizzled_pipeline_test
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    p5_swizzled_pipeline_test
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+  target_compile_definitions(
+    p5_swizzled_pipeline_test
+    PRIVATE
+      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
+  )
+endif()
+
+target_compile_features(p5_swizzled_pipeline_test PRIVATE cxx_std_20)
+
+nemotron_add_test(p5_swizzled_pipeline_test)
+
+add_executable(
   device_nvfp4_matrix_test
   backend/device_nvfp4_matrix_test.cpp
 )

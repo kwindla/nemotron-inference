@@ -18,6 +18,55 @@ log / artifact bundle for the recovery work:
 
 ## Canonical Update (2026-04-06)
 
+## Routed FP4 Update (2026-04-08)
+
+The unified swizzled FP4 `P5` path is now the default routed FC1 profile.
+
+What changed:
+- added standalone
+  `testing/backend/p5_swizzled_pipeline_test.cu` to prove the same swizzled
+  operand path that finally resolved `P15`
+- switched default routed `P5` dispatch from the older exact FP4 kernel to the
+  unified swizzled FP4 kernel after the standalone test and the live focused
+  gates all passed
+- added TTFT smoke tests for:
+  - `prefix128 / tail4`
+  - `prefix256 / tail128` committed-head
+  - `prefix256 / tail128` global-root
+
+Current focused validation:
+- `fused_moe_prefill_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+- targeted `ctest` over the two focused integration tests, the standalone
+  `p5_swizzled_pipeline_test`, and the three TTFT smoke tests: `6/6` passed
+
+Current TTFT smoke results on the live default unified `P5` path:
+- `prefix128 / tail4`
+  - `cold_prefill_prefix128 = 161.579 ms`
+  - `cached_committed_head_prefix128_tail4 hot-prefix = 63.801 ms`
+  - `cached_global_root_prefix128_tail4 hot-prefix = 63.917 ms`
+- `prefix256 / tail128`
+  - `cached_committed_head_prefix256_tail128 hot-prefix = 165.190 ms`
+  - `cached_global_root_prefix256_tail128 hot-prefix = 165.499 ms`
+
+Measured benefit versus the immediately previous default exact `P5` path:
+- `prefix128 / tail4`
+  - cold prefill: `256.344 -> 161.579 ms`
+  - committed-head hot-prefix: `73.566 -> 63.801 ms`
+  - global-root hot-prefix: `73.975 -> 63.917 ms`
+- `prefix256 / tail128`
+  - committed-head hot-prefix: `267.605 -> 165.190 ms`
+  - global-root hot-prefix: `263.181 -> 165.499 ms`
+
+Interpretation:
+- unified `P5` is now clearly better than the old exact `P5` on the production
+  TTFT smoke regimes, so keeping the old exact `P5` path as the default no
+  longer makes sense
+- the cold-TTFT gap versus the older `~120 ms prefix128` checkpoints remains,
+  so the remaining regression is broader than `P5` alone
+- next optimization work should treat `P5` as landed and move on to the
+  remaining routed FP4 kernels / broader prefill overhead
+
 ### Current Objective
 
 The target is no longer just "recover the old native baseline." The target is:
