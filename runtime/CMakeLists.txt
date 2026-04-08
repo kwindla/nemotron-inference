@@ -8,6 +8,15 @@ find_path(
   NO_DEFAULT_PATH
 )
 
+if(NOT NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR)
+  message(
+    FATAL_ERROR
+    "nemotron_runtime_backend now requires the local CUTLASS/CUTE snapshot for the live P15 "
+    "exact FP4 path. Expected cute/atom/mma_atom.hpp under "
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.venv-trtllm/lib/python3.12/site-packages/flashinfer/data/cutlass/include"
+  )
+endif()
+
 set(NEMOTRON_CUDNN_FRONTEND_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cudnn-frontend/include")
 find_path(
   NEMOTRON_CUDNN_INCLUDE_DIR
@@ -179,18 +188,16 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-if(NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR)
-  target_include_directories(
-    nemotron_runtime_backend
-    PRIVATE
-      ${NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR}
-  )
-  target_compile_definitions(
-    nemotron_runtime_backend
-    PRIVATE
-      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
-  )
-endif()
+target_include_directories(
+  nemotron_runtime_backend
+  PRIVATE
+    ${NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR}
+)
+target_compile_definitions(
+  nemotron_runtime_backend
+  PRIVATE
+    NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
+)
 
 if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   target_include_directories(

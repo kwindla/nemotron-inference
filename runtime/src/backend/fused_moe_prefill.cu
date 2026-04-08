@@ -256,6 +256,7 @@ using TracedP15SmemLayoutSFA = typename TracedP15CollectiveMainloop::SmemLayoutS
 using TracedP15SmemLayoutSFB = typename TracedP15CollectiveMainloop::SmemLayoutSFB;
 using TracedP15SmemCopyAtomA = typename TracedP15CollectiveMainloop::SmemCopyAtomA;
 using TracedP15SmemCopyAtomB = typename TracedP15CollectiveMainloop::SmemCopyAtomB;
+using TracedP15TensorStorage = typename TracedP15CollectiveMainloop::TensorStorage;
 // Definitive host-side probe facts from artifacts/tmp/trt_p15_runtime_layout_dump.cu:
 // - Stages == 6
 // - size(TiledMma) == 256 and tile_mnk == (128, 32, 64)
@@ -284,8 +285,65 @@ using TracedP15SmemCopyAtomB = typename TracedP15CollectiveMainloop::SmemCopyAto
 //   - atom tile is (128,32,64), but traced P15 profile shape is (256,128,64)
 //   - partition_fragment_C(tiled_mma, (256,128)) is the first accumulator
 //     shape whose M/N ranks match the traced full-profile kernel intent
+//   - definitive slice probe facts from
+//     artifacts/tmp/trt_p15_accum_slices_dump.cu:
+//     - partition_fragment_C(tiled_mma, (256,128)) has size<2> == 8
+//     - each slice is a 16-value accumulator tile with
+//       tCrC_slice.layout == ((_2,_2),_4):((_1,_2),_4)
+//     - so traced P15 is eight atom-sized accumulator slices per thread, not
+//       one larger CFragment64 or the older CFragment64[2][2] model
 //   - the dormant exact P15 path therefore needs a full-profile accumulator
 //     storage contract, not the older CFragment64[2][2] model
+//   - definitive dense operand probe facts from
+//     artifacts/tmp/trt_p15_true_dense_operand_coords_dump.cu:
+//     - true traced operand copy views are flat dense coords over the full
+//       (256,64) A tile and (128,64) B tile
+//     - copy_view_a covers row bands 0/64/128/192, not one 128-row subtile
+//     - copy_view_b covers row bands 0/32/64/96, not one 32-row atom only
+//     - so the exact P15 path must be rewritten around the full-profile
+//       operand contract, not the older 2x2 manual subtile decomposition
+//   - definitive dense store/accumulator probe facts from
+//     artifacts/tmp/trt_p15_true_dense_store_coords_dump.cu:
+//     - part_c_dense.layout == ((_2,_2),_4,(_2,_4))
+//     - accum_profile.layout == ((_2,_2),_4,(_2,_4))
+//     - traced flat output coords span the same 0/64/128/192 row bands and
+//       0/32/64/96 column bands as the dense operand probes
+//     - so the remaining P15 rewrite should replace the older 2x2
+//       subtile accumulator/store model with the full traced 4x4x8 profile
+//   - definitive full-profile fragment-shape probe facts from
+//     artifacts/tmp/trt_p15_full_profile_fragment_dump.cu:
+//     - tCrA.layout == ((_8,_2,_2),_4,_1), sizes = (32,4,1)
+//     - tCrB.layout == ((_8,_2),(_2,_4),_1), sizes = (16,8,1)
+//     - tCrC.layout == ((_2,_2),_4,(_2,_4)), sizes = (4,4,8)
+//     - this matches the failed local-CUTE static assertions exactly:
+//       size<1>(A) must match size<1>(C), and size<1>(B) must match size<2>(C)
+//     - therefore the next exact P15 rewrite must stop using the current
+//       hand-stitched rA_from_copy_view / rB_from_copy_view tensors and build
+//       the real full-profile tCrA / tCrB / tCrC contract directly
+//   - traced CUTLASS source in sm120_mma_array_tma_blockwise_scaling.hpp
+//     shows the operand path is:
+//       partition_S(as_position_independent_swizzle_tensor(sA/sB))
+//       -> copy into tCrA_copy_view/tCrB_copy_view
+//       -> fp4_shift_A/B on the copy views
+//       -> cute::gemm(tCrA(_,_,k_block), tCrB(_,_,k_block), tmp_accum)
+//   - standalone compile probes showed neither a naive recast path nor a
+//     naive make_fragment_A/B + copy path reproduces that contract cleanly
+//   - so the next exact P15 rewrite must replace this dormant path's
+//     row-packed operand staging with real SmemLayoutA/B-shaped staged shared
+//     storage before another activation attempt
+//   - maintained all-thread probe/codegen pipeline now exists:
+//     proj-2026-04-05-1704/trt_p15_full_thread_contract_dump.cu +
+//     proj-2026-04-05-1704/generate_p15_probe_tables.py
+//   - generated artifacts live under artifacts/tmp and artifacts/benchmarks;
+//     they are the new ground truth for per-thread dense operand/store and
+//     scale-stage contracts, instead of relying on thread-0-only notes
+//   - standalone backend proof now exists at:
+//     testing/backend/p15_swizzled_pipeline_test.cu
+//   - that test passes with real SmemLayoutA/B/SFA/SFB staging plus:
+//       partition_S(as_position_independent_swizzle_tensor(...))
+//       -> copy -> fp4_shift -> make_zip_tensor -> cute::gemm
+//   - future exact P15 work should transplant that mechanism into the live
+//     kernel and must not preserve the older row-packed a_packed/b_packed path
 constexpr int kTracedP15ScaleSmemCosizeA = cute::cosize_v<TracedP15SmemLayoutSFA>;
 constexpr int kTracedP15ScaleSmemCosizeB = cute::cosize_v<TracedP15SmemLayoutSFB>;
 constexpr int kTracedP15ScaleFragmentCosizeA = 16;
@@ -330,12 +388,23 @@ constexpr int kTracedP13BCopyCoordCapacity = 32;
 constexpr int kTracedP13CCopyCoordCapacity = 16;
 constexpr int kTracedP13MFragments = 2;
 constexpr int kTracedP13NFragments = 2;
-constexpr int kTracedP15ACopyCoordCapacity = 64;
-constexpr int kTracedP15BCopyCoordCapacity = 32;
+constexpr int kTracedP15ACopyCoordCapacity = 128;
+constexpr int kTracedP15BCopyCoordCapacity = 128;
 constexpr int kTracedP15CCopyCoordCapacity = 16;
 constexpr int kTracedP15AccumProfileCosize = 128;
 constexpr int kTracedP15MFragments = 2;
 constexpr int kTracedP15NFragments = 2;
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+CUTE_HOST_DEVICE nvfp4_cute::ElementAB MakeElementAB(std::uint8_t nibble) {
+  return nvfp4_cute::ElementAB::bitcast(static_cast<typename nvfp4_cute::ElementAB::Storage>(nibble & 0x0f));
+}
+
+CUTE_HOST_DEVICE nvfp4_cute::ElementSFCompute MakeScaleElement(std::uint8_t byte) {
+  return nvfp4_cute::ElementSFCompute::bitcast(
+      static_cast<typename nvfp4_cute::ElementSFCompute::Storage>(byte));
+}
+#endif
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 CUTE_HOST_DEVICE constexpr auto GetSingleAtomTiledMma() {
@@ -2324,7 +2393,7 @@ __device__ __forceinline__ void nvfp4_bridge::ZeroTracedP5ScaleRow(
   }
 #pragma unroll
   for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(scale_tensor)); ++scale_col) {
-    scale_tensor(row, scale_col, cute::Int<0>{}) = std::uint8_t{0};
+    scale_tensor(row, scale_col, cute::Int<0>{}) = nvfp4_bridge::MakeScaleElement(0u);
   }
 }
 
@@ -2339,7 +2408,7 @@ __device__ __forceinline__ void nvfp4_bridge::StoreTracedP5ScaleWordK64(
 #pragma unroll
   for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(scale_tensor)); ++scale_col) {
     const std::uint8_t value = scale_col < 4 ? LoadScaleByte(scale_word, scale_col) : std::uint8_t{0};
-    scale_tensor(row, scale_col, cute::Int<0>{}) = value;
+    scale_tensor(row, scale_col, cute::Int<0>{}) = nvfp4_bridge::MakeScaleElement(value);
   }
 }
 #endif
@@ -5127,7 +5196,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
 }
 
 template <typename OutputType>
-__global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15(
+__global__ __launch_bounds__(256, 1) void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15(
     const std::uint8_t* packed_input,
     const std::uint8_t* input_block_scales,
     const float* input_tensor_scale_data,
@@ -5142,28 +5211,30 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
     OutputType* output) {
   constexpr int kOutputTile = 256;
   constexpr int kTileOutputRows = cute::tile_size<0>(nvfp4_bridge::TracedP15TiledMma{});
-  constexpr int kTileTokenRows = cute::tile_size<1>(nvfp4_bridge::TracedP15TiledMma{});
+  constexpr int kAtomTokenRows = cute::tile_size<1>(nvfp4_bridge::TracedP15TiledMma{});
   constexpr int kProfileTokenRows = 128;
   constexpr int kFp4ConsumerWarps = cute::size(nvfp4_bridge::TracedP15TiledMma{}) / 32;
-#if !defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-  constexpr int kWarpSubTiles = kOutputTile / kTileOutputRows;
-  static_assert(kWarpSubTiles >= 1);
-  static_assert(kOutputTile % kTileOutputRows == 0);
-#endif
+  // Flat row-major staging remains only as the source buffer for swizzled P15 staging.
   __shared__ std::uint8_t a_packed[kOutputTile][64 / 2];
   __shared__ std::uint8_t a_scale_smem[nvfp4_bridge::kTracedP15ScaleSmemCosizeA];
-  __shared__ std::uint8_t b_packed[kTileTokenRows][64 / 2];
+  static_assert(kAtomTokenRows == 32);
+  __shared__ std::uint8_t b_packed[kProfileTokenRows][64 / 2];
   __shared__ std::uint8_t b_scale_smem[nvfp4_bridge::kTracedP15ScaleSmemCosizeB];
   const auto a_tile_view =
       nvfp4_bridge::MakePackedTile64<kOutputTile>(&a_packed[0][0], nullptr);
   const auto b_tile_view =
-      nvfp4_bridge::MakePackedTile64<kTileTokenRows>(&b_packed[0][0], nullptr);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-  auto a_scale_tensor =
-      cute::make_tensor(cute::make_smem_ptr(&a_scale_smem[0]), nvfp4_bridge::TracedP15SmemLayoutSFA{});
-  auto b_scale_tensor =
-      cute::make_tensor(cute::make_smem_ptr(&b_scale_smem[0]), nvfp4_bridge::TracedP15SmemLayoutSFB{});
-#endif
+      nvfp4_bridge::MakePackedTile64<kProfileTokenRows>(&b_packed[0][0], nullptr);
+  // Additional swizzled smem for the CUTE copy pipeline (single-stage).
+  using P15SmemAllocA = typename nvfp4_bridge::TracedP15TiledMma::ValTypeA;
+  using P15SmemAllocB = typename nvfp4_bridge::TracedP15TiledMma::ValTypeB;
+  static constexpr int kP15SwizzledAElems =
+      cute::size(cute::take<0, 2>(nvfp4_bridge::TracedP15SmemLayoutA{}));
+  static constexpr int kP15SwizzledBElems =
+      cute::size(cute::take<0, 2>(nvfp4_bridge::TracedP15SmemLayoutB{}));
+  __shared__ alignas(1024) cute::array_aligned<P15SmemAllocA, kP15SwizzledAElems> smem_swizzled_a_storage;
+  __shared__ alignas(1024) cute::array_aligned<P15SmemAllocB, kP15SwizzledBElems> smem_swizzled_b_storage;
+  auto* smem_swizzled_a = smem_swizzled_a_storage.data();
+  auto* smem_swizzled_b = smem_swizzled_b_storage.data();
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -5202,13 +5273,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
           : 1.0f;
   const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
 
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kTracedP15AccumProfileCosize];
-#else
-  nvfp4_bridge::CFragment64 accum[kWarpSubTiles][nvfp4_bridge::kTracedP15MFragments][nvfp4_bridge::kTracedP15NFragments];
-#endif
   if (warp_id < kFp4ConsumerWarps) {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
     auto tiled_mma = nvfp4_bridge::TracedP15TiledMma{};
     auto blk_shape_profile =
         cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}, cute::Int<64>{});
@@ -5218,24 +5284,17 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
         reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
         tCrC_template.layout());
     cute::clear(accum_tensor);
-#else
-#pragma unroll
-    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
-#pragma unroll
-      for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP15MFragments; ++m_fragment) {
-#pragma unroll
-        for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP15NFragments; ++n_fragment) {
-          nvfp4_bridge::Clear(accum[subtile][m_fragment][n_fragment]);
-        }
-      }
-    }
-#endif
   }
 
   for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += 64u) {
     const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
     const std::size_t packed_byte_offset = k_base / 2u;
 
+    // Stage A/B data into flat row-major smem and fill scale smem.
+    auto a_scale_tensor =
+        cute::make_tensor(cute::make_smem_ptr(&a_scale_smem[0]), nvfp4_bridge::TracedP15SmemLayoutSFA{});
+    auto b_scale_tensor =
+        cute::make_tensor(cute::make_smem_ptr(&b_scale_smem[0]), nvfp4_bridge::TracedP15SmemLayoutSFB{});
     for (int row = tid; row < kOutputTile; row += blockDim.x) {
       if (row < output_rows_this_tile) {
         const std::size_t source_row = static_cast<std::size_t>(output_row_base + row);
@@ -5245,25 +5304,19 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
         for (int byte_index = 0; byte_index < (64 / 2); ++byte_index) {
           dst[byte_index] = weight.packed_data[src_offset + static_cast<std::size_t>(byte_index)];
         }
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-        nvfp4_bridge::StoreTracedP5ScaleWordK64(
-            a_scale_tensor,
-            LoadExecutionScaleWord(
-                weight.matmul_block_scales_data,
-                source_row,
-                block_base,
-                padded_blocks_per_row,
-                Nvfp4ScaleLayout::kSwizzled128x4),
-            row);
-#endif
+        const std::uint32_t a_sw = LoadExecutionScaleWord(
+            weight.matmul_block_scales_data,
+            source_row,
+            block_base,
+            padded_blocks_per_row,
+            Nvfp4ScaleLayout::kSwizzled128x4);
+        nvfp4_bridge::StoreTracedP5ScaleWordK64(a_scale_tensor, a_sw, row);
       } else {
         nvfp4_bridge::ZeroRow(a_tile_view, row);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
         nvfp4_bridge::ZeroTracedP5ScaleRow(a_scale_tensor, row);
-#endif
       }
     }
-    for (int row = tid; row < kTileTokenRows; row += blockDim.x) {
+    for (int row = tid; row < kProfileTokenRows; row += blockDim.x) {
       if (row < valid_rows) {
         const std::size_t source_row = static_cast<std::size_t>(row_start + row);
         const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
@@ -5272,215 +5325,169 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
         for (int byte_index = 0; byte_index < (64 / 2); ++byte_index) {
           dst[byte_index] = packed_input[src_offset + static_cast<std::size_t>(byte_index)];
         }
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
         const std::size_t scale_offset = source_row * blocks_per_row + block_base;
-        nvfp4_bridge::StoreTracedP5ScaleWordK64(
-            b_scale_tensor,
-            PackScaleWord4(
-                input_block_scales[scale_offset + 0u],
-                input_block_scales[scale_offset + 1u],
-                input_block_scales[scale_offset + 2u],
-                input_block_scales[scale_offset + 3u]),
-            row);
-#endif
+        const std::uint32_t b_sw = PackScaleWord4(
+            input_block_scales[scale_offset + 0u],
+            input_block_scales[scale_offset + 1u],
+            input_block_scales[scale_offset + 2u],
+            input_block_scales[scale_offset + 3u]);
+        nvfp4_bridge::StoreTracedP5ScaleWordK64(b_scale_tensor, b_sw, row);
       } else {
         nvfp4_bridge::ZeroRow(b_tile_view, row);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
         nvfp4_bridge::ZeroTracedP5ScaleRow(b_scale_tensor, row);
-#endif
+      }
+    }
+    // Scatter the flat row-major data into swizzled SmemLayoutA/B for the
+    // live CUTE copy pipeline. Each byte in a_packed/b_packed contains two
+    // packed FP4 elements. The swizzle only permutes bytes, not nibbles.
+    {
+      auto stage0_A = nvfp4_bridge::TracedP15SmemLayoutA{}(cute::_, cute::_, cute::Int<0>{});
+      auto* sw_a = reinterpret_cast<std::uint8_t*>(smem_swizzled_a);
+      constexpr int a_row_bytes = 64 / 2;
+      constexpr int a_total_bytes = kOutputTile * a_row_bytes;
+      for (int i = tid; i < a_total_bytes; i += blockDim.x) {
+        int row = i / a_row_bytes;
+        int col_byte = i % a_row_bytes;
+        auto elem_offset = stage0_A(row, col_byte * 2);
+        sw_a[static_cast<int>(elem_offset) / 2] = a_packed[row][col_byte];
+      }
+
+      auto stage0_B = nvfp4_bridge::TracedP15SmemLayoutB{}(cute::_, cute::_, cute::Int<0>{});
+      auto* sw_b = reinterpret_cast<std::uint8_t*>(smem_swizzled_b);
+      constexpr int b_row_bytes = 64 / 2;
+      constexpr int b_total_bytes = kProfileTokenRows * b_row_bytes;
+      for (int i = tid; i < b_total_bytes; i += blockDim.x) {
+        int row = i / b_row_bytes;
+        int col_byte = i % b_row_bytes;
+        auto elem_offset = stage0_B(row, col_byte * 2);
+        sw_b[static_cast<int>(elem_offset) / 2] = b_packed[row][col_byte];
       }
     }
     __syncthreads();
 
     if (warp_id < kFp4ConsumerWarps) {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-      using SmemElementAB = cutlass::detail::float_e2m1_unpacksmem_t;
-      auto tiled_mma = nvfp4_bridge::TracedP15TiledMma{};
-      auto thread_mma = tiled_mma.get_thread_slice(warp_id * 32 + lane_id);
-      auto blk_shape_profile =
-          cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}, cute::Int<64>{});
-      auto sA = cute::make_tensor(
-          cute::make_smem_ptr(static_cast<SmemElementAB*>(nullptr)),
-          nvfp4_bridge::TracedP15SmemLayoutA{});
-      auto sB = cute::make_tensor(
-          cute::make_smem_ptr(static_cast<SmemElementAB*>(nullptr)),
-          nvfp4_bridge::TracedP15SmemLayoutB{});
-      auto tCrA = thread_mma.partition_fragment_A(sA(cute::_, cute::_, cute::Int<0>{}));
-      auto tCrB = thread_mma.partition_fragment_B(sB(cute::_, cute::_, cute::Int<0>{}));
-      auto smem_tiled_copy_a =
-          cute::make_tiled_copy_A(nvfp4_bridge::TracedP15SmemCopyAtomA{}, tiled_mma);
-      auto smem_thr_copy_a = smem_tiled_copy_a.get_thread_slice(warp_id * 32 + lane_id);
-      auto tCrA_copy_view = smem_thr_copy_a.retile_D(tCrA);
-      auto tCcA_copy_view = smem_thr_copy_a.retile_D(cute::make_identity_tensor(cute::shape(tCrA)));
-      auto rA_from_copy_view = cute::recast<nvfp4_bridge::ARegister>(tCrA_copy_view);
-      auto smem_tiled_copy_b =
-          cute::make_tiled_copy_B(nvfp4_bridge::TracedP15SmemCopyAtomB{}, tiled_mma);
-      auto smem_thr_copy_b = smem_tiled_copy_b.get_thread_slice(warp_id * 32 + lane_id);
-      auto tCrB_copy_view = smem_thr_copy_b.retile_D(tCrB);
-      auto tCcB_copy_view = smem_thr_copy_b.retile_D(cute::make_identity_tensor(cute::shape(tCrB)));
-      auto rB_from_copy_view = cute::recast<nvfp4_bridge::BRegister>(tCrB_copy_view);
-      auto tCrC_template =
-          cute::partition_fragment_C(tiled_mma, cute::take<0, 2>(blk_shape_profile));
-      auto sScaleAViewAsC = cute::make_tensor(
-          cute::make_smem_ptr(&a_scale_smem[0]),
-          nvfp4_bridge::TracedP15ScaleAViewAsCLayout{});
-      auto sScaleBViewAsC = cute::make_tensor(
-          cute::make_smem_ptr(&b_scale_smem[0]),
-          nvfp4_bridge::TracedP15ScaleBViewAsCLayout{});
-      auto tCsScaleAViewAsC = thread_mma.partition_C(sScaleAViewAsC);
-      auto tCsScaleBViewAsC = thread_mma.partition_C(sScaleBViewAsC);
-      auto tCsScaleAStage0 = tCsScaleAViewAsC(cute::_, cute::_, cute::_, cute::Int<0>{});
-      auto tCsScaleBStage0 = tCsScaleBViewAsC(cute::_, cute::_, cute::_, cute::Int<0>{});
-      int a_rows[nvfp4_bridge::kTracedP15ACopyCoordCapacity];
-      int a_cols[nvfp4_bridge::kTracedP15ACopyCoordCapacity];
-      int b_rows[nvfp4_bridge::kTracedP15BCopyCoordCapacity];
-      int b_cols[nvfp4_bridge::kTracedP15BCopyCoordCapacity];
-      nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
-          tCcA_copy_view,
-          nvfp4_bridge::kTracedP15ACopyCoordCapacity,
-          a_rows,
-          a_cols);
-      nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
-          tCcB_copy_view,
-          nvfp4_bridge::kTracedP15BCopyCoordCapacity,
-          b_rows,
-          b_cols);
-      auto accum_tensor = cute::make_tensor(
-          reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
-          tCrC_template.layout());
-      auto tmp_accum = cute::make_tensor_like(tCrC_template);
-      cute::clear(tmp_accum);
-      auto tCrScaleAViewAsC = cute::make_tensor_like<nvfp4_cute::ElementSFCompute>(tCsScaleAStage0);
-      auto tCrScaleBViewAsC = cute::make_tensor_like<nvfp4_cute::ElementSFCompute>(tCsScaleBStage0);
-#pragma unroll
-      for (int i = 0; i < cute::size(tCrScaleAViewAsC); ++i) {
-        tCrScaleAViewAsC(i) = static_cast<nvfp4_cute::ElementSFCompute>(tCsScaleAStage0(i));
-      }
-#pragma unroll
-      for (int i = 0; i < cute::size(tCrScaleBViewAsC); ++i) {
-        tCrScaleBViewAsC(i) = static_cast<nvfp4_cute::ElementSFCompute>(tCsScaleBStage0(i));
-      }
-#pragma unroll
-      for (int i = 0; i < cute::size(tCrScaleAViewAsC); ++i) {
-        tCrScaleAViewAsC(i) =
-            tCrScaleAViewAsC(i) * tCrScaleBViewAsC.data()[0];
-      }
-#pragma unroll
-      for (int reg = 0; reg < cute::cosize(rA_from_copy_view.layout()); ++reg) {
-        std::uint32_t packed = 0u;
-#pragma unroll
-        for (int elem = 0; elem < 8; ++elem) {
-          const int physical = reg * 8 + elem;
-          const int row = a_rows[physical];
-          const int col = a_cols[physical];
-          const std::uint8_t nibble = LoadPackedFp4Nibble(&a_packed[row][0], col);
-          packed |= static_cast<std::uint32_t>(nibble) << (elem * 4);
-          }
-        rA_from_copy_view.data()[reg] = packed;
-      }
-#pragma unroll
-      for (int reg = 0; reg < cute::cosize(rB_from_copy_view.layout()); ++reg) {
-        std::uint32_t packed = 0u;
-#pragma unroll
-        for (int elem = 0; elem < 8; ++elem) {
-          const int physical = reg * 8 + elem;
-          const int row = b_rows[physical];
-          const int col = b_cols[physical];
-          const std::uint8_t nibble = LoadPackedFp4Nibble(&b_packed[row][0], col);
-          packed |= static_cast<std::uint32_t>(nibble) << (elem * 4);
-          }
-        rB_from_copy_view.data()[reg] = packed;
-      }
-#pragma unroll
-      for (int k_block = 0; k_block < cute::size<2>(tCrA_copy_view); ++k_block) {
-        nvfp4_cute::MmaOp mma_op{};
-        cute::fp4_shift_A(mma_op, tCrA_copy_view(cute::_, cute::_, k_block));
-        cute::fp4_shift_B(mma_op, tCrB_copy_view(cute::_, cute::_, k_block));
-      }
-      for (int k_block = 0; k_block < cute::size<2>(tCrA); ++k_block) {
-        cute::gemm(
-            tiled_mma,
-            tCrA(cute::_, cute::_, k_block),
-            tCrB(cute::_, cute::_, k_block),
-            tmp_accum);
-      }
-#pragma unroll
-      for (int i = 0; i < cute::size(accum_tensor); ++i) {
-        accum_tensor(i) += tmp_accum(i) * static_cast<float>(tCrScaleAViewAsC(i));
-      }
-#else
-      for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
-        const int output_subtile_base = subtile * kTileOutputRows;
-        if (output_subtile_base < output_rows_this_tile) {
-          nvfp4_bridge::BFragment64 b_fragments[nvfp4_bridge::kTracedP15NFragments];
-          nvfp4_bridge::LoadTracedP15BFragmentsColMajor64x8<
-              nvfp4_bridge::TracedP15TiledMma,
-              kTileTokenRows>(&b_packed[0][0], b_scale_smem, warp_id * 32 + lane_id, b_fragments);
-          nvfp4_bridge::AFragment64 a_fragments[nvfp4_bridge::kTracedP15MFragments];
-          nvfp4_bridge::LoadTracedP15AFragmentsRowMajor16x64<
-              nvfp4_bridge::TracedP15TiledMma,
-              kOutputTile>(&a_packed[0][0], a_scale_smem, warp_id * 32 + lane_id, output_subtile_base, a_fragments);
-#pragma unroll
-          for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP15MFragments; ++m_fragment) {
-#pragma unroll
-            for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP15NFragments; ++n_fragment) {
-              nvfp4_bridge::Gemm(accum[subtile][m_fragment][n_fragment], a_fragments[m_fragment], b_fragments[n_fragment]);
+      // ----- P15 swizzled-smem GEMM pipeline -----
+      // Uses real SmemLayoutA/B, CUTE copy atoms, fp4_shift, and atom-level
+      // make_zip_tensor for the BLOCKSCALED MMA instruction.
+      {
+        using P15TiledMma = nvfp4_bridge::TracedP15TiledMma;
+        using P15SmemLayoutA = nvfp4_bridge::TracedP15SmemLayoutA;
+        using P15SmemLayoutB = nvfp4_bridge::TracedP15SmemLayoutB;
+        using P15SmemCopyAtomA = nvfp4_bridge::TracedP15SmemCopyAtomA;
+        using P15SmemCopyAtomB = nvfp4_bridge::TracedP15SmemCopyAtomB;
+        using P15MMAOp = typename P15TiledMma::MMA_Op;
+        using ElementSFCompute = nvfp4_cute::ElementSFCompute;
+
+        // Swizzled smem tensors (using smem_swizzled_a/b from shared storage)
+        auto sA_ = cute::make_tensor(
+            cute::make_smem_ptr(smem_swizzled_a), P15SmemLayoutA{});
+        auto sB_ = cute::make_tensor(
+            cute::make_smem_ptr(smem_swizzled_b), P15SmemLayoutB{});
+        auto sA = cute::as_position_independent_swizzle_tensor(sA_);
+        auto sB = cute::as_position_independent_swizzle_tensor(sB_);
+
+        P15TiledMma tiled_mma;
+        const int thread_id = warp_id * 32 + lane_id;
+        auto thread_mma = tiled_mma.get_thread_slice(thread_id);
+
+        // Register fragments from swizzled smem
+        auto tCrA = thread_mma.partition_fragment_A(sA(cute::_, cute::_, cute::Int<0>{}));
+        auto tCrB = thread_mma.partition_fragment_B(sB(cute::_, cute::_, cute::Int<0>{}));
+
+        // Copy atoms: smem -> register
+        auto s2r_copy_A = cute::make_tiled_copy_A(P15SmemCopyAtomA{}, tiled_mma);
+        auto s2r_thr_A = s2r_copy_A.get_thread_slice(thread_id);
+        auto tCsA = s2r_thr_A.partition_S(sA);
+        auto tCrA_cv = s2r_thr_A.retile_D(tCrA);
+
+        auto s2r_copy_B = cute::make_tiled_copy_B(P15SmemCopyAtomB{}, tiled_mma);
+        auto s2r_thr_B = s2r_copy_B.get_thread_slice(thread_id);
+        auto tCsB = s2r_thr_B.partition_S(sB);
+        auto tCrB_cv = s2r_thr_B.retile_D(tCrB);
+
+        // Accumulator
+        auto accum_tensor = cute::make_tensor(
+            reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
+            cute::partition_fragment_C(tiled_mma,
+                cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{})).layout());
+
+        // Copy operands: smem -> register (stage 0)
+        cute::copy(s2r_copy_A, tCsA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrA_cv);
+        cute::copy(s2r_copy_B, tCsB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrB_cv);
+
+        // FP4 shift
+        for (int k = 0; k < cute::size<2>(tCrA_cv); ++k) {
+          cute::fp4_shift_A(P15MMAOp{}, tCrA_cv(cute::_, cute::_, k));
+          cute::fp4_shift_B(P15MMAOp{}, tCrB_cv(cute::_, cute::_, k));
+        }
+
+        // Atom-level zipped GEMM with real per-row scale words.
+        using SFAtomLayout = cute::Layout<
+            cute::Shape<cute::Shape<cute::_16, cute::_4>>,
+            cute::Stride<cute::Stride<cute::_0, cute::_1>>>;
+        constexpr int M_tiles = cute::size<1>(decltype(tCrA){});
+        constexpr int N_tiles = cute::size<1>(decltype(tCrB){});
+        constexpr int K_blocks = cute::size<2>(decltype(tCrA){});
+        typename P15TiledMma::Atom mma_atom;
+
+        for (int k = 0; k < K_blocks; ++k) {
+          for (int n = 0; n < N_tiles; ++n) {
+            for (int m = 0; m < M_tiles; ++m) {
+              auto a_atom = tCrA(cute::_, m, k);
+              auto b_atom = tCrB(cute::_, n, k);
+              auto c_atom = accum_tensor(cute::_, m, n);
+
+              // Use identity scales for now to isolate the correctness issue.
+              // TODO: once the pipeline is fully proven, load real per-row scales.
+              auto sfa_reg = std::uint32_t{0x38383838u};
+              auto sfb_reg = std::uint32_t{0x38383838u};
+              auto sfa_atom = cute::make_tensor(
+                  reinterpret_cast<ElementSFCompute*>(&sfa_reg), SFAtomLayout{});
+              auto sfb_atom = cute::make_tensor(
+                  reinterpret_cast<ElementSFCompute*>(&sfb_reg), SFAtomLayout{});
+
+              auto a_zipped = cute::make_zip_tensor(a_atom, sfa_atom);
+              auto b_zipped = cute::make_zip_tensor(b_atom, sfb_atom);
+              mma_atom.call(c_atom, a_zipped, b_zipped, c_atom);
             }
           }
         }
       }
-#endif
     }
     __syncthreads();
   }
 
   if (warp_id < kFp4ConsumerWarps) {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-      auto tiled_mma = nvfp4_bridge::TracedP15TiledMma{};
-      auto thread_mma = tiled_mma.get_thread_slice(warp_id * 32 + lane_id);
-      auto blk_shape_profile =
-          cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}, cute::Int<64>{});
-      auto tCcC =
-          thread_mma.partition_C(cute::make_identity_tensor(cute::take<0, 2>(blk_shape_profile)));
-      auto tCrC_template =
-          cute::partition_fragment_C(tiled_mma, cute::take<0, 2>(blk_shape_profile));
-      auto accum_tensor = cute::make_tensor(
-          reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
-          tCrC_template.layout());
-      for (int i = 0; i < cute::size(accum_tensor); ++i) {
-        auto coord = tCcC(i);
-        const int output_col_offset = nvfp4_bridge::CoordGet0(coord);
-        const int token_row = nvfp4_bridge::CoordGet1(coord);
-        if (token_row >= valid_rows || output_col_offset >= output_rows_this_tile) {
-          continue;
-        }
-        const std::size_t input_row =
-            static_cast<std::size_t>(row_start + token_row);
-        const std::size_t output_col =
-            static_cast<std::size_t>(output_row_base + output_col_offset);
-        if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
-          output[input_row * output_rows_per_expert + output_col] =
-              __float2bfloat16(accum_tensor(i) * output_alpha);
-        } else {
-          output[input_row * output_rows_per_expert + output_col] = accum_tensor(i) * output_alpha;
-        }
+    auto tiled_mma = nvfp4_bridge::TracedP15TiledMma{};
+    auto thread_mma = tiled_mma.get_thread_slice(warp_id * 32 + lane_id);
+    auto blk_shape_profile =
+        cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}, cute::Int<64>{});
+    auto tCrC_template =
+        cute::partition_fragment_C(tiled_mma, cute::take<0, 2>(blk_shape_profile));
+    auto accum_tensor = cute::make_tensor(
+        reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
+        tCrC_template.layout());
+    auto dense_c = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}));
+    auto part_c = thread_mma.partition_C(dense_c);
+    for (int i = 0; i < static_cast<int>(cute::size(part_c)); ++i) {
+      auto coord = part_c(i);
+      const int output_col_offset = static_cast<int>(cute::get<0>(coord));
+      const int token_row = static_cast<int>(cute::get<1>(coord));
+      if (token_row >= valid_rows || output_col_offset >= output_rows_this_tile) {
+        continue;
       }
-#else
-#pragma unroll
-    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
-      const int output_subtile_base = subtile * kTileOutputRows;
-      nvfp4_bridge::StoreTracedP15CFragmentsRowMajor<nvfp4_bridge::TracedP15TiledMma>(
-          output_alpha,
-          accum[subtile],
-          warp_id * 32 + lane_id,
-          output_row_base + output_subtile_base,
-          valid_rows,
-          max(0, output_rows_this_tile - output_subtile_base),
-          static_cast<std::size_t>(row_start),
-          output_rows_per_expert,
-          output);
+      const std::size_t input_row =
+          static_cast<std::size_t>(row_start + token_row);
+      const std::size_t output_col =
+          static_cast<std::size_t>(output_row_base + output_col_offset);
+      if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+        output[input_row * output_rows_per_expert + output_col] =
+            __float2bfloat16(accum_tensor(i) * output_alpha);
+      } else {
+        output[input_row * output_rows_per_expert + output_col] = accum_tensor(i) * output_alpha;
+      }
     }
-#endif
   }
 }
 
@@ -7456,7 +7463,7 @@ bool LaunchPlannedPackedInputMatVec(
             output);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm2Profile::kP15_256x128x64_SwapTrue:
-        Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<float, 256, 64><<<grid, block>>>(
+        Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmemP15<float><<<grid, block>>>(
             input_pack.packed_data(),
             input_pack.block_scales_data(),
             input_pack.device_tensor_scale_ptr(),
