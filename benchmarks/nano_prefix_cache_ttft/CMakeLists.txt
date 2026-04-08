@@ -26,6 +26,7 @@ if(BUILD_TESTING)
     if(NEMOTRON_TTFT_TEST_ENVIRONMENT)
       set_tests_properties(${name} PROPERTIES ENVIRONMENT "${NEMOTRON_TTFT_TEST_ENVIRONMENT}")
     endif()
+    set_tests_properties(${name} PROPERTIES RUN_SERIAL TRUE)
   endfunction()
 
   nemotron_add_ttft_smoke_test(
