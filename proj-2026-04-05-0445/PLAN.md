@@ -918,6 +918,389 @@ specialized runtime:
       new probe
     - next target:
       `P15`, then a broader rerun/profile pass on the routed FP4 family
+  - `P15` first exact-source rollout and definitive probe:
+    - first source-based attempt:
+      - reused the `P13` exact-scale-smem kernel shape for `P15`
+      - failed the first real gate immediately:
+        - `fused_moe_prefill_test: FAIL`
+        - `nano_prefill_output_max_abs_diff = 15.4386`
+        - `nano_prefill_routed_max_abs_diff = 15.4386`
+        - `nano_prefill_worst_routed_index = 2692 actual=0 expected=15.4386`
+      - implication:
+        per the strategy rule, `P15` needed a definitive probe instead of more
+        shape reuse
+    - definitive `P15` builder-only probe:
+      [trt_p15_runtime_layout_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_runtime_layout_dump.cu)
+    - recorded output:
+      [trt_p15_runtime_layout_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_runtime_layout_dump_20260407.log)
+    - exact recovered facts:
+      - `Stages = 6`
+      - `size(TiledMma) = 256`
+      - `tile_mnk = (128, 32, 64)`
+      - `size(partA) = 64`, `cosize(partA) = 2920`
+      - `size(partB) = 32`, `cosize(partB) = 360`
+      - `size(partC) = 16`, `cosize(partC) = 730`
+      - `cosize(SmemLayoutSFA) = 6144`
+      - `cosize(SmemLayoutSFB) = 3072`
+      - `size(tCrSFA) = 256`, `cosize(tCrSFA) = 16`
+      - `size(tCrSFB) = 512`, `cosize(tCrSFB) = 32`
+      - `partB.coords` and `partC.coords` are now dumped explicitly in the log
+    - second source-based attempt:
+      - rewrote the dormant `P15` kernel to use the exact traced
+        `TiledMma + SmemLayoutSFA/SFB` contract
+      - that still failed the first real gate with the same routed diff
+    - conclusion:
+      the remaining `P15` blocker is no longer scale staging; it is the full
+      operand/store fragment contract. Reusing the simplified
+      `AFragment64/BFragment64/CFragment64` model is not faithful enough for
+      traced `P15`.
+    - next target:
+      implement a dedicated `P15` fragment family from the probed
+      `partA/partB/partC` contract, then re-enable only `P15`
+    - third source-based `P15` attempt:
+      - switched the dormant `P15` path to the traced operand order
+        `A=weights`, `B=activations`
+      - replaced the single-fragment reuse with a dedicated `2x2`
+        `A/B/C` family and two `128`-row subtiles for the `256` output tile
+      - failed the first real gates:
+        - `fused_moe_prefill_test: FAIL`
+          - `nano_prefill_output_max_abs_diff = 15.5936`
+          - `nano_prefill_routed_max_abs_diff = 15.5936`
+        - `multi_turn_prefix_reuse_test: FAIL`
+          - committed-head boundary argmax mismatch
+      - per the strategy rule, restored `P15` to the safe BF16 grouped fallback
+        before continuing
+    - definitive `P15` operand copy-view probe:
+      [trt_p15_copy_view_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_copy_view_dump.cu)
+    - recorded output:
+      [trt_p15_copy_view_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_copy_view_dump_20260407.log)
+    - useful exact facts:
+      - `copy_view_a` is contiguous `64`-element thread-fragment storage with the
+        first `32` coords at rows `0/8` and the second `32` coords at rows
+        `64/72`
+      - `copy_view_b` is contiguous `32`-element thread-fragment storage with the
+        first `16` coords at row `0` and the second `16` coords at row `8`
+      - implication:
+        the remaining `P15` blocker is less likely to be the coarse `A/B`
+        fragment chunk split and more likely to be either:
+        - the exact `SFA/SFB` scale-byte grouping for those fragments, or
+        - the final `C`/store-side contract
+    - next target:
+      add the smallest definitive `P15` probe for the scale-copy or store-side
+      contract, not another operand-chunking rewrite
+    - `P15` scale-copy flattening test and accumulator-order probe:
+      - source-based test:
+        - updated `FillPhysicalCoordMapCopyViewLimited` to flatten rank-4
+          copy-view tensors and retried `P15`
+        - exact-source `P15` still failed unchanged:
+          - `fused_moe_prefill_test: FAIL`
+            - `nano_prefill_output_max_abs_diff = 15.5936`
+            - `nano_prefill_routed_max_abs_diff = 15.5936`
+          - `multi_turn_prefix_reuse_test: FAIL`
+            - committed-head boundary argmax mismatch
+        - conclusion:
+          the remaining blocker is not just rank-4 scale-copy flattening
+      - definitive `P15` accumulator/store probe:
+        [trt_p15_accum_order_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_accum_order_dump.cu)
+      - recorded output:
+        [trt_p15_accum_order_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_accum_order_dump_20260407.log)
+      - exact recovered facts:
+        - `tCcC.layout = ((_2,_2),_2,_2):((_1@1,_8@0),_64@0,_8@1)`
+        - `tCrC.layout = ((_2,_2),_2,_2):((_1,_2),_4,_8)`
+        - flat accumulator destination order is:
+          - `0..3 -> (0,0) (0,1) (8,0) (8,1)`
+          - `4..7 -> (64,0) (64,1) (72,0) (72,1)`
+          - `8..11 -> (0,8) (0,9) (8,8) (8,9)`
+          - `12..15 -> (64,8) (64,9) (72,8) (72,9)`
+      - source-based follow-up:
+        - rewired `StoreTracedP15CFragmentsRowMajor` to match that traced flat
+          order and retried `P15`
+        - both real gates still failed with the same routed diff
+      - conclusion:
+        the remaining `P15` blocker is deeper than the final store permutation;
+        it is the full accumulator fragment contract, not just scale-copy
+        flattening or the last writeback order
+      - safe state restored:
+        `P15` is back on the known-good grouped BF16 fallback and both
+        correctness gates pass again
+    - definitive `P15` C-shaped scale-view probe and CUTLASS-style rescale test:
+      - probe source:
+        [trt_p15_scale_as_c_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_scale_as_c_dump.cu)
+      - recorded output:
+        [trt_p15_scale_as_c_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_scale_as_c_dump_20260407.log)
+      - exact recovered facts:
+        - `Stages = 6`
+        - `ScaleGranularityM = 128`
+        - `ScaleGranularityN = 128`
+        - `ScaleMsPerTile = 2`
+        - `ScaleNsPerTile = 1`
+        - `tCsScaleAViewAsC.layout = ((_2,_2),(_2,_2),_8,_6):((_0,_0),(_0,_1),_0,_2)`
+        - `tCsScaleBViewAsC.layout = ((_2,_2),_4,_8,_6):((_0,_0),_0,_0,_1)`
+        - `tCrScaleAViewAsC.layout = ((_2,_2),(_2,_2),_8):((_0,_0),(_0,_1),_0)`
+        - `tCrScaleBViewAsC.layout = ((_2,_2),_4,_8):((_0,_0),_0,_0)`
+      - source-based follow-up:
+        - retried `P15` with neutral instruction scales plus a CUTLASS-style
+          `C`-view rescale fold using the probed `ScaleMsPerTile = 2`,
+          `ScaleNsPerTile = 1` contract
+        - `fused_moe_prefill_test` still failed:
+          - `nano_prefill_output_max_abs_diff = 15.5936`
+          - `nano_prefill_routed_max_abs_diff = 15.5936`
+        - `multi_turn_prefix_reuse_test` still failed:
+          - committed-head boundary argmax mismatch
+          - `max_abs_diff = 12.0938`
+      - conclusion:
+        even the first CUTLASS-style `C`-view scale fold is not sufficient for
+        traced `P15`; the remaining blocker is now more likely the full
+        `tCrA/tCrB -> tmp_accum -> tCrC` contraction contract than scale
+        staging alone
+      - safe state restored:
+        `P15` stays on the known-good grouped BF16 fallback and both
+        correctness gates pass again
+    - definitive `P15` fragment-contract probe:
+      - probe source:
+        [trt_p15_fragment_contract_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_fragment_contract_dump.cu)
+      - recorded output:
+        [trt_p15_fragment_contract_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_fragment_contract_dump_20260407.log)
+      - exact recovered facts for thread `0`:
+        - `tCrA.layout = ((_8,_2,_2),_4,_1):((_1,_8,_16),_32,_0)`
+        - `tCrB.layout = ((_8,_2),(_2,_4),_1):((_1,_8),(_16,_32),_0)`
+        - `tCrC.layout = ((_2,_2),_2,_2):((_1,_2),_4,_8)`
+        - recast register views are all single `16`-element tensors:
+          - `rA.layout = ((_1,_2,_2),_4,_1):((_1,_1,_2),_4,_0)`, `size = 16`
+          - `rB.layout = ((_1,_2),(_2,_4),_1):((_1,_1),(_2,_4),_0)`, `size = 16`
+          - `rC.layout = ((_2,_2),_2,_2):((_1,_2),_4,_8)`, `size = 16`
+      - implication:
+        the traced `P15` thread fragment is not naturally modeled as our current
+        manual `AFragment64[2] / BFragment64[2] / CFragment64[2][2]` family.
+        The next rewrite should replace that hand-rolled `P15` fragment family
+        with a single CUTE-aligned thread-fragment model and only then retry
+        the active `P15` path.
+    - definitive `P15` copy-view to register probe:
+      - probe source:
+        [trt_p15_copy_to_reg_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_copy_to_reg_dump.cu)
+      - recorded output:
+        [trt_p15_copy_to_reg_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p15_copy_to_reg_dump_20260407.log)
+      - exact recovered facts:
+        - `tCrA_copy_view.layout = ((_32,_2),_2,_1):((_1,_32),_64,_0)`, `size = 128`
+        - `tCrB_copy_view.layout = ((_32,_1),_4,_1):((_1,_0),_32,_0)`, `size = 128`
+        - `tCrSFA_copy_view.layout = ((_1,(_16,_8)),_2,_1):((_0,(_0,_1)),_8,_0)`, `size = 256`
+        - `tCrSFB_copy_view.layout = ((_1,(_16,_4,_2)),_4,_1):((_0,(_0,_1,_16)),_4,_0)`, `size = 512`
+        - recast copy-view register layouts:
+          - `rA_from_copy_view.layout = ((_4,_2),_2,_1):((_1,_4),_8,_0)`, `size = 16`
+          - `rB_from_copy_view.layout = ((_4,_1),_4,_1):((_1,_0),_4,_0)`, `size = 16`
+          - `rSFA_from_copy_view.layout = ((_1,(_16,_2)),_2,_1):((_0,(_0,_1)),_2,_0)`, `size = 64`
+          - `rSFB_from_copy_view.layout = ((_1,(_16,_1,_2)),_4,_1):((_0,(_0,_1,_4)),_1,_0)`, `size = 128`
+      - implication:
+        the traced `P15` live path already has a precise CUTE retile contract
+        from copy views into register fragments. The next native rewrite should
+        stop hand-packing `P15` `A/B/SFA/SFB` fragments and instead build the
+        dormant path around real `tCrA/tCrB/tCrSFA/tCrSFB/tCrC` tensors plus
+        `cute::gemm(...)`.
+    - `P15` exact `gemm` / accumulator contract follow-up:
+      - safe state restored:
+        - active `P15` dispatch is back on the known-good grouped BF16 fallback
+        - `fused_moe_prefill_test`: `PASS`
+        - `multi_turn_prefix_reuse_test`: `PASS`
+      - definitive source-backed fact from
+        [sm120_mma_array_tma_blockwise_scaling.hpp]( /home/khkramer/.cache/uv/archive-v0/f24U_Ixv0hjsqw0Ylm8si/tensorrt_llm/deep_gemm/include/cutlass/gemm/collective/sm120_mma_array_tma_blockwise_scaling.hpp ):
+        - the live traced mainloop issues
+          `cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tmp_accum)`
+          after operand copy/shift and then rescales `tmp_accum`
+      - first definitive probe:
+        [trt_p15_gemm_contract_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_gemm_contract_dump.cu)
+      - result:
+        compiling that exact 4-arg `gemm` call against a naive
+        `thread_mma.make_fragment_C(partition_C(dense_sC))` accumulator still
+        fails the CUTE static assertions. That proves the missing piece is not
+        the 4-arg call syntax by itself; it is the exact `FrgTensorC`
+        accumulator contract passed to the live kernel.
+      - second definitive probe:
+        [trt_p15_accumulator_contract_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_accumulator_contract_dump.cu)
+      - result:
+        the builder-level `CollectiveMainloop` type does not expose the kernel
+        helpers we need:
+        - no `AccumulatorPipelineStageCount`
+        - no `IsOverlappingAccum`
+        - no `partition_accumulator_shape()`
+        - no `slice_accumulator()`
+        Those live one layer up, in the kernel wrapper.
+      - implication:
+        the next exact probe must target the `cutlass::gemm::kernel`
+        specialization used by the traced `P15` path, not just the builder
+        `CollectiveMainloop`. The remaining blocker is now explicitly the
+        kernel-layer accumulator contract.
+      - third definitive builder probe:
+        [trt_p15_blk_shape_accum_dump.cu](/home/khkramer/src/nemotron-inference/artifacts/tmp/trt_p15_blk_shape_accum_dump.cu)
+      - result:
+        the traced `P15` accumulator contract is not built over the
+        `TiledMma` atom tile shape. The recovered shapes are:
+        - `tile_size_mnk = (128, 32, 64)`
+        - `tCrA(_,_,0).layout = ((_8,_2,_2),_4):((_1,_8,_16),_32)`
+        - `tCrB(_,_,0).layout = ((_8,_2),(_2,_4)):((_1,_8),(_16,_32))`
+        - `partition_fragment_C(tiled_mma, (128,32)).layout = ((_2,_2),_2,_2)`
+        - `partition_fragment_C(tiled_mma, (256,32)).layout = ((_2,_2),_4,_2)`
+        - `partition_fragment_C(tiled_mma, (256,128)).layout = ((_2,_2),_4,(_2,_4))`
+      - implication:
+        the full traced `P15` profile shape is `256x128x64`, so the dormant
+        `P15` exact path cannot keep using the old `CFragment64[2][2]`
+        accumulator/storage model. The next rewrite must allocate and store a
+        full `partition_fragment_C(tiled_mma, (256,128))` accumulator contract
+        and then rebuild the `P15` store path around that shape before another
+        activation attempt.
+    - short-input TRT trace correction:
+      - a clean live serve run with
+        `TLLM_FUSED_MOE_PRINT_TACTICS=1` and
+        `TLLM_FUSED_MOE_PRINT_TACTIC_DESCRIPTORS=1` shows the real
+        `num_rows=4` request selecting:
+        - `gemm1_profile_id=1`: `128x128x64`, `swap_ab=false`
+        - `gemm2_profile_id=15`: `256x128x64`, `swap_ab=true`
+      - source: 
+        [trtllm_short_fc2_descriptor_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trtllm_short_fc2_descriptor_20260407.log)
+      - the earlier `gemm2=9` observation came from a probe-contaminated run:
+        the temporary `TLLM_FUSED_MOE_PRINT_COMPILE_PROBE_P15=1` launcher hook
+        was also forcing an early return in the unrelated `P5` branch during
+        autotuning, which perturbed tactic selection
+      - implication:
+        native short-input alignment should continue targeting `P15` for FC2,
+        but should treat short-input FC1 as `P1`, not assume the old
+        `P5/P15` pair unconditionally. Future TRT probe runs must avoid
+        launcher hooks that perturb unrelated tactic branches.
+      - native follow-up:
+        a narrow selector-only native trial changing `dispatch_rows == 4` from
+        FC1 `P5` to FC1 `P1` failed `multi_turn_prefix_reuse_test` with a real
+        cold-prefill execution failure. So the clean TRT `P1/P15` short-input
+        pair cannot be adopted by selector change alone; it needs the exact
+        traced `P1` math/contract path in native code before any live dispatch
+        change.
+      - additional live-probe result:
+        a dedicated live `P1` compile-probe run did not emit the `P1` probe
+        block and the same `num_rows=4` request selected `gemm1=5`, `gemm2=15`
+        instead. That means short-input FC1 tactic choice is sensitive enough
+        that probe instrumentation itself can perturb autotune/selection. The
+        next `P1` fact-finding step should therefore use an offline builder
+        probe or a direct runner invocation with fixed profile ids, not another
+        live-serve compile probe.
+      - definitive offline `P1` builder probe:
+        - artifact:
+          [trt_p1_runtime_layout_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p1_runtime_layout_dump_20260407.log)
+        - exact facts:
+          - `Stages = 9`
+          - `tile_mnk = (128,32,64)`
+          - `cosize(SmemLayoutSFA) = cosize(SmemLayoutSFB) = 4608`
+          - `cosize(tCrSFA) = 8`
+          - `cosize(tCrSFB) = 32`
+          - `accum_profile.layout = ((_2,_2),_2,(_2,_4)):((_1@1,_8@0),_64@0,(_8@1,_32@1))`
+        - implication:
+          native short-input FC1 `P1` cannot reuse the traced `P5`
+          scale-smem or accumulator assumptions.
+      - first exact-source native `P1` bridge attempt:
+        - added a dedicated traced `P1` scale-smem bridge family in
+          [fused_moe_prefill.cu](/home/khkramer/src/nemotron-inference/runtime/src/backend/fused_moe_prefill.cu)
+        - compile and focused correctness gates passed:
+          - `fused_moe_prefill_test`
+          - `multi_turn_prefix_reuse_test`
+        - first real runtime gate failed:
+          - `nano_prefix_cache_ttft_bench --prefix-length 4 --tail-token-count 4`
+          - `single_token_forward_model: layer 1 kind=2 execution failed`
+        - implication:
+          exact traced `P1` still needs more than scale-smem alignment alone;
+          keep live native `P1` dispatch on the known-good fallback until the
+          next definitive probe identifies the missing operand/store or
+          accumulator detail.
+      - definitive native runtime probe for the short-input failure:
+        - reran
+          `nano_prefix_cache_ttft_bench --prefix-length 4 --tail-token-count 4`
+          with `NEMOTRON_ROUTED_PROFILE_DEBUG=1`
+        - exact result:
+          - `dispatch_rows=4` cold prefill already ran safely on `P5/P15`
+          - the real failure was the resumed `dispatch_rows=8` island, where
+            native code selected `P1/P13`
+          - failure signature:
+            - `embedding_table: token id out of range at index 0 token_id=2147483647`
+            - `single_token_forward_model: embedding lookup failed`
+        - implication:
+          the current exact native `P1/P13` path is not safe for the resumed
+          `8`-row regime; the earlier short-input failure was not a `4`-row
+          cold-prefill issue
+      - temporary safety override:
+        - live native dispatch now routes `dispatch_rows == 8` back to the
+          known-good `P5/P15` pair while exact traced `P1/P13` work continues
+        - after rebuild, the full short-input bench completed successfully:
+          [ttft_20260407_rows8_safety_override_prefix4_tail4.stdout.txt](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/ttft_20260407_rows8_safety_override_prefix4_tail4.stdout.txt)
+          - `cold_prefill_prefix4 = 62.215 ms`
+          - `cached_committed_head_prefix4_tail4 hot-prefix = 57.982 ms`
+          - `cached_global_root_prefix4_tail4 hot-prefix = 58.065 ms`
+        - next exact target:
+          keep `dispatch_rows=8` as the active native gap and probe the missing
+          traced `P1/P13` operand/store or accumulator contract there before
+          moving the live selector back to TRT parity
+      - native A/B isolation on the `dispatch_rows=8` island:
+        - `P1/P15` completed safely, so FC1 `P1` is not the remaining blocker by
+          itself
+        - `P5/P13` reproduced the exact resumed failure:
+          - `embedding_table: token id out of range at index 0 token_id=2147483647`
+          - `single_token_forward_model: embedding lookup failed`
+        - implication:
+          the active low-row gap is now localized to FC2 `P13` at
+          `dispatch_rows=8`, not FC1 `P1`
+        - live state:
+          keep `dispatch_rows == 8` on the safe `P5/P15` island until the next
+          definitive low-row `P13` probe and fix land
+      - dedicated traced `P13` scale-smem bridge attempt:
+        - added a dedicated `TracedP13` family from the offline builder probe:
+          - `Stages = 9`
+          - `cosize(SmemLayoutSFA) = cosize(SmemLayoutSFB) = 4608`
+          - `cosize(tCrSFA) = 8`
+          - `cosize(tCrSFB) = 32`
+        - static gates stayed green:
+          - `fused_moe_prefill_test`
+          - `multi_turn_prefix_reuse_test`
+        - but the first real resumed runtime gate still failed when the live
+          selector was moved back to `dispatch_rows == 8 -> P13`:
+          - artifact:
+            [ttft_20260407_rows8_p13_retry_prefix4_tail4.stdout.txt](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/ttft_20260407_rows8_p13_retry_prefix4_tail4.stdout.txt)
+          - exact failure:
+            - `routed_gemm1 ... profile=p5_128x128x64_swap_true`
+            - `routed_gemm2 ... profile=p13_128x128x64_swap_true`
+            - `embedding_table: token id out of range at index 0 token_id=2147483647`
+            - `single_token_forward_model: embedding lookup failed`
+        - implication:
+          low-row FC2 `P13` needs more than traced scale-smem alignment; the
+          remaining mismatch is in the accumulator/store contract
+      - definitive `P13` accumulator/store probe:
+        - artifact:
+          [trt_p13_accum_order_dump_20260407.log](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/trt_p13_accum_order_dump_20260407.log)
+        - exact facts:
+          - `tCcC.layout = ((_2,_2),_2,_2):((_1@1,_8@0),_64@0,_8@1)`
+          - `tCrC.layout = ((_2,_2),_2,_2):((_1,_2),_4,_8)`
+          - `accum_profile.layout = ((_2,_2),_2,(_2,_4)):((_1@1,_8@0),_64@0,(_8@1,_32@1))`
+          - flat destination order:
+            - `0..3 -> (0,0) (0,1) (8,0) (8,1)`
+            - `4..7 -> (64,0) (64,1) (72,0) (72,1)`
+            - `8..11 -> (0,8) (0,9) (8,8) (8,9)`
+            - `12..15 -> (64,8) (64,9) (72,8) (72,9)`
+        - implication:
+          the next exact native rewrite should replace the current `P13`
+          `CFragment64` store path with a `tCcC/tCrC`-shaped accumulator/store
+          contract derived from the traced CUTLASS profile before re-enabling
+          live `dispatch_rows == 8 -> P13`
+      - `P13` traced accumulator/store rewrite:
+        - replaced the low-row `P13` exact path's generic `2`-subtile
+          accumulator/store model with a traced `2x2` `A/B/C` fragment family
+          and `tCcC/tCrC`-shaped row-major store path in
+          [fused_moe_prefill.cu](/home/khkramer/src/nemotron-inference/runtime/src/backend/fused_moe_prefill.cu)
+        - gates stayed green after re-enabling live `dispatch_rows == 8 -> P13`:
+          - `fused_moe_prefill_test`
+          - `multi_turn_prefix_reuse_test`
+        - definitive resumed runtime retry now passes:
+          [ttft_20260407_rows8_p13_accum_store_retry_prefix4_tail4.stdout.txt](/home/khkramer/src/nemotron-inference/artifacts/benchmarks/ttft_20260407_rows8_p13_accum_store_retry_prefix4_tail4.stdout.txt)
+          - `routed_gemm1 dispatch_rows=8 -> p5`
+          - `routed_gemm2 dispatch_rows=8 -> p13`
+          - `cached_committed_head_prefix4_tail4 hot-prefix = 58.087 ms`
+        - implication:
+          low-row FC2 `P13` is now behaviorally safe on the live path; the
+          temporary `dispatch_rows == 8 -> P15` safety override is no longer
+          needed
 
 #### Full TRT Mainloop Alignment Plan
 
@@ -1593,7 +1976,7 @@ Next definitive probes for `P5`:
 | 0 | Freeze the post-attention baseline and root-cause profile | done | Historical baseline frozen; newer external race targets now live above and in `proj-2026-04-05-1704/EXTERNAL_BASELINES_NOTES.md` |
 | 1 | Lock the revised optimization contract | done | One runtime path, device-only execution, behavioral reuse equivalence |
 | 2 | Decide routed-expert input format and packing strategy | done | `FP4xFP4` on tensor cores; quantize activations once per layer; grouped GEMM for all experts |
-| 3 | Grouped `FP4xFP4` tensor core MoE kernel | in progress | Device launch plan, padded row layout, C++20, and the narrow local `TiledCopy` bridge are in place; traced `P5`, `P12`, and `P13` routed FP4 paths are now active with exact `SmemLayoutSFA/SFB` scale staging, `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` pass, `compute-sanitizer` reports `0 errors`, focused TTFT improved to `cold_prefill_prefix128 = 107.215 ms` and `cold_prefill_prefix4096 = 1633.296 ms`; next exactness/perf target is `P15`, then a broader routed FP4 rerun/profile pass |
+| 3 | Grouped `FP4xFP4` tensor core MoE kernel | in progress | Device launch plan, padded row layout, C++20, and the narrow local `TiledCopy` bridge are in place; traced `P5`, `P12`, and `P13` routed FP4 paths are now live and behaviorally safe, with low-row `dispatch_rows == 8 -> P13` fixed by the traced `tCcC/tCrC` accumulator/store rewrite; `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` pass, focused TTFT improved to `cold_prefill_prefix128 = 107.215 ms`, `cold_prefill_prefix4096 = 1633.296 ms`, and the resumed short-input retry completes with `dispatch_rows=8 -> p13`; the remaining traced routed fallback is `P15`, which still needs its dedicated full-profile fragment/accumulator contract |
 | 4 | Shared-expert alignment | pending | Shared experts still distort short-prefix cold prefill and need the same stronger math family |
 | 5 | Optimize Mamba prefill | pending | Still the second blocker at `prefix4096` after routed MoE |
 | 6 | Re-profile and choose the next default workstream | pending | Final race phase only after routed MoE, shared, and long-prefix Mamba move materially |
