@@ -251,6 +251,27 @@ Measured `ncu` facts for the first profiled unified routed FP4 kernel:
   - tensor-pipe active: `4.83%` of peak sustained elapsed
   - kernel time: `2.367 ms`
 
+Measured transport-contract facts from the compile-time dump:
+- artifact:
+  `artifacts/benchmarks/phase05_transport_contract_20260409T065531Z.txt`
+- common SM120 transport contract across the active routed family:
+  - `tma_threads_ref = 128`
+  - `math_threads = 256`
+  - `total_threads_per_block_ref = 384`
+  - full barrier type: `cutlass::arch::ClusterTransactionBarrier`
+  - empty barrier type: `cutlass::arch::ClusterBarrier`
+  - operand copy atoms: `Copy_Atom<SM75_U32x4_LDSM_N, integer_subbyte<4,false>>`
+  - scale copy atoms: `Copy_Atom<UniversalCopy<float_ue4m3_t,float_ue4m3_t>, float_ue4m3_t>`
+- per-profile builder/runtime staging facts:
+  - `P5`: `ab_stages=4`, `sf_stages=4`, single-stage runtime bytes `34816`, builder multistage bytes `139264`
+  - `P12`: `ab_stages=4`, `sf_stages=4`, single-stage runtime bytes `34816`, builder multistage bytes `139264`
+  - `P13`: `ab_stages=9`, `sf_stages=9`, single-stage runtime bytes `17408`, builder multistage bytes `156672`
+  - `P15`: `ab_stages=6`, `sf_stages=6`, single-stage runtime bytes `26112`, builder multistage bytes `156672`
+- critical implication:
+  - the literal CUTLASS multistage storage for every active routed profile exceeds the per-CTA opt-in shared-memory cap of `101376` bytes
+  - Phase 1 cannot be a naive “port the builder storage exactly” rewrite
+  - Phase 1 must instead preserve the traced copy atoms / barrier contract while compressing stage storage to a runtime-feasible staged transport plan
+
 Interpretation:
 - the current unified routed kernel is not bandwidth-limited
 - it is also not tensor-core-limited
@@ -276,6 +297,7 @@ Interpretation:
    - CTA count per expert under the current launch plan
 4. Use TRT/CUTLASS source plus compile-time probes to recover the exact SM120
    staged-copy / barrier / stage-count contract needed for the TMA rewrite.
+   Status: done for the current unified routed profile family.
 
 **Reference points to start from, not rediscover:**
 - `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/sm120_blockwise_gemm/sm120_utils.cuh`
@@ -301,12 +323,18 @@ Interpretation:
   worth doing, and which experts dominate routed traffic
 - we have the exact source/probe facts needed to implement the SM120 staged
   transport contract without guesswork
+- we know that the literal builder multistage storage is too large for the
+  per-CTA shared-memory cap, so Phase 1 must use a compressed runtime stage
+  plan instead of a direct storage clone
 
 ### Phase 1: Weight Loading Pipeline (biggest lever)
 
 **Goal:** Get the weight bytes from DRAM to the Tensor Core as fast as
 the hardware allows.  This phase targets the corrected `~9.7 ms` routed
-MoE weight+scale floor, not the older `8.6 ms` weight-only floor.
+MoE weight+scale floor, not the older `8.6 ms` weight-only floor. The
+implementation constraint is now also explicit: keep the traced SM120 copy
+atoms and barrier contract, but do not try to replicate the builder’s full
+multistage storage literally when it exceeds the `101376`-byte per-CTA limit.
 
 **Why this is first:** At prefix128, routed MoE weight transport dominates the
 cost surface.  Every meaningful improvement in effective bandwidth moves TTFT.
@@ -324,9 +352,10 @@ shared memory in hardware, without consuming SM instruction slots.
 - Target: one TMA descriptor per K-tile, issued by a single producer
   thread.  Frees all other threads for MMA compute.
 
-The exact staged-copy primitive, stage count, and barrier structure should be
-derived from the SM120 TRT/CUTLASS builder path plus the measurement/probe gate,
-not hard-coded from an older architecture name.
+The exact staged-copy primitive and barrier structure are now pinned down by the
+Phase 0.5 probe. The remaining design choice is the compressed runtime stage
+count/layout that preserves those contracts while fitting within the per-CTA
+shared-memory limit.
 
 Concrete source anchors for this phase:
 - `sm120_utils.cuh` lines `271-307` for descriptor and transaction-byte types
@@ -360,9 +389,21 @@ K-tile `i+1` overlap with MMA compute on K-tile `i`.
 With 15 K-tiles per expert (at K=1920, TileK=128): 14 of 15 loads overlap
 with compute.  Only the first load is latency-exposed.
 
-Smem cost: 2-3 stages × ~24 KB per stage = 48-72 KB.  This fits within the
-actual per-CTA opt-in limit of `101376` bytes, but it leaves much less margin
-than the old rounded `100 KB` wording suggested.
+Measured single-stage runtime storage from Phase 0.5 is:
+- `P5/P12`: `34816` bytes per stage
+- `P13`: `17408` bytes per stage
+- `P15`: `26112` bytes per stage
+
+This means the feasible compressed runtime stage counts are roughly:
+- `P5/P12`: at most `2` stages (`69632` bytes) before extra barrier/epilogue
+  state; `3` stages would already be `104448` bytes and exceed the cap
+- `P13`: up to `5` stages in principle on raw stage bytes, though barrier and
+  epilogue state will reduce that headroom
+- `P15`: at most `3` stages on raw stage bytes; `4` stages would already be
+  `104448` bytes and exceed the cap
+
+So Phase 1b should start from a compressed `2`-stage design for `P5/P12`, with
+profile-specific expansion only where the measured storage budget allows it.
 
 **Expected impact:** Hides most K-tile load latency behind MMA.  Exact gain is
 measurement-gated.
