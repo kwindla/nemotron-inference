@@ -5371,13 +5371,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       p5_tma_b_full_mbar[0].init(1);
       cutlass::arch::fence_barrier_init();
     }
-    if (use_p5_tma_b) {
-      constexpr std::size_t kSwizzledBBytes =
-          sizeof(typename Traits::SmemAllocB) * Traits::kSwizzledBElems;
-      for (std::size_t i = static_cast<std::size_t>(tid); i < kSwizzledBBytes; i += blockDim.x) {
-        sw_b[i] = 0u;
-      }
-    }
     __syncthreads();
 
     if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
