@@ -366,30 +366,43 @@ Runtime `P5` TMA descriptor-ownership status:
   behind a narrow eligibility gate.
 - current live `P5` transport state:
   - `A`/weight uses resident per-expert host-built CUTE TMA descriptors
-  - `B`/activation now also has a live TMA transport path, but its ownership
-    is deliberately launch-local:
-    - host copies the exact `cta_row_starts` / `cta_valid_rows` metadata
-    - host builds one bare CUTE `P5TmaLoadB` descriptor per active CTA
-    - descriptors are copied to device for the launch and consumed by a
-      dedicated producer warp in the unified `P5` kernel
+  - `B`/activation now also has a live TMA transport path with cached
+    split ownership:
+    - `DeviceMoeLaunchPlan` now keeps host mirrors of the exact active CTA
+      row metadata (`cta_count`, `cta_row_starts`, `cta_valid_rows`) and a
+      build epoch that advances each time the plan is rebuilt
+    - `DeviceNvfp4Matrix` now caches one device array of bare CUTE
+      `P5TmaLoadB` descriptors per `(packed_input allocation, launch_plan,
+      build_epoch)` triple
+    - the unified `P5` kernel consumes that cached device descriptor array
+      directly, so the live path no longer pays per-launch D2H metadata copies
+      or per-launch descriptor malloc/free churn
   - scales and non-`P5` profiles still use the existing thread-coded
     global -> swizzled-smem scatter
-  - this is a transport-correctness landing, not the final roofline-ready
-    ownership model: per-launch host descriptor rebuild is expected to carry
-    overhead and should be treated as temporary
+  - this is still not the final roofline-ready form because the B cache is
+    tied to the current runtime objects rather than a fully persistent staged
+    workspace, but the immediate launch-local rebuild overhead is now gone
 - current live-gate status:
   - `fused_moe_prefill_test PASS`
   - `multi_turn_prefix_reuse_test PASS`
   - `testing/p5_swizzled_pipeline_test_120f` with
     `NEMOTRON_RUN_P5_TMA_SMOKE=1 PASS`
   - single-case canonical-capacity TTFT smoke:
-    - `cold_prefill_prefix128 = 142.097 ms` median
-    - `cached_committed_head_prefix128_tail4 hot-prefix = 66.129 ms` median
-    - `cached_global_root_prefix128_tail4 hot-prefix = 65.854 ms` median
+    - after the first live B-side transport landing:
+      - `cold_prefill_prefix128 = 142.097 ms` median
+      - `cached_committed_head_prefix128_tail4 hot-prefix = 66.129 ms` median
+      - `cached_global_root_prefix128_tail4 hot-prefix = 65.854 ms` median
+    - after moving B-descriptor ownership/caching into the plan + matrix
+      layer:
+      - `cold_prefill_prefix128 = 142.474 ms` median
+      - `cached_committed_head_prefix128_tail4 hot-prefix = 66.007 ms` median
+      - `cached_global_root_prefix128_tail4 hot-prefix = 66.000 ms` median
     with `resolved_runtime_moe_prefill_window_tokens=4096`
-  - still not a claimed full-matrix TTFT win: the launch-local `B`
-    descriptor path is correct enough to benchmark, but the ownership/caching
-    model still needs to move closer to the runtime plan / workspace layer
+  - interpretation:
+    - removing the launch-local descriptor rebuild eliminates that known
+      control overhead, but it does not materially move cold TTFT
+    - the remaining gap is now dominated by the kernel body / staging path,
+      which is the right point to hand over to `ncu`
 
 Immediate implication for Phase 1:
 - stop questioning whether CUTE TMA works for routed FP4 `P5`
@@ -406,10 +419,11 @@ Immediate implication for Phase 1:
   kernel:
   the smoke covers both the full 128-row B tile and the live-like
   logical-32 / valid-5 activation case with TMA out-of-bounds zero fill, and
-  the live `P5` path now consumes per-CTA launch-local `B` descriptors.
-  The next boundary is no longer "can live B TMA work?" but "how do we move
-  descriptor ownership/caching out of the per-launch host rebuild so the
-  transport experiment is representative?"
+  the live `P5` path now consumes cached per-CTA `B` descriptors via the
+  launch-plan + matrix ownership split.
+  The next boundary is no longer descriptor ownership; it is direct
+  measurement of the live kernel body and then removing the remaining known
+  temporary costs inside that body.
 - keep two temporary correctness-landing caveats explicit before reading too
   much into the first transport measurements:
   - the live `P5` B path still zero-fills the entire swizzled `B` stage before
@@ -462,16 +476,17 @@ Interpretation:
 4. Use TRT/CUTLASS source plus compile-time probes to recover the exact SM120
    staged-copy / barrier / stage-count contract needed for the TMA rewrite.
    Status: done for the current unified routed profile family.
-5. Replace the temporary launch-local `P5` B-descriptor rebuild with a
-   runtime-owned descriptor path:
-   - either cache per-CTA `P5TmaLoadB` descriptors alongside the launch plan
-     metadata for a stable workspace pointer
-   - or derive an equivalent launch-time object without host round-tripping
-     the CTA metadata
-6. When profiling the live `P5` TMA path, remove and then remeasure the two
+5. When profiling the live `P5` TMA path, remove and then remeasure the two
    known temporary costs:
    - the conservative full-stage `B` smem clear before TMA
    - any residual control-flow overhead from the fallback `B` packed-data loop
+6. Run `ncu` on the cached-descriptor live `P5` path and capture the first
+   transport-focused before/after counters:
+   - DRAM throughput
+   - L2 hit rate
+   - warp stall reasons
+   - active warps / occupancy
+   - shared-memory instructions and barriers
 
 **Reference points to start from, not rediscover:**
 - External references:

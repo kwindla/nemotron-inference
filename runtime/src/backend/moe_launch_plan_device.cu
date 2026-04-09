@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <vector>
 #include <utility>
 
 namespace nemotron {
@@ -31,6 +32,10 @@ struct DeviceMoeLaunchPlan::Impl {
   std::size_t selected_token_tile = kMoeLaunchPlanMaxTokenTile;
   std::size_t max_output_rows_per_expert = 0;
   std::size_t task_capacity = 0;
+  std::size_t build_epoch = 0;
+  int exact_cta_count_host = 0;
+  std::vector<int> cta_row_starts_host;
+  std::vector<int> cta_valid_rows_host;
 
   ~Impl() {
     if (task_output_row_bases != nullptr) {
@@ -536,6 +541,10 @@ std::size_t DeviceMoeLaunchPlan::task_capacity() const {
   return impl_ != nullptr ? impl_->task_capacity : 0;
 }
 
+std::size_t DeviceMoeLaunchPlan::build_epoch() const {
+  return impl_ != nullptr ? impl_->build_epoch : 0;
+}
+
 int* DeviceMoeLaunchPlan::cta_count() const {
   return impl_ != nullptr ? impl_->cta_count : nullptr;
 }
@@ -616,6 +625,22 @@ int* DeviceMoeLaunchPlan::task_output_row_bases() const {
   return impl_ != nullptr ? impl_->task_output_row_bases : nullptr;
 }
 
+int DeviceMoeLaunchPlan::exact_cta_count_host() const {
+  return impl_ != nullptr ? impl_->exact_cta_count_host : 0;
+}
+
+const int* DeviceMoeLaunchPlan::cta_row_starts_host() const {
+  return impl_ != nullptr && !impl_->cta_row_starts_host.empty()
+             ? impl_->cta_row_starts_host.data()
+             : nullptr;
+}
+
+const int* DeviceMoeLaunchPlan::cta_valid_rows_host() const {
+  return impl_ != nullptr && !impl_->cta_valid_rows_host.empty()
+             ? impl_->cta_valid_rows_host.data()
+             : nullptr;
+}
+
 bool BuildDeviceMoeLaunchPlan(
     const DeviceExpertRouting& routing,
     std::size_t active_selection_count,
@@ -675,7 +700,45 @@ bool BuildDeviceMoeLaunchPlan(
       plan->permuted_token_indices(),
       plan->sorted_to_permuted_indices(),
       static_cast<int>(active_selection_count));
-  return CheckCuda(cudaGetLastError());
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  int exact_cta_count = 0;
+  if (!CheckCuda(cudaMemcpy(
+          &exact_cta_count,
+          plan->cta_count(),
+          sizeof(exact_cta_count),
+          cudaMemcpyDeviceToHost)) ||
+      exact_cta_count < 0 ||
+      static_cast<std::size_t>(exact_cta_count) > *current_cta_capacity) {
+    return false;
+  }
+
+  plan->impl_->exact_cta_count_host = exact_cta_count;
+  plan->impl_->cta_row_starts_host.assign(static_cast<std::size_t>(exact_cta_count), 0);
+  plan->impl_->cta_valid_rows_host.assign(static_cast<std::size_t>(exact_cta_count), 0);
+  if (exact_cta_count > 0) {
+    const std::size_t cta_bytes = sizeof(int) * static_cast<std::size_t>(exact_cta_count);
+    if (!CheckCuda(cudaMemcpy(
+            plan->impl_->cta_row_starts_host.data(),
+            plan->cta_row_starts(),
+            cta_bytes,
+            cudaMemcpyDeviceToHost)) ||
+        !CheckCuda(cudaMemcpy(
+            plan->impl_->cta_valid_rows_host.data(),
+            plan->cta_valid_rows(),
+            cta_bytes,
+            cudaMemcpyDeviceToHost))) {
+      plan->impl_->exact_cta_count_host = 0;
+      plan->impl_->cta_row_starts_host.clear();
+      plan->impl_->cta_valid_rows_host.clear();
+      return false;
+    }
+  }
+
+  ++plan->impl_->build_epoch;
+  return true;
 }
 
 bool BuildDeviceMoeExactTaskMap(

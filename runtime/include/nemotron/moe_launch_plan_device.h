@@ -64,6 +64,7 @@ class DeviceMoeLaunchPlan {
   std::size_t selected_token_tile() const;
   std::size_t max_output_rows_per_expert() const;
   std::size_t task_capacity() const;
+  std::size_t build_epoch() const;
 
   int* cta_count() const;
   int* total_padded_rows() const;
@@ -86,6 +87,9 @@ class DeviceMoeLaunchPlan {
   int* task_row_starts() const;
   int* task_valid_rows() const;
   int* task_output_row_bases() const;
+  int exact_cta_count_host() const;
+  const int* cta_row_starts_host() const;
+  const int* cta_valid_rows_host() const;
 
  private:
   struct Impl;

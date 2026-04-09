@@ -8,8 +8,13 @@
 #include <cmath>
 #include <optional>
 #include <utility>
+#include <vector>
 
+#include "nemotron/moe_launch_plan_device.h"
 #include "nemotron/nvfp4_scale_layout.h"
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+#include "routed_p5_tma_descriptor.cuh"
+#endif
 
 namespace nemotron {
 namespace {
@@ -493,6 +498,9 @@ struct DeviceNvfp4Matrix::Impl {
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scale_data = nullptr;
+  const DeviceMoeLaunchPlan* cached_p5_tma_b_launch_plan = nullptr;
+  std::size_t cached_p5_tma_b_build_epoch = 0;
+  void* cached_p5_tma_b_descriptors = nullptr;
 };
 
 std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
@@ -546,6 +554,9 @@ DeviceNvfp4Matrix::~DeviceNvfp4Matrix() {
   }
   if (impl_->tensor_scale_data != nullptr) {
     cudaFree(impl_->tensor_scale_data);
+  }
+  if (impl_->cached_p5_tma_b_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_b_descriptors);
   }
   if (impl_->matmul_block_scales_data != nullptr) {
     cudaFree(impl_->matmul_block_scales_data);
@@ -626,6 +637,80 @@ const std::uint8_t* DeviceNvfp4Matrix::matmul_block_scales_data() const {
 
 const std::uint8_t* DeviceNvfp4Matrix::tensor_scale_data() const {
   return impl_ ? impl_->tensor_scale_data : nullptr;
+}
+
+const void* DeviceNvfp4Matrix::p5_tma_load_b_descriptors(
+    const DeviceMoeLaunchPlan& launch_plan) const {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (!valid() ||
+      cols() == 0 ||
+      (cols() % 128u) != 0 ||
+      launch_plan.exact_cta_count_host() <= 0 ||
+      launch_plan.cta_row_starts_host() == nullptr ||
+      launch_plan.cta_valid_rows_host() == nullptr) {
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_b_launch_plan == &launch_plan &&
+      impl_->cached_p5_tma_b_build_epoch == launch_plan.build_epoch() &&
+      impl_->cached_p5_tma_b_descriptors != nullptr) {
+    return impl_->cached_p5_tma_b_descriptors;
+  }
+
+  std::vector<routed_p5_tma::P5TmaLoadB> host_descriptors;
+  host_descriptors.reserve(static_cast<std::size_t>(launch_plan.exact_cta_count_host()));
+  const std::size_t packed_row_bytes = cols() / 2u;
+  const int32_t input_cols = static_cast<int32_t>(cols());
+  const int64_t input_cols_stride = static_cast<int64_t>(cols());
+  for (int cta_index = 0; cta_index < launch_plan.exact_cta_count_host(); ++cta_index) {
+    const int row_start = launch_plan.cta_row_starts_host()[cta_index];
+    const int valid_rows = launch_plan.cta_valid_rows_host()[cta_index];
+    if (row_start < 0 ||
+        valid_rows <= 0 ||
+        static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > rows()) {
+      return nullptr;
+    }
+
+    const auto* cta_packed =
+        packed_data() + static_cast<std::size_t>(row_start) * packed_row_bytes;
+    auto tensor_b = cute::make_tensor(
+        cute::make_gmem_ptr(cute::recast_ptr<routed_p5_tma::ElementAB>(cta_packed)),
+        cute::make_layout(
+            cute::make_shape(static_cast<int32_t>(valid_rows), input_cols, int32_t{1}),
+            cute::make_stride(
+                input_cols_stride,
+                cute::Int<1>{},
+                static_cast<int64_t>(valid_rows) * input_cols_stride)));
+    host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadB(tensor_b));
+  }
+
+  void* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes =
+      sizeof(routed_p5_tma::P5TmaLoadB) * host_descriptors.size();
+  if (descriptor_bytes == 0 ||
+      !CheckCuda(cudaMalloc(&device_descriptors, descriptor_bytes)) ||
+      !CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    if (device_descriptors != nullptr) {
+      cudaFree(device_descriptors);
+    }
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_b_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_b_descriptors);
+  }
+  impl_->cached_p5_tma_b_launch_plan = &launch_plan;
+  impl_->cached_p5_tma_b_build_epoch = launch_plan.build_epoch();
+  impl_->cached_p5_tma_b_descriptors = device_descriptors;
+  return impl_->cached_p5_tma_b_descriptors;
+#else
+  (void) launch_plan;
+  return nullptr;
+#endif
 }
 
 Nvfp4ScaleLayout DeviceNvfp4Matrix::scale_layout() const {

@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
-#include <vector>
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 #include <cutlass/arch/barrier.h>
@@ -1727,113 +1726,6 @@ bool LaunchProgrammaticKernel(
   return CheckCuda(cudaLaunchKernelEx(&config, kernel, args...)) &&
          CheckCuda(cudaGetLastError());
 }
-
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-bool CreateLaunchLocalP5TmaLoadBArray(
-    const DeviceNvfp4Matrix& input_pack,
-    const DeviceMoeLaunchPlan* launch_plan,
-    routed_p5_tma::P5TmaLoadB** descriptor_array) {
-  if (descriptor_array == nullptr) {
-    return false;
-  }
-  *descriptor_array = nullptr;
-  if (!input_pack.valid() ||
-      launch_plan == nullptr ||
-      !launch_plan->valid() ||
-      input_pack.packed_data() == nullptr ||
-      launch_plan->num_non_exiting_ctas() == nullptr ||
-      launch_plan->cta_row_starts() == nullptr ||
-      launch_plan->cta_valid_rows() == nullptr ||
-      input_pack.cols() == 0 ||
-      (input_pack.cols() % 128u) != 0) {
-    return false;
-  }
-
-  int exact_cta_count = 0;
-  if (!CheckCuda(cudaMemcpy(
-          &exact_cta_count,
-          launch_plan->num_non_exiting_ctas(),
-          sizeof(exact_cta_count),
-          cudaMemcpyDeviceToHost)) ||
-      exact_cta_count <= 0) {
-    return false;
-  }
-
-  std::vector<int> host_row_starts(static_cast<std::size_t>(exact_cta_count), 0);
-  std::vector<int> host_valid_rows(static_cast<std::size_t>(exact_cta_count), 0);
-  const std::size_t cta_bytes = sizeof(int) * static_cast<std::size_t>(exact_cta_count);
-  if (!CheckCuda(cudaMemcpy(
-          host_row_starts.data(),
-          launch_plan->cta_row_starts(),
-          cta_bytes,
-          cudaMemcpyDeviceToHost)) ||
-      !CheckCuda(cudaMemcpy(
-          host_valid_rows.data(),
-          launch_plan->cta_valid_rows(),
-          cta_bytes,
-          cudaMemcpyDeviceToHost))) {
-    return false;
-  }
-
-  const std::size_t packed_row_bytes = input_pack.cols() / 2u;
-  const std::size_t total_rows = input_pack.rows();
-  const int32_t input_cols = static_cast<int32_t>(input_pack.cols());
-  const int64_t input_cols_stride = static_cast<int64_t>(input_pack.cols());
-  std::vector<routed_p5_tma::P5TmaLoadB> host_descriptors;
-  host_descriptors.reserve(static_cast<std::size_t>(exact_cta_count));
-  for (int cta_index = 0; cta_index < exact_cta_count; ++cta_index) {
-    const int row_start = host_row_starts[static_cast<std::size_t>(cta_index)];
-    const int valid_rows = host_valid_rows[static_cast<std::size_t>(cta_index)];
-    if (row_start < 0 ||
-        valid_rows <= 0 ||
-        static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > total_rows) {
-      return false;
-    }
-
-    const auto* cta_packed =
-        input_pack.packed_data() + static_cast<std::size_t>(row_start) * packed_row_bytes;
-    auto tensor_b = cute::make_tensor(
-        cute::make_gmem_ptr(cute::recast_ptr<routed_p5_tma::ElementAB>(cta_packed)),
-        cute::make_layout(
-            cute::make_shape(static_cast<int32_t>(valid_rows), input_cols, int32_t{1}),
-            cute::make_stride(
-                input_cols_stride,
-                cute::Int<1>{},
-                static_cast<int64_t>(valid_rows) * input_cols_stride)));
-    host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadB(tensor_b));
-  }
-
-  routed_p5_tma::P5TmaLoadB* device_descriptors = nullptr;
-  const std::size_t descriptor_bytes =
-      sizeof(routed_p5_tma::P5TmaLoadB) * host_descriptors.size();
-  if (!CheckCuda(cudaMallocAsync(
-          reinterpret_cast<void**>(&device_descriptors),
-          descriptor_bytes,
-          cudaStream_t{}))) {
-    return false;
-  }
-  if (!CheckCuda(cudaMemcpyAsync(
-          device_descriptors,
-          host_descriptors.data(),
-          descriptor_bytes,
-          cudaMemcpyHostToDevice,
-          cudaStream_t{}))) {
-    cudaFreeAsync(device_descriptors, cudaStream_t{});
-    return false;
-  }
-
-  *descriptor_array = device_descriptors;
-  return true;
-}
-
-void DestroyLaunchLocalP5TmaLoadBArray(routed_p5_tma::P5TmaLoadB** descriptor_array) {
-  if (descriptor_array == nullptr || *descriptor_array == nullptr) {
-    return;
-  }
-  cudaFreeAsync(*descriptor_array, cudaStream_t{});
-  *descriptor_array = nullptr;
-}
-#endif
 
 int SelectContiguousOutputTile(std::size_t output_rows, std::size_t input_row_count) {
   const int multiprocessor_count = GetMultiProcessorCount();
@@ -8279,11 +8171,9 @@ bool LaunchPlannedPackedInputMatVecBf16(
         if (g_enable_p5_scale_trace != 0) {
           g_p5_scale_trace = {};
         }
-        routed_p5_tma::P5TmaLoadB* p5_tma_load_b_descriptors = nullptr;
-        const bool have_p5_tma_b = CreateLaunchLocalP5TmaLoadBArray(
-            input_pack,
-            launch_plan,
-            &p5_tma_load_b_descriptors);
+        const auto* p5_tma_load_b_descriptors =
+            reinterpret_cast<const routed_p5_tma::P5TmaLoadB*>(
+                input_pack.p5_tma_load_b_descriptors(*launch_plan));
         if (!LaunchProgrammaticKernel(
             grid,
             block,
@@ -8300,14 +8190,12 @@ bool LaunchPlannedPackedInputMatVecBf16(
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
             launch_plan->cta_valid_rows(),
-            have_p5_tma_b ? p5_tma_load_b_descriptors : nullptr,
+            p5_tma_load_b_descriptors,
             weights,
             output_rows_per_expert,
             output)) {
-          DestroyLaunchLocalP5TmaLoadBArray(&p5_tma_load_b_descriptors);
           return false;
         }
-        DestroyLaunchLocalP5TmaLoadBArray(&p5_tma_load_b_descriptors);
         if (g_enable_p5_scale_trace != 0) {
           if (!CheckCuda(cudaDeviceSynchronize())) {
             return false;
