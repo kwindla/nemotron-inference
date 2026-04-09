@@ -1,0 +1,637 @@
+# Roofline Optimization Plan
+
+## Target
+
+Stretch target: 20 ms cold TTFT for a 128-token prompt on RTX 5090.
+This is about 2x faster than the local TRT-LLM baseline (`38 ms`) and
+within about 1.7x of the corrected theoretical roofline floor
+(`~11.8-12.0 ms`).
+
+Planning target: drive the active `window=4096` production benchmark from
+today's `~176 ms` at `prefix128 / tail4` to below `70 ms`, then reassess
+against measured bandwidth and cache-utilization gains before committing to
+the `50 ms`, `35 ms`, and `20 ms` milestones.
+
+## Key Insight
+
+Nemotron-3 Nano at prefix128 is **entirely memory-bandwidth-bound**.  The
+Tensor Cores can finish the math in 0.3 ms.  The routed MoE weight traffic
+alone is not the whole story: routed block scales add another ~12% to the
+bytes that must move, pushing the routed MoE floor from `8.6 ms` to
+`~9.7 ms` at peak bandwidth.  Every optimization that matters is about
+moving bytes faster, moving fewer bytes, or hiding those bytes behind useful
+work.
+
+Current production state on the canonical surface:
+- `prefix4 / tail4`: `68.780 ms`
+- `prefix128 / tail4`: `175.692 ms`
+- `prefix4096 / tail4`: `2337.938 ms`
+- artifact:
+  `artifacts/benchmarks/ttft_20260409T_plan_matrix_tail4.stdout.txt`
+
+Reference baseline:
+- TRT-LLM `prefix128`: `38.407 ms`
+
+Interpretation:
+- current native `prefix128` is about `15x` off the corrected `~11.8-12.0 ms`
+  roofline floor
+- current native `prefix128` is about `4.6x` slower than local TRT-LLM
+- the plan must optimize the current `window=4096` production surface, not the
+  earlier reduced-window smoke surfaces
+
+## Numbers That Drive Every Decision
+
+```
+RTX 5090:
+  GDDR7 bandwidth:   1792 GB/s peak, ~1300 GB/s effective
+  L2 cache:          96 MB, ~7 TB/s to SMs
+  L1/smem per SM:    128 KB
+  Smem per CTA cap:  101376 B opt-in (~99 KB)
+  Smem per SM cap:   102400 B (~100 KB)
+  SMs:               170
+  FP4 Tensor:        1676 TOPS (dense)
+  Registers per SM:  256 KB
+
+Nano per MoE layer:
+  Routed weight:     661 MB (128 experts × FC1+FC2, FP4)
+  Routed scales:     78.75 MiB (1 ue4m3 scale byte per 16 FP4 weights)
+  Shared weight:     10 MB
+  Routed compute:    15.9 GFLOP
+  Shared compute:    5.1 GFLOP
+  Arithmetic intensity: 31 FLOP/byte (need 935 to balance)
+  Routed seam traffic:
+    ~2.8 MiB BF16 FC1 intermediate
+    ~0.7 MiB packed FC1->FC2 activation
+    ~4-8 MiB FC2 output / finalize writes
+    ~10-15 MiB total per layer, small for the roofline floor but important
+    for Phase 3 seam reduction
+
+One expert (FC1+FC2):
+  Weight:            5.2 MB
+  Scales:            0.615 MiB
+  Tokens (avg):      6 at prefix128
+  Compute:           62 MFLOP
+
+L2 capacity:         ~18 experts at a time
+
+Full forward pass:
+  MoE weight (23 layers): 15.4 GB → 8.6 ms at peak BW
+  MoE scales (23 layers): ~1.9 GB → ~1.1 ms at peak BW
+  Routed MoE total: ~17.3 GB → ~9.7 ms at peak BW
+  Mamba weight (23 layers): ~2.7 GB → 1.5 ms
+  Attention weight (8 layers): ~0.5 GB → 0.3 ms
+  LM head: ~0.7 GB → 0.4 ms
+  Total weight+scale floor: ~21.2 GB → ~11.8 ms at peak BW
+```
+
+## Canonical Benchmark Surface
+
+All optimization decisions in this plan use one benchmark contract only:
+
+- `--moe-prefill-window-tokens 4096`
+- `prefix-length 4`, `128`, and `4096`
+- `tail-token-count 4`
+- single active request
+
+That avoids mixing the old reduced-window smoke cases with the production
+surface.  All milestone numbers below refer to this contract unless
+explicitly stated otherwise.
+
+## Optimization Doctrine
+
+### Bytes are the primary API
+
+Every hot-path decision should be evaluated in terms of:
+
+- mandatory HBM bytes for one forward pass
+- actual HBM bytes moved by the runtime
+- bytes duplicated across multiple layouts or scratch buffers
+- bytes written to intermediate workspace and reread later
+- achieved DRAM bandwidth as a percentage of practical peak
+
+TTFT remains the user-facing score, but byte movement is the engineering
+control surface.
+
+### One execution layout on the active path
+
+On the active routed path we want:
+
+- one weight layout
+- one scale layout
+- one activation-pack layout
+- one routed kernel family
+- compile-time execution dimensions wherever the model family is static
+
+If a buffer exists only to translate between two internal layouts, that buffer
+is a likely tax that should be removed.  The ideal active path stores weights
+in the exact execution form, packs activations directly into the exact
+execution form, and consumes that form without repacking.
+
+For the active Nano routed path, execution dimensions like padded
+`routed_intermediate_size = 1920` should live in traits / template constants,
+not as dynamic hot-path loop bounds, so shared-memory sizing and address
+arithmetic can be constant-folded.
+
+### Transport before compute
+
+The next major wins should come from:
+
+1. direct global → swizzled shared-memory transport
+2. multi-stage overlap of transport and MMA
+3. warp-specialized producer/consumer execution
+
+This work comes before smaller math-side cleanups because the current gap is
+not MMA issue rate.  It is the cost of staging bytes and exposing load
+latency.
+
+### Treat FC1 and FC2 as one routed system
+
+The routed expert path should be optimized as one dataflow:
+
+- FC1 input pack
+- FC1 GEMM
+- activation / requantization
+- FC2 GEMM
+
+The expensive seams are usually between kernels, not inside a single MMA
+instruction.  The main question is therefore not “which kernel next?” but:
+
+- what must hit global memory?
+- what can remain in one request-scoped workspace?
+- what can be packed once and consumed directly?
+
+### Scheduling is a first-class optimization
+
+If the routed path is bandwidth-bound, then *which expert tiles run when*
+matters.  After the transport path is fixed, the next important lever is
+expert-clustered execution and popularity-sorted scheduling to maximize L2
+reuse of hot expert weights.
+
+## Architecture Phases
+
+### Phase 0: Foundation (done)
+
+**Status:** already landed.
+
+What is already true:
+1. Routed intermediate dimension is padded from `1856` to execution
+   `1920`.
+2. Routed resident expert weights now use execution-form residency more
+   closely, without a duplicate row-major resident scale copy.
+3. `P5`, `P12`, `P13`, and `P15` are active on the unified routed FP4 body.
+4. Old dedicated runtime `P15` path is deleted.
+5. The full TTFT matrix at `window=4096` completes again without the old
+   `prefix128` invalid-token failure.
+
+**Current baseline to optimize from:**
+- `prefix4 / tail4`: `68.780 ms`
+- `prefix128 / tail4`: `175.692 ms`
+- `prefix4096 / tail4`: `2337.938 ms`
+
+### Phase 0.5: Measurement / Probe Gate
+
+**Goal:** lock down the exact current bottleneck before touching the
+transport path.
+
+**Work:**
+1. Run `ncu` on the current unified routed FP4 path for representative
+   `P5/P12/P13/P15` regimes.
+2. Capture:
+   - DRAM throughput
+   - L2 hit rate
+   - warp stall reasons
+   - occupancy / active warps
+   - shared-memory and register usage
+3. Dump the actual routed expert selection histogram for the canonical
+   `prefix128` surface:
+   - per-layer expert popularity
+   - tokens per expert
+   - CTA count per expert under the current launch plan
+4. Use TRT/CUTLASS source plus compile-time probes to recover the exact SM120
+   staged-copy / barrier / stage-count contract needed for the TMA rewrite.
+
+**Reference points to start from, not rediscover:**
+- `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/sm120_blockwise_gemm/sm120_utils.cuh`
+  lines `271-307`: `TMA_A`, `TMA_B`, `TMA_SFA`, `TMA_SFB`, `SmemCopyAtomSF`,
+  and `TmaTransactionBytes*`.  This is where the local SM120 path confirms
+  that the current TRT/CUTLASS builder still uses `SM90_TMA_LOAD` copy atoms
+  on SM120.
+- `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/sm120_blockwise_gemm/sm120_fp8_moe_gemm_1d1d.cuh`
+  lines `395-530`: `load_ab()` and `load_sf()` producer paths, barrier usage,
+  and `as_position_independent_swizzle_tensor(...)`.
+- `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/sm120_blockwise_gemm/sm120_fp8_moe_gemm_1d1d.cuh`
+  lines `190-253`: `SM120BlockScaledMoeScheduler`.
+
+**Exit criteria:**
+- we have one measured bottleneck summary for the current unified routed FP4
+  path
+- we know whether the expert distribution is skewed enough for Phase 2 to be
+  worth doing, and which experts dominate routed traffic
+- we have the exact source/probe facts needed to implement the SM120 staged
+  transport contract without guesswork
+
+### Phase 1: Weight Loading Pipeline (biggest lever)
+
+**Goal:** Get the weight bytes from DRAM to the Tensor Core as fast as
+the hardware allows.  This phase targets the corrected `~9.7 ms` routed
+MoE weight+scale floor, not the older `8.6 ms` weight-only floor.
+
+**Why this is first:** At prefix128, routed MoE weight transport dominates the
+cost surface.  Every meaningful improvement in effective bandwidth moves TTFT.
+No smaller compute-side cleanup has comparable leverage.
+
+#### 1a. TMA for Operand Loads
+
+Replace the byte-level swizzled scatter with TMA (Tensor Memory
+Accelerator) loads.  TMA loads from global memory directly into swizzled
+shared memory in hardware, without consuming SM instruction slots.
+
+- Current: threads compute swizzled offsets, issue individual byte stores
+  to smem.  This saturates the SM instruction pipeline on address
+  computation instead of letting DRAM bandwidth be the bottleneck.
+- Target: one TMA descriptor per K-tile, issued by a single producer
+  thread.  Frees all other threads for MMA compute.
+
+The exact staged-copy primitive, stage count, and barrier structure should be
+derived from the SM120 TRT/CUTLASS builder path plus the measurement/probe gate,
+not hard-coded from an older architecture name.
+
+Concrete source anchors for this phase:
+- `sm120_utils.cuh` lines `271-307` for descriptor and transaction-byte types
+- `sm120_fp8_moe_gemm_1d1d.cuh` lines `395-530` for producer-side load methods
+- `sm120_fp8_moe_gemm_1d1d.cuh` lines `190-253` for the scheduler shape that
+  will later matter for persistent routing work
+
+TMA requires:
+- the exact SM120 copy atom / descriptor contract used by the traced builder
+- tensor map descriptors set up on the host before launch
+- barrier-synchronized producer/consumer warp specialization
+
+This is a significant kernel restructuring but it directly follows the local
+SM120 TRT/CUTLASS producer path shape in `sm120_utils.cuh` and
+`sm120_fp8_moe_gemm_1d1d.cuh`.
+
+**Expected impact:** Removes the current thread-coded staging path as the main
+front-end bottleneck and enables a real bandwidth-limited experiment.  Exact
+gain is measurement-gated.
+
+#### 1b. Multi-Stage Pipeline
+
+Double-buffer (or triple-buffer) the smem K-tiles so that TMA loads for
+K-tile `i+1` overlap with MMA compute on K-tile `i`.
+
+- Current: load all → `__syncthreads` → compute all → `__syncthreads`.
+  DRAM latency (~400-600 ns) is fully exposed on every K-tile boundary.
+- Target: producer warps fill the next stage via TMA while consumer warps
+  run MMA on the current stage.  Pipeline barriers replace `__syncthreads`.
+
+With 15 K-tiles per expert (at K=1920, TileK=128): 14 of 15 loads overlap
+with compute.  Only the first load is latency-exposed.
+
+Smem cost: 2-3 stages × ~24 KB per stage = 48-72 KB.  This fits within the
+actual per-CTA opt-in limit of `101376` bytes, but it leaves much less margin
+than the old rounded `100 KB` wording suggested.
+
+**Expected impact:** Hides most K-tile load latency behind MMA.  Exact gain is
+measurement-gated.
+
+#### 1c. Warp-Specialized Producer/Consumer
+
+Dedicate a subset of warps to TMA production and the rest to MMA
+consumption.  This is the standard TRT-LLM pattern:
+
+```
+Warps 0-5:  MMA consumers (math)
+Warp 6:     TMA A/B loader (operand producer)
+Warp 7:     TMA SFA/SFB loader (scale producer)
+```
+
+The producers issue TMA loads and signal barriers.  The consumers wait on
+barriers, run MMA, and signal completion.  No warp ever does both.
+
+This pairs with Phase 1b (multi-stage pipeline) — the producer fills
+stage `i+1` while consumers drain stage `i`.
+
+**Expected impact:** Eliminates warp scheduling contention between load and
+compute instructions and makes the transport pipeline TRT-like.
+
+### Phase 2: L2 Cache Optimization (measurement-gated)
+
+**Goal:** Maximize reuse of expert weights through L2 cache, reducing
+effective DRAM traffic.
+
+#### 2a. Expert-Clustered CTA Scheduling
+
+Replace the default grid launch (which distributes CTAs round-robin
+across SMs) with a persistent kernel that processes all CTAs for one
+expert before moving to the next.
+
+- Current: 40,000+ CTAs launched, distributed across 170 SMs by the
+  hardware scheduler.  Expert A's weight tiles and Expert B's tiles
+  compete for L2 space.
+- Target: 170 persistent CTAs (one per SM).  Each SM works through a
+  global work queue, processing all output tiles for expert A, then
+  all tiles for expert B, etc.
+
+When an SM finishes expert A's tiles, expert A's weight data is hot in
+L2 from the TMA loads.  The next SM that starts expert A's tiles gets
+L2 hits instead of DRAM loads.
+
+With 128 experts and 170 SMs: at any moment, ~170 SMs are working on a
+small number of experts.  If 10 SMs work on the same expert
+simultaneously, each TMA load from DRAM is reused 10x through L2.
+
+This should only proceed if Phase 0.5 / Phase 1 measurements show that routed
+weight traffic still misses L2 heavily enough for expert clustering to matter.
+The Phase 0.5 expert histogram is the gating input here: if a small set of
+experts dominates routed tokens at `prefix128`, clustering and popularity
+sorting become much more attractive; if the distribution is flat, Phase 2
+should be deprioritized.
+
+Concrete reference patterns:
+- `SM120BlockScaledMoeScheduler` in `sm120_fp8_moe_gemm_1d1d.cuh` lines
+  `190-253` shows the current per-expert token-offset/block assignment model
+  that a clustered persistent scheduler would replace or wrap.
+- `cutlass::gemm::StaticPersistentScheduler` is referenced in
+  `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/nvfp4_nvfp4_gemm_template_sm120.h`
+  and provides the generic persistent-scheduler pattern worth borrowing where
+  it matches our launch model.
+
+**Expected impact:** potentially material for popular experts, but must be
+validated against measured L2 hit rate and expert popularity histograms before
+the work is justified.
+
+#### 2b. Popularity-Sorted Expert Scheduling
+
+Sort experts by token count (descending) before scheduling.  Popular
+experts (more tokens, more output tiles) run first while L2 is cold and
+has maximum capacity.  Unpopular experts (1-2 tokens) run last — they
+each load one weight set and produce minimal output, so L2 thrashing
+from them is irrelevant.
+
+This pairs with Phase 2a — the persistent kernel's work queue is sorted
+by expert popularity.
+
+**Expected impact:** secondary improvement on top of expert clustering if the
+measured L2 behavior justifies it.
+
+### Phase 3: Routed Dataflow Restructuring
+
+**Goal:** optimize the routed FC1→activation→FC2 system as one dataflow, not
+as isolated kernel islands.
+
+#### 3a. Minimize the FC1→FC2 seam
+
+Evaluate the whole routed layer boundary in byte terms:
+
+- which FC1 outputs must materialize to global memory?
+- which buffers can remain request-scoped only once?
+- which activation packs can be produced once and consumed directly by FC2?
+
+This phase should remove redundant intermediate traffic before adding more
+profile coverage.
+
+#### 3a.5. Experimental expert-local FC1→activation→FC2 fusion
+
+After Phase 1 transport/pipeline work is in place, evaluate a more aggressive
+expert-local fusion path for the low-token regime:
+
+- one persistent CTA lifetime per expert tile family
+- FC1 compute
+- activation / requantization
+- FC2 consume
+- only the final routed output hits global memory
+
+At the canonical `prefix128` surface, the average expert sees about `6` tokens,
+so a BF16 FC1 intermediate of `6 × 1920` is only about `23 KiB`.  That is
+small enough to consider keeping the expert-local intermediate in shared memory
+while FC2 consumes it directly.
+
+This is not the default plan because routed weight bytes still dominate the
+roofline, but it is the most promising Phase 3 variant if the seam bytes and
+launch boundaries remain visible after Phase 1-2.
+
+#### 3b. Split Fused FC1 into Gemm1 + Activation
+
+The current FC1 kernel fuses gemm + Relu² + FP4 requantization.  This:
+- Forces the compiler to keep all three stages' registers live
+  simultaneously (high register pressure).
+- Prevents TMA/pipeline optimizations because the fused store path
+  can't overlap with the next K-tile load.
+- Differs from TRT-LLM, which runs activation as a separate kernel.
+
+Split into:
+1. Gemm1 kernel: unified FP4 body with `swap_ab=false` support.
+   Produces BF16 intermediate output.
+2. Activation kernel: Relu² + FP4 requantization.  Lightweight, reads
+   BF16, writes packed FP4.
+
+#### 3c. Port Remaining FC1 Profiles to the Unified Kernel
+
+`P5` is already on the unified routed FP4 body.  The remaining FC1 work is:
+
+- `P0`
+- `P1`
+- `P4`
+- `P7`
+
+Add the remaining FC1 `swap_ab=false` and FC1-side `swap_ab=true` profile
+instantiations to the unified kernel traits layer.  The kernel body should stay
+the same; only the per-profile builder/layout parameters change.
+
+The TMA/pipeline/scheduling optimizations from Phase 1-2 should then apply to
+all routed FC1 and FC2 profiles through one unified body.
+
+### Phase 4: Shared Expert Optimization
+
+**Goal:** Bring the shared expert (~20% of MoE time) onto the same
+optimized path.
+
+The shared expert is a single expert that processes ALL tokens (not
+routed).  At prefix128: 128 tokens × hidden(2688) → intermediate(3712)
+→ hidden(2688).
+
+This is a regular dense GEMM, not a grouped MoE GEMM.  It has much
+better arithmetic intensity (128 tokens × 3712 × 2688 × 2 / (3712 ×
+2688 × 0.5) = 512 FLOP/byte).  This is close to the compute-bandwidth
+balance point.
+
+Options:
+- Reuse the unified FP4 kernel body (treat as 1 expert, many tokens).
+- Or use cuBLAS for the dense GEMM (may be faster for well-shaped
+  dense problems).
+
+Profile first.  Only optimize if shared expert is still >10% of TTFT
+after routed expert optimization.
+
+### Phase 5: Mamba Prefill
+
+**Goal:** Optimize Mamba SSM prefill for long sequences.
+
+At prefix128, Mamba is ~8% of TTFT (~11 ms).  At prefix4096, it becomes
+a larger fraction because the scan cost grows with sequence length while
+MoE cost grows sublinearly (more tokens per expert = better weight
+amortization).
+
+The current implementation uses `MambaSsdPrefillFixedKernel` with a
+fixed tile size.  TRT-LLM and vLLM use chunked-scan approaches that
+parallelize the scan across sequence chunks.
+
+This is lower priority than MoE optimization for prefix128 but becomes
+critical for prefix4096.
+
+### Phase 6: System-Level
+
+**Goal:** Optimize everything outside the per-layer compute.
+
+#### 6a. Model Load Time
+
+Current model loading unpacks weights from the checkpoint format and
+repacks them into runtime layout.  The 1920-padding (Phase 0) adds a
+small cost here.  Opportunities:
+- Memory-map the weight file directly if the runtime format matches
+  the on-disk format.
+- Pre-pack weights into the runtime format in a one-time offline step.
+- Parallelize weight loading across CPU cores.
+
+#### 6b. Prefix Cache
+
+The model has Mamba recurrent state and Attention KV-cache that can be
+cached for prefix reuse.  Opportunities:
+- Efficient state serialization/deserialization.
+- Hierarchical cache (L2 → VRAM → host memory → disk).
+- Speculative prefix matching.
+
+#### 6c. Batch Scheduling
+
+For serving scenarios with multiple concurrent requests:
+- Dynamic batching to increase tokens-per-expert ratio (better weight
+  amortization).
+- Expert-aware request scheduling (group requests that activate
+  similar experts).
+
+## Measurement Framework
+
+Every phase must be validated against concrete roofline metrics, not
+just wall-clock TTFT:
+
+1. **DRAM bandwidth utilization:** `nsys` or `ncu` reported memory
+   throughput as a percentage of 1792 GB/s.  Target: >60%.
+
+2. **L2 hit rate:** `ncu` L2 cache metrics.  Target: >30% for MoE
+   weight accesses.
+
+3. **SM occupancy:** Warps active per cycle.  Not a primary target
+   (bandwidth-bound kernels don't need high occupancy) but monitor for
+   regressions.
+
+4. **Tensor Core utilization:** Percentage of cycles with active MMA.
+   At prefix128 this will always be low (<10%) because we're
+   bandwidth-bound.  But it should not be zero (which would indicate
+   a broken pipeline).
+
+5. **Kernel launch overhead:** Total CPU-side launch time across all
+   kernels per forward pass.  Target: <1 ms.
+
+6. **Per-layer breakdown:** `nsys` trace with per-kernel timing for
+   one full forward pass.  Identifies which layers/components are
+   above their roofline share.
+
+7. **Intermediate byte accounting:** total bytes written to routed
+   intermediate workspace and reread later.  This is the key metric for
+   judging whether FC1→activation→FC2 restructuring is actually reducing
+   traffic.
+
+8. **Launch count across the routed layer:** number of kernel launches per
+   routed layer forward.  If we are still moving the same bytes through too
+   many boundaries, launch count will reveal it.
+
+9. **Traffic decomposition:** break total routed-layer bytes into:
+   - weight bytes
+   - scale bytes
+   - FC1→FC2 seam / intermediate bytes
+   This is the only way to tell whether a speedup came from better transport,
+   better overlap, or simply shifting traffic between buffers.
+
+## Execution Order
+
+The work should proceed in this order:
+
+1. Freeze the canonical `window=4096` benchmark surface.
+2. Run the Phase 0.5 measurement/probe gate and quantify current transport
+   bottlenecks.
+3. Replace thread-driven staging with direct-to-swizzled staged transport.
+4. Add multi-stage overlap and warp-specialized producer/consumer execution.
+5. Measure again.
+6. Only then optimize expert scheduling / clustering if the measured L2
+   behavior justifies it.
+7. Then finish the routed FC1 dataflow and remaining FC1 profile coverage on
+   top of the new transport path.
+8. Optimize shared expert and Mamba only after the routed path has been pushed
+   close enough to the roofline that they become meaningful fractions of TTFT.
+
+## Phase Dependencies
+
+```
+Phase 0 (foundation)
+  ↓
+Phase 0.5 (measurement / probe gate)
+  ↓
+Phase 1a (TMA loads)
+  ↓
+Phase 1b (multi-stage pipeline) ← requires 1a
+  ↓
+Phase 1c (warp specialization) ← requires 1b
+  ↓
+Phase 2a (expert clustering) ← requires 1a, can overlap with 1b/1c
+  ↓
+Phase 2b (popularity sorting) ← requires 2a
+  ↓
+Phase 3 (routed FC1 / dataflow) ← requires Phase 1 complete, benefits from Phase 2
+  ↓
+Phase 4 (shared expert) ← profile after Phase 1-3
+  ↓
+Phase 5 (Mamba) ← independent, can start after Phase 0
+  ↓
+Phase 6 (system) ← independent, can start anytime
+```
+
+## What We're NOT Doing (and why)
+
+- **Atom-loop serpentine optimization:** Saves <0.3 ms across all layers
+  (compute is 30x faster than bandwidth).  Not worth the complexity
+  until we're within 2x of roofline.
+
+- **Vectorized epilogue first:** output writes are not the first roofline
+  limiter.  Defer until transport, overlap, and routing seams are fixed.
+
+- **Host-side `cudaMemPrefetchAsync` expert prefetch:** our routed expert
+  weights are ordinary device allocations, not managed-memory pages, so this is
+  not a reliable way to stage the next expert into L2.  If we need explicit
+  cache warming later, it should come from kernel-side transport/scheduling or
+  a proven L2 access-policy mechanism, not per-expert host-side prefetch calls.
+
+- **Weight compression below FP4:** Would require model retraining or
+  quality-loss-tolerant deployment.  Out of scope for the runtime.
+
+- **Cross-layer weight sharing:** Not possible — each layer has
+  independent expert weights.
+
+- **cuBLAS/cuDNN replacement for Attention:** Only 8 layers, already
+  well-optimized by NVIDIA libraries.  Not on the critical path.
+
+## Milestones
+
+| Milestone | TTFT target | Key change |
+|---|---|---|
+| Phase 0 complete | baseline established | padded/unified production baseline |
+| Phase 0.5 complete | measured bottleneck locked | `ncu` + source/probe gate |
+| Phase 1a (TMA) | ≤140 ms prefix128 | hardware-accelerated staged loads |
+| Phase 1b+c (pipeline) | ≤70 ms prefix128 | latency hiding + warp specialization |
+| Phase 2 (L2 opt) | ≤50 ms prefix128 | measured cache-aware scheduling |
+| Phase 3 (FC1) | ≤35 ms prefix128 | full routed path optimized |
+| Phase 4+5 | stretch: ≤20 ms prefix128 | shared expert + Mamba |
+
+These are estimates based on the corrected roofline analysis, including routed
+block-scale traffic.  Each phase will be re-evaluated against measured
+`nsys`/`ncu` data before proceeding to the next.
