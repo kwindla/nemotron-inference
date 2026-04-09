@@ -64,6 +64,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
 using SmemLayoutA = typename CollectiveMainloop::SmemLayoutA;
+using SmemLayoutB = typename CollectiveMainloop::SmemLayoutB;
 
 template <class TensorA>
 auto MakeP5TmaLoadA(TensorA const& tensor_a) {
@@ -75,7 +76,23 @@ auto MakeP5TmaLoadA(TensorA const& tensor_a) {
       cute::_1{});
 }
 
+template <class TensorB>
+auto MakeP5TmaLoadB(TensorB const& tensor_b) {
+  return cute::make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      tensor_b,
+      SmemLayoutB{}(cute::_, cute::_, cute::Int<0>{}),
+      cute::make_shape(cute::Int<128>{}, cute::Int<128>{}),
+      cute::_1{});
+}
+
 using P5TmaLoadA = decltype(MakeP5TmaLoadA(cute::make_tensor(
+    cute::make_gmem_ptr(static_cast<ElementAB const*>(nullptr)),
+    cute::make_layout(
+        cute::make_shape(int32_t{128}, int32_t{128}, int32_t{1}),
+        cute::make_stride(int64_t{128}, cute::Int<1>{}, int64_t{16384})))));
+
+using P5TmaLoadB = decltype(MakeP5TmaLoadB(cute::make_tensor(
     cute::make_gmem_ptr(static_cast<ElementAB const*>(nullptr)),
     cute::make_layout(
         cute::make_shape(int32_t{128}, int32_t{128}, int32_t{1}),

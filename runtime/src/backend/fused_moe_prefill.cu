@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 #include <cutlass/arch/barrier.h>
@@ -1726,6 +1727,113 @@ bool LaunchProgrammaticKernel(
   return CheckCuda(cudaLaunchKernelEx(&config, kernel, args...)) &&
          CheckCuda(cudaGetLastError());
 }
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+bool CreateLaunchLocalP5TmaLoadBArray(
+    const DeviceNvfp4Matrix& input_pack,
+    const DeviceMoeLaunchPlan* launch_plan,
+    routed_p5_tma::P5TmaLoadB** descriptor_array) {
+  if (descriptor_array == nullptr) {
+    return false;
+  }
+  *descriptor_array = nullptr;
+  if (!input_pack.valid() ||
+      launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      input_pack.packed_data() == nullptr ||
+      launch_plan->num_non_exiting_ctas() == nullptr ||
+      launch_plan->cta_row_starts() == nullptr ||
+      launch_plan->cta_valid_rows() == nullptr ||
+      input_pack.cols() == 0 ||
+      (input_pack.cols() % 128u) != 0) {
+    return false;
+  }
+
+  int exact_cta_count = 0;
+  if (!CheckCuda(cudaMemcpy(
+          &exact_cta_count,
+          launch_plan->num_non_exiting_ctas(),
+          sizeof(exact_cta_count),
+          cudaMemcpyDeviceToHost)) ||
+      exact_cta_count <= 0) {
+    return false;
+  }
+
+  std::vector<int> host_row_starts(static_cast<std::size_t>(exact_cta_count), 0);
+  std::vector<int> host_valid_rows(static_cast<std::size_t>(exact_cta_count), 0);
+  const std::size_t cta_bytes = sizeof(int) * static_cast<std::size_t>(exact_cta_count);
+  if (!CheckCuda(cudaMemcpy(
+          host_row_starts.data(),
+          launch_plan->cta_row_starts(),
+          cta_bytes,
+          cudaMemcpyDeviceToHost)) ||
+      !CheckCuda(cudaMemcpy(
+          host_valid_rows.data(),
+          launch_plan->cta_valid_rows(),
+          cta_bytes,
+          cudaMemcpyDeviceToHost))) {
+    return false;
+  }
+
+  const std::size_t packed_row_bytes = input_pack.cols() / 2u;
+  const std::size_t total_rows = input_pack.rows();
+  const int32_t input_cols = static_cast<int32_t>(input_pack.cols());
+  const int64_t input_cols_stride = static_cast<int64_t>(input_pack.cols());
+  std::vector<routed_p5_tma::P5TmaLoadB> host_descriptors;
+  host_descriptors.reserve(static_cast<std::size_t>(exact_cta_count));
+  for (int cta_index = 0; cta_index < exact_cta_count; ++cta_index) {
+    const int row_start = host_row_starts[static_cast<std::size_t>(cta_index)];
+    const int valid_rows = host_valid_rows[static_cast<std::size_t>(cta_index)];
+    if (row_start < 0 ||
+        valid_rows <= 0 ||
+        static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > total_rows) {
+      return false;
+    }
+
+    const auto* cta_packed =
+        input_pack.packed_data() + static_cast<std::size_t>(row_start) * packed_row_bytes;
+    auto tensor_b = cute::make_tensor(
+        cute::make_gmem_ptr(cute::recast_ptr<routed_p5_tma::ElementAB>(cta_packed)),
+        cute::make_layout(
+            cute::make_shape(static_cast<int32_t>(valid_rows), input_cols, int32_t{1}),
+            cute::make_stride(
+                input_cols_stride,
+                cute::Int<1>{},
+                static_cast<int64_t>(valid_rows) * input_cols_stride)));
+    host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadB(tensor_b));
+  }
+
+  routed_p5_tma::P5TmaLoadB* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes =
+      sizeof(routed_p5_tma::P5TmaLoadB) * host_descriptors.size();
+  if (!CheckCuda(cudaMallocAsync(
+          reinterpret_cast<void**>(&device_descriptors),
+          descriptor_bytes,
+          cudaStream_t{}))) {
+    return false;
+  }
+  if (!CheckCuda(cudaMemcpyAsync(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice,
+          cudaStream_t{}))) {
+    cudaFreeAsync(device_descriptors, cudaStream_t{});
+    return false;
+  }
+
+  *descriptor_array = device_descriptors;
+  return true;
+}
+
+void DestroyLaunchLocalP5TmaLoadBArray(routed_p5_tma::P5TmaLoadB** descriptor_array) {
+  if (descriptor_array == nullptr || *descriptor_array == nullptr) {
+    return;
+  }
+  cudaFreeAsync(*descriptor_array, cudaStream_t{});
+  *descriptor_array = nullptr;
+}
+#endif
 
 int SelectContiguousOutputTile(std::size_t output_rows, std::size_t input_row_count) {
   const int multiprocessor_count = GetMultiProcessorCount();
@@ -5227,6 +5335,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     const int* cta_batch_indices,
     const int* cta_row_starts,
     const int* cta_valid_rows,
+    const routed_p5_tma::P5TmaLoadB* p5_tma_load_b_descriptors,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
     OutputType* output) {
@@ -5258,6 +5367,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   __shared__ alignas(1024) cute::array_aligned<nvfp4_cute::ElementSFCompute, Traits::kScaleSmemCosizeB>
       b_scale_smem_storage;
   __shared__ alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType p5_tma_a_full_mbar_storage[1];
+  __shared__ alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType p5_tma_b_full_mbar_storage[1];
 
   auto* smem_swizzled_a = smem_swizzled_a_storage.data();
   auto* smem_swizzled_b = smem_swizzled_b_storage.data();
@@ -5265,6 +5375,8 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   auto* b_scale_smem = b_scale_smem_storage.data();
   auto* p5_tma_a_full_mbar =
       cute::recast_ptr<cutlass::arch::ClusterTransactionBarrier>(&p5_tma_a_full_mbar_storage[0]);
+  auto* p5_tma_b_full_mbar =
+      cute::recast_ptr<cutlass::arch::ClusterTransactionBarrier>(&p5_tma_b_full_mbar_storage[0]);
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -5298,14 +5410,26 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       (weight.input_cols % 128u) == 0;
   const auto* p5_tma_load_a_ptr =
       reinterpret_cast<const routed_p5_tma::P5TmaLoadA*>(weight.p5_tma_load_a);
+  const bool use_p5_tma_b =
+      Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 &&
+      p5_tma_load_b_descriptors != nullptr &&
+      (weight.input_cols % 128u) == 0;
   const int lane_predicate = cute::elect_one_sync();
   const bool is_p5_tma_a_thread =
       use_p5_tma_a &&
       warp_id == kFp4ConsumerWarps &&
       lane_predicate != 0;
+  const bool is_p5_tma_b_thread =
+      use_p5_tma_b &&
+      warp_id == (kFp4ConsumerWarps + 1) &&
+      lane_predicate != 0;
   if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
     if (is_p5_tma_a_thread) {
       cute::prefetch_tma_descriptor(p5_tma_load_a_ptr->get_tma_descriptor());
+    }
+    if (is_p5_tma_b_thread) {
+      cute::prefetch_tma_descriptor(
+          p5_tma_load_b_descriptors[cta_index].get_tma_descriptor());
     }
   }
   const std::size_t packed_row_bytes = weight.input_cols / 2u;
@@ -5351,6 +5475,17 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       p5_tma_a_full_mbar[0].init(1);
       cutlass::arch::fence_barrier_init();
     }
+    if (use_p5_tma_b && is_p5_tma_b_thread) {
+      p5_tma_b_full_mbar[0].init(1);
+      cutlass::arch::fence_barrier_init();
+    }
+    if (use_p5_tma_b) {
+      constexpr std::size_t kSwizzledBBytes =
+          sizeof(typename Traits::SmemAllocB) * Traits::kSwizzledBElems;
+      for (std::size_t i = static_cast<std::size_t>(tid); i < kSwizzledBBytes; i += blockDim.x) {
+        sw_b[i] = 0u;
+      }
+    }
     __syncthreads();
 
     if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
@@ -5386,6 +5521,38 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
             static_cast<uint32_t>(
                 cutlass::bits_to_bytes(
                     cute::size(cute::take<0, 2>(SmemLayoutA{})) *
+                    cute::sizeof_bits_v<routed_p5_tma::ElementAB>)));
+      }
+      if (use_p5_tma_b && is_p5_tma_b_thread) {
+        using X = cute::Underscore;
+        using ProducerBarrierType = typename cutlass::arch::ClusterTransactionBarrier::ValueType;
+        const auto& tma_load_b = p5_tma_load_b_descriptors[cta_index];
+        auto mB_nkl = tma_load_b.get_tma_tensor(cute::make_shape(
+            static_cast<int32_t>(valid_rows),
+            static_cast<int32_t>(weight.input_cols),
+            cute::Int<1>{}));
+        auto gB_nkl = cute::local_tile(
+            mB_nkl,
+            routed_p5_tma::MmaTileShape{},
+            cute::make_coord(cute::_, cute::_, cute::_),
+            cute::Step<X, cute::_1, cute::_1>{});
+        auto block_tma_b = tma_load_b.get_slice(0);
+        auto gB = gB_nkl(cute::_, cute::_, 0, cute::_, 0);
+        auto tBgB = block_tma_b.partition_S(gB);
+        auto sB_ = cute::make_tensor(cute::make_smem_ptr(smem_swizzled_b), SmemLayoutB{});
+        auto sB = cute::as_position_independent_swizzle_tensor(sB_);
+        auto tBsB = block_tma_b.partition_D(sB);
+        auto& barrier = p5_tma_b_full_mbar[0];
+        auto tma_copy_b =
+            tma_load_b.with(*cute::recast_ptr<ProducerBarrierType>(&barrier));
+        cute::copy(
+            tma_copy_b,
+            tBgB(cute::_, cute::_, cute::_, cute::Int<0>{}),
+            tBsB(cute::_, cute::_, cute::_, cute::Int<0>{}));
+        p5_tma_b_full_mbar[0].arrive_and_expect_tx(
+            static_cast<uint32_t>(
+                cutlass::bits_to_bytes(
+                    cute::size(cute::take<0, 2>(SmemLayoutB{})) *
                     cute::sizeof_bits_v<routed_p5_tma::ElementAB>)));
       }
     }
@@ -5430,12 +5597,14 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
 #pragma unroll
       for (int byte_index = 0; byte_index < kMacroTileBytes; ++byte_index) {
-        std::uint8_t value = 0u;
-        if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
-          value = packed_input[src_offset + static_cast<std::size_t>(byte_index)];
+        if (!use_p5_tma_b) {
+          std::uint8_t value = 0u;
+          if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
+            value = packed_input[src_offset + static_cast<std::size_t>(byte_index)];
+          }
+          auto elem_offset = stage0_B(row, byte_index * 2);
+          sw_b[static_cast<int>(elem_offset) / 2] = value;
         }
-        auto elem_offset = stage0_B(row, byte_index * 2);
-        sw_b[static_cast<int>(elem_offset) / 2] = value;
       }
       if (row_valid) {
         std::uint8_t scale_bytes[kMacroScaleBytes] = {};
@@ -5457,6 +5626,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     }
     if (use_p5_tma_a) {
       p5_tma_a_full_mbar[0].wait(0);
+    }
+    if (use_p5_tma_b) {
+      p5_tma_b_full_mbar[0].wait(0);
     }
     __syncthreads();
 
@@ -5655,6 +5827,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   (void) cta_batch_indices;
   (void) cta_row_starts;
   (void) cta_valid_rows;
+  (void) p5_tma_load_b_descriptors;
   (void) weights;
   (void) output_rows_per_expert;
   (void) output;
@@ -7904,6 +8077,7 @@ bool LaunchPlannedPackedInputMatVec(
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
             launch_plan->cta_valid_rows(),
+            nullptr,
             weights,
             output_rows_per_expert,
             output);
@@ -7922,6 +8096,7 @@ bool LaunchPlannedPackedInputMatVec(
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
             launch_plan->cta_valid_rows(),
+            nullptr,
             weights,
             output_rows_per_expert,
             output);
@@ -7944,6 +8119,7 @@ bool LaunchPlannedPackedInputMatVec(
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
             launch_plan->cta_valid_rows(),
+            nullptr,
             weights,
             output_rows_per_expert,
             output);
@@ -8098,11 +8274,16 @@ bool LaunchPlannedPackedInputMatVecBf16(
             output_rows_per_expert,
             output);
         return CheckCuda(cudaGetLastError());
-      case RoutedGemm1Profile::kP5_128x128x64_SwapTrue:
+      case RoutedGemm1Profile::kP5_128x128x64_SwapTrue: {
         g_enable_p5_scale_trace = std::getenv("NEMOTRON_P5_SCALE_DEBUG") != nullptr ? 1 : 0;
         if (g_enable_p5_scale_trace != 0) {
           g_p5_scale_trace = {};
         }
+        routed_p5_tma::P5TmaLoadB* p5_tma_load_b_descriptors = nullptr;
+        const bool have_p5_tma_b = CreateLaunchLocalP5TmaLoadBArray(
+            input_pack,
+            launch_plan,
+            &p5_tma_load_b_descriptors);
         if (!LaunchProgrammaticKernel(
             grid,
             block,
@@ -8119,11 +8300,14 @@ bool LaunchPlannedPackedInputMatVecBf16(
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
             launch_plan->cta_valid_rows(),
+            have_p5_tma_b ? p5_tma_load_b_descriptors : nullptr,
             weights,
             output_rows_per_expert,
             output)) {
+          DestroyLaunchLocalP5TmaLoadBArray(&p5_tma_load_b_descriptors);
           return false;
         }
+        DestroyLaunchLocalP5TmaLoadBArray(&p5_tma_load_b_descriptors);
         if (g_enable_p5_scale_trace != 0) {
           if (!CheckCuda(cudaDeviceSynchronize())) {
             return false;
@@ -8131,6 +8315,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
           PrintP5ScaleTrace();
         }
         return true;
+      }
       case RoutedGemm1Profile::kP7_256x128x64_SwapTrue:
         Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue<__nv_bfloat16, 256, 64><<<grid, block>>>(
             input_pack.packed_data(),
