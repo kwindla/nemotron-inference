@@ -264,6 +264,16 @@ std::optional<UploadedWeights> UploadWeights(
     uploaded.dequantized.push_back(DequantizeNvfp4Matrix(*packed));
   }
   uploaded.views = uploaded.storage->BuildAllViews();
+  if (rows % 128u == 0 && cols % 128u == 0) {
+    for (std::size_t expert_index = 0; expert_index < uploaded.views.size(); ++expert_index) {
+      if (uploaded.views[expert_index].p5_tma_load_a == nullptr ||
+          (expert_index > 0 &&
+           uploaded.views[expert_index].p5_tma_load_a ==
+               uploaded.views[expert_index - 1].p5_tma_load_a)) {
+        return std::nullopt;
+      }
+    }
+  }
   return uploaded;
 }
 
@@ -297,8 +307,40 @@ std::optional<RepeatedUploadedWeights> UploadRepeatedWeights(
   RepeatedUploadedWeights uploaded;
   uploaded.storage = std::move(storage);
   uploaded.views = uploaded.storage->BuildAllViews();
+  if (rows % 128u == 0 && cols % 128u == 0) {
+    for (std::size_t expert_index = 0; expert_index < uploaded.views.size(); ++expert_index) {
+      if (uploaded.views[expert_index].p5_tma_load_a == nullptr ||
+          (expert_index > 0 &&
+           uploaded.views[expert_index].p5_tma_load_a ==
+               uploaded.views[expert_index - 1].p5_tma_load_a)) {
+        return std::nullopt;
+      }
+    }
+  }
   uploaded.dequantized = DequantizeNvfp4Matrix(*packed);
   return uploaded;
+}
+
+bool DeviceWeightViewsCarryP5TmaDescriptors(const std::vector<FusedNvfp4WeightView>& views) {
+  auto views_device = DeviceArray<FusedNvfp4WeightView>::CopyFromHost(views);
+  if (views_device == nullptr) {
+    return false;
+  }
+  std::vector<FusedNvfp4WeightView> copied_views(views.size());
+  if (cudaMemcpy(
+          copied_views.data(),
+          views_device->data(),
+          copied_views.size() * sizeof(FusedNvfp4WeightView),
+          cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return false;
+  }
+  for (std::size_t index = 0; index < views.size(); ++index) {
+    if (copied_views[index].p5_tma_load_a == nullptr ||
+        copied_views[index].p5_tma_load_a != views[index].p5_tma_load_a) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::vector<float> RowMajorMatVec(
@@ -1178,6 +1220,35 @@ bool TestFusedMoePrefillRejectsMissingSelectionContract() {
       "prefill should reject a missing selected_weights contract");
 }
 
+bool TestP5TmaDescriptorViewsReachDeviceWeightTable() {
+  if (!HasCudaDevice()) {
+    std::cout << "fused_moe_prefill_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  constexpr std::size_t kExperts = 3;
+  constexpr std::size_t kRows = 128;
+  constexpr std::size_t kCols = 128;
+
+  std::vector<std::vector<float>> matrices;
+  matrices.reserve(kExperts);
+  for (std::size_t expert_index = 0; expert_index < kExperts; ++expert_index) {
+    matrices.push_back(MakePatternedValues(
+        kRows,
+        kCols,
+        101 + static_cast<int>(expert_index),
+        0.00390625f));
+  }
+
+  auto uploaded = UploadWeights(matrices, kRows, kCols);
+  return Expect(
+             uploaded.has_value(),
+             "P5 TMA-eligible resident weights should upload with descriptor views") &&
+         Expect(
+             DeviceWeightViewsCarryP5TmaDescriptors(uploaded->views),
+             "P5 TMA descriptor pointers should reach the device-side weight-view table");
+}
+
 bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
   if (!HasCudaDevice()) {
     std::cout << "fused_moe_prefill_test: SKIP (no CUDA device)\n";
@@ -1705,6 +1776,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
 int main() {
   const bool ok =
       TestFusedMoePrefillRejectsMissingSelectionContract() &&
+      TestP5TmaDescriptorViewsReachDeviceWeightTable() &&
       TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() &&
       TestFusedMoePrefillNanoDeploymentShapeMatchesReference();
   if (!ok) {

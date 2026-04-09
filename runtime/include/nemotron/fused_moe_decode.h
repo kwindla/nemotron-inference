@@ -14,6 +14,7 @@ struct FusedNvfp4WeightView {
   const float* tensor_scale_data = nullptr;
   std::size_t output_rows = 0;
   std::size_t input_cols = 0;
+  const void* p5_tma_load_a = nullptr;
 };
 
 struct FusedMoeDirectLayerParams {

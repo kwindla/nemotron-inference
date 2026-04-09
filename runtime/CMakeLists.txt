@@ -163,6 +163,7 @@ add_library(
   src/backend/nvfp4_weight.cpp
   src/backend/primitive_ops.cu
   src/backend/request_context.cpp
+  src/backend/routed_p5_tma_descriptor.cu
   src/backend/scaled_fp8_linear.cu
 )
 

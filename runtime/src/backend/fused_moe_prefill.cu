@@ -12,10 +12,12 @@
 #include <type_traits>
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+#include <cutlass/arch/barrier.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/layout/layout.h>
+#include <cute/algorithm/copy.hpp>
 #include <cute/algorithm/cooperative_gemm.hpp>
 #include <cute/arch/copy_sm75.hpp>
 #include <cute/arch/mma_sm120.hpp>
@@ -28,6 +30,9 @@
 
 #include "nemotron/device_nvfp4_matrix.h"
 #include "fused_decode_common.cuh"
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+#include "routed_p5_tma_descriptor.cuh"
+#endif
 
 namespace nemotron {
 namespace {
@@ -5252,11 +5257,14 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       a_scale_smem_storage;
   __shared__ alignas(1024) cute::array_aligned<nvfp4_cute::ElementSFCompute, Traits::kScaleSmemCosizeB>
       b_scale_smem_storage;
+  __shared__ alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType p5_tma_a_full_mbar_storage[1];
 
   auto* smem_swizzled_a = smem_swizzled_a_storage.data();
   auto* smem_swizzled_b = smem_swizzled_b_storage.data();
   auto* a_scale_smem = a_scale_smem_storage.data();
   auto* b_scale_smem = b_scale_smem_storage.data();
+  auto* p5_tma_a_full_mbar =
+      cute::recast_ptr<cutlass::arch::ClusterTransactionBarrier>(&p5_tma_a_full_mbar_storage[0]);
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -5282,6 +5290,24 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   }
 
   const FusedNvfp4WeightView weight = weights[expert_index];
+  const bool use_p5_tma_a =
+      Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 &&
+      weight.p5_tma_load_a != nullptr &&
+      (output_row_base % 128) == 0 &&
+      (weight.output_rows % 128u) == 0 &&
+      (weight.input_cols % 128u) == 0;
+  const auto* p5_tma_load_a_ptr =
+      reinterpret_cast<const routed_p5_tma::P5TmaLoadA*>(weight.p5_tma_load_a);
+  const int lane_predicate = cute::elect_one_sync();
+  const bool is_p5_tma_a_thread =
+      use_p5_tma_a &&
+      warp_id == kFp4ConsumerWarps &&
+      lane_predicate != 0;
+  if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
+    if (is_p5_tma_a_thread) {
+      cute::prefetch_tma_descriptor(p5_tma_load_a_ptr->get_tma_descriptor());
+    }
+  }
   const std::size_t packed_row_bytes = weight.input_cols / 2u;
   const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
   const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
@@ -5321,18 +5347,63 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     auto* sw_a = reinterpret_cast<std::uint8_t*>(smem_swizzled_a);
     auto* sw_b = reinterpret_cast<std::uint8_t*>(smem_swizzled_b);
 
+    if (use_p5_tma_a && is_p5_tma_a_thread) {
+      p5_tma_a_full_mbar[0].init(1);
+      cutlass::arch::fence_barrier_init();
+    }
+    __syncthreads();
+
+    if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
+      if (use_p5_tma_a && is_p5_tma_a_thread) {
+        using X = cute::Underscore;
+        using ProducerBarrierType = typename cutlass::arch::ClusterTransactionBarrier::ValueType;
+        const auto& tma_load_a = *p5_tma_load_a_ptr;
+        auto mA_mkl = tma_load_a.get_tma_tensor(cute::make_shape(
+            static_cast<int32_t>(weight.output_rows),
+            static_cast<int32_t>(weight.input_cols),
+            cute::Int<1>{}));
+        auto gA_mkl = cute::local_tile(
+            mA_mkl,
+            routed_p5_tma::MmaTileShape{},
+            cute::make_coord(cute::_, cute::_, cute::_),
+            cute::Step<cute::_1, X, cute::_1>{});
+        auto block_tma_a = tma_load_a.get_slice(0);
+        const int output_tile_coord = output_row_base / 128;
+        const int k_tile_coord = static_cast<int>(macro_k_base / 128u);
+        auto gA = gA_mkl(cute::_, cute::_, output_tile_coord, cute::_, 0);
+        auto tAgA = block_tma_a.partition_S(gA);
+        auto sA_ = cute::make_tensor(cute::make_smem_ptr(smem_swizzled_a), SmemLayoutA{});
+        auto sA = cute::as_position_independent_swizzle_tensor(sA_);
+        auto tAsA = block_tma_a.partition_D(sA);
+        auto& barrier = p5_tma_a_full_mbar[0];
+        auto tma_copy_a =
+            tma_load_a.with(*cute::recast_ptr<ProducerBarrierType>(&barrier));
+        cute::copy(
+            tma_copy_a,
+            tAgA(cute::_, cute::_, cute::_, k_tile_coord),
+            tAsA(cute::_, cute::_, cute::_, cute::Int<0>{}));
+        p5_tma_a_full_mbar[0].arrive_and_expect_tx(
+            static_cast<uint32_t>(
+                cutlass::bits_to_bytes(
+                    cute::size(cute::take<0, 2>(SmemLayoutA{})) *
+                    cute::sizeof_bits_v<routed_p5_tma::ElementAB>)));
+      }
+    }
+
     for (int row = tid; row < kOutputTile; row += blockDim.x) {
       const bool row_valid = row < output_rows_this_tile;
       const std::size_t source_row = static_cast<std::size_t>(output_row_base + row);
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
 #pragma unroll
       for (int byte_index = 0; byte_index < kMacroTileBytes; ++byte_index) {
-        std::uint8_t value = 0u;
-        if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
-          value = weight.packed_data[src_offset + static_cast<std::size_t>(byte_index)];
+        if (!use_p5_tma_a) {
+          std::uint8_t value = 0u;
+          if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
+            value = weight.packed_data[src_offset + static_cast<std::size_t>(byte_index)];
+          }
+          auto elem_offset = stage0_A(row, byte_index * 2);
+          sw_a[static_cast<int>(elem_offset) / 2] = value;
         }
-        auto elem_offset = stage0_A(row, byte_index * 2);
-        sw_a[static_cast<int>(elem_offset) / 2] = value;
       }
       if (row_valid) {
         std::uint8_t scale_bytes[kMacroScaleBytes] = {};
@@ -5383,6 +5454,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       } else {
         nvfp4_bridge::ZeroTracedP5ScaleRow(b_scale_tensor, row);
       }
+    }
+    if (use_p5_tma_a) {
+      p5_tma_a_full_mbar[0].wait(0);
     }
     __syncthreads();
 
@@ -8029,9 +8103,12 @@ bool LaunchPlannedPackedInputMatVecBf16(
         if (g_enable_p5_scale_trace != 0) {
           g_p5_scale_trace = {};
         }
-        Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
-            nvfp4_bridge::UnifiedRoutedFp4Profile::kP5,
-            __nv_bfloat16><<<grid, block>>>(
+        if (!LaunchProgrammaticKernel(
+            grid,
+            block,
+            Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
+                nvfp4_bridge::UnifiedRoutedFp4Profile::kP5,
+                __nv_bfloat16>,
             input_pack.packed_data(),
             input_pack.matmul_block_scales_data(),
             input_pack.scale_layout(),
@@ -8044,8 +8121,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             launch_plan->cta_valid_rows(),
             weights,
             output_rows_per_expert,
-            output);
-        if (!CheckCuda(cudaGetLastError())) {
+            output)) {
           return false;
         }
         if (g_enable_p5_scale_trace != 0) {

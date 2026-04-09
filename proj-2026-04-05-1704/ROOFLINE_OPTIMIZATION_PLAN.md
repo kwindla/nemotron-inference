@@ -299,23 +299,42 @@ Measured transport-contract facts from the compile-time dump:
   - Phase 1 must instead preserve the traced copy atoms / barrier contract while compressing stage storage to a runtime-feasible staged transport plan
 
 Measured standalone `P5` TMA smoke status on the current branch:
-- `testing/p5_swizzled_pipeline_test_120f` now passes both:
+  - `testing/p5_swizzled_pipeline_test_120f` now passes both:
   - `tma_copy_only_a_raw PASS`
   - `tma_copy_only_a_global_object PASS`
+  - `tma_copy_only_a_offset_tile PASS`
+  - `tma_copy_only_b_raw_full128 PASS`
+  - `tma_copy_only_b_raw_logical32_valid5 PASS`
   - `tma_fragment_a PASS`
 - and now also passes the first full-math numeric step above the fragment
   boundary:
-  - `tma_single_tile_dispatch_rows_5`
-  - `tma_single_tile_dispatch_rows_4`
+  - `tma_single_tile_k64_dispatch_rows_5`
+  - `tma_single_tile_k64_dispatch_rows_4`
+  - `tma_single_tile_k128_dispatch_rows_5`
 - meaning:
   - the host-built `make_tma_copy(SM90_TMA_LOAD{}, ...)` producer path is valid for the routed FP4 `P5` operand contract
   - the host-built `TmaCopyA` object remains valid when copied into device
     global memory and dereferenced from the kernel, which is the key ownership
     model needed for routed per-expert weight views
+  - the same bare CUTE TMA object can select a nonzero output-row CTA tile and
+    a nonzero batch/expert coordinate from a larger `(M,K,L)` tensor; the raw
+    stage bytes still match the selected row-major packed source tile
+    byte-for-byte
+  - a B-side bare CUTE TMA object can load a 128x128 logical `(N,K)` packed
+    source tile into `SmemLayoutB` and its raw stage bytes match the row-major
+    packed source model byte-for-byte
+  - the same B-side path can also use a logical 32x128 source tensor while
+    retaining the 128x128 TMA tile; rows outside the 32-row tensor arrive as
+    zero in shared memory.  This is the direct smoke proof needed for low-row
+    grouped activations; live B TMA does not require overreading adjacent
+    grouped rows or first padding the global activation workspace to 128 rows.
   - the immediate consumer boundary also survives intact:
     `SmemLayoutA -> make_tiled_copy_A(...) -> retile_D(...) -> fp4_shift_A(...)`
   - a single-tile `P5` math path with `A` on TMA and `B/scales` on the existing
     path is numerically valid for the low-row `dispatch_rows=4/5` regimes
+  - the full 128-K staged tile is numerically consumable by the traced P5
+    math path: P5 has `size<2>(tCrA)=size<2>(tCrB)=2`, and the consumer runs
+    the two 64-K register k-blocks from one 128-K producer stage
 - the two actual bugs in the earlier smoke were:
   - wrong full-barrier wait phase: the producer-complete wait must use phase `0`, matching TRT's initial consumer-side `ab_full_mbar.wait(ab_phase)` contract
   - wrong physical-byte reference model: the valid stage-0 `P5` raw-byte reference for this smoke is the packed row-major source bytes, not the earlier `stage0_A(...)/2` reconstruction
@@ -325,12 +344,72 @@ Measured standalone `P5` TMA smoke status on the current branch:
   - `SYNCS.ARRIVE.TRANS64`
   - `SYNCS.PHASECHK.TRANS64`
 
+Runtime `P5` TMA descriptor-ownership status:
+- implemented an optional resident-weight sidecar:
+  - public weight-view field: `FusedNvfp4WeightView::p5_tma_load_a`
+  - internal descriptor type:
+    `nemotron::routed_p5_tma::P5TmaLoadA`
+  - owner: `MonolithicNvfp4ExpertWeights`
+  - descriptors are built on the host with the same bare CUTE
+    `make_tma_copy(SM90_TMA_LOAD{}, ...)` pattern as the smoke, copied once
+    to device memory, and exposed as one device-resident descriptor pointer
+    per expert
+- descriptor creation is optional rather than part of `valid()`:
+  small/ragged test matrices remain valid with a null descriptor; TMA-eligible
+  matrices are expected to publish non-null per-expert descriptor pointers
+- `fused_moe_prefill_test` now has a focused 128x128 resident-weight upload
+  check that verifies the descriptor pointers are present in the host views
+  and survive the same host-to-device weight-view-table copy used by prefill
+- important boundary:
+  descriptor residency / pointer publication is wired and the live unified
+  routed MMA kernel now has an incremental `P5` A/weight-operand TMA path
+  behind a narrow eligibility gate.  It still consumes the B/activation
+  operand, scales, and non-`P5` profiles through the existing thread-coded
+  global -> swizzled-smem scatter.
+- current live-gate status:
+  - `fused_moe_prefill_test PASS`
+  - `multi_turn_prefix_reuse_test PASS`
+  - `testing/p5_swizzled_pipeline_test_120f` with
+    `NEMOTRON_RUN_P5_TMA_SMOKE=1 PASS`
+  - single-case canonical-capacity TTFT smoke:
+    `cold_prefill_prefix128 = 142.898 ms` median with
+    `--moe-prefill-window-tokens 4096`, `--prefix-length 128`,
+    `--prefix-length 4096`, and `--warmup 1`
+  - not benchmarked yet; this is a transport-correctness milestone, not a
+    claimed full-matrix TTFT improvement
+
 Immediate implication for Phase 1:
 - stop questioning whether CUTE TMA works for routed FP4 `P5`
-- the next step is to lift this now-proven `A`-operand producer+consumer path
-  into the live unified routed kernel, with the main open problem now being
-  runtime descriptor ownership / launch integration rather than copy semantics
+- the now-proven `A`-operand producer+consumer path has been lifted into the
+  live unified routed kernel for eligible `P5` tiles. The next boundary is
+  measurement plus the B-operand live contract, not more A-side smoke.
+- resolved shape seam:
+  - the host TMA object uses the traced top-level `128x128` operand tile
+  - the traced P5 math tile is `128x32x64`
+  - the P5 register consumer has two K blocks per loaded stage
+  - therefore the live P5 staged-K step is now `128`, matching the producer
+    tile; do not re-split P5 back into artificial 64-K load iterations
+- treat B-side TMA as transport-proven but not wired in the live kernel:
+  the smoke now covers both the full 128-row B tile and the live-like
+  logical-32 / valid-5 activation case with TMA out-of-bounds zero fill.
+  The next live B step is launch-local descriptor construction over the
+  grouped activation rows plus the same raw-byte debug fallback used for A.
 - do not go back down to raw descriptor/PTX debugging unless the runtime-like integration breaks at a new boundary
+
+Live-integration boundary decisions:
+- the standalone proof deliberately uses the same bare TRT-style
+  `make_tma_copy(SM90_TMA_LOAD{}, tensor_A, SmemLayoutA{}(_,_,0), ...)`
+  pattern used by the local SM120 reference.  Keep it unless the live path
+  proves a CTA-coordinate / view-offset bug.
+- if live per-expert weights or multi-CTA coordinates fail, first compare the
+  exact selected packed source tile against the raw stage-0 bytes.  Only suspect
+  the higher-level `make_tma_atom_*` / CTA-v-coordinate wrapper after that
+  raw-byte check fails.
+- the raw-byte proof also established an important storage fact: the physical
+  `SmemLayoutA` stage allocation is 1 byte per logical FP4 element, while the
+  packed TMA payload occupies the first half of the per-stage physical byte
+  span. Account for that 2x physical stage footprint when sizing the eventual
+  multistage pipeline.
 
 Interpretation:
 - the current unified routed kernel is not bandwidth-limited

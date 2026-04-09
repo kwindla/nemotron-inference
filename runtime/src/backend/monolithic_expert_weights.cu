@@ -8,6 +8,7 @@
 
 #include "nemotron/nvfp4_scale_layout.h"
 #include "nemotron/routed_expert_runtime.h"
+#include "routed_p5_tma_descriptor.cuh"
 
 namespace nemotron {
 namespace {
@@ -98,10 +99,12 @@ struct MonolithicNvfp4ExpertWeights::Impl {
   std::size_t total_block_scales_nbytes = 0;
   std::size_t total_matmul_block_scales_nbytes = 0;
   std::size_t total_tensor_scales_nbytes = 0;
+  std::size_t total_p5_tma_load_a_descriptor_nbytes = 0;
   std::uint8_t* packed_data = nullptr;
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scales_data = nullptr;
+  void* p5_tma_load_a_descriptors = nullptr;
   std::vector<float> host_tensor_scales;
   bool store_row_major_block_scales = true;
 };
@@ -157,6 +160,16 @@ std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Crea
     ReleaseBuffer(&impl->packed_data);
     return nullptr;
   }
+  impl->p5_tma_load_a_descriptors = routed_p5_tma::CreateDeviceP5TmaLoadAArray(
+      impl->packed_data,
+      impl->num_experts,
+      impl->expert_packed_nbytes,
+      impl->output_rows,
+      impl->input_cols);
+  if (impl->p5_tma_load_a_descriptors != nullptr) {
+    impl->total_p5_tma_load_a_descriptor_nbytes =
+        num_experts * sizeof(routed_p5_tma::P5TmaLoadA);
+  }
 
   return std::unique_ptr<MonolithicNvfp4ExpertWeights>(
       new MonolithicNvfp4ExpertWeights(std::move(impl)));
@@ -175,6 +188,7 @@ MonolithicNvfp4ExpertWeights::~MonolithicNvfp4ExpertWeights() {
   if (!impl_) {
     return;
   }
+  routed_p5_tma::DestroyDeviceP5TmaLoadAArray(&impl_->p5_tma_load_a_descriptors);
   ReleaseBuffer(&impl_->tensor_scales_data);
   ReleaseBuffer(&impl_->matmul_block_scales_data);
   ReleaseBuffer(&impl_->block_scales_data);
@@ -305,6 +319,11 @@ FusedNvfp4WeightView MonolithicNvfp4ExpertWeights::GetView(std::size_t expert_in
       impl_->tensor_scales_data + (expert_index * impl_->expert_tensor_scale_stride_nbytes));
   view.output_rows = impl_->output_rows;
   view.input_cols = impl_->input_cols;
+  if (impl_->p5_tma_load_a_descriptors != nullptr) {
+    const auto* p5_tma_load_a =
+        static_cast<const routed_p5_tma::P5TmaLoadA*>(impl_->p5_tma_load_a_descriptors);
+    view.p5_tma_load_a = p5_tma_load_a + expert_index;
+  }
   return view;
 }
 
@@ -324,7 +343,8 @@ std::vector<FusedNvfp4WeightView> MonolithicNvfp4ExpertWeights::BuildAllViews() 
 std::size_t MonolithicNvfp4ExpertWeights::total_bytes() const {
   return impl_ ? (impl_->total_packed_nbytes + impl_->total_block_scales_nbytes +
                   impl_->total_matmul_block_scales_nbytes +
-                  impl_->total_tensor_scales_nbytes)
+                  impl_->total_tensor_scales_nbytes +
+                  impl_->total_p5_tma_load_a_descriptor_nbytes)
                : 0;
 }
 
