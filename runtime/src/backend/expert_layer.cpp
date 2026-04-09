@@ -14,10 +14,13 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <iostream>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -576,6 +579,157 @@ bool CopyDeviceBufferToHost(
              device_data,
              count * sizeof(T),
              cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+void WarnRoutedPhase05DumpFailure(const std::string& message) {
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    std::cerr << "expert_layer: routed phase05 dump failed: " << message << "\n";
+  }
+}
+
+void MaybeDumpRoutedPhase05Histogram(
+    const ExpertLayerConfig& config,
+    std::size_t token_count,
+    const DeviceExpertRouting& routing,
+    const DeviceMoeLaunchPlan& launch_plan) {
+  const char* dump_path = std::getenv("NEMOTRON_ROUTED_PHASE05_DUMP");
+  if (dump_path == nullptr || dump_path[0] == '\0') {
+    return;
+  }
+
+  static std::mutex dumped_keys_mutex;
+  static std::set<std::pair<std::size_t, std::size_t>> dumped_keys;
+  const std::lock_guard<std::mutex> lock(dumped_keys_mutex);
+  const auto dump_key = std::make_pair(config.layer_index, token_count);
+  if (dumped_keys.find(dump_key) != dumped_keys.end()) {
+    return;
+  }
+
+  std::vector<int> active_expert_count_host;
+  std::vector<int> active_expert_ids_host;
+  std::vector<int> expert_offsets_host;
+  std::vector<int> cta_count_host;
+  std::vector<int> total_padded_rows_host;
+  std::vector<int> expert_first_token_offsets_host;
+  if (!CopyDeviceBufferToHost(routing.active_expert_count(), 1, &active_expert_count_host) ||
+      !CopyDeviceBufferToHost(routing.active_expert_ids(), routing.n_experts(), &active_expert_ids_host) ||
+      !CopyDeviceBufferToHost(routing.expert_offsets(), routing.n_experts() + 1, &expert_offsets_host) ||
+      !CopyDeviceBufferToHost(launch_plan.cta_count(), 1, &cta_count_host) ||
+      !CopyDeviceBufferToHost(launch_plan.total_padded_rows(), 1, &total_padded_rows_host) ||
+      !CopyDeviceBufferToHost(
+          launch_plan.expert_first_token_offsets(),
+          launch_plan.n_experts() + 1,
+          &expert_first_token_offsets_host)) {
+    WarnRoutedPhase05DumpFailure("device-to-host copy");
+    return;
+  }
+
+  const int cta_count = cta_count_host.empty() ? 0 : cta_count_host.front();
+  if (cta_count < 0 || static_cast<std::size_t>(cta_count) > launch_plan.cta_capacity()) {
+    WarnRoutedPhase05DumpFailure("invalid cta count");
+    return;
+  }
+
+  std::vector<int> cta_expert_ids_host;
+  if (!CopyDeviceBufferToHost(
+          launch_plan.cta_expert_ids(),
+          static_cast<std::size_t>(cta_count),
+          &cta_expert_ids_host)) {
+    WarnRoutedPhase05DumpFailure("cta expert ids");
+    return;
+  }
+
+  struct ExpertHistogramEntry {
+    int expert_id = -1;
+    int selection_count = 0;
+    int cta_count = 0;
+    int padded_row_begin = 0;
+    int padded_row_end = 0;
+  };
+
+  std::vector<int> cta_counts_by_expert(routing.n_experts(), 0);
+  for (int cta_index = 0; cta_index < cta_count; ++cta_index) {
+    const int expert_id = cta_expert_ids_host[static_cast<std::size_t>(cta_index)];
+    if (expert_id >= 0 && static_cast<std::size_t>(expert_id) < cta_counts_by_expert.size()) {
+      ++cta_counts_by_expert[static_cast<std::size_t>(expert_id)];
+    }
+  }
+
+  std::vector<ExpertHistogramEntry> entries;
+  entries.reserve(routing.n_experts());
+  for (std::size_t expert_index = 0; expert_index < routing.n_experts(); ++expert_index) {
+    const int selection_count =
+        expert_offsets_host[expert_index + 1] - expert_offsets_host[expert_index];
+    if (selection_count <= 0) {
+      continue;
+    }
+    entries.push_back(ExpertHistogramEntry{
+        static_cast<int>(expert_index),
+        selection_count,
+        cta_counts_by_expert[expert_index],
+        expert_first_token_offsets_host[expert_index],
+        expert_first_token_offsets_host[expert_index + 1]});
+  }
+
+  std::sort(
+      entries.begin(),
+      entries.end(),
+      [](const ExpertHistogramEntry& lhs, const ExpertHistogramEntry& rhs) {
+        if (lhs.selection_count != rhs.selection_count) {
+          return lhs.selection_count > rhs.selection_count;
+        }
+        if (lhs.cta_count != rhs.cta_count) {
+          return lhs.cta_count > rhs.cta_count;
+        }
+        return lhs.expert_id < rhs.expert_id;
+      });
+
+  std::ofstream output(dump_path, std::ios::app);
+  if (!output.is_open()) {
+    WarnRoutedPhase05DumpFailure(std::string("open failed: ") + dump_path);
+    return;
+  }
+
+  output << "{";
+  output << "\"layer_index\":" << config.layer_index;
+  output << ",\"token_count\":" << token_count;
+  output << ",\"top_k\":" << config.top_k;
+  output << ",\"selection_count\":" << routing.selection_count();
+  output << ",\"active_expert_count\":"
+         << (active_expert_count_host.empty() ? 0 : active_expert_count_host.front());
+  output << ",\"selected_token_tile\":" << launch_plan.selected_token_tile();
+  output << ",\"cta_count\":" << cta_count;
+  output << ",\"total_padded_rows\":"
+         << (total_padded_rows_host.empty() ? 0 : total_padded_rows_host.front());
+  output << ",\"active_expert_ids\":[";
+  const int active_expert_count =
+      active_expert_count_host.empty() ? 0 : active_expert_count_host.front();
+  for (int index = 0; index < active_expert_count; ++index) {
+    if (index != 0) {
+      output << ",";
+    }
+    output << active_expert_ids_host[static_cast<std::size_t>(index)];
+  }
+  output << "]";
+  output << ",\"experts\":[";
+  for (std::size_t index = 0; index < entries.size(); ++index) {
+    if (index != 0) {
+      output << ",";
+    }
+    const auto& entry = entries[index];
+    output << "{";
+    output << "\"expert_id\":" << entry.expert_id;
+    output << ",\"selection_count\":" << entry.selection_count;
+    output << ",\"cta_count\":" << entry.cta_count;
+    output << ",\"padded_row_begin\":" << entry.padded_row_begin;
+    output << ",\"padded_row_end\":" << entry.padded_row_end;
+    output << "}";
+  }
+  output << "]";
+  output << "}\n";
+  dumped_keys.insert(dump_key);
 }
 
 std::unique_ptr<DeviceTensorFp32> CreateWorkspaceView(
@@ -1400,6 +1554,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.routed_output = routed_output_scratch->data();
 
   if (RunFusedMoePrefill(params)) {
+    MaybeDumpRoutedPhase05Histogram(config, token_count, *routing, *launch_plan);
     return true;
   }
   return false;

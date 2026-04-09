@@ -193,6 +193,41 @@ What is already true:
 **Goal:** lock down the exact current bottleneck before touching the
 transport path.
 
+**Current status: partially complete.**
+
+Histogram deliverable is landed and measured on the canonical surface:
+- raw artifact:
+  `artifacts/benchmarks/routed_phase05_prefix128_20260409T061848Z.jsonl`
+- summary artifact:
+  `artifacts/benchmarks/routed_phase05_prefix128_20260409T061848Z.summary.txt`
+- benchmark stdout:
+  `artifacts/benchmarks/routed_phase05_prefix128_20260409T061848Z.stdout.txt`
+
+Measured histogram facts from `cold_prefill_prefix128` at `window=4096`:
+- `23` routed expert layers
+- per-layer active experts range: `104 .. 127`
+- per-layer top-5 expert share range: `10.81% .. 33.07%`
+- per-layer top-10 expert share range: `19.79% .. 49.74%`
+- per-layer max tokens for a single expert: up to `75`
+- per-layer max CTAs for a single expert: up to `10`
+- aggregate over the whole forward:
+  - overall top-5 expert share: `6.86%`
+  - overall top-10 expert share: `12.65%`
+  - max aggregate tokens for one expert: `256`
+  - max aggregate CTAs for one expert: `43`
+
+Interpretation:
+- the routed distribution is skewed at the per-layer level
+- it is not globally concentrated enough to assume large L2 wins up front
+- Phase 2 remains measurement-gated; transport and overlap are still the
+  correct priorities ahead of persistent expert clustering
+
+Profiler status:
+- `ncu` harness is checked in, but live Phase 0.5 counter capture is currently
+  blocked on this machine by `ERR_NVGPUCTRPERM`
+- until performance counter permissions are enabled, the histogram result is
+  the only completed Phase 0.5 runtime measurement
+
 **Work:**
 1. Run `ncu` on the current unified routed FP4 path for representative
    `P5/P12/P13/P15` regimes.
@@ -221,6 +256,11 @@ transport path.
   and `as_position_independent_swizzle_tensor(...)`.
 - `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/sm120_blockwise_gemm/sm120_fp8_moe_gemm_1d1d.cuh`
   lines `190-253`: `SM120BlockScaledMoeScheduler`.
+- Local Phase 0.5 harnesses:
+  - `proj-2026-04-05-1704/run_phase05_routed_histogram.sh`
+  - `proj-2026-04-05-1704/summarize_routed_phase05_histogram.py`
+  - `proj-2026-04-05-1704/run_phase05_routed_ncu.sh`
+  - `proj-2026-04-05-1704/summarize_phase05_ncu_csv.py`
 
 **Exit criteria:**
 - we have one measured bottleneck summary for the current unified routed FP4
@@ -229,6 +269,9 @@ transport path.
   worth doing, and which experts dominate routed traffic
 - we have the exact source/probe facts needed to implement the SM120 staged
   transport contract without guesswork
+- if `ncu` is unavailable due counter permissions, that blocker is documented
+  explicitly and Phase 1 starts from the histogram result plus source/probe
+  facts rather than from speculative profiler assumptions
 
 ### Phase 1: Weight Loading Pipeline (biggest lever)
 
