@@ -259,7 +259,7 @@ add_executable(
 )
 
 target_link_libraries(fused_moe_prefill_test PRIVATE nemotron_runtime_backend)
-target_compile_features(fused_moe_prefill_test PRIVATE cxx_std_17)
+target_compile_features(fused_moe_prefill_test PRIVATE cxx_std_20)
 
 nemotron_add_test(fused_moe_prefill_test)
 
@@ -334,6 +334,54 @@ target_compile_features(p5_swizzled_pipeline_test PRIVATE cxx_std_20)
 nemotron_add_test(p5_swizzled_pipeline_test)
 
 add_executable(
+  p5_swizzled_pipeline_test_120f
+  backend/p5_swizzled_pipeline_test.cu
+)
+
+target_link_libraries(
+  p5_swizzled_pipeline_test_120f
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  p5_swizzled_pipeline_test_120f
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    p5_swizzled_pipeline_test_120f
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+  target_compile_definitions(
+    p5_swizzled_pipeline_test_120f
+    PRIVATE
+      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
+  )
+endif()
+
+target_compile_features(p5_swizzled_pipeline_test_120f PRIVATE cxx_std_20)
+
+# CMake's CUDA_ARCHITECTURES property does not currently accept the Blackwell
+# feature-set suffix, so keep the main build on the repo-default arch and add a
+# dedicated 120f smoke target with explicit nvcc flags for TMA experiments.
+set_property(TARGET p5_swizzled_pipeline_test_120f PROPERTY CUDA_ARCHITECTURES OFF)
+target_compile_options(
+  p5_swizzled_pipeline_test_120f
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_120f,code=[compute_120f,sm_120f]>
+)
+target_link_options(
+  p5_swizzled_pipeline_test_120f
+  PRIVATE
+    $<$<LINK_LANGUAGE:CUDA>:--generate-code=arch=compute_120f,code=[compute_120f,sm_120f]>
+)
+
+add_executable(
   device_nvfp4_matrix_test
   backend/device_nvfp4_matrix_test.cpp
 )
@@ -393,7 +441,7 @@ add_executable(
 )
 
 target_link_libraries(request_context_test PRIVATE nemotron_runtime_backend)
-target_compile_features(request_context_test PRIVATE cxx_std_17)
+target_compile_features(request_context_test PRIVATE cxx_std_20)
 
 nemotron_add_test(request_context_test)
 
@@ -642,7 +690,7 @@ add_executable(
 )
 
 target_link_libraries(full_forward_manifest_smoke_test PRIVATE nemotron_runtime_api)
-target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_17)
+target_compile_features(full_forward_manifest_smoke_test PRIVATE cxx_std_20)
 
 nemotron_add_test(full_forward_manifest_smoke_test)
 
@@ -652,7 +700,7 @@ add_executable(
 )
 
 target_link_libraries(nano_global_root_prefix_cache_test PRIVATE nemotron_runtime_api)
-target_compile_features(nano_global_root_prefix_cache_test PRIVATE cxx_std_17)
+target_compile_features(nano_global_root_prefix_cache_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nano_global_root_prefix_cache_test)
 
@@ -662,7 +710,7 @@ add_executable(
 )
 
 target_link_libraries(multi_turn_prefix_reuse_test PRIVATE nemotron_runtime_api)
-target_compile_features(multi_turn_prefix_reuse_test PRIVATE cxx_std_17)
+target_compile_features(multi_turn_prefix_reuse_test PRIVATE cxx_std_20)
 target_compile_definitions(
   multi_turn_prefix_reuse_test
   PRIVATE
@@ -730,7 +778,7 @@ add_executable(
 )
 
 target_link_libraries(single_token_forward_model_test PRIVATE nemotron_runtime_api)
-target_compile_features(single_token_forward_model_test PRIVATE cxx_std_17)
+target_compile_features(single_token_forward_model_test PRIVATE cxx_std_20)
 
 nemotron_add_test(single_token_forward_model_test)
 

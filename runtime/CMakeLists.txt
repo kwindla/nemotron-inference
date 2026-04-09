@@ -63,7 +63,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_compile_features(nemotron_runtime_state PUBLIC cxx_std_17)
+target_compile_features(nemotron_runtime_state PUBLIC cxx_std_20)
 
 add_library(
   nemotron_runtime_cache
@@ -83,7 +83,7 @@ target_link_libraries(
     nemotron_runtime_state
 )
 
-target_compile_features(nemotron_runtime_cache PUBLIC cxx_std_17)
+target_compile_features(nemotron_runtime_cache PUBLIC cxx_std_20)
 
 add_library(
   nemotron_runtime_planning
@@ -96,7 +96,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_compile_features(nemotron_runtime_planning PUBLIC cxx_std_17)
+target_compile_features(nemotron_runtime_planning PUBLIC cxx_std_20)
 
 add_library(
   nemotron_runtime_loader
@@ -127,7 +127,7 @@ target_link_libraries(
     nemotron_runtime_planning
 )
 
-target_compile_features(nemotron_runtime_loader PUBLIC cxx_std_17)
+target_compile_features(nemotron_runtime_loader PUBLIC cxx_std_20)
 
 add_library(
   nemotron_runtime_backend
@@ -226,7 +226,7 @@ if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   )
 endif()
 
-target_compile_features(nemotron_runtime_backend PUBLIC cxx_std_17)
+target_compile_features(nemotron_runtime_backend PUBLIC cxx_std_20)
 
 target_link_libraries(
   nemotron_runtime_cache
@@ -255,7 +255,7 @@ target_link_libraries(
     nemotron_runtime_loader
 )
 
-target_compile_features(nemotron_runtime_api PUBLIC cxx_std_17)
+target_compile_features(nemotron_runtime_api PUBLIC cxx_std_20)
 
 if(NEMOTRON_PRODUCTION_BUILD)
   foreach(

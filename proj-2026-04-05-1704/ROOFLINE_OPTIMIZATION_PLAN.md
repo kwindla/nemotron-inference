@@ -12,6 +12,32 @@ today's `~176 ms` at `prefix128 / tail4` to below `70 ms`, then reassess
 against measured bandwidth and cache-utilization gains before committing to
 the `50 ms`, `35 ms`, and `20 ms` milestones.
 
+## Debugging Discipline
+
+When a hardware-level test fails (illegal memory access, silent corruption,
+hang), do NOT iterate by tweaking parameters at the same abstraction level.
+After 2 failures with the same API/approach:
+
+1. **Stop and re-read the reference implementation.** The answer is almost
+   always that we're using the wrong abstraction, not the wrong parameters.
+2. **Write a minimal copy-only smoke test** at the abstraction level the
+   reference actually uses, before touching the full kernel again.
+3. **Isolate one variable at a time** (operand isolation, copy-only vs
+   copy+MMA, static vs dynamic smem) — but only after confirming you're at
+   the right API level.
+
+Concrete lesson: the Phase 0.5 TMA proof burned 5 loops trying to make raw
+`SM90_TMA_LOAD_2D::copy(...)` work when TRT's reference code — already open
+in context — uses `make_tma_copy(SM90_TMA_LOAD{}, ...) + cute::copy(...)`.
+The fix was changing mechanism, not parameters.
+
+Corollary for the next TMA pass:
+- stay inside the CUTE abstraction by default
+- use host-side `make_tma_copy(...)` objects plus kernel-side
+  `copy(tma.with(barrier), partition_S, partition_D)`
+- only go down to raw `cuTensorMapEncodeTiled` / PTX-level TMA if we are
+  explicitly debugging CUTE itself
+
 ## Key Insight
 
 Nemotron-3 Nano at prefix128 is **entirely memory-bandwidth-bound**.  The
@@ -272,6 +298,36 @@ Measured transport-contract facts from the compile-time dump:
   - Phase 1 cannot be a naive “port the builder storage exactly” rewrite
   - Phase 1 must instead preserve the traced copy atoms / barrier contract while compressing stage storage to a runtime-feasible staged transport plan
 
+Measured standalone `P5` TMA smoke status on the current branch:
+- `testing/p5_swizzled_pipeline_test_120f` now passes both:
+  - `tma_copy_only_a_raw PASS`
+  - `tma_fragment_a PASS`
+- and now also passes the first full-math numeric step above the fragment
+  boundary:
+  - `tma_single_tile_dispatch_rows_5`
+  - `tma_single_tile_dispatch_rows_4`
+- meaning:
+  - the host-built `make_tma_copy(SM90_TMA_LOAD{}, ...)` producer path is valid for the routed FP4 `P5` operand contract
+  - the immediate consumer boundary also survives intact:
+    `SmemLayoutA -> make_tiled_copy_A(...) -> retile_D(...) -> fp4_shift_A(...)`
+  - a single-tile `P5` math path with `A` on TMA and `B/scales` on the existing
+    path is numerically valid for the low-row `dispatch_rows=4/5` regimes
+- the two actual bugs in the earlier smoke were:
+  - wrong full-barrier wait phase: the producer-complete wait must use phase `0`, matching TRT's initial consumer-side `ab_full_mbar.wait(ab_phase)` contract
+  - wrong physical-byte reference model: the valid stage-0 `P5` raw-byte reference for this smoke is the packed row-major source bytes, not the earlier `stage0_A(...)/2` reconstruction
+- `cuobjdump --dump-sass` on the smoke confirms the kernel really lowers to TMA:
+  - `UTMACCTL.PF`
+  - `UTMALDG.3D`
+  - `SYNCS.ARRIVE.TRANS64`
+  - `SYNCS.PHASECHK.TRANS64`
+
+Immediate implication for Phase 1:
+- stop questioning whether CUTE TMA works for routed FP4 `P5`
+- the next step is to lift this now-proven `A`-operand producer+consumer path
+  into the live unified routed kernel, with the main open problem now being
+  runtime descriptor ownership / launch integration rather than copy semantics
+- do not go back down to raw descriptor/PTX debugging unless the runtime-like integration breaks at a new boundary
+
 Interpretation:
 - the current unified routed kernel is not bandwidth-limited
 - it is also not tensor-core-limited
@@ -300,6 +356,24 @@ Interpretation:
    Status: done for the current unified routed profile family.
 
 **Reference points to start from, not rediscover:**
+- External references:
+  - Colfax, *Mastering the NVIDIA TMA*:
+    `https://research.colfax-intl.com/tutorial-hopper-tma/`
+    This is the canonical end-to-end explanation of the host
+    `make_tma_copy(...)` + kernel `copy(tma.with(barrier), ...)` pattern.
+  - Colfax, *CUTLASS tutorial: sub-byte GEMM on NVIDIA Blackwell GPUs*:
+    `https://research.colfax-intl.com/cutlass-tutorial-sub-byte-gemm-on-nvidia-blackwell-gpus/`
+    This is the most relevant external explanation of sub-byte / FP4 TMA
+    behavior on Blackwell, including the packed-to-packed versus auto-unpack
+    tensor-map modes.
+  - CUTLASS issue `#2906`:
+    `https://github.com/NVIDIA/cutlass/issues/2906`
+    Track this as the main alignment hazard reference for SM120 NVFP4 TMA:
+    descriptor alignment and scale-SMEM alignment are both easy footguns.
+  - CUTLASS issue `#3096`:
+    `https://github.com/NVIDIA/cutlass/issues/3096`
+    Track this as the main Blackwell grouped-FP4 correctness reference,
+    especially the `compute_120f` build caution.
 - `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/sm120_blockwise_gemm/sm120_utils.cuh`
   lines `271-307`: `TMA_A`, `TMA_B`, `TMA_SFA`, `TMA_SFB`, `SmemCopyAtomSF`,
   and `TmaTransactionBytes*`.  This is where the local SM120 path confirms
@@ -356,6 +430,31 @@ The exact staged-copy primitive and barrier structure are now pinned down by the
 Phase 0.5 probe. The remaining design choice is the compressed runtime stage
 count/layout that preserves those contracts while fitting within the per-CTA
 shared-memory limit.
+
+Phase 1a implementation rule:
+- prototype transport through the same CUTE contract TRT uses:
+  - host: `make_tma_copy(SM90_TMA_LOAD{}, gmem_tensor, smem_layout, ...)`
+  - kernel: `copy(tma.with(barrier), partition_S(...), partition_D(...))`
+- do not start from raw `CUtensorMap` descriptors or raw
+  `SM90_TMA_LOAD_*::copy(...)` wrappers unless the purpose of the test is to
+  debug CUTE itself
+
+FP4-specific hazards that must be treated as fixed constraints:
+- sub-byte TMA mode selection matters:
+  - packed-to-packed FP4 transport corresponds to the `16U4_ALIGN8B` contract
+  - mixed auto-unpack modes such as `16U4_ALIGN16B` are a different path
+- if we do descend to raw tensor-map descriptors during debugging, remember the
+  documented sub-byte constraints:
+  - GMEM base alignment is stricter than generic byte tensors
+  - logical K/box dimensions are constrained for FP4 tensor maps
+  - only the documented sub-byte swizzle modes are legal
+- TMA descriptor storage must respect the stricter alignment used by
+  `prefetch.tensormap` on Blackwell-class paths
+- scale-factor SMEM should be treated as requiring at least `128`-byte
+  alignment on the FP4 path
+- build/runtime validation for SM120 grouped FP4 should keep the
+  `compute_120f` caution in view; do not assume `compute_120` is enough just
+  because dense FP4 kernels compile
 
 Concrete source anchors for this phase:
 - `sm120_utils.cuh` lines `271-307` for descriptor and transaction-byte types
