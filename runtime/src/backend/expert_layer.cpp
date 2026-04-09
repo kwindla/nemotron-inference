@@ -95,6 +95,14 @@ void RecordExpertNativeMultiTokenExecution(std::size_t token_count) {
   g_expert_layer_execution_counters.native_multi_token_tokens += token_count;
 }
 
+void RecordExpertRowReplayExecution(std::size_t token_count) {
+  if (token_count <= 1) {
+    return;
+  }
+  ++g_expert_layer_execution_counters.row_replay_runs;
+  g_expert_layer_execution_counters.row_replay_tokens += token_count;
+}
+
 bool IsFp32Storage(const std::string& storage_dtype) {
   return storage_dtype == "fp32" || storage_dtype == "float32" || storage_dtype == "float";
 }
@@ -744,6 +752,20 @@ std::unique_ptr<DeviceTensorFp32> CreateWorkspaceView(
     return nullptr;
   }
   return DeviceTensorFp32::CreateView({rows, cols}, buffer->data());
+}
+
+std::unique_ptr<DeviceTensorFp32> CreateTokenRowView(
+    DeviceTensorFp32* buffer,
+    std::size_t row_index,
+    std::size_t cols) {
+  if (buffer == nullptr ||
+      !buffer->valid() ||
+      buffer->shape().size() != 2 ||
+      row_index >= buffer->shape()[0] ||
+      buffer->shape()[1] != cols) {
+    return nullptr;
+  }
+  return DeviceTensorFp32::CreateView({1, cols}, buffer->data() + (row_index * cols));
 }
 
 std::unique_ptr<DeviceTensorBf16> CreateWorkspaceView(
@@ -2614,10 +2636,6 @@ bool ExpertLayerSlice::Run(
     return false;
   }
 
-  if (token_count > 1) {
-    RecordExpertNativeMultiTokenExecution(token_count);
-  }
-
   std::unique_ptr<DeviceTensorBf16> normalized_bf16_owned;
   std::unique_ptr<DeviceTensorBf16> normalized_bf16_workspace_view;
   std::unique_ptr<DeviceTensorFp32> input_fp32_owned;
@@ -2780,15 +2798,38 @@ bool ExpertLayerSlice::Run(
                   topk_ids,
                   topk_weights,
                   output_fp32)
-            : impl_->RunFusedMoePrefillPath(
-                  cublas_handle,
-                  heuristic_cache,
-                  *input_fp32,
-                  *normalized,
-                  *router_logits,
-                  topk_ids,
-                  topk_weights,
-                  output_fp32);
+            : [&]() -> bool {
+                // The fused multi-row MoE prefill path uses batch-coupled activation
+                // scaling. Replaying rows through the single-row decode contract keeps
+                // prefix tokens invariant until the unified expert kernel replaces it.
+                RecordExpertRowReplayExecution(token_count);
+                for (std::size_t row_index = 0; row_index < token_count; ++row_index) {
+                  auto input_row =
+                      CreateTokenRowView(input_fp32, row_index, impl_->config.hidden_size);
+                  auto normalized_row =
+                      CreateTokenRowView(normalized, row_index, impl_->config.hidden_size);
+                  auto router_row =
+                      CreateTokenRowView(router_logits, row_index, impl_->config.n_routed_experts);
+                  auto output_row =
+                      CreateTokenRowView(output_fp32, row_index, impl_->config.hidden_size);
+                  if (input_row == nullptr ||
+                      normalized_row == nullptr ||
+                      router_row == nullptr ||
+                      output_row == nullptr ||
+                      !impl_->RunDirectMoeDecodePath(
+                          cublas_handle,
+                          heuristic_cache,
+                          *input_row,
+                          *normalized_row,
+                          *router_row,
+                          topk_ids + (row_index * impl_->config.top_k),
+                          topk_weights + (row_index * impl_->config.top_k),
+                          output_row.get())) {
+                    return false;
+                  }
+                }
+                return true;
+              }();
     if (!ok) {
       if (debug) {
         std::cout << "expert_layer: direct MoE "
@@ -2798,6 +2839,10 @@ bool ExpertLayerSlice::Run(
       return false;
     }
     return CastTensorFp32ToBf16(*output_fp32, output);
+  }
+
+  if (token_count > 1) {
+    RecordExpertNativeMultiTokenExecution(token_count);
   }
 
   auto latent = DeviceTensorFp32::Create({token_count, impl_->config.moe_latent_size});

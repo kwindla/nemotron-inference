@@ -289,6 +289,12 @@ int main() {
             << "\n";
 
   if (!expect(
+          split_prefill_matches,
+          "split-prefill continuation should preserve the full-prefill next-token argmax") ||
+      !expect(
+          split_single_matches,
+          "single-token continuation from a prefetched prefix should preserve the full-prefill next-token argmax") ||
+      !expect(
           all_single_argmax.has_value() && full_argmax.has_value() && *all_single_argmax == *full_argmax,
           "all-single-token replay should preserve the full-prefill next-token argmax")) {
     return 1;
