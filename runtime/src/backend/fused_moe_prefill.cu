@@ -1623,7 +1623,8 @@ const char* RoutedGemm2ProfileName(RoutedGemm2Profile profile) {
 
 bool ValidFusedNvfp4WeightView(const FusedNvfp4WeightView& weight) {
   return weight.packed_data != nullptr &&
-         weight.block_scales_data != nullptr &&
+         (weight.block_scales_data != nullptr ||
+          weight.matmul_block_scales_data != nullptr) &&
          weight.tensor_scale_data != nullptr &&
          weight.output_rows > 0 &&
          weight.input_cols > 0;
@@ -1634,6 +1635,7 @@ __host__ __device__ fused_decode::Nvfp4WeightView MakeDeviceWeightView(
   return fused_decode::Nvfp4WeightView{
       weight.packed_data,
       weight.block_scales_data,
+      weight.matmul_block_scales_data,
       weight.tensor_scale_data,
       weight.output_rows,
       weight.input_cols,
@@ -2209,21 +2211,32 @@ void RoutedBf16Relu2PackKernel(
 #endif
 }
 
+__device__ __forceinline__ std::uint8_t LoadExecutionScaleByte(
+    const std::uint8_t* scale_bytes,
+    std::size_t row,
+    std::size_t block_col,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout);
+
+__device__ __forceinline__ float LoadNvfp4WeightBlockScale(
+    const FusedNvfp4WeightView& weight,
+    std::size_t row,
+    std::size_t block_col);
+
+__device__ __forceinline__ float LoadNvfp4WeightBlockScale(
+    const fused_decode::Nvfp4WeightView& weight,
+    std::size_t row,
+    std::size_t block_col);
+
 __device__ __forceinline__ float DecodeNvfp4WeightElement(
     const FusedNvfp4WeightView& weight,
     std::size_t output_row,
     std::size_t col) {
   const std::size_t pairs_per_row = weight.input_cols / 2u;
-  const std::size_t blocks_per_row =
-      weight.input_cols / fused_decode::kNvfp4BlockWidth;
   const std::size_t pair_index = col / 2u;
   const std::size_t block = col / fused_decode::kNvfp4BlockWidth;
   const std::size_t packed_row_offset = output_row * pairs_per_row;
-  const std::size_t scale_row_offset = output_row * blocks_per_row;
-  const float tensor_scale = *weight.tensor_scale_data;
-  const float block_scale =
-      fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-      tensor_scale;
+  const float block_scale = LoadNvfp4WeightBlockScale(weight, output_row, block);
   const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
   const std::uint8_t nibble =
       (col & 1u) == 0u ? (packed & 0x0Fu) : ((packed >> 4u) & 0x0Fu);
@@ -2285,10 +2298,7 @@ __device__ __forceinline__ void DecodeNvfp4WeightBlockBf16(
       weight.input_cols / fused_decode::kNvfp4BlockWidth;
   const std::size_t packed_row_offset =
       output_row * (weight.input_cols / 2u) + block_index * (fused_decode::kNvfp4BlockWidth / 2u);
-  const std::size_t scale_row_offset = output_row * blocks_per_row + block_index;
-  const float block_scale =
-      fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset]) *
-      (*weight.tensor_scale_data);
+  const float block_scale = LoadNvfp4WeightBlockScale(weight, output_row, block_index);
   DecodePackedNvfp4BlockToBf16(weight.packed_data + packed_row_offset, block_scale, output);
 }
 
@@ -2389,6 +2399,48 @@ __device__ __forceinline__ std::uint8_t LoadExecutionScaleByte(
     std::size_t padded_blocks_per_row,
     Nvfp4ScaleLayout scale_layout) {
   return scale_bytes[ExecutionScaleOffset(row, block_col, padded_blocks_per_row, scale_layout)];
+}
+
+__device__ __forceinline__ float LoadNvfp4WeightBlockScale(
+    const FusedNvfp4WeightView& weight,
+    std::size_t row,
+    std::size_t block_col) {
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const float tensor_scale = *weight.tensor_scale_data;
+  if (weight.block_scales_data != nullptr) {
+    return fused_decode::DecodeFp8(weight.block_scales_data[row * blocks_per_row + block_col]) *
+           tensor_scale;
+  }
+  const std::size_t padded_blocks_per_row = (blocks_per_row + 3u) & ~std::size_t{3u};
+  return fused_decode::DecodeFp8(
+             LoadExecutionScaleByte(
+                 weight.matmul_block_scales_data,
+                 row,
+                 block_col,
+                 padded_blocks_per_row,
+                 Nvfp4ScaleLayout::kSwizzled128x4)) *
+         tensor_scale;
+}
+
+__device__ __forceinline__ float LoadNvfp4WeightBlockScale(
+    const fused_decode::Nvfp4WeightView& weight,
+    std::size_t row,
+    std::size_t block_col) {
+  const std::size_t blocks_per_row = weight.input_cols / fused_decode::kNvfp4BlockWidth;
+  const float tensor_scale = *weight.tensor_scale_data;
+  if (weight.block_scales_data != nullptr) {
+    return fused_decode::DecodeFp8(weight.block_scales_data[row * blocks_per_row + block_col]) *
+           tensor_scale;
+  }
+  const std::size_t padded_blocks_per_row = (blocks_per_row + 3u) & ~std::size_t{3u};
+  return fused_decode::DecodeFp8(
+             LoadExecutionScaleByte(
+                 weight.matmul_block_scales_data,
+                 row,
+                 block_col,
+                 padded_blocks_per_row,
+                 Nvfp4ScaleLayout::kSwizzled128x4)) *
+         tensor_scale;
 }
 
 __device__ __forceinline__ void Sm120BlockScaledFp4Mma(
@@ -3771,7 +3823,7 @@ __global__ void Nvfp4GroupedExpertMatVecRowsKernel(
       const std::size_t pair_in_block = pair_index % 8u;
       const std::size_t col = block * fused_decode::kNvfp4BlockWidth + pair_in_block * 2u;
       const float block_scale =
-          fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) * tensor_scale;
+          LoadNvfp4WeightBlockScale(weight, output_row, block);
       const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
       const float w0 = fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
       const float w1 = fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
@@ -3879,8 +3931,7 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -4020,8 +4071,7 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRowsBf16Kernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -4157,8 +4207,7 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRelu2MaxAbsKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -4315,8 +4364,7 @@ __global__ void Nvfp4LaunchPlannedExpertMatVecRelu2PackKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * input_blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            weight_tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -6301,8 +6349,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            weight_tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -6466,8 +6513,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsBf16Kernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            weight_tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -6626,8 +6672,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRelu2MaxAbsKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            weight_tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -6803,8 +6848,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRelu2PackKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * input_blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            weight_tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);
@@ -6960,7 +7004,7 @@ __global__ void Nvfp4MatVecRowsKernel(
       const std::size_t pair_in_block = pair_index % 8u;
       const std::size_t col = block * fused_decode::kNvfp4BlockWidth + pair_in_block * 2u;
       const float block_scale =
-          fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) * tensor_scale;
+          LoadNvfp4WeightBlockScale(weight, output_row, block);
       const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
       const float w0 = fused_decode::DecodeFp4(packed & 0x0Fu) * block_scale;
       const float w1 = fused_decode::DecodeFp4((packed >> 4) & 0x0Fu) * block_scale;
@@ -7064,8 +7108,7 @@ __global__ void Nvfp4ContiguousWmmaMatVecRowsKernel(
         const std::size_t scale_row_offset =
             static_cast<std::size_t>(output_row) * blocks_per_row;
         const float block_scale =
-            fused_decode::DecodeFp8(weight.block_scales_data[scale_row_offset + block]) *
-            tensor_scale;
+            LoadNvfp4WeightBlockScale(weight, static_cast<std::size_t>(output_row), block);
         const std::uint8_t packed = weight.packed_data[packed_row_offset + pair_index];
         const std::uint8_t nibble =
             (tile_k & 1) == 0 ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu);

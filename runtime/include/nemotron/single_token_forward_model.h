@@ -46,6 +46,7 @@ struct SingleTokenForwardConfig {
 
   std::size_t moe_latent_size = 0;
   std::size_t routed_expert_intermediate_size = 0;
+  std::size_t routed_expert_intermediate_size_padded = 0;
   std::size_t shared_expert_intermediate_size = 0;
   std::size_t n_routed_experts = 0;
   std::size_t experts_per_token = 0;

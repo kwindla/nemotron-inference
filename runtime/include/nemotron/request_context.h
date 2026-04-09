@@ -18,6 +18,7 @@ struct MoePrefillWorkspaceConfig {
   std::size_t num_experts = 0;
   std::size_t top_k = 0;
   std::size_t routed_expert_intermediate_size = 0;
+  std::size_t routed_expert_intermediate_size_padded = 0;
   std::size_t shared_expert_intermediate_size = 0;
 };
 

@@ -14,7 +14,8 @@ class MonolithicNvfp4ExpertWeights {
   static std::unique_ptr<MonolithicNvfp4ExpertWeights> Create(
       std::size_t num_experts,
       std::size_t output_rows,
-      std::size_t input_cols);
+      std::size_t input_cols,
+      bool store_row_major_block_scales = true);
 
   MonolithicNvfp4ExpertWeights(MonolithicNvfp4ExpertWeights&&) noexcept;
   MonolithicNvfp4ExpertWeights& operator=(MonolithicNvfp4ExpertWeights&&) noexcept;
@@ -29,7 +30,9 @@ class MonolithicNvfp4ExpertWeights {
       std::size_t packed_nbytes,
       const std::uint8_t* host_block_scales,
       std::size_t block_scales_nbytes,
-      const float* host_tensor_scale);
+      const float* host_tensor_scale,
+      std::size_t host_output_rows = 0,
+      std::size_t host_input_cols = 0);
   float host_tensor_scale(std::size_t expert_index) const;
   FusedNvfp4WeightView GetView(std::size_t expert_index) const;
   std::vector<FusedNvfp4WeightView> BuildAllViews() const;

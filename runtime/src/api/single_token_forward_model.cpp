@@ -28,6 +28,7 @@
 #include "nemotron/embedding_table.h"
 #include "nemotron/expert_layer.h"
 #include "nemotron/gemm_catalog.h"
+#include "nemotron/routed_expert_runtime.h"
 #include "nemotron/gemm_planner.h"
 #include "nemotron/kernel_catalog.h"
 #include "nemotron/linear_op.h"
@@ -122,6 +123,8 @@ MoePrefillWorkspaceConfig BuildMoePrefillWorkspaceConfig(
   workspace_config.top_k = config.experts_per_token;
   workspace_config.routed_expert_intermediate_size =
       config.routed_expert_intermediate_size;
+  workspace_config.routed_expert_intermediate_size_padded =
+      config.routed_expert_intermediate_size_padded;
   workspace_config.shared_expert_intermediate_size =
       config.shared_expert_intermediate_size;
   return workspace_config;
@@ -738,6 +741,8 @@ SingleTokenForwardConfig KnownNemotron3Super120BA12BConfig() {
 
   config.moe_latent_size = 1024;
   config.routed_expert_intermediate_size = 2688;
+  config.routed_expert_intermediate_size_padded =
+      DefaultRoutedExpertIntermediateSizePadded(config.routed_expert_intermediate_size);
   config.shared_expert_intermediate_size = 5376;
   config.n_routed_experts = 512;
   config.experts_per_token = 22;
@@ -774,6 +779,8 @@ SingleTokenForwardConfig KnownNemotron3Nano30BA3BConfig() {
   // Nano's MoE path is a direct MLP, so routed outputs stay in hidden-size space.
   config.moe_latent_size = 2688;
   config.routed_expert_intermediate_size = 1856;
+  config.routed_expert_intermediate_size_padded =
+      DefaultRoutedExpertIntermediateSizePadded(config.routed_expert_intermediate_size);
   config.shared_expert_intermediate_size = 3712;
   config.n_routed_experts = 128;
   config.experts_per_token = 6;
@@ -807,6 +814,9 @@ std::optional<SingleTokenForwardPlan> BuildSingleTokenForwardPlan(
       config.mamba_conv_kernel_size == 0 ||
       config.moe_latent_size == 0 ||
       config.routed_expert_intermediate_size == 0 ||
+      !RoutedExpertIntermediateSizePaddingValid(
+          config.routed_expert_intermediate_size,
+          config.routed_expert_intermediate_size_padded) ||
       config.shared_expert_intermediate_size == 0 ||
       config.n_routed_experts == 0 ||
       config.experts_per_token == 0 ||
@@ -1089,6 +1099,8 @@ std::unique_ptr<SingleTokenForwardModel> SingleTokenForwardModel::Create(
         expert_config.hidden_size = config.hidden_size;
         expert_config.moe_latent_size = config.moe_latent_size;
         expert_config.routed_expert_intermediate_size = config.routed_expert_intermediate_size;
+        expert_config.routed_expert_intermediate_size_padded =
+            config.routed_expert_intermediate_size_padded;
         expert_config.shared_expert_intermediate_size = config.shared_expert_intermediate_size;
         expert_config.n_routed_experts = config.n_routed_experts;
         expert_config.top_k = config.experts_per_token;

@@ -17,19 +17,56 @@ constexpr float kNvfp4MinScale = 1.0f / 1024.0f;
 struct Nvfp4WeightView {
   const std::uint8_t* packed_data = nullptr;
   const std::uint8_t* block_scales_data = nullptr;
+  const std::uint8_t* matmul_block_scales_data = nullptr;
   const float* tensor_scale_data = nullptr;
   std::size_t output_rows = 0;
   std::size_t input_cols = 0;
 
   __host__ __device__ bool valid() const {
     return packed_data != nullptr &&
-           block_scales_data != nullptr &&
+           (block_scales_data != nullptr || matmul_block_scales_data != nullptr) &&
            tensor_scale_data != nullptr &&
            output_rows != 0 &&
            input_cols != 0 &&
            (input_cols % 16) == 0;
   }
 };
+
+__host__ __device__ inline std::size_t RoundUpTo4(std::size_t value) {
+  return (value + 3u) & ~std::size_t{3u};
+}
+
+__device__ inline std::size_t Swizzled128x4ScaleOffset(
+    std::size_t row,
+    std::size_t block_col,
+    std::size_t padded_blocks_per_row) {
+  const std::size_t num_k_tiles = padded_blocks_per_row / 4u;
+  const std::size_t k_tile = block_col / 4u;
+  const std::size_t inner_k = block_col & 3u;
+  const std::size_t m_tile = row / 128u;
+  const std::size_t outer_m = row & 31u;
+  const std::size_t inner_m = (row >> 5u) & 3u;
+  return ((((m_tile * num_k_tiles) + k_tile) << 9u) |
+          (outer_m << 4u) |
+          (inner_m << 2u) |
+          inner_k);
+}
+
+__device__ inline std::uint8_t LoadWeightScaleByte(
+    const Nvfp4WeightView& weight,
+    std::size_t row,
+    std::size_t block_col) {
+  const std::size_t blocks_per_row = weight.input_cols / kNvfp4BlockWidth;
+  if (weight.block_scales_data != nullptr) {
+    return weight.block_scales_data[row * blocks_per_row + block_col];
+  }
+  if (weight.matmul_block_scales_data != nullptr) {
+    const std::size_t padded_blocks_per_row = RoundUpTo4(blocks_per_row);
+    return weight.matmul_block_scales_data[
+        Swizzled128x4ScaleOffset(row, block_col, padded_blocks_per_row)];
+  }
+  return 0u;
+}
 
 __device__ inline float Sigmoid(float value) {
   if (value >= 0.0f) {
@@ -161,13 +198,12 @@ __device__ inline float Nvfp4RowMajorDot(
     std::size_t row_index) {
   const std::size_t blocks_per_row = weight.input_cols / 16;
   const std::size_t packed_row_offset = row_index * (weight.input_cols / 2);
-  const std::size_t scale_row_offset = row_index * blocks_per_row;
   const float tensor_scale = *weight.tensor_scale_data;
   double accum = 0.0;
   std::size_t packed_index = packed_row_offset;
   for (std::size_t block = 0; block < blocks_per_row; ++block) {
     const float block_scale =
-        DecodeFp8(weight.block_scales_data[scale_row_offset + block]) * tensor_scale;
+        DecodeFp8(LoadWeightScaleByte(weight, row_index, block)) * tensor_scale;
     const std::size_t col_start = block * 16;
     for (std::size_t offset = 0; offset < 16; offset += 2) {
       const std::uint8_t byte = weight.packed_data[packed_index++];

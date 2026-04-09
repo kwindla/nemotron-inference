@@ -97,6 +97,7 @@ bool test_single_token_forward_plan_tracks_layer_order_and_state_layout() {
   config.mamba_conv_kernel_size = 4;
   config.moe_latent_size = 12;
   config.routed_expert_intermediate_size = 24;
+  config.routed_expert_intermediate_size_padded = 32;
   config.shared_expert_intermediate_size = 48;
   config.n_routed_experts = 8;
   config.experts_per_token = 2;
@@ -182,6 +183,8 @@ bool test_known_nano_config_matches_runtime_expectations() {
                 "nano config should use hidden-size routed outputs for direct MoE") &&
          expect(config.routed_expert_intermediate_size == 1856,
                 "nano config should preserve routed expert width") &&
+         expect(config.routed_expert_intermediate_size_padded == 1920,
+                "nano config should expose the padded routed expert execution width") &&
          expect(config.shared_expert_intermediate_size == 3712,
                 "nano config should preserve shared expert width") &&
          expect(config.n_routed_experts == 128, "nano config should preserve routed expert count") &&

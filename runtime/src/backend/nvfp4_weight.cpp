@@ -7,6 +7,7 @@
 #include <iostream>
 #include <vector>
 
+#include "nvfp4_routed_padding.h"
 #include "nemotron/nvfp4_scale_layout.h"
 
 namespace nemotron {
@@ -88,25 +89,47 @@ std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescripto
   }
 
   auto impl = std::make_unique<Impl>();
-  impl->output_rows = descriptor.output_rows;
-  impl->input_cols = descriptor.input_cols;
-  impl->packed_nbytes = descriptor.packed_nbytes;
-  impl->block_scales_nbytes = descriptor.block_scales_nbytes;
+  PreparedNvfp4ExecutionWeightHostData prepared;
+  if (!PrepareNvfp4WeightForExecution(
+          descriptor.op_class,
+          descriptor.output_rows,
+          descriptor.input_cols,
+          descriptor.packed_data,
+          descriptor.packed_nbytes,
+          descriptor.block_scales_data,
+          descriptor.block_scales_nbytes,
+          &prepared)) {
+    return debug_fail("execution padding preparation failed");
+  }
+
+  const std::uint8_t* packed_src =
+      prepared.padded ? prepared.packed.data() : descriptor.packed_data;
+  const std::uint8_t* block_scales_src =
+      prepared.padded ? prepared.block_scales.data() : descriptor.block_scales_data;
+  const std::size_t packed_nbytes =
+      prepared.padded ? prepared.packed.size() : descriptor.packed_nbytes;
+  const std::size_t block_scales_nbytes =
+      prepared.padded ? prepared.block_scales.size() : descriptor.block_scales_nbytes;
+
+  impl->output_rows = prepared.output_rows;
+  impl->input_cols = prepared.input_cols;
+  impl->packed_nbytes = packed_nbytes;
+  impl->block_scales_nbytes = block_scales_nbytes;
   impl->tensor_scale_nbytes = descriptor.tensor_scale_nbytes;
   std::memcpy(&impl->host_tensor_scale, descriptor.tensor_scale_data, sizeof(float));
   const std::vector<std::uint8_t> matmul_block_scales = SwizzleRowMajorNvfp4ScalesForExecution(
-      descriptor.block_scales_data,
-      descriptor.output_rows,
-      descriptor.input_cols);
+      block_scales_src,
+      impl->output_rows,
+      impl->input_cols);
   if (matmul_block_scales.empty()) {
     return debug_fail("scale swizzle failed");
   }
   impl->matmul_block_scales_nbytes = matmul_block_scales.size();
 
-  if (!AllocateAndCopy(descriptor.packed_data, descriptor.packed_nbytes, &impl->packed_data) ||
+  if (!AllocateAndCopy(packed_src, packed_nbytes, &impl->packed_data) ||
       !AllocateAndCopy(
-          descriptor.block_scales_data,
-          descriptor.block_scales_nbytes,
+          block_scales_src,
+          block_scales_nbytes,
           &impl->block_scales_data) ||
       !AllocateAndCopy(
           matmul_block_scales.data(),

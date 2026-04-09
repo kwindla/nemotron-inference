@@ -173,6 +173,7 @@ __global__ void FusedMoeDirectDecodeKernel(
     const fused_decode::Nvfp4WeightView up_view{
         params.routed_up[expert_index].packed_data,
         params.routed_up[expert_index].block_scales_data,
+        params.routed_up[expert_index].matmul_block_scales_data,
         params.routed_up[expert_index].tensor_scale_data,
         params.routed_up[expert_index].output_rows,
         params.routed_up[expert_index].input_cols,
@@ -180,6 +181,7 @@ __global__ void FusedMoeDirectDecodeKernel(
     const fused_decode::Nvfp4WeightView down_view{
         params.routed_down[expert_index].packed_data,
         params.routed_down[expert_index].block_scales_data,
+        params.routed_down[expert_index].matmul_block_scales_data,
         params.routed_down[expert_index].tensor_scale_data,
         params.routed_down[expert_index].output_rows,
         params.routed_down[expert_index].input_cols,
@@ -216,6 +218,7 @@ __global__ void FusedMoeDirectDecodeKernel(
   const fused_decode::Nvfp4WeightView shared_up_view{
       params.shared_up.packed_data,
       params.shared_up.block_scales_data,
+      params.shared_up.matmul_block_scales_data,
       params.shared_up.tensor_scale_data,
       params.shared_up.output_rows,
       params.shared_up.input_cols,
@@ -223,6 +226,7 @@ __global__ void FusedMoeDirectDecodeKernel(
   const fused_decode::Nvfp4WeightView shared_down_view{
       params.shared_down.packed_data,
       params.shared_down.block_scales_data,
+      params.shared_down.matmul_block_scales_data,
       params.shared_down.tensor_scale_data,
       params.shared_down.output_rows,
       params.shared_down.input_cols,

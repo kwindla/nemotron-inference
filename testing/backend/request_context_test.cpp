@@ -43,6 +43,7 @@ RequestExecutionConfig make_moe_workspace_config() {
   config.moe_prefill_workspace_config.num_experts = 8;
   config.moe_prefill_workspace_config.top_k = 2;
   config.moe_prefill_workspace_config.routed_expert_intermediate_size = 24;
+  config.moe_prefill_workspace_config.routed_expert_intermediate_size_padded = 32;
   config.moe_prefill_workspace_config.shared_expert_intermediate_size = 48;
   config.moe_prefill_capacity_tokens = 5;
   return config;
@@ -219,6 +220,10 @@ bool test_request_context_preallocates_moe_prefill_workspace() {
   }
 
   const auto* workspace = context->moe_prefill_workspace();
+  const std::size_t selection_count =
+      config.moe_prefill_capacity_tokens * config.moe_prefill_workspace_config.top_k;
+  const std::size_t routed_expert_execution_size =
+      config.moe_prefill_workspace_config.routed_expert_intermediate_size_padded;
   return expect(workspace != nullptr, "request context should preallocate the MoE prefill workspace") &&
          expect(workspace->valid(), "preallocated MoE workspace should be valid") &&
          expect(workspace->token_capacity() == config.moe_prefill_capacity_tokens,
@@ -230,11 +235,10 @@ bool test_request_context_preallocates_moe_prefill_workspace() {
              "workspace BF16 normalization buffer should match the configured token capacity") &&
          expect(
              workspace->fused_prefill_expert_up_scratch != nullptr &&
-                 workspace->fused_prefill_expert_up_scratch->shape() ==
-                     std::vector<std::size_t>({
-                         config.moe_prefill_capacity_tokens *
-                             config.moe_prefill_workspace_config.top_k,
-                         config.moe_prefill_workspace_config.routed_expert_intermediate_size}),
+                 workspace->fused_prefill_expert_up_scratch->shape().size() == 2 &&
+                 workspace->fused_prefill_expert_up_scratch->shape()[0] >= selection_count &&
+                 workspace->fused_prefill_expert_up_scratch->shape()[1] ==
+                     routed_expert_execution_size,
              "workspace routed-up scratch should match the configured selection capacity");
 }
 

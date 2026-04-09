@@ -20,6 +20,41 @@ log / artifact bundle for the recovery work:
 
 ## Routed FP4 Update (2026-04-08)
 
+## Routed Layout Update (2026-04-08)
+
+The routed-expert resident layout is now closer to TRT-LLM's execution form for
+the padded Nano path:
+
+- routed resident expert weights now keep only the execution block-scale form
+  in monolithic device residency; the duplicate row-major device block-scale
+  copy is gone for the active routed resident path
+- routed expert execution width is now padded from logical `1856` to execution
+  `1920` during load/repack for Nano routed experts
+- resident direct-MoE layers no longer reserve a full per-layer `4096`-window
+  fused-prefill scratch; the multi-token path now expects request-scoped
+  `MoePrefillWorkspace` first and creates a temporary fallback workspace only
+  when none is supplied
+
+Measured effect:
+- resident routed layer bytes dropped from the earlier padded split
+  `up_bytes=412878848 / down_bytes=371591168`
+  to
+  `up_bytes=371591168 / down_bytes=371591168`
+- `resident_total_expert_mib` per routed layer dropped to `720.648 MiB`
+- the padded Nano TTFT bench now builds and runs again with
+  `--moe-prefill-window-tokens 4096`
+
+Focused validation after the layout/residency change:
+- `fused_moe_prefill_test`: pass
+- `request_context_test`: pass
+- `single_token_forward_model_test`: pass
+- `multi_turn_prefix_reuse_test`: pass
+- padded TTFT smoke:
+  - `prefix4 / tail4`: cold `59.332 ms`, committed `59.174 ms`,
+    global-root `59.388 ms`
+  - `prefix128 / tail4`: cold `150.498 ms`, committed `61.289 ms`,
+    global-root `60.609 ms`
+
 The unified swizzled FP4 `P5` path is now the default routed FC1 profile.
 
 What changed:

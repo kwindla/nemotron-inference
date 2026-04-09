@@ -3,6 +3,8 @@
 #include <limits>
 #include <utility>
 
+#include "nemotron/routed_expert_runtime.h"
+
 namespace nemotron {
 namespace {
 
@@ -62,13 +64,19 @@ Nvfp4ScaleLayout MoePrefillPackScaleLayout() {
 }
 
 bool WorkspaceConfigSupported(const MoePrefillWorkspaceConfig& config) {
+  const std::size_t routed_expert_intermediate_size =
+      ResolveRoutedExpertIntermediateSizeExecution(
+          config.routed_expert_intermediate_size,
+          config.routed_expert_intermediate_size_padded);
   return config.hidden_size != 0 &&
          config.num_experts != 0 &&
          config.num_experts <= kMaxDeviceExpertRoutingExperts &&
          config.top_k != 0 &&
          config.top_k <= config.num_experts &&
-         config.routed_expert_intermediate_size != 0 &&
-         config.routed_expert_intermediate_size % kMoeNvfp4ScaleBlockWidth == 0 &&
+         RoutedExpertIntermediateSizePaddingValid(
+             config.routed_expert_intermediate_size,
+             config.routed_expert_intermediate_size_padded) &&
+         routed_expert_intermediate_size % kMoeNvfp4ScaleBlockWidth == 0 &&
          config.shared_expert_intermediate_size != 0;
 }
 
@@ -176,7 +184,12 @@ bool SameWorkspaceConfig(
   return lhs.hidden_size == rhs.hidden_size &&
          lhs.num_experts == rhs.num_experts &&
          lhs.top_k == rhs.top_k &&
-         lhs.routed_expert_intermediate_size == rhs.routed_expert_intermediate_size &&
+         ResolveRoutedExpertIntermediateSizeExecution(
+             lhs.routed_expert_intermediate_size,
+             lhs.routed_expert_intermediate_size_padded) ==
+             ResolveRoutedExpertIntermediateSizeExecution(
+                 rhs.routed_expert_intermediate_size,
+                 rhs.routed_expert_intermediate_size_padded) &&
          lhs.shared_expert_intermediate_size == rhs.shared_expert_intermediate_size;
 }
 
@@ -188,6 +201,10 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
   if (token_capacity == 0 || !WorkspaceConfigSupported(config)) {
     return std::nullopt;
   }
+  const std::size_t routed_expert_intermediate_size =
+      ResolveRoutedExpertIntermediateSizeExecution(
+          config.routed_expert_intermediate_size,
+          config.routed_expert_intermediate_size_padded);
 
   const auto selection_capacity = CheckedMul(token_capacity, config.top_k);
   const auto padded_selection_capacity =
@@ -234,15 +251,15 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                  add_bytes(MatrixBytes(config.num_experts, 1, sizeof(float))) &&
                  add_bytes(MatrixBytes(
                      *padded_selection_capacity,
-                     config.routed_expert_intermediate_size,
+                     routed_expert_intermediate_size,
                      sizeof(__nv_bfloat16))) &&
                  add_bytes(MatrixBytes(
                      *padded_selection_capacity,
-                     config.routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth,
+                     routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth,
                      sizeof(float))) &&
                  add_bytes(MatrixBytes(
                      *padded_selection_capacity,
-                     config.routed_expert_intermediate_size,
+                     routed_expert_intermediate_size,
                      sizeof(float))) &&
                  add_bytes(MatrixBytes(
                      token_capacity,
@@ -254,7 +271,7 @@ std::optional<std::size_t> MoePrefillWorkspace::BytesForTokenCapacity(
                      pack_scale_layout)) &&
                  add_bytes(Nvfp4MatrixBytes(
                      *padded_selection_capacity,
-                     config.routed_expert_intermediate_size,
+                     routed_expert_intermediate_size,
                      pack_scale_layout)) &&
                  add_bytes(Nvfp4MatrixBytes(
                      token_capacity,
@@ -270,6 +287,10 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
   if (!BytesForTokenCapacity(token_capacity, config).has_value()) {
     return nullptr;
   }
+  const std::size_t routed_expert_intermediate_size =
+      ResolveRoutedExpertIntermediateSizeExecution(
+          config.routed_expert_intermediate_size,
+          config.routed_expert_intermediate_size_padded);
 
   const std::size_t selection_capacity = token_capacity * config.top_k;
   const auto padded_selection_capacity =
@@ -305,14 +326,14 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       DeviceTensorFp32::Create({config.num_experts, 1});
   workspace->fused_prefill_gemm1_output_bf16 =
       DeviceTensorBf16::Create(
-          {*padded_selection_capacity, config.routed_expert_intermediate_size});
+          {*padded_selection_capacity, routed_expert_intermediate_size});
   workspace->fused_prefill_gemm1_output_scales =
       DeviceTensorFp32::Create(
           {*padded_selection_capacity,
-           config.routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth});
+           routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth});
   workspace->fused_prefill_expert_up_scratch =
       DeviceTensorFp32::Create(
-          {*padded_selection_capacity, config.routed_expert_intermediate_size});
+          {*padded_selection_capacity, routed_expert_intermediate_size});
   workspace->fused_prefill_shared_up_scratch =
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
   workspace->fused_prefill_normalized_pack =
@@ -327,7 +348,7 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
           pack_scale_layout);
   workspace->fused_prefill_expert_up_pack = DeviceNvfp4Matrix::Create(
       *padded_selection_capacity,
-      config.routed_expert_intermediate_size,
+      routed_expert_intermediate_size,
       pack_scale_layout);
   workspace->fused_prefill_shared_up_pack = DeviceNvfp4Matrix::Create(
       token_capacity,
@@ -352,6 +373,10 @@ bool MoePrefillWorkspace::valid() const {
   if (!padded_selection_capacity.has_value()) {
     return false;
   }
+  const std::size_t routed_expert_intermediate_size =
+      ResolveRoutedExpertIntermediateSizeExecution(
+          config.routed_expert_intermediate_size,
+          config.routed_expert_intermediate_size_padded);
   return TensorMatchesShape(normalized_bf16.get(), token_capacity_value, config.hidden_size) &&
          TensorMatchesShape(input_fp32.get(), token_capacity_value, config.hidden_size) &&
          TensorMatchesShape(normalized.get(), token_capacity_value, config.hidden_size) &&
@@ -387,15 +412,15 @@ bool MoePrefillWorkspace::valid() const {
          TensorMatchesShape(
              fused_prefill_gemm1_output_bf16.get(),
              *padded_selection_capacity,
-             config.routed_expert_intermediate_size) &&
+             routed_expert_intermediate_size) &&
          TensorMatchesShape(
              fused_prefill_gemm1_output_scales.get(),
              *padded_selection_capacity,
-             config.routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth) &&
+             routed_expert_intermediate_size / kMoeNvfp4ScaleBlockWidth) &&
          TensorMatchesShape(
              fused_prefill_expert_up_scratch.get(),
              *padded_selection_capacity,
-             config.routed_expert_intermediate_size) &&
+             routed_expert_intermediate_size) &&
          TensorMatchesShape(
              fused_prefill_shared_up_scratch.get(),
              token_capacity_value,
@@ -411,7 +436,7 @@ bool MoePrefillWorkspace::valid() const {
          fused_prefill_expert_up_pack != nullptr &&
          fused_prefill_expert_up_pack->valid() &&
          fused_prefill_expert_up_pack->rows() >= *padded_selection_capacity &&
-         fused_prefill_expert_up_pack->cols() == config.routed_expert_intermediate_size &&
+         fused_prefill_expert_up_pack->cols() == routed_expert_intermediate_size &&
          fused_prefill_shared_up_pack != nullptr &&
          fused_prefill_shared_up_pack->valid() &&
          fused_prefill_shared_up_pack->rows() >= token_capacity_value &&
