@@ -403,6 +403,39 @@ Runtime `P5` TMA descriptor-ownership status:
       control overhead, but it does not materially move cold TTFT
     - the remaining gap is now dominated by the kernel body / staging path,
       which is the right point to hand over to `ncu`
+  - post-stabilization profiling boundary:
+    - the default full-model path now intentionally replays multi-token direct
+      MoE rows through the single-row decode contract for correctness, so
+      default TTFT smoke numbers are no longer a valid native-kernel profiler
+      surface
+    - use the explicit profiling override only for measurement:
+      `NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL=1`
+    - with that override plus
+      `--moe-prefill-window-tokens 133 --case cold_prefill_prefix128`, the
+      live native routed path is visible again and currently measures
+      `cold TTFT = 130.018 ms` median with:
+      - `expert native multi-token runs = 23`
+      - `expert row replay runs = 0`
+  - first post-cleanup `ncu` read on that explicit profiling surface:
+    - before removing the conservative full-stage `B` clear:
+      - `Memory Throughput = 473.5 GB/s`
+      - `Max Bandwidth = 26.83%`
+      - `L2 Hit Rate = 43.82%`
+      - `One or More Eligible = 11.70%`
+      - `Issued Warp / Scheduler = 0.12`
+      - `Warp Cycles / Issued Instruction = 25.58`
+    - after removing the conservative full-stage `B` clear:
+      - `Memory Throughput = 658.9 GB/s`
+      - `Max Bandwidth = 37.34%`
+      - `L2 Hit Rate = 65.17%`
+      - `One or More Eligible = 15.29%`
+      - `Issued Warp / Scheduler = 0.15`
+      - `Warp Cycles / Issued Instruction = 19.44`
+    - interpretation:
+      - the `B`-stage clear was real overhead, not noise
+      - the live kernel is still far from bandwidth-bound, but the next stall
+        targets should be barrier structure / eligibility / occupancy, not
+        descriptor transport
 
 Immediate implication for Phase 1:
 - stop questioning whether CUTE TMA works for routed FP4 `P5`
@@ -424,15 +457,12 @@ Immediate implication for Phase 1:
   The next boundary is no longer descriptor ownership; it is direct
   measurement of the live kernel body and then removing the remaining known
   temporary costs inside that body.
-- keep two temporary correctness-landing caveats explicit before reading too
+- keep one temporary correctness-landing caveat explicit before reading too
   much into the first transport measurements:
-  - the live `P5` B path still zero-fills the entire swizzled `B` stage before
-    issuing TMA, even though TMA already zero-fills out-of-bounds rows; remove
-    that conservative clear before serious roofline profiling
   - the old thread-coded `B` packed-data loop still exists structurally around
-    the `if (!use_p5_tma_b)` fallback; confirm with SASS / `ncu` that the
-    empty loop body is fully elided on the TMA path instead of paying a hidden
-    control-flow cost
+    the `if (!use_p5_tma_b)` fallback while the scale scatter runs. Confirm
+    with SASS / `ncu` whether the remaining control flow is negligible on the
+    TMA path or whether it still needs a dedicated scale/TMA producer split.
 - do not go back down to raw descriptor/PTX debugging unless the runtime-like integration breaks at a new boundary
 
 Live-integration boundary decisions:

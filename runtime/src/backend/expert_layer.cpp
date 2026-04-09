@@ -43,6 +43,10 @@ bool EnvEnabled(const char* env_var) {
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+bool AllowUnsafeNativeDirectMoePrefillProfiling() {
+  return EnvEnabled("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+}
+
 std::size_t ExecutionRoutedExpertIntermediateSize(const ExpertLayerConfig& config) {
   return ResolveRoutedExpertIntermediateSizeExecution(
       config.routed_expert_intermediate_size,
@@ -2799,6 +2803,18 @@ bool ExpertLayerSlice::Run(
                   topk_weights,
                   output_fp32)
             : [&]() -> bool {
+                if (AllowUnsafeNativeDirectMoePrefillProfiling()) {
+                  RecordExpertNativeMultiTokenExecution(token_count);
+                  return impl_->RunFusedMoePrefillPath(
+                      cublas_handle,
+                      heuristic_cache,
+                      *input_fp32,
+                      *normalized,
+                      *router_logits,
+                      topk_ids,
+                      topk_weights,
+                      output_fp32);
+                }
                 // The fused multi-row MoE prefill path uses batch-coupled activation
                 // scaling. Replaying rows through the single-row decode contract keeps
                 // prefix tokens invariant until the unified expert kernel replaces it.
