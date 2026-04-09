@@ -193,7 +193,7 @@ What is already true:
 **Goal:** lock down the exact current bottleneck before touching the
 transport path.
 
-**Current status: partially complete.**
+**Current status: complete enough to start Phase 1.**
 
 Histogram deliverable is landed and measured on the canonical surface:
 - raw artifact:
@@ -223,10 +223,42 @@ Interpretation:
   correct priorities ahead of persistent expert clustering
 
 Profiler status:
-- `ncu` harness is checked in, but live Phase 0.5 counter capture is currently
-  blocked on this machine by `ERR_NVGPUCTRPERM`
-- until performance counter permissions are enabled, the histogram result is
-  the only completed Phase 0.5 runtime measurement
+- live `ncu` profiling now works on this machine
+- canonical routed profile artifacts:
+  - report:
+    `artifacts/profiles/routed_phase05_20260409T064530Z/ncu_cold_prefill_prefix128_unified_routed_fp4.ncu-rep`
+  - csv:
+    `artifacts/profiles/routed_phase05_20260409T064530Z/ncu_cold_prefill_prefix128_unified_routed_fp4.csv`
+  - summary:
+    `artifacts/profiles/routed_phase05_20260409T064530Z/ncu_cold_prefill_prefix128_unified_routed_fp4.summary.txt`
+
+Measured `ncu` facts for the first profiled unified routed FP4 kernel:
+- kernel:
+  `Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel`
+- launch:
+  - block size `(384, 1, 1)`
+  - grid size `(15, 208, 1)`
+- per-CTA resources:
+  - `168` registers per thread
+  - `41.984 KiB` shared memory per block allocated
+  - occupancy limited by both registers and shared memory to `1` block/SM
+- bottleneck metrics:
+  - DRAM throughput: `9.19%` of peak sustained
+  - L2 sector hit rate: `25.26%`
+  - active warps: `24.96%` of peak sustained active
+  - eligible warps per cycle: `0.098`
+  - issue active: `8.65%` of peak sustained active
+  - tensor-pipe active: `4.83%` of peak sustained elapsed
+  - kernel time: `2.367 ms`
+
+Interpretation:
+- the current unified routed kernel is not bandwidth-limited
+- it is also not tensor-core-limited
+- it is issue-starved and underfed, with too few eligible warps and too much
+  front-end / transport overhead per useful MMA cycle
+- this strongly supports the next planned direction:
+  direct-to-swizzled transport, multistage overlap, and producer/consumer warp
+  specialization before any attempt to chase persistent expert clustering
 
 **Work:**
 1. Run `ncu` on the current unified routed FP4 path for representative
@@ -269,9 +301,6 @@ Profiler status:
   worth doing, and which experts dominate routed traffic
 - we have the exact source/probe facts needed to implement the SM120 staged
   transport contract without guesswork
-- if `ncu` is unavailable due counter permissions, that blocker is documented
-  explicitly and Phase 1 starts from the histogram result plus source/probe
-  facts rather than from speculative profiler assumptions
 
 ### Phase 1: Weight Loading Pipeline (biggest lever)
 

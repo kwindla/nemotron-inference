@@ -26,24 +26,39 @@ FIELDS = [
 def load_rows(path: Path):
     with path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.reader(handle))
-    if len(rows) < 5:
+    if not rows:
+        raise ValueError(f"empty ncu csv: {path}")
+
+    header = None
+    data_rows = []
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "ID":
+            header = row
+            continue
+        if header is None:
+            continue
+        if len(row) != len(header):
+            continue
+        if not row[0].strip().isdigit():
+            continue
+        data_rows.append(row)
+
+    if header is None or not data_rows:
         raise ValueError(f"unexpected ncu csv shape: {path}")
-    return rows[2], rows[4:]
+    return header, data_rows
 
 
-def as_ms(value: str) -> str:
+def with_ms_suffix(value: str) -> str:
     try:
-        return f"{float(value) / 1_000_000.0:.3f} ms"
+        return f"{float(value):.3f} ms"
     except ValueError:
         return value
 
 
 def summarize(path: Path) -> int:
     header, data_rows = load_rows(path)
-    if not data_rows:
-      print(f"empty ncu csv: {path}", file=sys.stderr)
-      return 1
-
     first = data_rows[0]
     print(f"phase05_ncu_csv={path}")
     for field in FIELDS:
@@ -51,7 +66,7 @@ def summarize(path: Path) -> int:
             continue
         value = first[header.index(field)]
         if field == "gpu__time_duration.sum":
-            value = as_ms(value)
+            value = with_ms_suffix(value)
         print(f"{field}={value}")
     return 0
 
