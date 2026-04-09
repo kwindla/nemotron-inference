@@ -763,6 +763,21 @@ target_compile_features(nano_16_token_correctness_test PRIVATE cxx_std_17)
 nemotron_add_test(nano_16_token_correctness_test)
 
 add_executable(
+  continuation_prefill_oracle_test
+  api/continuation_prefill_oracle_test.cpp
+)
+
+target_link_libraries(continuation_prefill_oracle_test PRIVATE nemotron_runtime_api)
+target_compile_features(continuation_prefill_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  continuation_prefill_oracle_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+nemotron_add_test(continuation_prefill_oracle_test)
+
+add_executable(
   nano_24_token_prefill_regression_test
   api/nano_24_token_prefill_regression_test.cpp
 )
