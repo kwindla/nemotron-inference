@@ -301,6 +301,7 @@ Measured transport-contract facts from the compile-time dump:
 Measured standalone `P5` TMA smoke status on the current branch:
 - `testing/p5_swizzled_pipeline_test_120f` now passes both:
   - `tma_copy_only_a_raw PASS`
+  - `tma_copy_only_a_global_object PASS`
   - `tma_fragment_a PASS`
 - and now also passes the first full-math numeric step above the fragment
   boundary:
@@ -308,6 +309,9 @@ Measured standalone `P5` TMA smoke status on the current branch:
   - `tma_single_tile_dispatch_rows_4`
 - meaning:
   - the host-built `make_tma_copy(SM90_TMA_LOAD{}, ...)` producer path is valid for the routed FP4 `P5` operand contract
+  - the host-built `TmaCopyA` object remains valid when copied into device
+    global memory and dereferenced from the kernel, which is the key ownership
+    model needed for routed per-expert weight views
   - the immediate consumer boundary also survives intact:
     `SmemLayoutA -> make_tiled_copy_A(...) -> retile_D(...) -> fp4_shift_A(...)`
   - a single-tile `P5` math path with `A` on TMA and `B/scales` on the existing

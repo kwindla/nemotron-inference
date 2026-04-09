@@ -137,6 +137,14 @@ struct P5ATmaCopyOnlyParams {
   std::uint8_t* raw_ref_bytes;
 };
 
+template <class TmaCopyA>
+struct P5ATmaCopyOnlyPtrParams {
+  const TmaCopyA* tma_load_a_ptr;
+  const std::uint8_t* a_packed_global;
+  std::uint8_t* raw_tma_bytes;
+  std::uint8_t* raw_ref_bytes;
+};
+
 struct TmaRuntimeLikeSharedStorageA {
   SharedStorage gemm;
   alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType ab_full_mbar[1];
@@ -802,6 +810,94 @@ __global__ void P5ATmaCopyOnlyKernel(
   }
 }
 
+template <class TmaCopyA>
+__global__ void P5ATmaCopyOnlyKernelFromGlobalObject(
+    __grid_constant__ P5ATmaCopyOnlyPtrParams<TmaCopyA> const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<TmaCopyOnlySharedStorageA*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int lane_predicate = cute::elect_one_sync();
+  const bool is_tma_thread = (warp_idx == 0) && lane_predicate;
+
+  using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using ProducerBarrierType = typename FullBarrier::ValueType;
+  auto* ab_full_mbar = cute::recast_ptr<FullBarrier>(&shared.ab_full_mbar[0]);
+  const TmaCopyA& tma_load_a = *params.tma_load_a_ptr;
+
+  if (is_tma_thread) {
+    cute::prefetch_tma_descriptor(tma_load_a.get_tma_descriptor());
+  }
+  __syncthreads();
+
+  if (is_tma_thread) {
+    ab_full_mbar[0].init(1);
+    cutlass::arch::fence_barrier_init();
+  }
+  auto* smem_a_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_A.data());
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemABytes; i += blockDim.x) {
+    smem_a_bytes[i] = 0u;
+  }
+  __syncthreads();
+
+  using X = cute::Underscore;
+  auto mA_mkl = tma_load_a.get_tma_tensor(
+      cute::make_shape(cute::Int<kOutputRows>{}, cute::Int<kTmaCopyOnlyTileK>{}, cute::Int<1>{}));
+  auto gA_mkl = cute::local_tile(
+      mA_mkl,
+      MmaTileShape{},
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<cute::_1, X, cute::_1>{});
+
+  auto block_tma_a = tma_load_a.get_slice(0);
+  auto gA = gA_mkl(cute::_, cute::_, 0, cute::_, 0);
+  auto tAgA = block_tma_a.partition_S(gA);
+
+  auto sA_ = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_A.data()), SmemLayoutA{});
+  auto sA = cute::as_position_independent_swizzle_tensor(sA_);
+  auto tAsA = block_tma_a.partition_D(sA);
+
+  if (is_tma_thread) {
+    auto& ab_full_barrier = ab_full_mbar[0];
+    auto tma_copy_a =
+        tma_load_a.with(*cute::recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+    cute::copy(
+        tma_copy_a,
+        tAgA(cute::_, cute::_, cute::_, cute::Int<0>{}),
+        tAsA(cute::_, cute::_, cute::_, cute::Int<0>{}));
+    ab_full_mbar[0].arrive_and_expect_tx(
+        static_cast<uint32_t>(
+            cutlass::bits_to_bytes(
+                cute::size(cute::take<0, 2>(SmemLayoutA{})) *
+                cute::sizeof_bits_v<ElementAB>)));
+  }
+
+  ab_full_mbar[0].wait(0);
+  __syncthreads();
+
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemABytes; i += blockDim.x) {
+    params.raw_tma_bytes[i] = smem_a_bytes[i];
+  }
+  __syncthreads();
+
+  constexpr int a_row_bytes = kTmaCopyOnlyTileK / 2;
+  constexpr int a_total_bytes = kOutputRows * a_row_bytes;
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemABytes; i += blockDim.x) {
+    smem_a_bytes[i] = 0u;
+  }
+  __syncthreads();
+  for (int i = tid; i < a_total_bytes; i += blockDim.x) {
+    smem_a_bytes[i] = params.a_packed_global[static_cast<std::size_t>(i)];
+  }
+  __syncthreads();
+
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemABytes; i += blockDim.x) {
+    params.raw_ref_bytes[i] = smem_a_bytes[i];
+  }
+}
+
 int RunP5ATmaCopyOnlySmoke() {
   constexpr std::size_t kPackedRowBytes = kTmaCopyOnlyTileK / 2;
   std::vector<std::uint8_t> packed_a(
@@ -935,6 +1031,140 @@ int RunP5ATmaCopyOnlySmoke() {
     std::cerr << ' ' << static_cast<unsigned>(h_raw_ref[i]);
   }
   std::cerr << "\n";
+  return 1;
+}
+
+int RunP5ATmaCopyOnlyGlobalObjectSmoke() {
+  constexpr std::size_t kPackedRowBytes = kTmaCopyOnlyTileK / 2;
+  std::vector<std::uint8_t> packed_a(
+      static_cast<std::size_t>(kOutputRows) * kPackedRowBytes,
+      std::uint8_t{0});
+  for (std::size_t row = 0; row < static_cast<std::size_t>(kOutputRows); ++row) {
+    for (std::size_t col_byte = 0; col_byte < kPackedRowBytes; ++col_byte) {
+      const std::uint8_t lo = static_cast<std::uint8_t>((row + 3u * col_byte) & 0x0Fu);
+      const std::uint8_t hi = static_cast<std::uint8_t>(((row * 7u) + (5u * col_byte) + 1u) & 0x0Fu);
+      packed_a[row * kPackedRowBytes + col_byte] =
+          static_cast<std::uint8_t>(lo | static_cast<std::uint8_t>(hi << 4));
+    }
+  }
+
+  const std::size_t a_bytes = packed_a.size();
+  std::uint8_t* d_a = nullptr;
+  std::uint8_t* d_raw_tma = nullptr;
+  std::uint8_t* d_raw_ref = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_a, a_bytes), "malloc A tma copy-only global-object") ||
+      !CheckCuda(cudaMalloc(&d_raw_tma, kTmaCopyOnlySmemABytes), "malloc raw tma bytes global-object") ||
+      !CheckCuda(cudaMalloc(&d_raw_ref, kTmaCopyOnlySmemABytes), "malloc raw ref bytes global-object")) {
+    cudaFree(d_a);
+    cudaFree(d_raw_tma);
+    cudaFree(d_raw_ref);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemcpy(d_a, packed_a.data(), a_bytes, cudaMemcpyHostToDevice), "copy A tma copy-only global-object") ||
+      !CheckCuda(cudaMemset(d_raw_tma, 0, kTmaCopyOnlySmemABytes), "memset raw tma bytes global-object") ||
+      !CheckCuda(cudaMemset(d_raw_ref, 0, kTmaCopyOnlySmemABytes), "memset raw ref bytes global-object")) {
+    cudaFree(d_a);
+    cudaFree(d_raw_tma);
+    cudaFree(d_raw_ref);
+    return 1;
+  }
+
+  auto tensor_A = cute::make_tensor(
+      cute::make_gmem_ptr(cute::recast_ptr<ElementAB>(d_a)),
+      cute::make_layout(
+          cute::make_shape(kOutputRows, kTmaCopyOnlyTileK, 1),
+          cute::make_stride(
+              int64_t(kTmaCopyOnlyTileK),
+              cute::Int<1>{},
+              int64_t(kOutputRows) * int64_t(kTmaCopyOnlyTileK))));
+  auto tma_load_a = cute::make_tma_copy(
+      cute::SM90_TMA_LOAD{},
+      tensor_A,
+      SmemLayoutA{}(cute::_, cute::_, cute::Int<0>{}),
+      cute::make_shape(cute::Int<kOutputRows>{}, cute::Int<kTmaCopyOnlyTileK>{}),
+      cute::_1{});
+
+  using TmaCopyA = decltype(tma_load_a);
+  TmaCopyA* d_tma_load_a = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_tma_load_a, sizeof(TmaCopyA)), "malloc global tma object") ||
+      !CheckCuda(cudaMemcpy(d_tma_load_a, &tma_load_a, sizeof(TmaCopyA), cudaMemcpyHostToDevice), "copy global tma object")) {
+    cudaFree(d_tma_load_a);
+    cudaFree(d_a);
+    cudaFree(d_raw_tma);
+    cudaFree(d_raw_ref);
+    return 1;
+  }
+
+  using Params = P5ATmaCopyOnlyPtrParams<TmaCopyA>;
+  auto kernel_typed = P5ATmaCopyOnlyKernelFromGlobalObject<TmaCopyA>;
+  if (!CheckCuda(cudaFuncSetAttribute(
+          kernel_typed,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          sizeof(TmaCopyOnlySharedStorageA)),
+          "func attr p5 a tma copy-only global-object")) {
+    cudaFree(d_tma_load_a);
+    cudaFree(d_a);
+    cudaFree(d_raw_tma);
+    cudaFree(d_raw_ref);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kTmaThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(TmaCopyOnlySharedStorageA);
+  config.stream = nullptr;
+  cudaLaunchAttribute attrs[1]{};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+
+  alignas(64) Params params{d_tma_load_a, d_a, d_raw_tma, d_raw_ref};
+  if (!CheckCuda(
+          cudaLaunchKernelEx(&config, kernel_typed, params),
+          "launch p5 a tma copy-only global-object") ||
+      !CheckCuda(cudaDeviceSynchronize(), "sync p5 a tma copy-only global-object")) {
+    cudaFree(d_tma_load_a);
+    cudaFree(d_a);
+    cudaFree(d_raw_tma);
+    cudaFree(d_raw_ref);
+    return 1;
+  }
+
+  std::vector<std::uint8_t> h_raw_tma(kTmaCopyOnlySmemABytes, 0);
+  std::vector<std::uint8_t> h_raw_ref(kTmaCopyOnlySmemABytes, 0);
+  if (!CheckCuda(cudaMemcpy(h_raw_tma.data(), d_raw_tma, kTmaCopyOnlySmemABytes, cudaMemcpyDeviceToHost), "copy raw tma bytes global-object") ||
+      !CheckCuda(cudaMemcpy(h_raw_ref.data(), d_raw_ref, kTmaCopyOnlySmemABytes, cudaMemcpyDeviceToHost), "copy raw ref bytes global-object")) {
+    cudaFree(d_tma_load_a);
+    cudaFree(d_a);
+    cudaFree(d_raw_tma);
+    cudaFree(d_raw_ref);
+    return 1;
+  }
+  cudaFree(d_tma_load_a);
+  cudaFree(d_a);
+  cudaFree(d_raw_tma);
+  cudaFree(d_raw_ref);
+
+  std::size_t mismatch_index = kTmaCopyOnlySmemABytes;
+  for (std::size_t i = 0; i < kTmaCopyOnlySmemABytes; ++i) {
+    if (h_raw_tma[i] != h_raw_ref[i]) {
+      mismatch_index = i;
+      break;
+    }
+  }
+
+  std::cout << "  tma_copy_only_a_global_object";
+  if (mismatch_index == kTmaCopyOnlySmemABytes) {
+    std::cout << " PASS\n";
+    return 0;
+  }
+
+  std::cerr << " FAIL first_byte=" << mismatch_index
+            << " tma=" << static_cast<unsigned>(h_raw_tma[mismatch_index])
+            << " ref=" << static_cast<unsigned>(h_raw_ref[mismatch_index])
+            << "\n";
   return 1;
 }
 
@@ -1731,6 +1961,9 @@ int RunTest() {
       if (RunP5ATmaCopyOnlySmoke() != 0) {
         return 1;
       }
+      if (RunP5ATmaCopyOnlyGlobalObjectSmoke() != 0) {
+        return 1;
+      }
       if (RunP5ATmaFragmentSmoke() != 0) {
         return 1;
       }
@@ -1742,12 +1975,14 @@ int RunTest() {
       }
     } else {
       std::cout << "  tma_copy_only_a SKIP (env disabled)\n";
+      std::cout << "  tma_copy_only_a_global_object SKIP (env disabled)\n";
       std::cout << "  tma_fragment_a SKIP (env disabled)\n";
       std::cout << "  tma_single_tile_dispatch_rows_5 SKIP (env disabled)\n";
       std::cout << "  tma_single_tile_dispatch_rows_4 SKIP (env disabled)\n";
     }
   } else {
     std::cout << "  tma_copy_only_a SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
+    std::cout << "  tma_copy_only_a_global_object SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_fragment_a SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_single_tile_dispatch_rows_5 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_single_tile_dispatch_rows_4 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
