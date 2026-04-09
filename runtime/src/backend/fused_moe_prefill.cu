@@ -503,7 +503,7 @@ struct UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP5> {
   using AccumLayout = TracedP5AccumProfileLayout;
   static constexpr int kOutputTile = 128;
   static constexpr int kTokenRows = cute::tile_size<1>(TiledMma{});
-  static constexpr int kMacroTileK = 64;
+  static constexpr int kMacroTileK = 128;
   static constexpr int kScaleSmemCosizeA = kTracedP5ScaleSmemCosizeA;
   static constexpr int kScaleSmemCosizeB = kTracedP5ScaleSmemCosizeB;
   static constexpr int kAccumProfileCosize = kTracedP5AccumProfileCosize;
