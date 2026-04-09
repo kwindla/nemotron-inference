@@ -763,6 +763,21 @@ target_compile_features(nano_16_token_correctness_test PRIVATE cxx_std_17)
 nemotron_add_test(nano_16_token_correctness_test)
 
 add_executable(
+  nano_24_token_prefill_regression_test
+  api/nano_24_token_prefill_regression_test.cpp
+)
+
+target_link_libraries(nano_24_token_prefill_regression_test PRIVATE nemotron_runtime_api)
+target_compile_features(nano_24_token_prefill_regression_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  nano_24_token_prefill_regression_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+nemotron_add_test(nano_24_token_prefill_regression_test)
+
+add_executable(
   nano_save_prompt_oracle
   api/nano_save_prompt_oracle.cpp
 )

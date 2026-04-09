@@ -177,6 +177,15 @@ class SingleTokenForwardModel {
  private:
   struct Impl;
 
+  bool RunPrefillWindowed(
+      const std::int32_t* token_ids,
+      std::size_t token_count,
+      RequestExecutionContext& request_context,
+      DeviceTensorFp32* logits,
+      const std::vector<std::size_t>& capture_layer_indices,
+      SingleTokenForwardTrace* trace,
+      std::optional<std::size_t> stop_layer_index,
+      bool reset_request_state) const;
   bool RunTokens(
       const std::int32_t* token_ids,
       std::size_t token_count,

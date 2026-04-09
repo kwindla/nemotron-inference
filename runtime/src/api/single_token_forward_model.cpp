@@ -154,9 +154,9 @@ std::size_t ConfiguredMoePrefillCapacityTokens(const SingleTokenForwardConfig& c
 }
 
 std::size_t ResolveMoePrefillWindowTokens(const SingleTokenForwardConfig& config) {
-  return config.moe_prefill_window_tokens > 0
-             ? config.moe_prefill_window_tokens
-             : std::size_t{1};
+  const std::size_t requested_window =
+      config.moe_prefill_window_tokens > 0 ? config.moe_prefill_window_tokens : std::size_t{1};
+  return config.max_tokens > 0 ? std::min(config.max_tokens, requested_window) : requested_window;
 }
 
 std::size_t RequestMoePrefillCapacityTokens(
@@ -786,6 +786,9 @@ SingleTokenForwardConfig KnownNemotron3Nano30BA3BConfig() {
   config.experts_per_token = 6;
   config.expert_n_group = 1;
   config.expert_topk_group = 1;
+  // Keep routed MoE prefill on the known-stable window until the roofline
+  // kernel rewrite replaces the legacy row-count launch matrix.
+  config.moe_prefill_window_tokens = 23;
 
   config.layer_norm_epsilon = 1.0e-5f;
   config.mamba_time_step_min = 1.0e-3f;
@@ -1229,6 +1232,130 @@ bool SingleTokenForwardModel::RunSingleToken(
       true);
 }
 
+bool SingleTokenForwardModel::RunPrefillWindowed(
+    const std::int32_t* token_ids,
+    std::size_t token_count,
+    RequestExecutionContext& request_context,
+    DeviceTensorFp32* logits,
+    const std::vector<std::size_t>& capture_layer_indices,
+    SingleTokenForwardTrace* trace,
+    std::optional<std::size_t> stop_layer_index,
+    bool reset_request_state) const {
+  const std::size_t prefill_window_tokens = ResolveMoePrefillWindowTokens(impl_->config);
+  if (prefill_window_tokens <= 1 || token_count <= prefill_window_tokens) {
+    return RunTokens(
+        token_ids,
+        token_count,
+        request_context,
+        logits,
+        capture_layer_indices,
+        trace,
+        stop_layer_index,
+        reset_request_state);
+  }
+
+  if (logits == nullptr || !logits->valid()) {
+    return RunTokens(
+        token_ids,
+        token_count,
+        request_context,
+        logits,
+        capture_layer_indices,
+        trace,
+        stop_layer_index,
+        reset_request_state);
+  }
+  const std::vector<std::size_t> expected_full_logits_shape = {token_count, impl_->config.vocab_size};
+  const std::vector<std::size_t> expected_boundary_logits_shape = {1, impl_->config.vocab_size};
+  const bool full_logits = logits->shape() == expected_full_logits_shape;
+  const bool boundary_only_logits = logits->shape() == expected_boundary_logits_shape;
+  if (!full_logits && !boundary_only_logits) {
+    return RunTokens(
+        token_ids,
+        token_count,
+        request_context,
+        logits,
+        capture_layer_indices,
+        trace,
+        stop_layer_index,
+        reset_request_state);
+  }
+
+  if (trace != nullptr) {
+    trace->embedding_output.clear();
+    trace->captured_layers.clear();
+    trace->final_hidden.clear();
+    trace->final_hidden_normed.clear();
+    trace->logits.clear();
+  }
+
+  const std::size_t vocab_size = impl_->config.vocab_size;
+  for (std::size_t token_offset = 0; token_offset < token_count; token_offset += prefill_window_tokens) {
+    const std::size_t chunk_token_count =
+        std::min(prefill_window_tokens, token_count - token_offset);
+    const bool last_chunk = (token_offset + chunk_token_count) == token_count;
+
+    std::unique_ptr<DeviceTensorFp32> owned_chunk_logits;
+    std::unique_ptr<DeviceTensorFp32> chunk_logits_view;
+    DeviceTensorFp32* chunk_logits = nullptr;
+    if (boundary_only_logits) {
+      if (last_chunk) {
+        chunk_logits = logits;
+      } else {
+        owned_chunk_logits = DeviceTensorFp32::Create({1, vocab_size});
+        chunk_logits = owned_chunk_logits.get();
+      }
+    } else {
+      chunk_logits_view = DeviceTensorFp32::CreateView(
+          {chunk_token_count, vocab_size},
+          logits->data() + (token_offset * vocab_size));
+      chunk_logits = chunk_logits_view.get();
+    }
+    if (chunk_logits == nullptr || !chunk_logits->valid()) {
+      std::cerr << "single_token_forward_model: windowed prefill logits view allocation failed\n";
+      return false;
+    }
+
+    SingleTokenForwardTrace chunk_trace;
+    SingleTokenForwardTrace* chunk_trace_ptr = trace != nullptr ? &chunk_trace : nullptr;
+    if (!RunTokens(
+            token_ids + token_offset,
+            chunk_token_count,
+            request_context,
+            chunk_logits,
+            capture_layer_indices,
+            chunk_trace_ptr,
+            stop_layer_index,
+            reset_request_state && token_offset == 0)) {
+      return false;
+    }
+
+    if (trace != nullptr) {
+      trace->embedding_output.insert(
+          trace->embedding_output.end(),
+          chunk_trace.embedding_output.begin(),
+          chunk_trace.embedding_output.end());
+      AppendCapturedLayers(chunk_trace.captured_layers, &trace->captured_layers);
+      if (boundary_only_logits) {
+        if (last_chunk) {
+          trace->logits = std::move(chunk_trace.logits);
+        }
+      } else {
+        trace->logits.insert(
+            trace->logits.end(),
+            chunk_trace.logits.begin(),
+            chunk_trace.logits.end());
+      }
+      if (last_chunk) {
+        trace->final_hidden = std::move(chunk_trace.final_hidden);
+        trace->final_hidden_normed = std::move(chunk_trace.final_hidden_normed);
+      }
+    }
+  }
+
+  return true;
+}
+
 bool SingleTokenForwardModel::RunPrefill(
     const std::int32_t* token_ids,
     std::size_t token_count,
@@ -1237,7 +1364,7 @@ bool SingleTokenForwardModel::RunPrefill(
     const std::vector<std::size_t>& capture_layer_indices,
     SingleTokenForwardTrace* trace,
     std::optional<std::size_t> stop_layer_index) const {
-  return RunTokens(
+  return RunPrefillWindowed(
       token_ids,
       token_count,
       request_context,
@@ -1274,7 +1401,7 @@ bool SingleTokenForwardModel::ContinuePrefill(
     const std::vector<std::size_t>& capture_layer_indices,
     SingleTokenForwardTrace* trace,
     std::optional<std::size_t> stop_layer_index) const {
-  return RunTokens(
+  return RunPrefillWindowed(
       token_ids,
       token_count,
       request_context,
@@ -1388,8 +1515,13 @@ bool SingleTokenForwardModel::RunGreedyConversationTurn(
     lookup_request.identity = identity;
     lookup_request.conversation_id = conversation_id;
     const CacheMatch match = impl_->prefix_cache->Lookup(lookup_request);
+    const bool allow_partial_conversation_resume =
+        !(impl_->config.moe_prefill_window_tokens != 0 &&
+          match.source == CacheMatchSource::kConversationCommittedHead &&
+          match.matched_token_count < identity.token_ids.size());
     if (match.hit() &&
         match.matched_token_count > 0 &&
+        allow_partial_conversation_resume &&
         impl_->prefix_cache->RestoreMatchState(match, request_context)) {
       if (match.matched_token_count < identity.token_ids.size()) {
         resumed_from_cache = true;

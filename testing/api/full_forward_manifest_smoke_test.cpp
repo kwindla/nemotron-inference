@@ -822,6 +822,8 @@ bool run_full_forward_manifest_smoke() {
   nemotron::GreedyDecodeResult turn2_cached_result;
   nemotron::GreedyDecodeResult turn2_baseline_result;
   std::size_t turn2_match = 0;
+  const std::size_t expected_turn2_match =
+      config.moe_prefill_window_tokens != 0 ? 0 : turn2_reused_prefix_tokens;
   if (!expect(
           model->RunGreedyConversationTurn(
               turn2_identity,
@@ -842,8 +844,8 @@ bool run_full_forward_manifest_smoke() {
     return false;
   }
   if (!expect(
-          turn2_match == turn2_reused_prefix_tokens,
-          "turn-2 execution should reuse the committed head from turn 1") ||
+          turn2_match == expected_turn2_match,
+          "turn-2 execution should use the expected committed-head reuse policy") ||
       !expect(
           turn2_cached_result.generated_token_ids == turn2_baseline_result.generated_token_ids,
           "cached turn-2 decode should match the baseline decode tokens") ||

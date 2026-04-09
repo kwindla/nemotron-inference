@@ -1254,7 +1254,9 @@ int main(int argc, char** argv) {
   nemotron::SingleTokenForwardConfig config = *config_opt;
   config.max_tokens =
       std::max(config.max_tokens, max_total_prompt_tokens + kFirstDecodeTokenCount);
-  config.moe_prefill_window_tokens = options.moe_prefill_window_tokens;
+  if (options.moe_prefill_window_tokens != 0) {
+    config.moe_prefill_window_tokens = options.moe_prefill_window_tokens;
+  }
   auto model = nemotron::SingleTokenForwardModel::Create(*runtime_environment, config);
   if (model == nullptr || !model->valid()) {
     std::cerr << "nano_prefix_cache_ttft_bench: forward model build failed\n";

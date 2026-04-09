@@ -173,6 +173,16 @@ def render_chat_token_ids(
     return normalize_token_ids(token_ids)
 
 
+def extract_visible_assistant_text(raw_text: str) -> str:
+    if not raw_text:
+        return raw_text
+    if "</think>" in raw_text:
+        visible = raw_text.rsplit("</think>", maxsplit=1)[-1].strip()
+        if visible:
+            return visible
+    return raw_text.strip()
+
+
 def build_turn_prompt_token_ids(
     tokenizer: Any,
     history_messages: list[dict[str, str]],
@@ -198,11 +208,10 @@ def build_turn_prompt_token_ids(
         add_generation_prompt=True,
     )
     history_length = len(rendered_history_token_ids)
-    if (
-        len(rendered_turn_token_ids) < history_length
-        or rendered_turn_token_ids[:history_length] != rendered_history_token_ids
-    ):
+    if len(rendered_turn_token_ids) < history_length or rendered_turn_token_ids[:history_length] != rendered_history_token_ids:
         raise RuntimeError("chat template did not preserve the completed history prefix")
+    if exact_history_token_ids != rendered_history_token_ids:
+        return rendered_turn_token_ids
     return exact_history_token_ids + rendered_turn_token_ids[history_length:]
 
 
@@ -417,16 +426,19 @@ def main() -> int:
             response = send_command(process, command)
 
             detokenize_start = time.perf_counter()
-            generated_text = tokenizer.decode(
+            raw_generated_text = tokenizer.decode(
                 response["generated_token_ids"],
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
             detokenize_ms = (time.perf_counter() - detokenize_start) * 1000.0
+            generated_text = extract_visible_assistant_text(raw_generated_text)
 
             messages = pending_messages + [{"role": "assistant", "content": generated_text}]
-            committed_token_ids = prompt_token_ids + normalize_token_ids(
-                response["generated_token_ids"]
+            committed_token_ids = render_chat_token_ids(
+                tokenizer,
+                messages,
+                add_generation_prompt=False,
             )
             print_turn_summary(response, tokenize_ms, detokenize_ms, generated_text, args)
 

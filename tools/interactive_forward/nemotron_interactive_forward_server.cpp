@@ -572,7 +572,11 @@ bool ExecuteTurn(
     response->cache_lookup_ms = ElapsedMs(lookup_start, lookup_end);
     response->cache_lookup_hit = match.hit();
     response->cache_lookup_source = CacheMatchSourceName(match.source);
-    if (match.hit() && match.matched_token_count > 0) {
+    const bool allow_partial_conversation_resume =
+        !(state->model->config().moe_prefill_window_tokens != 0 &&
+          match.source == nemotron::CacheMatchSource::kConversationCommittedHead &&
+          match.matched_token_count < identity.token_ids.size());
+    if (match.hit() && match.matched_token_count > 0 && allow_partial_conversation_resume) {
       const auto restore_start = std::chrono::steady_clock::now();
       response->cache_restore_ok =
           state->environment->prefix_cache().RestoreMatchState(match, *request_context);
@@ -601,6 +605,9 @@ bool ExecuteTurn(
           }
         }
       }
+    } else if (!allow_partial_conversation_resume) {
+      response->cache_lookup_hit = false;
+      response->cache_mode = "cold";
     }
   }
 
