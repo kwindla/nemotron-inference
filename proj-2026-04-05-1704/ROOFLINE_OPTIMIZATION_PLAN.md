@@ -1190,6 +1190,43 @@ Current Phase 1b experiment record:
     - the direct-global `SFB` base plus intra-stage copy/MMA overlap is the
       first Phase `1b` structure worth keeping and extending
 
+- Attempt E: move the next-stage handoff into the last `k_block` of the current
+  macro tile, CUTLASS-style, instead of waiting for the next stage only at the
+  top of the next outer tile
+  - variant E1:
+    - added a cross-consumer named barrier before `consumer_release`, then
+      waited the next full stage and preloaded `k_block 0` of the next tile
+      before finishing `gemm(k_block=1)` on the current tile
+  - variant E2:
+    - removed the named barrier but kept the earlier `consumer_release /
+      consumer_wait(next) / copy(next, k_block 0)` handoff
+  - correctness:
+    - `fused_moe_prefill_test`: PASS
+    - `multi_turn_prefix_reuse_test`: PASS
+    - `p5_swizzled_pipeline_test_120f`: PASS
+  - grouped `P5` bench reads on this machine:
+    - E1 first read: `hot_mean_ms=0.532`, `hot_median_ms=0.363`
+    - E2 first read: `hot_mean_ms=0.504`, `hot_median_ms=0.337`
+  - targeted isolated-kernel `ncu` reads:
+    - E1 artifact set:
+      - `artifacts/profiles/p5_stage_transition_20260410T104620Z/ncu_p5_grouped_prefix128.csv`
+    - E2 artifact set:
+      - `artifacts/profiles/p5_stage_transition_noblockbar_20260410T104801Z/ncu_p5_grouped_prefix128.csv`
+    - averaged key metrics:
+      - E1: `eligible=0.190`, `issue_active=15.89%`,
+        `dram=67.03%`, `tensor_pipe=14.16%`
+      - E2: `eligible=0.190`, `issue_active=16.07%`,
+        `dram=67.59%`, `tensor_pipe=14.24%`
+  - conclusion:
+    - both variants are worse than Attempt D on the stronger scheduler metrics
+      (`eligible=0.44`, `issue_active=36.04%`)
+    - the wall-clock grouped bench can look superficially better on a noisy
+      machine state, but the isolated `ncu` read says this handoff shape
+      over-serializes the consumers on our current producer design
+    - do not keep the next-stage `consumer_wait(next)` inside the last
+      `k_block` of the current tile on the live `P5` path without a stronger
+      producer-side redesign
+
 Phase 1b measurement hygiene note:
 - `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench` is statically
   linked. Rebuilding only `fused_moe_prefill_test` is not sufficient after
@@ -1200,8 +1237,60 @@ Phase 1b next-step constraint:
 - do not reintroduce Attempts A, B, or C as-is
 - Attempt D is now the active Phase `1b` base
 - next work should keep the direct-global `SFB` and inner `k_block` overlap,
-  then target the remaining stage-transition / producer-side overhead from that
-  stronger base instead of revisiting transport legality
+  but it should not pull the next-stage full-barrier wait into the last
+  `k_block` of the current tile the way Attempt E did
+- next work should instead target producer-side issue/setup overhead from the
+  stronger Attempt D base instead of revisiting transport legality
+
+Phase 1b end-to-end integration checkpoint (`fc9dde5`, clean worktree):
+- isolated grouped-kernel result:
+  - `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench`
+  - `prefix_tokens=128`
+  - `selected_token_tile=8`
+  - `sfb_live_mode=direct_gmem_sparse`
+  - `hot_mean_ms=0.595`
+  - `hot_median_ms=0.379`
+  - `hot_weight_gib_per_s=581.778`
+- safe full-model TTFT result:
+  - `SingleTokenForwardConfig.moe_prefill_window_tokens` still defaults to
+    `23` in `runtime/src/api/single_token_forward_model.cpp`
+  - at `dispatch_rows=23`, `SelectRoutedGemm1Profile` and
+    `SelectRoutedGemm2Profile` both return `legacy`
+  - the stable runtime therefore still routes direct multi-token MoE prefill
+    through row replay in `runtime/src/backend/expert_layer.cpp`
+  - clean `fc9dde5` TTFT results on the safe path:
+    - `cold_prefill_prefix128`: `1010.200 ms`
+    - `cached_committed_head_prefix128_tail4`: `50.196 ms`
+    - `cached_global_root_prefix128_tail4`: `50.353 ms`
+    - `cached_committed_head_prefix256_tail128`: `1020.110 ms`
+    - `cached_global_root_prefix256_tail128`: `1019.302 ms`
+    - all of those runs report `expert native multi-token runs=0` and high
+      `expert row replay runs`
+- unsafe profiling-only result:
+  - enabling `NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL=1` allows the
+    full model to use native multi-token routed MoE again
+  - clean `fc9dde5` TTFT results on that surface:
+    - `cold_prefill_prefix128`: `375.189 ms`
+    - `cached_committed_head_prefix128_tail4`: `59.397 ms`
+    - `cached_global_root_prefix128_tail4`: `56.753 ms`
+    - `cached_committed_head_prefix256_tail128`: `377.474 ms`
+    - `cached_global_root_prefix256_tail128`: `378.508 ms`
+    - those runs report `expert native multi-token runs>0` and
+      `expert row replay runs=0`
+- correctness gate:
+  - safe `continuation_prefill_oracle_test`: PASS
+  - unsafe native direct MoE: FAIL
+    - `split_single_tail_argmax_match=0`
+    - `full_argmax=1710`
+    - `single_argmax=1584`
+- conclusion:
+  - the committed `P5` Phase `1b` kernel win is real, but it cannot move the
+    stable end-to-end path until native multi-token direct MoE continuation
+    correctness is fixed
+  - the next project is therefore not more `P5` microkernel tuning; it is to
+    make native multi-token direct MoE pass the continuation oracle, then
+    raise or remove the `23`-token safety clamp so the routed kernels can
+    become active on the stable full-model surface
 
 #### 1c. Warp-Specialized Producer/Consumer
 
