@@ -44,10 +44,22 @@ class DeviceMoeLaunchPlan {
       std::size_t n_experts,
       std::size_t selection_count,
       std::size_t max_output_rows_per_expert = 0);
+  static std::optional<std::size_t> Bytes(
+      std::size_t n_experts,
+      std::size_t selection_count,
+      std::size_t max_output_rows_per_expert,
+      std::size_t token_tile,
+      std::size_t expert_row_alignment);
   static std::unique_ptr<DeviceMoeLaunchPlan> Create(
       std::size_t n_experts,
       std::size_t selection_count,
       std::size_t max_output_rows_per_expert = 0);
+  static std::unique_ptr<DeviceMoeLaunchPlan> Create(
+      std::size_t n_experts,
+      std::size_t selection_count,
+      std::size_t max_output_rows_per_expert,
+      std::size_t token_tile,
+      std::size_t expert_row_alignment);
 
   DeviceMoeLaunchPlan(DeviceMoeLaunchPlan&&) noexcept;
   DeviceMoeLaunchPlan& operator=(DeviceMoeLaunchPlan&&) noexcept;
@@ -102,11 +114,23 @@ class DeviceMoeLaunchPlan {
       const DeviceExpertRouting& routing,
       std::size_t active_selection_count,
       DeviceMoeLaunchPlan* plan);
+  friend bool BuildDeviceMoeLaunchPlanWithTokenTile(
+      const DeviceExpertRouting& routing,
+      std::size_t active_selection_count,
+      std::size_t token_tile,
+      std::size_t expert_row_alignment,
+      DeviceMoeLaunchPlan* plan);
 };
 
 bool BuildDeviceMoeLaunchPlan(
     const DeviceExpertRouting& routing,
     std::size_t active_selection_count,
+    DeviceMoeLaunchPlan* plan);
+bool BuildDeviceMoeLaunchPlanWithTokenTile(
+    const DeviceExpertRouting& routing,
+    std::size_t active_selection_count,
+    std::size_t token_tile,
+    std::size_t expert_row_alignment,
     DeviceMoeLaunchPlan* plan);
 bool BuildDeviceMoeExactTaskMap(
     std::size_t output_rows_per_expert,

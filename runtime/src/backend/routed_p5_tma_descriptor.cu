@@ -71,12 +71,70 @@ void* CreateDeviceP5TmaLoadAArray(
   return device_descriptors;
 }
 
+void* CreateDeviceP5TmaLoadSFAArray(
+    const std::uint8_t* scale_data,
+    std::size_t expert_count,
+    std::size_t expert_scale_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols) {
+  if (scale_data == nullptr ||
+      expert_count == 0 ||
+      expert_scale_stride_bytes == 0 ||
+      output_rows == 0 ||
+      input_cols == 0 ||
+      (output_rows % 128u) != 0 ||
+      (input_cols % 128u) != 0) {
+    return nullptr;
+  }
+
+  int device_count = 0;
+  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+    return nullptr;
+  }
+
+  std::vector<P5TmaLoadSFA> host_descriptors;
+  host_descriptors.reserve(expert_count);
+  for (std::size_t expert_index = 0; expert_index < expert_count; ++expert_index) {
+    const std::uint8_t* expert_scales =
+        scale_data + (expert_index * expert_scale_stride_bytes);
+    auto tensor_sfa = cute::make_tensor(
+        cute::make_gmem_ptr(
+            reinterpret_cast<ElementSF const*>(expert_scales)),
+        MakeP5ScaleLayoutSFA(
+            static_cast<int32_t>(output_rows),
+            static_cast<int32_t>(input_cols)));
+    host_descriptors.push_back(MakeP5TmaLoadSFA(tensor_sfa));
+  }
+
+  P5TmaLoadSFA* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes = sizeof(P5TmaLoadSFA) * host_descriptors.size();
+  if (!CheckCuda(cudaMalloc(
+          reinterpret_cast<void**>(&device_descriptors),
+          descriptor_bytes))) {
+    return nullptr;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    cudaFree(device_descriptors);
+    return nullptr;
+  }
+
+  return device_descriptors;
+}
+
 void DestroyDeviceP5TmaLoadAArray(void** descriptor_array) {
   if (descriptor_array == nullptr || *descriptor_array == nullptr) {
     return;
   }
   cudaFree(*descriptor_array);
   *descriptor_array = nullptr;
+}
+
+void DestroyDeviceP5TmaLoadSFAArray(void** descriptor_array) {
+  DestroyDeviceP5TmaLoadAArray(descriptor_array);
 }
 
 }  // namespace nemotron::routed_p5_tma

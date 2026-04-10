@@ -61,6 +61,15 @@ bool RunLaunchPlannedNvfp4ExpertMatVec(
     std::size_t output_rows_per_expert,
     float* output);
 
+bool RunLaunchPlannedPackedNvfp4ExpertMatVecBf16(
+    const DeviceNvfp4Matrix& input_pack,
+    const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t dispatch_rows,
+    std::size_t active_selection_count,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    __nv_bfloat16* output);
+
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params);
 
 }  // namespace nemotron

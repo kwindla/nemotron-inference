@@ -377,8 +377,30 @@ Runtime `P5` TMA descriptor-ownership status:
     - the unified `P5` kernel consumes that cached device descriptor array
       directly, so the live path no longer pays per-launch D2H metadata copies
       or per-launch descriptor malloc/free churn
-  - scales and non-`P5` profiles still use the existing thread-coded
-    global -> swizzled-smem scatter
+  - scales are now split the same way as operands:
+    - `SFA`/weight scales use resident per-expert host-built CUTE TMA
+      descriptors, published through `FusedNvfp4WeightView::p5_tma_load_sfa`
+    - `SFB`/activation scales do not have a live routed fast path yet:
+      - the first exact-source attempt cached per-CTA host-built CUTE TMA
+        descriptors keyed by `(packed_input allocation, launch_plan,
+        build_epoch)`
+      - removing the old guard proved that path is structurally incompatible
+        with the current routed launch geometry: `make_tma_copy<uint16_t>(...)`
+        fails immediately for the active grouped launch slices
+        (`selected_token_tile=8/16`, non-128-aligned `cta_row_start`)
+      - CUTLASS/TRT build `TMA_SFB` from the full grouped scale tensor plus
+        block coordinates, not from tiny per-CTA row-sliced descriptors
+      - keep `SFB` on the thread-coded fallback path until the grouped launch
+        geometry is rebuilt around 128-row slabs or the live kernel is
+        reworked to consume a full-tensor `SFB` descriptor
+    - the live `P5` kernel now issues `A+SFA` on the A-side producer barrier;
+      `B` is on TMA, while `SFB` still falls back
+  - decisive probe result behind that landing:
+    - CUTLASS `Sm1xxBlockScaledConfig<16>::tile_atom_to_shape_SFA/SFB(...)`
+      matches our runtime `matmul_block_scales_data` execution layout exactly
+      for `kSwizzled128x4`
+    - use that gmem layout for `SFA/SFB` descriptors; do not try to model
+      the compact execution-scale buffer with `SmemLayoutSFA/SFB`
   - this is still not the final roofline-ready form because the B cache is
     tied to the current runtime objects rather than a fully persistent staged
     workspace, but the immediate launch-local rebuild overhead is now gone
@@ -403,6 +425,46 @@ Runtime `P5` TMA descriptor-ownership status:
       control overhead, but it does not materially move cold TTFT
     - the remaining gap is now dominated by the kernel body / staging path,
       which is the right point to hand over to `ncu`
+  - direct grouped-kernel profiling surface:
+    - `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench`
+      now isolates the routed FC1 grouped `P5` surface directly
+    - current measured state on that harness:
+      - `prefix_tokens=128`
+      - `selection_count=768`
+      - `selected_token_tile=8`
+      - `b_tma_cached=yes`
+      - `sfb_tma_cached=no`
+      - `sfb_tma_launch_compatible=no`
+      - `cold_ms=0.394`
+      - `hot_mean_ms=0.591`
+      - `hot_tflops=13.420`
+      - `hot_weight_gib_per_s=585.850`
+    - the same harness now confirms finite BF16 outputs on the isolated path,
+      so it is a valid profiler surface instead of just a transport smoke
+    - `P5`-only explicit slab experiment:
+      - the benchmark can now force `token_tile=128` /
+        `expert_row_alignment=128` without changing the default runtime path
+      - this makes `SFB` TMA legal on the isolated surface:
+        - `selected_token_tile=128`
+        - `sfb_tma_cached=yes`
+        - `sfb_tma_launch_compatible=yes`
+      - the direct harness now reports median / p90 as well as mean, because
+        single-run jitter was large enough to hide the real signal:
+        - baseline auto-tile (`selected_token_tile=8`):
+          - `hot_mean_ms=0.334`
+          - `hot_median_ms=0.315`
+          - `hot_p90_ms=0.317`
+        - forced slab (`selected_token_tile=128`):
+          - `hot_mean_ms=0.413`
+          - `hot_median_ms=0.336`
+          - `hot_p90_ms=0.773`
+      - implication:
+        - `128`-row slabs are sufficient to make the `SFB` transport contract
+          legal
+        - but this workload averages only `~6` valid rows per CTA, so a forced
+          `128`-row slab overfetches heavily and is still slightly slower even
+          after `SFB` becomes TMA-legal
+        - do not promote the slab experiment to the default launch shape
   - post-stabilization profiling boundary:
     - the default full-model path now intentionally replays multi-token direct
       MoE rows through the single-row decode contract for correctness, so
@@ -413,7 +475,11 @@ Runtime `P5` TMA descriptor-ownership status:
     - with that override plus
       `--moe-prefill-window-tokens 133 --case cold_prefill_prefix128`, the
       live native routed path is visible again and currently measures
-      `cold TTFT = 130.018 ms` median with:
+      - before live scale TMA:
+        - `cold TTFT = 130.018 ms` median
+      - after live `SFA/SFB` scale TMA:
+        - `cold TTFT = 127.436 ms` median
+      with:
       - `expert native multi-token runs = 23`
       - `expert row replay runs = 0`
   - first post-cleanup `ncu` read on that explicit profiling surface:
@@ -436,6 +502,199 @@ Runtime `P5` TMA descriptor-ownership status:
       - the live kernel is still far from bandwidth-bound, but the next stall
         targets should be barrier structure / eligibility / occupancy, not
         descriptor transport
+  - first post-scale-TMA `ncu` read on the same explicit profiling surface:
+    - `Block Size = (384, 1, 1)`
+    - `Grid Size = (15, 208, 1)`
+    - `launch__registers_per_thread = 168`
+    - `launch__shared_mem_per_block_allocated = 42.112 KB`
+    - `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed = 41.32%`
+    - `lts__t_sector_hit_rate.pct = 68.82%`
+    - `sm__warps_active.avg.pct_of_peak_sustained_active = 24.72%`
+    - `smsp__warps_eligible.avg.per_cycle_active = 0.2145`
+    - `smsp__issue_active.avg.pct_of_peak_sustained_active = 16.15%`
+    - `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed = 12.38%`
+    - profile artifact set:
+      - `artifacts/profiles/routed_phase05_post_scale_tma_20260409T231946Z/ncu_cold_prefill_prefix128_unified_routed_fp4_post_scale_tma.ncu-rep`
+      - `artifacts/profiles/routed_phase05_post_scale_tma_20260409T231946Z/ncu_cold_prefill_prefix128_unified_routed_fp4_post_scale_tma.csv`
+      - `artifacts/profiles/routed_phase05_post_scale_tma_20260409T231946Z/ncu_cold_prefill_prefix128_unified_routed_fp4_post_scale_tma.summary.txt`
+    - interpretation:
+      - scale TMA moved the live path forward, but the kernel is still
+        scheduler/eligibility limited rather than bandwidth limited
+      - the next profitable work is inside the remaining consumer/control
+        structure around the unified P5 body, not another transport-object
+        rewrite
+  - single-producer cleanup on the live `P5` fast path:
+    - replaced the prior two-producer-warps / two-transaction-barriers
+      structure with one elected producer thread and one shared transaction
+      barrier for the full `A/B/SFA/SFB` stage
+    - this is closer to CUTLASS
+      `sm120_blockscaled_mma_tma.hpp`, which issues all four TMA copies under
+      one producer barrier
+    - correctness remained green:
+      - `fused_moe_prefill_test`: PASS
+      - `multi_turn_prefix_reuse_test`: PASS
+      - `NEMOTRON_RUN_P5_TMA_SMOKE=1 p5_swizzled_pipeline_test`: PASS
+    - explicit unsafe native prefix128 measurement moved only slightly:
+      - before single-producer cleanup: `127.29-127.44 ms`
+      - after single-producer cleanup: `127.118 ms`
+    - interpretation:
+      - this removes a real structural divergence from the CUTLASS producer
+        contract, but it is not the missing large win
+      - the dominant limiter is still deeper in the consumer-side wait/copy
+        path or in the way the full-model profiling surface reaches the routed
+        kernel
+  - profiling-surface warning after the single-producer cleanup:
+    - the full-model `ncu` surface is no longer a trustworthy direct read of
+      the unified routed `P5` kernel
+    - a whole-model metric capture on the unsafe native prefix128 bench now
+      intermittently aborts early with driver `UnknownError` while profiling
+      unrelated kernels, and the surviving report rows prominently show
+      `cutlass3x_sm120...` kernels before the grouped routed `P5` body
+    - implication:
+      - do not treat whole-model `ncu` on the unsafe override as the canonical
+        optimization loop for the grouped routed kernel anymore
+      - the next measurement step should be a direct grouped-kernel harness
+        around `LaunchPlannedPackedInputMatVec{,Bf16}` or an equivalent focused
+        `fused_moe_prefill` microbench so the unified routed `P5` body can be
+        profiled in isolation
+  - occupancy diagnosis on the same explicit native P5 profiling surface:
+    - `Registers Per Thread = 168`
+    - `Static Shared Memory Per Block = 40984 B`
+    - `Shared Memory Configuration Size = 65536 B`
+    - `Block Limit Registers = 1`
+    - `Block Limit Shared Mem = 1`
+    - `Theoretical Occupancy = 25%`
+    - `Achieved Occupancy = 25.03%`
+    - `Achieved Active Warps Per SM = 12.02`
+    - interpretation:
+      - live P5 is hard-capped at one CTA per SM by footprint, not by launch
+        overhead
+      - optimizing descriptor ownership was necessary, but it is no longer the
+        dominant limiter
+  - first direct grouped-kernel `ncu` read on the isolated harness:
+    - `dram__throughput.avg.pct_of_peak_sustained_elapsed = 53.58%`
+    - `lts__t_sector_hit_rate.pct = 61.97%`
+    - `Achieved Occupancy = 24.89%`
+    - `Registers Per Thread = 164`
+    - `Static Shared Memory Per Block = 40.97 KiB`
+    - `One or More Eligible = 14.59%`
+    - `Eligible Warps Per Scheduler = 0.20`
+    - `Issued Warp Per Scheduler = 0.15`
+    - `Warp Cycles Per Issued Instruction = 20.42`
+    - conclusion:
+      - the isolated grouped `P5` kernel is still one-CTA-per-SM limited by
+        registers plus shared memory
+      - the next optimization target is warp eligibility / consumer-side stall
+        reduction, not another descriptor-ownership tweak
+  - first direct grouped-kernel source-counter read on the same harness:
+    - `706560` excessive global sectors (`40%` of `1788480`)
+    - `1532160` excessive shared wavefronts (`10%` of `15240960`)
+    - branch ratio is negligible (`0.13%`), so control divergence is not the
+      dominant issue
+    - implication:
+      - with `A`, `B`, and `SFA` already on TMA in this harness, the remaining
+        obvious uncoalesced hot-path traffic is the `SFB` fallback plus the
+        surrounding consumer/store scaffolding
+      - do not spend more time trying to force per-CTA `SFB` descriptors onto
+        the current 8/16-row launch plan
+      - the next structural win is to move the grouped launch geometry toward
+        128-row slabs or an equivalent full-tensor `SFB` contract that lets
+        the scale path become coalesced/TMA-driven too
+  - source-counter result for the forced `128`-row slab:
+    - excessive global sectors drop from `40%` (`706560 / 1788480`) to `8%`
+      (`61440 / 807300`)
+    - excessive shared wavefronts stay similar (`10%` -> `9%`)
+    - issue activity does not improve (`14.49%` -> `14.00%`)
+    - implication:
+      - making `SFB` legal/coalesced is real progress, not a phantom
+      - but after that fix, the next limiter is deeper in the consumer-side
+        wait/copy/store structure, not in raw global-memory coalescing
+  - standalone `SFB` offset smoke on the existing `P5` TMA harness:
+    - added a new gated case under
+      `NEMOTRON_RUN_P5_TMA_SMOKE=1 p5_swizzled_pipeline_test`
+    - exact question:
+      - can a full-tensor `TMA_SFB` descriptor service a small-row offset
+        (`row_start=8`, `valid_rows=8`) by shifting the tensor in device code
+        with `cute::domain_offset(...)`, without rebasing the descriptor
+        pointer per CTA?
+    - definitive result:
+      - no, not with the current `get_tma_tensor(...) -> domain_offset(...) ->
+        local_tile(...) -> get_slice(...).partition_S(...)` path
+      - the smoke fails deterministically at
+        `row=0 col=64 tma=0 ref=137`
+    - implication:
+      - the old per-CTA sliced-descriptor model is not the only problem
+      - a naive full-tensor `domain_offset` rewrite is also insufficient
+      - follow-up source check:
+        - the local SM120 array collective
+          (`sm120_blockscaled_mma_array_tma.hpp`) does not use the SM100
+          `make_tma_atom_* + tma_partition(...)` contract for `SFB`
+        - it uses `make_tma_copy(...) -> get_tma_tensor(...) -> local_tile(...)`
+          and then `block_tma_sfb.partition_S(...)`
+      - follow-up result:
+        - the grouped shadow-descriptor path is now also modeled in the
+          standalone harness
+        - the local helper-built `SFB` TMA object matches the
+          CUTLASS-selected `GmemTiledCopySFB` contract byte-for-byte:
+          `tma_copy_only_sfb_builder_contract PASS`
+        - the real bug was in our helper, not CUTLASS:
+          `MakeP5ScaleLayoutSFB(token_rows, input_cols)` was passing
+          `tile_atom_to_shape_SFB(make_shape(token_rows, input_cols, 1))`
+        - for `tile_atom_to_shape_SFB`, a rank-3 problem shape is interpreted
+          as `(M, N, K)`, so that helper built a layout for
+          `N=input_cols, K=1` instead of `N=token_rows, K=input_cols`
+        - after fixing the helper to pass
+          `make_shape(1, token_rows, input_cols, 1)`:
+          - `tma_copy_only_sfb_execution_layout_contract PASS`
+          - `tma_copy_only_sfb_tileindex_row0 PASS`
+          - `tma_copy_only_sfb_tileindex_row128 PASS`
+          - `tma_copy_only_sfb_grouped_tileindex_row128 PASS`
+        - the exact host-side alias probe now reports:
+          `layout=(((_32,_4),2),((_16,_4),2),(_1,1)):
+          (((_16,_4),1024),((_0,_1),_512),(_0,2048))`
+          with `cosize=2048`
+      - consequence:
+        - `tma_partition(...)` is the wrong abstraction for this exact
+          collective, and the grouped descriptor-update lifecycle was not the
+          missing fix
+        - the aligned `SFB` gmem contract is now proven correct for the
+          swizzled execution-scale buffer
+        - the remaining failure is the intentionally unaligned path:
+          `tma_copy_only_sfb_offset_row8 FAIL row=24 col=0 tma=0 ref=33`
+        - so the blocker has narrowed back to launch geometry:
+          `SFB` TMA works for tile-aligned `128`-row slices, but not for the
+          active `8/16`-row grouped slices
+        - the corrected runtime helper also reaches the direct grouped live
+          path:
+          - `nano_routed_up_p5_grouped_bench --prefix-tokens 128
+            --force-token-tile 128`
+          - `selected_token_tile=128`
+          - `sfb_tma_cached=yes`
+          - `sfb_tma_launch_compatible=yes`
+          - `hot_mean_ms=0.589`
+  - traced thread-shape fact from the existing transport-contract dump:
+    - `math_threads = 256`
+    - `math_warps = 8`
+    - `tma_threads_ref = 128`
+    - `total_threads_per_block_ref = 384`
+    - this means the traced `384`-thread P5 shape is not arbitrary padding; it
+      is a `256`-thread math block plus `128` reference TMA threads
+    - our current live kernel uses the A/B transport subset of that TMA budget
+      on the active routed launch geometry; `SFB` still rides the older
+      thread-coded path because the current 8/16-row grouped launch slices are
+      not `TMA_SFB` compatible
+  - rejected shortcut:
+    - a targeted occupancy experiment that combined:
+      - `__launch_bounds__(384, 2)` on the unified routed kernel, and
+      - preferred shared-memory carveout `100` on the P5 programmatic launch
+    - built cleanly, but the unsafe native prefix128 profiling bench stopped
+      making forward progress on the first measured iteration and had to be
+      killed
+    - conclusion:
+      - do not retry brute-force occupancy pressure as the next step
+      - preserve the known-good post-`B`-clear-removal kernel body
+      - the next TRT-aligned move is to spend the reserved TMA thread budget on
+        the missing scale path, not to force a smaller launch shape
 
 Immediate implication for Phase 1:
 - stop questioning whether CUTE TMA works for routed FP4 `P5`
@@ -463,6 +722,20 @@ Immediate implication for Phase 1:
     the `if (!use_p5_tma_b)` fallback while the scale scatter runs. Confirm
     with SASS / `ncu` whether the remaining control flow is negligible on the
     TMA path or whether it still needs a dedicated scale/TMA producer split.
+- next TRT-aligned kernel step after the scale-TMA landing:
+  - the missing P5 scale transport is no longer the blocker
+  - next measurement boundary:
+    - profile the live `A+SFA` / `B+SFB` path with `ncu` on the explicit
+      unsafe native profiling surface
+    - check whether the remaining stall mix is still barrier/eligibility
+      dominated or has shifted toward the consumer-side scale/copy path
+  - next implementation boundary:
+    - remove or isolate any residual thread-coded scale/control scaffolding
+      that still structurally surrounds the TMA fast path
+    - keep non-`P5` profiles on the old path until they are replaced by the
+      same unified swizzled/TMA contract
+  - only after reading that post-scale-TMA profile should we revisit
+    occupancy/launch-shape work
 - do not go back down to raw descriptor/PTX debugging unless the runtime-like integration breaks at a new boundary
 
 Live-integration boundary decisions:

@@ -21,6 +21,7 @@ namespace {
 
 constexpr std::size_t kBlockWidth = 16;
 constexpr std::size_t kScaleBlockTile = 4;
+constexpr std::size_t kP5ScaleTmaRowTile = 128;
 constexpr float kFp4MaxFinite = 6.0f;
 constexpr float kFp8E4M3MaxFinite = 448.0f;
 constexpr float kMinScale = 1.0f / 1024.0f;
@@ -126,7 +127,7 @@ __global__ void MultiplyTensorScalesKernel(
   *alpha_device = (*activation_tensor_scale_device) * (*weight_tensor_scale_device);
 }
 
-__device__ std::size_t ExecutionScaleOffset(
+__host__ __device__ std::size_t ExecutionScaleOffset(
     std::size_t row,
     std::size_t block_col,
     std::size_t padded_blocks_per_row,
@@ -501,6 +502,9 @@ struct DeviceNvfp4Matrix::Impl {
   const DeviceMoeLaunchPlan* cached_p5_tma_b_launch_plan = nullptr;
   std::size_t cached_p5_tma_b_build_epoch = 0;
   void* cached_p5_tma_b_descriptors = nullptr;
+  const DeviceMoeLaunchPlan* cached_p5_tma_sfb_launch_plan = nullptr;
+  std::size_t cached_p5_tma_sfb_build_epoch = 0;
+  void* cached_p5_tma_sfb_descriptors = nullptr;
 };
 
 std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
@@ -557,6 +561,9 @@ DeviceNvfp4Matrix::~DeviceNvfp4Matrix() {
   }
   if (impl_->cached_p5_tma_b_descriptors != nullptr) {
     cudaFree(impl_->cached_p5_tma_b_descriptors);
+  }
+  if (impl_->cached_p5_tma_sfb_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_sfb_descriptors);
   }
   if (impl_->matmul_block_scales_data != nullptr) {
     cudaFree(impl_->matmul_block_scales_data);
@@ -707,6 +714,91 @@ const void* DeviceNvfp4Matrix::p5_tma_load_b_descriptors(
   impl_->cached_p5_tma_b_build_epoch = launch_plan.build_epoch();
   impl_->cached_p5_tma_b_descriptors = device_descriptors;
   return impl_->cached_p5_tma_b_descriptors;
+#else
+  (void) launch_plan;
+  return nullptr;
+#endif
+}
+
+const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
+    const DeviceMoeLaunchPlan& launch_plan) const {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (!valid() ||
+      scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4 ||
+      cols() == 0 ||
+      (cols() % 128u) != 0 ||
+      // The current per-CTA SFB descriptor path only works for 128-row,
+      // tile-aligned grouped slices. The active routed launch plan uses
+      // 8/16-row token tiles, so keep SFB on the fallback path until the
+      // launch geometry is rebuilt around full 128-row slabs.
+      launch_plan.selected_token_tile() != kP5ScaleTmaRowTile ||
+      launch_plan.exact_cta_count_host() <= 0 ||
+      launch_plan.cta_row_starts_host() == nullptr ||
+      launch_plan.cta_valid_rows_host() == nullptr) {
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_sfb_launch_plan == &launch_plan &&
+      impl_->cached_p5_tma_sfb_build_epoch == launch_plan.build_epoch() &&
+      impl_->cached_p5_tma_sfb_descriptors != nullptr) {
+    return impl_->cached_p5_tma_sfb_descriptors;
+  }
+
+  const std::size_t blocks_per_row = cols() / kBlockWidth;
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kScaleBlockTile);
+  const std::size_t tile_rows = launch_plan.selected_token_tile();
+  std::vector<routed_p5_tma::P5TmaLoadSFB> host_descriptors;
+  host_descriptors.reserve(static_cast<std::size_t>(launch_plan.exact_cta_count_host()));
+  for (int cta_index = 0; cta_index < launch_plan.exact_cta_count_host(); ++cta_index) {
+    const int row_start = launch_plan.cta_row_starts_host()[cta_index];
+    const int valid_rows = launch_plan.cta_valid_rows_host()[cta_index];
+    if (row_start < 0 ||
+        valid_rows <= 0 ||
+        (row_start % static_cast<int>(kP5ScaleTmaRowTile)) != 0 ||
+        static_cast<std::size_t>(row_start) + tile_rows > rows() ||
+        static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > rows()) {
+      return nullptr;
+    }
+
+    const std::size_t scale_offset =
+        ExecutionScaleOffset(
+            static_cast<std::size_t>(row_start),
+            0u,
+            padded_blocks_per_row,
+            scale_layout());
+    const auto* cta_scales = reinterpret_cast<const routed_p5_tma::ElementSF*>(
+        matmul_block_scales_data() + scale_offset);
+    auto tensor_sfb = cute::make_tensor(
+        cute::make_gmem_ptr(cta_scales),
+        routed_p5_tma::MakeP5ScaleLayoutSFB(
+            static_cast<int32_t>(tile_rows),
+            static_cast<int32_t>(cols())));
+    host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadSFB(tensor_sfb));
+  }
+
+  void* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes =
+      sizeof(routed_p5_tma::P5TmaLoadSFB) * host_descriptors.size();
+  if (descriptor_bytes == 0 ||
+      !CheckCuda(cudaMalloc(&device_descriptors, descriptor_bytes)) ||
+      !CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    if (device_descriptors != nullptr) {
+      cudaFree(device_descriptors);
+    }
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_sfb_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_sfb_descriptors);
+  }
+  impl_->cached_p5_tma_sfb_launch_plan = &launch_plan;
+  impl_->cached_p5_tma_sfb_build_epoch = launch_plan.build_epoch();
+  impl_->cached_p5_tma_sfb_descriptors = device_descriptors;
+  return impl_->cached_p5_tma_sfb_descriptors;
 #else
   (void) launch_plan;
   return nullptr;
