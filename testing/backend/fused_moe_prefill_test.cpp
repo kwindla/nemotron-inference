@@ -677,6 +677,124 @@ PrefillReferenceCase BuildNanoP13SingleRowCase() {
   return test_case;
 }
 
+PrefillReferenceCase BuildNanoP13PartialTailCase(
+    std::size_t token_count,
+    bool zero_pad_after_nine) {
+  PrefillReferenceCase test_case;
+  test_case.token_count = token_count;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 1;
+  test_case.top_k = 1;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      111,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      113,
+      0.01171875f);
+  if (zero_pad_after_nine) {
+    for (std::size_t token_index = 9; token_index < test_case.token_count; ++token_index) {
+      std::fill_n(
+          test_case.input.data() + token_index * test_case.hidden_size,
+          test_case.hidden_size,
+          0.0f);
+      std::fill_n(
+          test_case.normalized.data() + token_index * test_case.hidden_size,
+          test_case.hidden_size,
+          0.0f);
+    }
+  }
+  test_case.topk_ids.assign(test_case.token_count * test_case.top_k, 0);
+  test_case.topk_weights.assign(test_case.token_count * test_case.top_k, 1.0f);
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          47,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          53,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      59,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      61,
+      0.0068359375f);
+  return test_case;
+}
+
+PrefillReferenceCase BuildNanoP15DispatchCase() {
+  PrefillReferenceCase test_case;
+  test_case.token_count = 16;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 128;
+  test_case.top_k = 6;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      95,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      97,
+      0.01171875f);
+  test_case.topk_ids.reserve(test_case.token_count * test_case.top_k);
+  test_case.topk_weights.reserve(test_case.token_count * test_case.top_k);
+  constexpr float kTopKWeights[6] = {0.22f, 0.19f, 0.17f, 0.15f, 0.14f, 0.13f};
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    const int base = static_cast<int>((token_index * 13u) % test_case.n_routed_experts);
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const int expert_index =
+          (base + static_cast<int>(slot * 23u)) % static_cast<int>(test_case.n_routed_experts);
+      test_case.topk_ids.push_back(expert_index);
+      test_case.topk_weights.push_back(kTopKWeights[slot]);
+    }
+  }
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          47,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          53,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      59,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      61,
+      0.0068359375f);
+  return test_case;
+}
+
 PrefillReferenceCase BuildNanoP13ScaleMapProbeCase() {
   PrefillReferenceCase test_case;
   test_case.token_count = 8;
@@ -2259,9 +2377,19 @@ bool TestFusedMoePrefillNanoP13FragmentCompareIfRequested() {
   bool a_scale_match = true;
   bool b_scale_match = true;
   bool store_coords_match = true;
+  bool a_regs_match = true;
+  bool b_regs_match = true;
+  bool native_b_regs_expected_match = true;
+  bool a_copy_coords_match = true;
+  bool b_copy_coords_match = true;
+  bool a_copy_raw_match = true;
   for (int m = 0; m < 2; ++m) {
     a_scale_match = a_scale_match &&
                     native_trace.a_scale_words[m] == legacy_trace.a_scale_words[m];
+    for (int reg = 0; reg < 4; ++reg) {
+      a_regs_match = a_regs_match &&
+                     native_trace.a_regs[m][reg] == legacy_trace.a_regs[m][reg];
+    }
     for (int reg = 0; reg < 4; ++reg) {
       for (int n = 0; n < 2; ++n) {
         block0_accum_max_abs_diff = std::max(
@@ -2282,22 +2410,125 @@ bool TestFusedMoePrefillNanoP13FragmentCompareIfRequested() {
   for (int n = 0; n < 2; ++n) {
     b_scale_match = b_scale_match &&
                     native_trace.b_scale_words[n] == legacy_trace.b_scale_words[n];
+    for (int reg = 0; reg < 2; ++reg) {
+      b_regs_match = b_regs_match &&
+                     native_trace.b_regs[n][reg] == legacy_trace.b_regs[n][reg];
+      native_b_regs_expected_match =
+          native_b_regs_expected_match &&
+          native_trace.b_regs[n][reg] == native_trace.expected_b_regs[n][reg];
+    }
   }
   for (int physical = 0; physical < 16; ++physical) {
     store_coords_match = store_coords_match &&
                          native_trace.store_rows[physical] == legacy_trace.store_rows[physical] &&
                          native_trace.store_cols[physical] == legacy_trace.store_cols[physical];
+    b_copy_coords_match = b_copy_coords_match &&
+                          native_trace.b_copy_rows[physical] == legacy_trace.b_copy_rows[physical] &&
+                          native_trace.b_copy_cols[physical] == legacy_trace.b_copy_cols[physical];
+  }
+  for (int physical = 0; physical < 32; ++physical) {
+    a_copy_coords_match = a_copy_coords_match &&
+                          native_trace.a_copy_rows[physical] == legacy_trace.a_copy_rows[physical] &&
+                          native_trace.a_copy_cols[physical] == legacy_trace.a_copy_cols[physical];
+    a_copy_raw_match = a_copy_raw_match &&
+                       native_trace.a_copy_raw[physical] == legacy_trace.a_copy_raw[physical];
   }
 
   std::cout << "fused_moe_prefill_test: " << case_prefix
             << " native_valid=" << native_trace.valid
             << " legacy_valid=" << legacy_trace.valid
+            << " a_regs_match=" << (a_regs_match ? 1 : 0)
+            << " b_regs_match=" << (b_regs_match ? 1 : 0)
+            << " native_b_regs_expected_match="
+            << (native_b_regs_expected_match ? 1 : 0)
+            << " a_copy_coords_match=" << (a_copy_coords_match ? 1 : 0)
+            << " b_copy_coords_match=" << (b_copy_coords_match ? 1 : 0)
+            << " a_copy_raw_match=" << (a_copy_raw_match ? 1 : 0)
             << " block0_accum_max_abs_diff=" << block0_accum_max_abs_diff
             << " accum_max_abs_diff=" << accum_max_abs_diff
             << " a_scale_match=" << (a_scale_match ? 1 : 0)
             << " b_scale_match=" << (b_scale_match ? 1 : 0)
             << " store_coords_match=" << (store_coords_match ? 1 : 0)
             << "\n";
+  if (!a_regs_match) {
+    for (int m = 0; m < 2; ++m) {
+      for (int reg = 0; reg < 4; ++reg) {
+        if (native_trace.a_regs[m][reg] != legacy_trace.a_regs[m][reg]) {
+          std::cout << "fused_moe_prefill_test: " << case_prefix
+                    << " a_reg_mismatch m=" << m
+                    << " reg=" << reg
+                    << " native=" << native_trace.a_regs[m][reg]
+                    << " legacy=" << legacy_trace.a_regs[m][reg]
+                    << "\n";
+          goto printed_a_reg_mismatch;
+        }
+      }
+    }
+  }
+printed_a_reg_mismatch:
+  if (!b_regs_match) {
+    for (int n = 0; n < 2; ++n) {
+      for (int reg = 0; reg < 2; ++reg) {
+        if (native_trace.b_regs[n][reg] != legacy_trace.b_regs[n][reg]) {
+          std::cout << "fused_moe_prefill_test: " << case_prefix
+                    << " b_reg_mismatch n=" << n
+                    << " reg=" << reg
+                    << " native=" << legacy_trace.b_regs[n][reg]
+                    << " legacy=" << native_trace.b_regs[n][reg]
+                    << "\n";
+          goto printed_b_reg_mismatch;
+        }
+      }
+    }
+  }
+printed_b_reg_mismatch:
+  if (!native_b_regs_expected_match) {
+    for (int n = 0; n < 2; ++n) {
+      for (int reg = 0; reg < 2; ++reg) {
+        if (native_trace.b_regs[n][reg] != native_trace.expected_b_regs[n][reg]) {
+          std::cout << "fused_moe_prefill_test: " << case_prefix
+                    << " native_b_expected_mismatch n=" << n
+                    << " reg=" << reg
+                    << " actual=" << native_trace.b_regs[n][reg]
+                    << " expected=" << native_trace.expected_b_regs[n][reg]
+                    << "\n";
+          goto printed_native_b_expected_mismatch;
+        }
+      }
+    }
+  }
+printed_native_b_expected_mismatch:
+  if (!a_copy_raw_match) {
+    for (int physical = 0; physical < 32; ++physical) {
+      if (native_trace.a_copy_raw[physical] != legacy_trace.a_copy_raw[physical]) {
+        std::cout << "fused_moe_prefill_test: " << case_prefix
+                  << " a_copy_raw_mismatch physical=" << physical
+                  << " row=" << native_trace.a_copy_rows[physical]
+                  << " col=" << native_trace.a_copy_cols[physical]
+                  << " native=" << static_cast<int>(native_trace.a_copy_raw[physical])
+                  << " legacy=" << static_cast<int>(legacy_trace.a_copy_raw[physical])
+                  << "\n";
+        goto printed_a_copy_raw_mismatch;
+      }
+    }
+  }
+printed_a_copy_raw_mismatch:
+  if (!b_copy_coords_match) {
+    for (int physical = 0; physical < 16; ++physical) {
+      if (native_trace.b_copy_rows[physical] != legacy_trace.b_copy_rows[physical] ||
+          native_trace.b_copy_cols[physical] != legacy_trace.b_copy_cols[physical]) {
+        std::cout << "fused_moe_prefill_test: " << case_prefix
+                  << " b_copy_coord_mismatch physical=" << physical
+                  << " native_row=" << native_trace.b_copy_rows[physical]
+                  << " native_col=" << native_trace.b_copy_cols[physical]
+                  << " legacy_row=" << legacy_trace.b_copy_rows[physical]
+                  << " legacy_col=" << legacy_trace.b_copy_cols[physical]
+                  << "\n";
+        goto printed_b_copy_coord_mismatch;
+      }
+    }
+  }
+printed_b_copy_coord_mismatch:
 
   return Expect(native_trace.valid != 0 && legacy_trace.valid != 0,
                 "nano p13 fragment traces should be valid") &&
@@ -2406,11 +2637,68 @@ bool TestFusedMoePrefillNanoP13NativeSingleVsMultiTraceIfRequested() {
               << " physical=" << physical
               << " single_row=" << single_trace.b_copy_rows[physical]
               << " single_col=" << single_trace.b_copy_cols[physical]
+              << " single_raw=" << static_cast<int>(single_trace.b_copy_raw[physical])
               << " multi_row=" << multi_trace.b_copy_rows[physical]
               << " multi_col=" << multi_trace.b_copy_cols[physical]
+              << " multi_raw=" << static_cast<int>(multi_trace.b_copy_raw[physical])
               << "\n";
   }
   return true;
+}
+
+bool TestFusedMoePrefillNanoP13InactiveBCopyZeroIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_INACTIVE_BCOPY_ZERO") == nullptr) {
+    return true;
+  }
+  const PrefillReferenceCase test_case = BuildNanoP13DispatchCase();
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_p13_debug_trace("NEMOTRON_P13_DEBUG_TRACE");
+  ScopedEnvVar scoped_target_valid_rows("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS");
+  ScopedEnvVar scoped_target_thread_id("NEMOTRON_P13_DEBUG_TRACE_TARGET_THREAD_ID");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+  setenv("NEMOTRON_P13_DEBUG_TRACE", "1", 1);
+  setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS", "1", 1);
+
+  bool saw_inactive_coord = false;
+  for (int thread_id = 0; thread_id < 224; ++thread_id) {
+    const std::string thread_id_str = std::to_string(thread_id);
+    setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_THREAD_ID", thread_id_str.c_str(), 1);
+    nemotron::ResetP13DebugTrace();
+    if (!RunNanoDeploymentCaseMatchesReference(
+            test_case,
+            "nano_p13_inactive_bcopy_zero",
+            nullptr,
+            false)) {
+      return false;
+    }
+    nemotron::P13DebugTrace trace;
+    if (!Expect(CopyP13DebugTrace(&trace),
+                "nano p13 inactive-b-copy trace should copy")) {
+      return false;
+    }
+    if (trace.valid == 0 || trace.valid_rows != 1) {
+      continue;
+    }
+    for (int physical = 0; physical < 16; ++physical) {
+      if (trace.b_copy_rows[physical] < trace.valid_rows) {
+        continue;
+      }
+      saw_inactive_coord = true;
+      if (trace.b_copy_raw[physical] != 0u) {
+        std::cerr << "nano_p13_inactive_bcopy_zero"
+                  << " thread=" << thread_id
+                  << " physical=" << physical
+                  << " row=" << trace.b_copy_rows[physical]
+                  << " col=" << trace.b_copy_cols[physical]
+                  << " raw=" << static_cast<int>(trace.b_copy_raw[physical])
+                  << "\n";
+        return false;
+      }
+    }
+  }
+
+  return Expect(saw_inactive_coord,
+                "nano p13 inactive-b-copy zero sweep should observe at least one inactive B coord");
 }
 
 void PrintNanoCaseGroupedRowDiffSummary(
@@ -2473,6 +2761,7 @@ void PrintNanoCaseGroupedRowDiffSummary(
       top_row_diffs.begin(),
       top_row_diffs.end(),
       [](const RowDiff& lhs, const RowDiff& rhs) { return lhs.abs_diff > rhs.abs_diff; });
+  int printed_column_summaries = 0;
   for (const RowDiff& diff_entry : top_row_diffs) {
     int cta_index = -1;
     int expert_id = -1;
@@ -2508,6 +2797,29 @@ void PrintNanoCaseGroupedRowDiffSummary(
                 legacy_capture.routed_grouped_output[alias_index]));
       }
     }
+    std::size_t best_alias_row = 0;
+    float best_alias_diff = std::numeric_limits<float>::infinity();
+    const std::size_t grouped_rows =
+        legacy_capture.routed_grouped_output.size() / test_case.hidden_size;
+    for (std::size_t alias_row = 0; alias_row < grouped_rows; ++alias_row) {
+      float row_alias_diff = 0.0f;
+      for (std::size_t col = 0; col < test_case.hidden_size; ++col) {
+        const std::size_t native_index = diff_entry.row * test_case.hidden_size + col;
+        const std::size_t alias_index = alias_row * test_case.hidden_size + col;
+        row_alias_diff = std::max(
+            row_alias_diff,
+            std::fabs(
+                native_capture.routed_grouped_output[native_index] -
+                legacy_capture.routed_grouped_output[alias_index]));
+        if (row_alias_diff >= best_alias_diff) {
+          break;
+        }
+      }
+      if (row_alias_diff < best_alias_diff) {
+        best_alias_diff = row_alias_diff;
+        best_alias_row = alias_row;
+      }
+    }
     std::cout << "fused_moe_prefill_test: " << label
               << "_row_diff row=" << diff_entry.row
               << " max_abs_diff=" << diff_entry.abs_diff
@@ -2518,7 +2830,54 @@ void PrintNanoCaseGroupedRowDiffSummary(
               << " local_offset=" << local_offset
               << " alias_row=" << local_offset
               << " alias_max_abs_diff=" << alias_row_diff
+              << " best_alias_row=" << best_alias_row
+              << " best_alias_max_abs_diff=" << best_alias_diff
               << "\n";
+    if (printed_column_summaries < 3) {
+      struct ColumnDiff {
+        float abs_diff = 0.0f;
+        std::size_t col = 0;
+        float native_value = 0.0f;
+        float legacy_value = 0.0f;
+      };
+      std::vector<ColumnDiff> top_col_diffs;
+      for (std::size_t col = 0; col < test_case.hidden_size; ++col) {
+        const std::size_t index = diff_entry.row * test_case.hidden_size + col;
+        const float native_value = native_capture.routed_grouped_output[index];
+        const float legacy_value = legacy_capture.routed_grouped_output[index];
+        const float abs_diff = std::fabs(native_value - legacy_value);
+        if (abs_diff == 0.0f) {
+          continue;
+        }
+        if (top_col_diffs.size() < 12) {
+          top_col_diffs.push_back({abs_diff, col, native_value, legacy_value});
+        } else {
+          auto min_it = std::min_element(
+              top_col_diffs.begin(),
+              top_col_diffs.end(),
+              [](const ColumnDiff& lhs, const ColumnDiff& rhs) {
+                return lhs.abs_diff < rhs.abs_diff;
+              });
+          if (abs_diff > min_it->abs_diff) {
+            *min_it = {abs_diff, col, native_value, legacy_value};
+          }
+        }
+      }
+      std::sort(
+          top_col_diffs.begin(),
+          top_col_diffs.end(),
+          [](const ColumnDiff& lhs, const ColumnDiff& rhs) { return lhs.abs_diff > rhs.abs_diff; });
+      for (const ColumnDiff& col_diff : top_col_diffs) {
+        std::cout << "fused_moe_prefill_test: " << label
+                  << "_col_diff row=" << diff_entry.row
+                  << " col=" << col_diff.col
+                  << " abs_diff=" << col_diff.abs_diff
+                  << " native=" << col_diff.native_value
+                  << " legacy=" << col_diff.legacy_value
+                  << "\n";
+      }
+      ++printed_column_summaries;
+    }
   }
   for (int valid_rows = 1; valid_rows <= 8; ++valid_rows) {
     for (int local_offset = 0; local_offset < valid_rows; ++local_offset) {
@@ -2612,6 +2971,196 @@ bool TestFusedMoePrefillNanoP13OutputCompareIfRequested() {
                 "nano p13 output compare fc2 tensor scale should stay identical across FC2 modes");
 }
 
+bool TestFusedMoePrefillNanoP13StoreThreadSweepIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_STORE_THREAD_SWEEP") == nullptr) {
+    return true;
+  }
+  const PrefillReferenceCase test_case = BuildNanoP13DispatchCase();
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_force_legacy_p13("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  ScopedEnvVar scoped_p13_debug_trace("NEMOTRON_P13_DEBUG_TRACE");
+  ScopedEnvVar scoped_target_valid_rows("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS");
+  ScopedEnvVar scoped_target_thread_id("NEMOTRON_P13_DEBUG_TRACE_TARGET_THREAD_ID");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+  setenv("NEMOTRON_P13_DEBUG_TRACE", "1", 1);
+  setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS", "1", 1);
+
+  auto is_target_col = [](int output_col) {
+    const int mod = output_col & 63;
+    return mod == 14 || mod == 15 || mod == 30 || mod == 31;
+  };
+
+  std::vector<int> target_threads;
+  for (int thread_id = 0; thread_id < 224 && target_threads.size() < 8; ++thread_id) {
+    const std::string thread_id_str = std::to_string(thread_id);
+    setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_THREAD_ID", thread_id_str.c_str(), 1);
+    unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+    nemotron::ResetP13DebugTrace();
+    if (!RunNanoDeploymentCaseMatchesReference(
+            test_case,
+            "nano_p13_store_thread_sweep_find",
+            nullptr,
+            false)) {
+      return false;
+    }
+    nemotron::P13DebugTrace trace;
+    if (!Expect(CopyP13DebugTrace(&trace),
+                "nano p13 store-thread sweep trace should copy")) {
+      return false;
+    }
+    if (trace.valid == 0 || trace.valid_rows != 1) {
+      continue;
+    }
+    for (int physical = 0; physical < 16; ++physical) {
+      if (trace.store_cols[physical] == 0 && is_target_col(trace.store_rows[physical])) {
+        target_threads.push_back(thread_id);
+        std::cout << "fused_moe_prefill_test: nano_p13_store_thread_target"
+                  << " thread=" << thread_id
+                  << " physical=" << physical
+                  << " output_col=" << trace.store_rows[physical]
+                  << " token_row=" << trace.store_cols[physical]
+                  << "\n";
+        break;
+      }
+    }
+  }
+
+  if (!Expect(!target_threads.empty(),
+              "nano p13 store-thread sweep should find at least one target thread")) {
+    return false;
+  }
+
+  for (int thread_id : target_threads) {
+    const std::string thread_id_str = std::to_string(thread_id);
+    setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_THREAD_ID", thread_id_str.c_str(), 1);
+
+    unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+    nemotron::ResetP13DebugTrace();
+    if (!RunNanoDeploymentCaseMatchesReference(
+            test_case,
+            "nano_p13_store_thread_sweep_native",
+            nullptr,
+            false)) {
+      return false;
+    }
+    nemotron::P13DebugTrace native_trace;
+    if (!Expect(CopyP13DebugTrace(&native_trace),
+                "nano p13 native store-thread trace should copy")) {
+      return false;
+    }
+
+    setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13", "1", 1);
+    nemotron::ResetP13DebugTrace();
+    if (!RunNanoDeploymentCaseMatchesReference(
+            test_case,
+            "nano_p13_store_thread_sweep_legacy",
+            nullptr,
+            false)) {
+      return false;
+    }
+    nemotron::P13DebugTrace legacy_trace;
+    if (!Expect(CopyP13DebugTrace(&legacy_trace),
+                "nano p13 legacy store-thread trace should copy")) {
+      return false;
+    }
+
+    for (int m = 0; m < 2; ++m) {
+      for (int n = 0; n < 2; ++n) {
+        for (int reg = 0; reg < 4; ++reg) {
+          const float block0_diff = std::fabs(
+              native_trace.block0_accum_regs[m][n][reg] -
+              legacy_trace.block0_accum_regs[m][n][reg]);
+          const float accum_diff = std::fabs(
+              native_trace.accum_regs[m][n][reg] -
+              legacy_trace.accum_regs[m][n][reg]);
+          if (block0_diff != 0.0f || accum_diff != 0.0f) {
+            std::cout << "fused_moe_prefill_test: nano_p13_store_thread_accum_diff"
+                      << " thread=" << thread_id
+                      << " m=" << m
+                      << " n=" << n
+                      << " reg=" << reg
+                      << " block0_diff=" << block0_diff
+                      << " accum_diff=" << accum_diff
+                      << " native=" << native_trace.accum_regs[m][n][reg]
+                      << " legacy=" << legacy_trace.accum_regs[m][n][reg]
+                      << "\n";
+            goto next_thread;
+          }
+        }
+      }
+    }
+  next_thread:;
+  }
+
+  return true;
+}
+
+bool TestFusedMoePrefillNanoP13PartialTailInvarianceIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_PARTIAL_TAIL_INVARIANCE") == nullptr) {
+    return true;
+  }
+  const PrefillReferenceCase partial_case =
+      BuildNanoP13PartialTailCase(9, false);
+  const PrefillReferenceCase padded_case =
+      BuildNanoP13PartialTailCase(16, true);
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+
+  NanoCaseCapture partial_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          partial_case,
+          "nano_p13_partial_tail9",
+          &partial_capture,
+          false)) {
+    return false;
+  }
+  NanoCaseCapture padded_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          padded_case,
+          "nano_p13_partial_tail16_padded",
+          &padded_capture,
+          false)) {
+    return false;
+  }
+
+  std::vector<float> partial_prefix(
+      partial_capture.routed_output.begin(),
+      partial_capture.routed_output.begin() +
+          static_cast<std::ptrdiff_t>(partial_case.token_count * partial_case.hidden_size));
+  std::vector<float> padded_prefix(
+      padded_capture.routed_output.begin(),
+      padded_capture.routed_output.begin() +
+          static_cast<std::ptrdiff_t>(partial_case.token_count * partial_case.hidden_size));
+  const float routed_prefix_diff = MaxAbsDiff(partial_prefix, padded_prefix);
+
+  std::vector<float> partial_full(
+      partial_capture.output.begin(),
+      partial_capture.output.begin() +
+          static_cast<std::ptrdiff_t>(partial_case.token_count * partial_case.hidden_size));
+  std::vector<float> padded_full(
+      padded_capture.output.begin(),
+      padded_capture.output.begin() +
+          static_cast<std::ptrdiff_t>(partial_case.token_count * partial_case.hidden_size));
+  const float output_prefix_diff = MaxAbsDiff(partial_full, padded_full);
+
+  std::cout << "fused_moe_prefill_test: nano_p13_partial_tail_invariance"
+            << " output_prefix_max_abs_diff=" << output_prefix_diff
+            << " routed_prefix_max_abs_diff=" << routed_prefix_diff
+            << " partial_ctas=" << partial_capture.cta_valid_rows.size()
+            << " padded_ctas=" << padded_capture.cta_valid_rows.size()
+            << "\n";
+  PrintNanoCaseGroupedRowDiffSummary(
+      "nano_p13_partial_tail_invariance",
+      partial_case,
+      partial_capture,
+      padded_capture);
+
+  return Expect(output_prefix_diff <= kNanoPackedContractTolerance,
+                "nano p13 partial-tail full output should match zero-padded full-tile prefix") &&
+         Expect(routed_prefix_diff <= kNanoPackedContractTolerance,
+                "nano p13 partial-tail routed output should match zero-padded full-tile prefix");
+}
+
 bool TestFusedMoePrefillNanoDeploymentP13OutputCompareIfRequested() {
   if (std::getenv("NEMOTRON_RUN_NANO_DEPLOYMENT_P13_OUTPUT_COMPARE") == nullptr) {
     return true;
@@ -2660,6 +3209,82 @@ bool TestFusedMoePrefillNanoDeploymentP13OutputCompareIfRequested() {
 
   return Expect(shared_diff <= kMaxAbsDiffTolerance,
                 "nano deployment p13 output compare shared output should stay identical across FC2 modes");
+}
+
+bool TestFusedMoePrefillNanoP15OutputCompareIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P15_OUTPUT_COMPARE") == nullptr) {
+    return true;
+  }
+  const PrefillReferenceCase test_case = BuildNanoP15DispatchCase();
+  ScopedEnvVar scoped_force_legacy_p15("NEMOTRON_DEBUG_FORCE_LEGACY_P15");
+
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P15");
+  NanoCaseCapture native_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_p15_dispatch16_native",
+          &native_capture,
+          false)) {
+    return false;
+  }
+
+  setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P15", "1", 1);
+  NanoCaseCapture legacy_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_p15_dispatch16_legacy",
+          &legacy_capture,
+          false)) {
+    return false;
+  }
+
+  const float output_diff = MaxAbsDiff(native_capture.output, legacy_capture.output);
+  const float routed_diff =
+      MaxAbsDiff(native_capture.routed_output, legacy_capture.routed_output);
+  const float shared_diff =
+      MaxAbsDiff(native_capture.shared_output, legacy_capture.shared_output);
+  const float gemm1_scale_diff =
+      MaxAbsDiff(native_capture.gemm1_output_scales, legacy_capture.gemm1_output_scales);
+  const bool packed_match = native_capture.fc2_packed == legacy_capture.fc2_packed;
+  const bool block_scales_match =
+      native_capture.fc2_block_scales == legacy_capture.fc2_block_scales;
+  const bool matmul_block_scales_match =
+      native_capture.fc2_matmul_block_scales == legacy_capture.fc2_matmul_block_scales;
+  const float tensor_scale_diff =
+      std::fabs(native_capture.fc2_tensor_scale - legacy_capture.fc2_tensor_scale);
+
+  std::cout << "fused_moe_prefill_test: nano_p15_output_compare"
+            << " output_max_abs_diff=" << output_diff
+            << " routed_max_abs_diff=" << routed_diff
+            << " shared_max_abs_diff=" << shared_diff
+            << " gemm1_scale_max_abs_diff=" << gemm1_scale_diff
+            << " packed_match=" << (packed_match ? 1 : 0)
+            << " block_scales_match=" << (block_scales_match ? 1 : 0)
+            << " matmul_block_scales_match=" << (matmul_block_scales_match ? 1 : 0)
+            << " tensor_scale_abs_diff=" << tensor_scale_diff
+            << "\n";
+  PrintNanoCaseGroupedRowDiffSummary(
+      "nano_p15_output_compare",
+      test_case,
+      native_capture,
+      legacy_capture);
+
+  return Expect(shared_diff <= kMaxAbsDiffTolerance,
+                "nano p15 output compare shared output should stay identical across FC2 modes") &&
+         Expect(gemm1_scale_diff <= kMaxAbsDiffTolerance,
+                "nano p15 output compare gemm1 output scales should stay identical across FC2 modes") &&
+         Expect(packed_match,
+                "nano p15 output compare fc2 packed data should stay identical across FC2 modes") &&
+         Expect(block_scales_match,
+                "nano p15 output compare fc2 block scales should stay identical across FC2 modes") &&
+         Expect(matmul_block_scales_match,
+                "nano p15 output compare fc2 matmul block scales should stay identical across FC2 modes") &&
+         Expect(tensor_scale_diff <= kMaxAbsDiffTolerance,
+                "nano p15 output compare fc2 tensor scale should stay identical across FC2 modes") &&
+         Expect(output_diff <= kNanoPackedContractTolerance,
+                "nano p15 output compare total output should stay within packed-contract tolerance") &&
+         Expect(routed_diff <= kNanoPackedContractTolerance,
+                "nano p15 output compare routed output should stay within packed-contract tolerance");
 }
 
 bool TestFusedMoePrefillNanoExpertLayerRoutingNativeVsLegacyIfRequested() {
@@ -2751,8 +3376,12 @@ int main() {
       TestFusedMoePrefillNanoP13ScaleMapProbeIfRequested() &&
       TestFusedMoePrefillNanoP13FragmentCompareIfRequested() &&
       TestFusedMoePrefillNanoP13NativeSingleVsMultiTraceIfRequested() &&
+      TestFusedMoePrefillNanoP13InactiveBCopyZeroIfRequested() &&
       TestFusedMoePrefillNanoP13OutputCompareIfRequested() &&
+      TestFusedMoePrefillNanoP13StoreThreadSweepIfRequested() &&
+      TestFusedMoePrefillNanoP13PartialTailInvarianceIfRequested() &&
       TestFusedMoePrefillNanoDeploymentP13OutputCompareIfRequested() &&
+      TestFusedMoePrefillNanoP15OutputCompareIfRequested() &&
       TestFusedMoePrefillNanoExpertLayerRoutingMatchesReferenceIfRequested() &&
       TestFusedMoePrefillNanoExpertLayerRoutingNativeVsLegacyIfRequested();
   if (!ok) {

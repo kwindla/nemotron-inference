@@ -53,6 +53,7 @@ struct P13DebugTrace {
   int output_row_base = -1;
   std::uint32_t a_regs[2][4] = {};
   std::uint32_t b_regs[2][2] = {};
+  std::uint32_t expected_b_regs[2][2] = {};
   std::uint32_t a_scale_words[2] = {};
   std::uint32_t b_scale_words[2] = {};
   float block0_accum_regs[2][2][4] = {};
@@ -64,6 +65,7 @@ struct P13DebugTrace {
   std::uint8_t a_copy_raw[32] = {};
   int b_copy_rows[16] = {};
   int b_copy_cols[16] = {};
+  std::uint8_t b_copy_raw[16] = {};
 };
 
 bool RunGroupedNvfp4ExpertMatVec(
