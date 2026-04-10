@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cuda_bf16.h>
 
 #include "nemotron/expert_routing_device.h"
@@ -45,6 +46,26 @@ struct FusedMoePrefillParams {
   float* shared_output = nullptr;  // Optional.
 };
 
+struct P13DebugTrace {
+  int valid = 0;
+  int row_start = -1;
+  int valid_rows = -1;
+  int output_row_base = -1;
+  std::uint32_t a_regs[2][4] = {};
+  std::uint32_t b_regs[2][2] = {};
+  std::uint32_t a_scale_words[2] = {};
+  std::uint32_t b_scale_words[2] = {};
+  float block0_accum_regs[2][2][4] = {};
+  float accum_regs[2][2][4] = {};
+  int store_rows[16] = {};
+  int store_cols[16] = {};
+  int a_copy_rows[32] = {};
+  int a_copy_cols[32] = {};
+  std::uint8_t a_copy_raw[32] = {};
+  int b_copy_rows[16] = {};
+  int b_copy_cols[16] = {};
+};
+
 bool RunGroupedNvfp4ExpertMatVec(
     const float* input,
     const int* expert_offsets,
@@ -71,5 +92,8 @@ bool RunLaunchPlannedPackedNvfp4ExpertMatVecBf16(
     __nv_bfloat16* output);
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params);
+
+bool CopyP13DebugTrace(P13DebugTrace* out);
+void ResetP13DebugTrace();
 
 }  // namespace nemotron

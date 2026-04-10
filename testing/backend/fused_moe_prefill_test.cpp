@@ -59,12 +59,46 @@ bool HasCudaDevice() {
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
 }
 
+class ScopedEnvVar {
+ public:
+  explicit ScopedEnvVar(const char* name)
+      : name_(name), had_value_(false) {
+    const char* existing = std::getenv(name_.c_str());
+    if (existing != nullptr) {
+      had_value_ = true;
+      old_value_ = existing;
+    }
+  }
+
+  ~ScopedEnvVar() {
+    if (had_value_) {
+      setenv(name_.c_str(), old_value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::string old_value_;
+  bool had_value_;
+};
+
 float MaxAbsDiff(const std::vector<float>& lhs, const std::vector<float>& rhs) {
   if (lhs.size() != rhs.size()) {
     return std::numeric_limits<float>::infinity();
   }
   float max_diff = 0.0f;
   for (std::size_t i = 0; i < lhs.size(); ++i) {
+    max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
+  }
+  return max_diff;
+}
+
+template <std::size_t N>
+float MaxAbsDiff(const float (&lhs)[N], const float (&rhs)[N]) {
+  float max_diff = 0.0f;
+  for (std::size_t i = 0; i < N; ++i) {
     max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
   }
   return max_diff;
@@ -80,6 +114,10 @@ float DecodeFp8(std::uint8_t raw_byte) {
   __nv_fp8_e4m3 value;
   value.__x = raw_byte;
   return static_cast<float>(value);
+}
+
+float Sigmoid(float value) {
+  return 1.0f / (1.0f + std::exp(-value));
 }
 
 std::vector<float> MakePatternedValues(
@@ -359,6 +397,25 @@ std::vector<float> RowMajorMatVec(
   return output;
 }
 
+std::vector<float> RowMajorMatmul(
+    const std::vector<float>& lhs,
+    std::size_t lhs_rows,
+    std::size_t lhs_cols,
+    const std::vector<float>& rhs,
+    std::size_t rhs_rows) {
+  std::vector<float> output(lhs_rows * rhs_rows, 0.0f);
+  for (std::size_t lhs_row = 0; lhs_row < lhs_rows; ++lhs_row) {
+    for (std::size_t rhs_row = 0; rhs_row < rhs_rows; ++rhs_row) {
+      float accum = 0.0f;
+      for (std::size_t col = 0; col < lhs_cols; ++col) {
+        accum += lhs[lhs_row * lhs_cols + col] * rhs[rhs_row * lhs_cols + col];
+      }
+      output[lhs_row * rhs_rows + rhs_row] = accum;
+    }
+  }
+  return output;
+}
+
 void Relu2InPlace(std::vector<float>* values) {
   if (values == nullptr) {
     return;
@@ -383,6 +440,21 @@ struct PrefillReferenceCase {
   std::vector<std::vector<float>> routed_down;
   std::vector<float> shared_up;
   std::vector<float> shared_down;
+};
+
+struct NanoCaseCapture {
+  std::vector<float> output;
+  std::vector<float> routed_output;
+  std::vector<float> shared_output;
+  std::vector<float> routed_grouped_output;
+  std::vector<float> gemm1_output_scales;
+  std::vector<std::uint8_t> fc2_packed;
+  std::vector<std::uint8_t> fc2_block_scales;
+  std::vector<std::uint8_t> fc2_matmul_block_scales;
+  std::vector<int> cta_expert_ids;
+  std::vector<int> cta_row_starts;
+  std::vector<int> cta_valid_rows;
+  float fc2_tensor_scale = 0.0f;
 };
 
 // Synthetic contract case: intentionally tiny and ragged so the active kernel
@@ -497,6 +569,250 @@ PrefillReferenceCase BuildNanoDeploymentCase() {
       test_case.hidden_size,
       test_case.shared_expert_intermediate_size,
       61,
+      0.0068359375f);
+  return test_case;
+}
+
+PrefillReferenceCase BuildNanoP13DispatchCase() {
+  PrefillReferenceCase test_case;
+  test_case.token_count = 24;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 128;
+  test_case.top_k = 6;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      71,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      73,
+      0.01171875f);
+  test_case.topk_ids.reserve(test_case.token_count * test_case.top_k);
+  test_case.topk_weights.reserve(test_case.token_count * test_case.top_k);
+  constexpr float kTopKWeights[6] = {0.22f, 0.19f, 0.17f, 0.15f, 0.14f, 0.13f};
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    const int base = static_cast<int>((token_index * 17u) % test_case.n_routed_experts);
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const int expert_index =
+          (base + static_cast<int>(slot * 19u)) % static_cast<int>(test_case.n_routed_experts);
+      test_case.topk_ids.push_back(expert_index);
+      test_case.topk_weights.push_back(kTopKWeights[slot]);
+    }
+  }
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          47,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          53,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      59,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      61,
+      0.0068359375f);
+  return test_case;
+}
+
+PrefillReferenceCase BuildNanoP13SingleRowCase() {
+  PrefillReferenceCase test_case;
+  test_case.token_count = 1;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 128;
+  test_case.top_k = 1;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      91,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      93,
+      0.01171875f);
+  test_case.topk_ids = {0};
+  test_case.topk_weights = {1.0f};
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          47,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          53,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      59,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      61,
+      0.0068359375f);
+  return test_case;
+}
+
+PrefillReferenceCase BuildNanoP13ScaleMapProbeCase() {
+  PrefillReferenceCase test_case;
+  test_case.token_count = 8;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 128;
+  test_case.top_k = 1;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      81,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      83,
+      0.01171875f);
+  test_case.topk_ids.assign(test_case.token_count, 0);
+  test_case.topk_weights.assign(test_case.token_count, 1.0f);
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          47,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          53,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      59,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      61,
+      0.0068359375f);
+  return test_case;
+}
+
+PrefillReferenceCase BuildNanoExpertLayerRoutingCase() {
+  PrefillReferenceCase test_case;
+  test_case.token_count = 24;
+  test_case.hidden_size = 2688;
+  test_case.routed_expert_intermediate_size = 1856;
+  test_case.shared_expert_intermediate_size = 3712;
+  test_case.n_routed_experts = 128;
+  test_case.top_k = 6;
+  test_case.input = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      71,
+      0.015625f);
+  test_case.normalized = MakePatternedValues(
+      test_case.token_count,
+      test_case.hidden_size,
+      73,
+      0.01171875f);
+
+  const std::vector<float> gate_weight = MakePatternedValues(
+      test_case.n_routed_experts,
+      test_case.hidden_size,
+      11,
+      0.0025f);
+  const std::vector<float> gate_bias(test_case.n_routed_experts, 0.0f);
+  const std::vector<float> router_logits = RowMajorMatmul(
+      test_case.normalized,
+      test_case.token_count,
+      test_case.hidden_size,
+      gate_weight,
+      test_case.n_routed_experts);
+
+  test_case.topk_ids.reserve(test_case.token_count * test_case.top_k);
+  test_case.topk_weights.reserve(test_case.token_count * test_case.top_k);
+  for (std::size_t token_index = 0; token_index < test_case.token_count; ++token_index) {
+    std::vector<float> scores(test_case.n_routed_experts, 0.0f);
+    std::vector<std::pair<float, int>> scored_experts;
+    scored_experts.reserve(test_case.n_routed_experts);
+    for (std::size_t expert_index = 0; expert_index < test_case.n_routed_experts; ++expert_index) {
+      const float router_value =
+          router_logits[token_index * test_case.n_routed_experts + expert_index];
+      scores[expert_index] = Sigmoid(router_value);
+      scored_experts.emplace_back(scores[expert_index] + gate_bias[expert_index],
+                                  static_cast<int>(expert_index));
+    }
+    std::partial_sort(
+        scored_experts.begin(),
+        scored_experts.begin() + test_case.top_k,
+        scored_experts.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+    float weight_sum = 0.0f;
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const int expert_index = scored_experts[slot].second;
+      test_case.topk_ids.push_back(expert_index);
+      const float weight = scores[static_cast<std::size_t>(expert_index)];
+      test_case.topk_weights.push_back(weight);
+      weight_sum += weight;
+    }
+    const float denominator = weight_sum + 1.0e-20f;
+    for (std::size_t slot = 0; slot < test_case.top_k; ++slot) {
+      const std::size_t offset = token_index * test_case.top_k + slot;
+      test_case.topk_weights[offset] =
+          (test_case.topk_weights[offset] / denominator) * 5.0f;
+    }
+  }
+
+  test_case.routed_up = {
+      MakePatternedValues(
+          test_case.routed_expert_intermediate_size,
+          test_case.hidden_size,
+          67,
+          0.0078125f),
+  };
+  test_case.routed_down = {
+      MakePatternedValues(
+          test_case.hidden_size,
+          test_case.routed_expert_intermediate_size,
+          101,
+          0.0078125f),
+  };
+  test_case.shared_up = MakePatternedValues(
+      test_case.shared_expert_intermediate_size,
+      test_case.hidden_size,
+      43,
+      0.0068359375f);
+  test_case.shared_down = MakePatternedValues(
+      test_case.hidden_size,
+      test_case.shared_expert_intermediate_size,
+      59,
       0.0068359375f);
   return test_case;
 }
@@ -1497,13 +1813,15 @@ bool TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() {
       "prefill output should equal routed + shared contributions");
 }
 
-bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
+bool RunNanoDeploymentCaseMatchesReference(
+    const PrefillReferenceCase& test_case,
+    const char* case_name,
+    NanoCaseCapture* capture = nullptr,
+    bool check_reference = true) {
   if (!HasCudaDevice()) {
     std::cout << "fused_moe_prefill_test: SKIP (no CUDA device)\n";
     return true;
   }
-
-  const PrefillReferenceCase test_case = BuildNanoDeploymentCase();
   auto routed_up = UploadRepeatedWeights(
       test_case.routed_up.front(),
       test_case.n_routed_experts,
@@ -1527,7 +1845,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               routed_down.has_value() &&
               shared_up.has_value() &&
               shared_down.has_value(),
-          "Nano deployment-shape weights should upload")) {
+          std::string(case_name) + " weights should upload")) {
     return false;
   }
   auto routed_up_views_device =
@@ -1537,7 +1855,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   if (!Expect(
           routed_up_views_device != nullptr &&
               routed_down_views_device != nullptr,
-          "Nano deployment-shape weight-view tables should upload")) {
+          std::string(case_name) + " weight-view tables should upload")) {
     return false;
   }
 
@@ -1622,25 +1940,25 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               gemm1_output_bf16 != nullptr &&
               expert_up_scratch != nullptr &&
               shared_up_scratch != nullptr,
-          "Nano deployment-shape tensors should allocate") ||
+          std::string(case_name) + " tensors should allocate") ||
       !Expect(input->CopyFromHost(test_case.input.data(), test_case.input.size()),
-              "Nano deployment-shape input should upload") ||
+              std::string(case_name) + " input should upload") ||
       !Expect(
           normalized->CopyFromHost(
               test_case.normalized.data(),
               test_case.normalized.size()),
-          "Nano deployment-shape normalized should upload") ||
+          std::string(case_name) + " normalized should upload") ||
       !Expect(
           topk_ids->CopyFromHost(test_case.topk_ids.data(), test_case.topk_ids.size()),
-          "Nano deployment-shape topk ids should upload") ||
+          std::string(case_name) + " topk ids should upload") ||
       !Expect(
           topk_weights->CopyFromHost(
               test_case.topk_weights.data(),
               test_case.topk_weights.size()),
-          "Nano deployment-shape topk weights should upload") ||
+          std::string(case_name) + " topk weights should upload") ||
       !Expect(
           normalized_pack->PackInto(*normalized, pack_options),
-          "Nano deployment-shape normalized pack should build")) {
+          std::string(case_name) + " normalized pack should build")) {
     return false;
   }
 
@@ -1678,9 +1996,9 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   params.output = output->data();
   params.routed_output = routed_output->data();
   params.shared_output = shared_output->data();
-  if (!Expect(RunFusedMoePrefill(params), "Nano deployment-shape prefill should launch") ||
+  if (!Expect(RunFusedMoePrefill(params), std::string(case_name) + " prefill should launch") ||
       !Expect(cudaDeviceSynchronize() == cudaSuccess,
-              "Nano deployment-shape prefill should synchronize")) {
+              std::string(case_name) + " prefill should synchronize")) {
     return false;
   }
 
@@ -1688,18 +2006,72 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
   std::vector<float> actual_routed_output(routed_output->numel(), 0.0f);
   std::vector<float> actual_shared_output(shared_output->numel(), 0.0f);
   if (!Expect(output->CopyToHost(actual_output.data(), actual_output.size()),
-              "Nano deployment-shape output should copy to host") ||
+              std::string(case_name) + " output should copy to host") ||
       !Expect(
           routed_output->CopyToHost(
               actual_routed_output.data(),
               actual_routed_output.size()),
-          "Nano deployment-shape routed output should copy to host") ||
+          std::string(case_name) + " routed output should copy to host") ||
       !Expect(
           shared_output->CopyToHost(
               actual_shared_output.data(),
               actual_shared_output.size()),
-          "Nano deployment-shape shared output should copy to host")) {
+              std::string(case_name) + " shared output should copy to host")) {
     return false;
+  }
+  if (capture != nullptr) {
+    capture->output = actual_output;
+    capture->routed_output = actual_routed_output;
+    capture->shared_output = actual_shared_output;
+    capture->routed_grouped_output.assign(routed_gather_scratch->numel(), 0.0f);
+    capture->gemm1_output_scales.assign(gemm1_output_scales->numel(), 0.0f);
+    if (!Expect(
+            routed_gather_scratch->CopyToHost(
+                capture->routed_grouped_output.data(),
+                capture->routed_grouped_output.size()),
+            std::string(case_name) + " routed grouped output should copy to host") ||
+        !Expect(
+            gemm1_output_scales->CopyToHost(
+                capture->gemm1_output_scales.data(),
+                capture->gemm1_output_scales.size()),
+            std::string(case_name) + " gemm1 output scales should copy to host") ||
+        !Expect(
+            fc2_grouped_pack->CopyPackedToHost(&capture->fc2_packed),
+            std::string(case_name) + " fc2 packed data should copy to host") ||
+        !Expect(
+            fc2_grouped_pack->CopyBlockScalesToHost(&capture->fc2_block_scales),
+            std::string(case_name) + " fc2 block scales should copy to host") ||
+        !Expect(
+            fc2_grouped_pack->CopyMatmulBlockScalesToHost(&capture->fc2_matmul_block_scales),
+            std::string(case_name) + " fc2 matmul block scales should copy to host") ||
+        !Expect(
+            fc2_grouped_pack->CopyTensorScaleToHost(&capture->fc2_tensor_scale),
+            std::string(case_name) + " fc2 tensor scale should copy to host")) {
+      return false;
+    }
+    const int cta_count = launch_plan->exact_cta_count_host();
+    capture->cta_row_starts.assign(static_cast<std::size_t>(cta_count), 0);
+    capture->cta_valid_rows.assign(static_cast<std::size_t>(cta_count), 0);
+    capture->cta_expert_ids.assign(static_cast<std::size_t>(cta_count), 0);
+    if (cta_count > 0) {
+      if (!Expect(
+              cudaMemcpy(
+                  capture->cta_expert_ids.data(),
+                  launch_plan->cta_expert_ids(),
+                  sizeof(int) * static_cast<std::size_t>(cta_count),
+                  cudaMemcpyDeviceToHost) == cudaSuccess,
+              std::string(case_name) + " cta expert ids should copy to host")) {
+        return false;
+      }
+      std::copy(
+          launch_plan->cta_row_starts_host(),
+          launch_plan->cta_row_starts_host() + cta_count,
+          capture->cta_row_starts.begin());
+      std::copy(
+          launch_plan->cta_valid_rows_host(),
+          launch_plan->cta_valid_rows_host() + cta_count,
+          capture->cta_valid_rows.begin());
+    }
   }
 
   std::vector<float> expected_output;
@@ -1715,7 +2087,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
               &expected_output,
               &expected_routed_output,
               &expected_shared_output),
-          "Nano deployment-shape CPU reference should build")) {
+          std::string(case_name) + " CPU reference should build")) {
     return false;
   }
 
@@ -1724,15 +2096,16 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
       MaxAbsDiff(actual_routed_output, expected_routed_output);
   const float shared_diff =
       MaxAbsDiff(actual_shared_output, expected_shared_output);
-  if (!Expect(
-          output_diff <= kNanoPackedContractTolerance,
-          "Nano deployment-shape output should stay within the packed-contract budget") ||
-      !Expect(
-          routed_diff <= kNanoPackedContractTolerance,
-          "Nano deployment-shape routed output should stay within the packed-contract budget") ||
-      !Expect(
-          shared_diff <= kMaxAbsDiffTolerance,
-          "Nano deployment-shape shared output should match reference")) {
+  if (check_reference &&
+      (!Expect(
+           output_diff <= kNanoPackedContractTolerance,
+           std::string(case_name) + " output should stay within the packed-contract budget") ||
+       !Expect(
+           routed_diff <= kNanoPackedContractTolerance,
+           std::string(case_name) + " routed output should stay within the packed-contract budget") ||
+       !Expect(
+           shared_diff <= kMaxAbsDiffTolerance,
+           std::string(case_name) + " shared output should match reference"))) {
     if (std::getenv("NEMOTRON_P15_DEBUG") != nullptr) {
       DumpNanoP15GroupedPackDebug(
           test_case,
@@ -1743,9 +2116,9 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
           *fc2_grouped_pack,
           *routed_gather_scratch);
     }
-    std::cerr << "nano_prefill_output_max_abs_diff=" << output_diff << "\n";
-    std::cerr << "nano_prefill_routed_max_abs_diff=" << routed_diff << "\n";
-    std::cerr << "nano_prefill_shared_max_abs_diff=" << shared_diff << "\n";
+    std::cerr << case_name << "_output_max_abs_diff=" << output_diff << "\n";
+    std::cerr << case_name << "_routed_max_abs_diff=" << routed_diff << "\n";
+    std::cerr << case_name << "_shared_max_abs_diff=" << shared_diff << "\n";
     std::size_t worst_index = 0;
     float worst_abs = 0.0f;
     for (std::size_t i = 0; i < actual_routed_output.size(); ++i) {
@@ -1755,7 +2128,7 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
         worst_index = i;
       }
     }
-    std::cerr << "nano_prefill_worst_routed_index=" << worst_index
+    std::cerr << case_name << "_worst_routed_index=" << worst_index
               << " actual=" << actual_routed_output[worst_index]
               << " expected=" << expected_routed_output[worst_index] << "\n";
     return false;
@@ -1766,9 +2139,603 @@ bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
     recomposed_output[index] =
         actual_routed_output[index] + actual_shared_output[index];
   }
-  return Expect(
-      MaxAbsDiff(actual_output, recomposed_output) <= kMaxAbsDiffTolerance,
-      "Nano deployment-shape output should equal routed + shared contributions");
+  return !check_reference ||
+         Expect(
+             MaxAbsDiff(actual_output, recomposed_output) <= kMaxAbsDiffTolerance,
+             std::string(case_name) + " output should equal routed + shared contributions");
+}
+
+bool TestFusedMoePrefillNanoDeploymentShapeMatchesReference() {
+  return RunNanoDeploymentCaseMatchesReference(
+      BuildNanoDeploymentCase(),
+      "nano_deployment_shape");
+}
+
+bool TestFusedMoePrefillNanoP13DispatchMatchesReference() {
+  return RunNanoDeploymentCaseMatchesReference(
+      BuildNanoP13DispatchCase(),
+      "nano_p13_dispatch24");
+}
+
+bool TestFusedMoePrefillNanoP13SingleRowMatchesReferenceIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_SINGLE_ROW") == nullptr) {
+    return true;
+  }
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_force_legacy_p13("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  if (!RunNanoDeploymentCaseMatchesReference(
+          BuildNanoP13SingleRowCase(),
+          "nano_p13_dispatch1_native")) {
+    return false;
+  }
+
+  setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13", "1", 1);
+  return RunNanoDeploymentCaseMatchesReference(
+      BuildNanoP13SingleRowCase(),
+      "nano_p13_dispatch1_legacy");
+}
+
+bool TestFusedMoePrefillNanoExpertLayerRoutingMatchesReferenceIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_EXPERT_LAYER_ROUTING_CASE") == nullptr) {
+    return true;
+  }
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+  return RunNanoDeploymentCaseMatchesReference(
+      BuildNanoExpertLayerRoutingCase(),
+      "nano_expert_layer_routing24");
+}
+
+bool TestFusedMoePrefillNanoP13ScaleMapProbeIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_SCALE_MAP_PROBE") == nullptr) {
+    return true;
+  }
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_old_p13("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL");
+  ScopedEnvVar scoped_p13_scale_debug("NEMOTRON_P13_SCALE_DEBUG");
+  ScopedEnvVar scoped_p13_scale_map_probe("NEMOTRON_P13_SCALE_MAP_PROBE");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+  setenv("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL", "1", 1);
+  setenv("NEMOTRON_P13_SCALE_DEBUG", "1", 1);
+  setenv("NEMOTRON_P13_SCALE_MAP_PROBE", "1", 1);
+  return RunNanoDeploymentCaseMatchesReference(
+      BuildNanoP13ScaleMapProbeCase(),
+      "nano_p13_scale_map_probe",
+      nullptr,
+      false);
+}
+
+bool TestFusedMoePrefillNanoP13FragmentCompareIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_FRAGMENT_COMPARE") == nullptr) {
+    return true;
+  }
+  const bool single_row =
+      std::getenv("NEMOTRON_RUN_NANO_P13_FRAGMENT_COMPARE_SINGLE_ROW") != nullptr;
+  const PrefillReferenceCase test_case =
+      single_row ? BuildNanoP13SingleRowCase() : BuildNanoP13DispatchCase();
+  const char* case_prefix = single_row ? "nano_p13_fragment_compare_dispatch1"
+                                       : "nano_p13_fragment_compare_dispatch24";
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_old_p13("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL");
+  ScopedEnvVar scoped_p13_debug_trace("NEMOTRON_P13_DEBUG_TRACE");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+  setenv("NEMOTRON_P13_DEBUG_TRACE", "1", 1);
+
+  nemotron::ResetP13DebugTrace();
+  unsetenv("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL");
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          std::string(case_prefix).append("_native").c_str(),
+          nullptr,
+          false)) {
+    return false;
+  }
+  nemotron::P13DebugTrace native_trace;
+  if (!Expect(CopyP13DebugTrace(&native_trace),
+              "nano p13 native debug trace should copy")) {
+    return false;
+  }
+
+  nemotron::ResetP13DebugTrace();
+  setenv("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL", "1", 1);
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          std::string(case_prefix).append("_legacy").c_str(),
+          nullptr,
+          false)) {
+    return false;
+  }
+  nemotron::P13DebugTrace legacy_trace;
+  if (!Expect(CopyP13DebugTrace(&legacy_trace),
+              "nano p13 legacy debug trace should copy")) {
+    return false;
+  }
+
+  float block0_accum_max_abs_diff = 0.0f;
+  float accum_max_abs_diff = 0.0f;
+  bool a_scale_match = true;
+  bool b_scale_match = true;
+  bool store_coords_match = true;
+  for (int m = 0; m < 2; ++m) {
+    a_scale_match = a_scale_match &&
+                    native_trace.a_scale_words[m] == legacy_trace.a_scale_words[m];
+    for (int reg = 0; reg < 4; ++reg) {
+      for (int n = 0; n < 2; ++n) {
+        block0_accum_max_abs_diff = std::max(
+            block0_accum_max_abs_diff,
+            std::fabs(
+                native_trace.block0_accum_regs[m][n][reg] -
+                legacy_trace.block0_accum_regs[m][n][reg]));
+      }
+      for (int n = 0; n < 2; ++n) {
+        accum_max_abs_diff = std::max(
+            accum_max_abs_diff,
+            std::fabs(
+                native_trace.accum_regs[m][n][reg] -
+                legacy_trace.accum_regs[m][n][reg]));
+      }
+    }
+  }
+  for (int n = 0; n < 2; ++n) {
+    b_scale_match = b_scale_match &&
+                    native_trace.b_scale_words[n] == legacy_trace.b_scale_words[n];
+  }
+  for (int physical = 0; physical < 16; ++physical) {
+    store_coords_match = store_coords_match &&
+                         native_trace.store_rows[physical] == legacy_trace.store_rows[physical] &&
+                         native_trace.store_cols[physical] == legacy_trace.store_cols[physical];
+  }
+
+  std::cout << "fused_moe_prefill_test: " << case_prefix
+            << " native_valid=" << native_trace.valid
+            << " legacy_valid=" << legacy_trace.valid
+            << " block0_accum_max_abs_diff=" << block0_accum_max_abs_diff
+            << " accum_max_abs_diff=" << accum_max_abs_diff
+            << " a_scale_match=" << (a_scale_match ? 1 : 0)
+            << " b_scale_match=" << (b_scale_match ? 1 : 0)
+            << " store_coords_match=" << (store_coords_match ? 1 : 0)
+            << "\n";
+
+  return Expect(native_trace.valid != 0 && legacy_trace.valid != 0,
+                "nano p13 fragment traces should be valid") &&
+         Expect(a_scale_match,
+                "nano p13 A scale words should match between native and legacy") &&
+         Expect(b_scale_match,
+                "nano p13 B scale words should match between native and legacy") &&
+         Expect(store_coords_match,
+                "nano p13 store coords should match between native and legacy") &&
+         Expect(block0_accum_max_abs_diff <= kMaxAbsDiffTolerance,
+                "nano p13 first macro-k accumulators should match between native and legacy") &&
+         Expect(accum_max_abs_diff <= kMaxAbsDiffTolerance,
+                "nano p13 accumulator registers should match between native and legacy");
+}
+
+bool TestFusedMoePrefillNanoP13NativeSingleVsMultiTraceIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_NATIVE_SINGLE_MULTI_TRACE") == nullptr) {
+    return true;
+  }
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_old_p13("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL");
+  ScopedEnvVar scoped_p13_debug_trace("NEMOTRON_P13_DEBUG_TRACE");
+  ScopedEnvVar scoped_target_valid_rows("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+  setenv("NEMOTRON_P13_DEBUG_TRACE", "1", 1);
+  unsetenv("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL");
+
+  nemotron::ResetP13DebugTrace();
+  setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS", "1", 1);
+  if (!RunNanoDeploymentCaseMatchesReference(
+          BuildNanoP13SingleRowCase(),
+          "nano_p13_native_trace_dispatch1",
+          nullptr,
+          true)) {
+    return false;
+  }
+  nemotron::P13DebugTrace single_trace;
+  if (!Expect(CopyP13DebugTrace(&single_trace),
+              "nano p13 single-row native debug trace should copy")) {
+    return false;
+  }
+
+  nemotron::ResetP13DebugTrace();
+  setenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS", "8", 1);
+  if (!RunNanoDeploymentCaseMatchesReference(
+          BuildNanoExpertLayerRoutingCase(),
+          "nano_p13_native_trace_expert_routing24",
+          nullptr,
+          false)) {
+    return false;
+  }
+  nemotron::P13DebugTrace multi_trace;
+  if (!Expect(CopyP13DebugTrace(&multi_trace),
+              "nano p13 multi-row native debug trace should copy")) {
+    return false;
+  }
+
+  int single_valid_b_coords = 0;
+  int multi_valid_b_coords = 0;
+  int single_valid_a_coords = 0;
+  int multi_valid_a_coords = 0;
+  for (int physical = 0; physical < 32; ++physical) {
+    if (single_trace.a_copy_rows[physical] >= 0 &&
+        single_trace.a_copy_rows[physical] < single_trace.valid_rows) {
+      ++single_valid_a_coords;
+    }
+    if (multi_trace.a_copy_rows[physical] >= 0 &&
+        multi_trace.a_copy_rows[physical] < multi_trace.valid_rows) {
+      ++multi_valid_a_coords;
+    }
+  }
+  for (int physical = 0; physical < 16; ++physical) {
+    if (single_trace.b_copy_rows[physical] >= 0 &&
+        single_trace.b_copy_rows[physical] < single_trace.valid_rows) {
+      ++single_valid_b_coords;
+    }
+    if (multi_trace.b_copy_rows[physical] >= 0 &&
+        multi_trace.b_copy_rows[physical] < multi_trace.valid_rows) {
+      ++multi_valid_b_coords;
+    }
+  }
+
+  std::cout << "fused_moe_prefill_test: nano_p13_native_single_multi_trace"
+            << " single_valid_rows=" << single_trace.valid_rows
+            << " multi_valid_rows=" << multi_trace.valid_rows
+            << " single_block0_accum00_reg0=" << single_trace.block0_accum_regs[0][0][0]
+            << " multi_block0_accum00_reg0=" << multi_trace.block0_accum_regs[0][0][0]
+            << " single_valid_a_coords=" << single_valid_a_coords
+            << " multi_valid_a_coords=" << multi_valid_a_coords
+            << " single_valid_b_coords=" << single_valid_b_coords
+            << " multi_valid_b_coords=" << multi_valid_b_coords
+            << "\n";
+  for (int physical = 0; physical < 32; ++physical) {
+    std::cout << "fused_moe_prefill_test: nano_p13_a_copy_coord"
+              << " physical=" << physical
+              << " single_row=" << single_trace.a_copy_rows[physical]
+              << " single_col=" << single_trace.a_copy_cols[physical]
+              << " single_raw=" << static_cast<int>(single_trace.a_copy_raw[physical])
+              << " multi_row=" << multi_trace.a_copy_rows[physical]
+              << " multi_col=" << multi_trace.a_copy_cols[physical]
+              << " multi_raw=" << static_cast<int>(multi_trace.a_copy_raw[physical])
+              << "\n";
+  }
+  for (int physical = 0; physical < 16; ++physical) {
+    std::cout << "fused_moe_prefill_test: nano_p13_b_copy_coord"
+              << " physical=" << physical
+              << " single_row=" << single_trace.b_copy_rows[physical]
+              << " single_col=" << single_trace.b_copy_cols[physical]
+              << " multi_row=" << multi_trace.b_copy_rows[physical]
+              << " multi_col=" << multi_trace.b_copy_cols[physical]
+              << "\n";
+  }
+  return true;
+}
+
+void PrintNanoCaseGroupedRowDiffSummary(
+    const char* label,
+    const PrefillReferenceCase& test_case,
+    const NanoCaseCapture& native_capture,
+    const NanoCaseCapture& legacy_capture) {
+  struct RowDiff {
+    float abs_diff = 0.0f;
+    std::size_t row = 0;
+  };
+  struct BucketSummary {
+    float max_abs_diff = 0.0f;
+    int nonzero_rows = 0;
+  };
+  std::vector<RowDiff> top_row_diffs;
+  std::vector<BucketSummary> bucket_summaries(9u * 8u);
+  const std::size_t padded_rows =
+      native_capture.routed_grouped_output.size() / test_case.hidden_size;
+  for (std::size_t row = 0; row < padded_rows; ++row) {
+    float row_max = 0.0f;
+    for (std::size_t col = 0; col < test_case.hidden_size; ++col) {
+      const std::size_t index = row * test_case.hidden_size + col;
+      row_max = std::max(
+          row_max,
+          std::fabs(
+              native_capture.routed_grouped_output[index] -
+              legacy_capture.routed_grouped_output[index]));
+    }
+    if (row_max == 0.0f) {
+      continue;
+    }
+    for (std::size_t i = 0; i < native_capture.cta_row_starts.size(); ++i) {
+      const int start = native_capture.cta_row_starts[i];
+      const int valid = native_capture.cta_valid_rows[i];
+      if (static_cast<int>(row) >= start &&
+          static_cast<int>(row) < (start + valid)) {
+        const int local_offset = static_cast<int>(row) - start;
+        BucketSummary& bucket =
+            bucket_summaries[static_cast<std::size_t>(valid) * 8u +
+                             static_cast<std::size_t>(local_offset)];
+        bucket.nonzero_rows += 1;
+        bucket.max_abs_diff = std::max(bucket.max_abs_diff, row_max);
+        break;
+      }
+    }
+    if (top_row_diffs.size() < 12) {
+      top_row_diffs.push_back({row_max, row});
+    } else {
+      auto min_it = std::min_element(
+          top_row_diffs.begin(),
+          top_row_diffs.end(),
+          [](const RowDiff& lhs, const RowDiff& rhs) { return lhs.abs_diff < rhs.abs_diff; });
+      if (row_max > min_it->abs_diff) {
+        *min_it = {row_max, row};
+      }
+    }
+  }
+  std::sort(
+      top_row_diffs.begin(),
+      top_row_diffs.end(),
+      [](const RowDiff& lhs, const RowDiff& rhs) { return lhs.abs_diff > rhs.abs_diff; });
+  for (const RowDiff& diff_entry : top_row_diffs) {
+    int cta_index = -1;
+    int expert_id = -1;
+    int row_start = -1;
+    int valid_rows = -1;
+    int local_offset = -1;
+    for (std::size_t i = 0; i < native_capture.cta_row_starts.size(); ++i) {
+      const int start = native_capture.cta_row_starts[i];
+      const int valid = native_capture.cta_valid_rows[i];
+      if (static_cast<int>(diff_entry.row) >= start &&
+          static_cast<int>(diff_entry.row) < (start + valid)) {
+        cta_index = static_cast<int>(i);
+        expert_id = native_capture.cta_expert_ids[i];
+        row_start = start;
+        valid_rows = valid;
+        local_offset = static_cast<int>(diff_entry.row) - start;
+        break;
+      }
+    }
+    float alias_row_diff = -1.0f;
+    if (local_offset >= 0 &&
+        static_cast<std::size_t>(local_offset) <
+            (legacy_capture.routed_grouped_output.size() / test_case.hidden_size)) {
+      alias_row_diff = 0.0f;
+      for (std::size_t col = 0; col < test_case.hidden_size; ++col) {
+        const std::size_t native_index = diff_entry.row * test_case.hidden_size + col;
+        const std::size_t alias_index =
+            static_cast<std::size_t>(local_offset) * test_case.hidden_size + col;
+        alias_row_diff = std::max(
+            alias_row_diff,
+            std::fabs(
+                native_capture.routed_grouped_output[native_index] -
+                legacy_capture.routed_grouped_output[alias_index]));
+      }
+    }
+    std::cout << "fused_moe_prefill_test: " << label
+              << "_row_diff row=" << diff_entry.row
+              << " max_abs_diff=" << diff_entry.abs_diff
+              << " cta=" << cta_index
+              << " expert=" << expert_id
+              << " row_start=" << row_start
+              << " valid_rows=" << valid_rows
+              << " local_offset=" << local_offset
+              << " alias_row=" << local_offset
+              << " alias_max_abs_diff=" << alias_row_diff
+              << "\n";
+  }
+  for (int valid_rows = 1; valid_rows <= 8; ++valid_rows) {
+    for (int local_offset = 0; local_offset < valid_rows; ++local_offset) {
+      const BucketSummary& bucket =
+          bucket_summaries[static_cast<std::size_t>(valid_rows) * 8u +
+                           static_cast<std::size_t>(local_offset)];
+      if (bucket.nonzero_rows == 0) {
+        continue;
+      }
+      std::cout << "fused_moe_prefill_test: " << label
+                << "_bucket valid_rows=" << valid_rows
+                << " local_offset=" << local_offset
+                << " nonzero_rows=" << bucket.nonzero_rows
+                << " max_abs_diff=" << bucket.max_abs_diff
+                << "\n";
+    }
+  }
+}
+
+bool TestFusedMoePrefillNanoP13OutputCompareIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_OUTPUT_COMPARE") == nullptr) {
+    return true;
+  }
+  const PrefillReferenceCase test_case = BuildNanoP13DispatchCase();
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_force_legacy_p13("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  NanoCaseCapture native_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_p13_dispatch24_native",
+          &native_capture,
+          false)) {
+    return false;
+  }
+
+  setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13", "1", 1);
+  NanoCaseCapture legacy_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_p13_dispatch24_legacy",
+          &legacy_capture,
+          false)) {
+    return false;
+  }
+
+  const float output_diff = MaxAbsDiff(native_capture.output, legacy_capture.output);
+  const float routed_diff =
+      MaxAbsDiff(native_capture.routed_output, legacy_capture.routed_output);
+  const float shared_diff =
+      MaxAbsDiff(native_capture.shared_output, legacy_capture.shared_output);
+  const float gemm1_scale_diff =
+      MaxAbsDiff(native_capture.gemm1_output_scales, legacy_capture.gemm1_output_scales);
+  const bool packed_match = native_capture.fc2_packed == legacy_capture.fc2_packed;
+  const bool block_scales_match =
+      native_capture.fc2_block_scales == legacy_capture.fc2_block_scales;
+  const bool matmul_block_scales_match =
+      native_capture.fc2_matmul_block_scales == legacy_capture.fc2_matmul_block_scales;
+  const float tensor_scale_diff =
+      std::fabs(native_capture.fc2_tensor_scale - legacy_capture.fc2_tensor_scale);
+
+  std::cout << "fused_moe_prefill_test: nano_p13_output_compare"
+            << " output_max_abs_diff=" << output_diff
+            << " routed_max_abs_diff=" << routed_diff
+            << " shared_max_abs_diff=" << shared_diff
+            << " gemm1_scale_max_abs_diff=" << gemm1_scale_diff
+            << " packed_match=" << (packed_match ? 1 : 0)
+            << " block_scales_match=" << (block_scales_match ? 1 : 0)
+            << " matmul_block_scales_match=" << (matmul_block_scales_match ? 1 : 0)
+            << " tensor_scale_abs_diff=" << tensor_scale_diff
+            << "\n";
+  PrintNanoCaseGroupedRowDiffSummary(
+      "nano_p13_output_compare",
+      test_case,
+      native_capture,
+      legacy_capture);
+
+  return Expect(shared_diff <= kMaxAbsDiffTolerance,
+                "nano p13 output compare shared output should stay identical across FC2 modes") &&
+         Expect(gemm1_scale_diff <= kMaxAbsDiffTolerance,
+                "nano p13 output compare gemm1 output scales should stay identical across FC2 modes") &&
+         Expect(packed_match,
+                "nano p13 output compare fc2 packed data should stay identical across FC2 modes") &&
+         Expect(block_scales_match,
+                "nano p13 output compare fc2 block scales should stay identical across FC2 modes") &&
+         Expect(matmul_block_scales_match,
+                "nano p13 output compare fc2 matmul block scales should stay identical across FC2 modes") &&
+         Expect(tensor_scale_diff <= kMaxAbsDiffTolerance,
+                "nano p13 output compare fc2 tensor scale should stay identical across FC2 modes");
+}
+
+bool TestFusedMoePrefillNanoDeploymentP13OutputCompareIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_DEPLOYMENT_P13_OUTPUT_COMPARE") == nullptr) {
+    return true;
+  }
+  const PrefillReferenceCase test_case = BuildNanoDeploymentCase();
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_force_legacy_p13("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  NanoCaseCapture native_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_deployment_p13_native",
+          &native_capture,
+          false)) {
+    return false;
+  }
+
+  setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13", "1", 1);
+  NanoCaseCapture legacy_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_deployment_p13_legacy",
+          &legacy_capture,
+          false)) {
+    return false;
+  }
+
+  const float output_diff = MaxAbsDiff(native_capture.output, legacy_capture.output);
+  const float routed_diff =
+      MaxAbsDiff(native_capture.routed_output, legacy_capture.routed_output);
+  const float shared_diff =
+      MaxAbsDiff(native_capture.shared_output, legacy_capture.shared_output);
+
+  std::cout << "fused_moe_prefill_test: nano_deployment_p13_output_compare"
+            << " output_max_abs_diff=" << output_diff
+            << " routed_max_abs_diff=" << routed_diff
+            << " shared_max_abs_diff=" << shared_diff
+            << "\n";
+  PrintNanoCaseGroupedRowDiffSummary(
+      "nano_deployment_p13_output_compare",
+      test_case,
+      native_capture,
+      legacy_capture);
+
+  return Expect(shared_diff <= kMaxAbsDiffTolerance,
+                "nano deployment p13 output compare shared output should stay identical across FC2 modes");
+}
+
+bool TestFusedMoePrefillNanoExpertLayerRoutingNativeVsLegacyIfRequested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_EXPERT_LAYER_ROUTING_COMPARE") == nullptr) {
+    return true;
+  }
+
+  const PrefillReferenceCase test_case = BuildNanoExpertLayerRoutingCase();
+  ScopedEnvVar scoped_dispatch_rows("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH");
+  ScopedEnvVar scoped_force_legacy_p13("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  setenv("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH", "1", 1);
+
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  NanoCaseCapture native_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_expert_layer_routing24_native",
+          &native_capture,
+          false)) {
+    return false;
+  }
+
+  setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13", "1", 1);
+  NanoCaseCapture legacy_capture;
+  if (!RunNanoDeploymentCaseMatchesReference(
+          test_case,
+          "nano_expert_layer_routing24_legacy",
+          &legacy_capture,
+          false)) {
+    return false;
+  }
+
+  const float output_diff = MaxAbsDiff(native_capture.output, legacy_capture.output);
+  const float routed_diff =
+      MaxAbsDiff(native_capture.routed_output, legacy_capture.routed_output);
+  const float shared_diff =
+      MaxAbsDiff(native_capture.shared_output, legacy_capture.shared_output);
+  const float gemm1_scale_diff =
+      MaxAbsDiff(native_capture.gemm1_output_scales, legacy_capture.gemm1_output_scales);
+  const bool packed_match = native_capture.fc2_packed == legacy_capture.fc2_packed;
+  const bool block_scales_match =
+      native_capture.fc2_block_scales == legacy_capture.fc2_block_scales;
+  const bool matmul_block_scales_match =
+      native_capture.fc2_matmul_block_scales == legacy_capture.fc2_matmul_block_scales;
+  const float tensor_scale_diff =
+      std::fabs(native_capture.fc2_tensor_scale - legacy_capture.fc2_tensor_scale);
+
+  std::cout << "fused_moe_prefill_test: nano_expert_layer_routing_compare"
+            << " output_max_abs_diff=" << output_diff
+            << " routed_max_abs_diff=" << routed_diff
+            << " shared_max_abs_diff=" << shared_diff
+            << " gemm1_scale_max_abs_diff=" << gemm1_scale_diff
+            << " packed_match=" << (packed_match ? 1 : 0)
+            << " block_scales_match=" << (block_scales_match ? 1 : 0)
+            << " matmul_block_scales_match=" << (matmul_block_scales_match ? 1 : 0)
+            << " tensor_scale_abs_diff=" << tensor_scale_diff
+            << "\n";
+
+  PrintNanoCaseGroupedRowDiffSummary(
+      "nano_expert_layer_routing",
+      test_case,
+      native_capture,
+      legacy_capture);
+
+  return Expect(shared_diff <= kMaxAbsDiffTolerance,
+                "nano expert-layer routing shared output should stay identical across FC2 modes") &&
+         Expect(gemm1_scale_diff <= kMaxAbsDiffTolerance,
+                "nano expert-layer routing gemm1 output scales should stay identical across FC2 modes") &&
+         Expect(packed_match,
+                "nano expert-layer routing fc2 packed data should stay identical across FC2 modes") &&
+         Expect(block_scales_match,
+                "nano expert-layer routing fc2 block scales should stay identical across FC2 modes") &&
+         Expect(matmul_block_scales_match,
+                "nano expert-layer routing fc2 matmul block scales should stay identical across FC2 modes") &&
+         Expect(tensor_scale_diff <= kMaxAbsDiffTolerance,
+                "nano expert-layer routing fc2 tensor scale should stay identical across FC2 modes");
 }
 
 }  // namespace
@@ -1778,7 +2745,16 @@ int main() {
       TestFusedMoePrefillRejectsMissingSelectionContract() &&
       TestP5TmaDescriptorViewsReachDeviceWeightTable() &&
       TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() &&
-      TestFusedMoePrefillNanoDeploymentShapeMatchesReference();
+      TestFusedMoePrefillNanoDeploymentShapeMatchesReference() &&
+      TestFusedMoePrefillNanoP13DispatchMatchesReference() &&
+      TestFusedMoePrefillNanoP13SingleRowMatchesReferenceIfRequested() &&
+      TestFusedMoePrefillNanoP13ScaleMapProbeIfRequested() &&
+      TestFusedMoePrefillNanoP13FragmentCompareIfRequested() &&
+      TestFusedMoePrefillNanoP13NativeSingleVsMultiTraceIfRequested() &&
+      TestFusedMoePrefillNanoP13OutputCompareIfRequested() &&
+      TestFusedMoePrefillNanoDeploymentP13OutputCompareIfRequested() &&
+      TestFusedMoePrefillNanoExpertLayerRoutingMatchesReferenceIfRequested() &&
+      TestFusedMoePrefillNanoExpertLayerRoutingNativeVsLegacyIfRequested();
   if (!ok) {
     return 1;
   }

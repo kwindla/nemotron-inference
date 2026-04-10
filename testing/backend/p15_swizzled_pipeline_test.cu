@@ -1674,6 +1674,126 @@ int RunTest() {
     return 1;
   }
 
+  constexpr float kShortMultiKTolerance = 12.0f;
+  const int short_multi_k = 64;
+  const int short_multi_k_row_bytes = short_multi_k / 2;
+  const int short_multi_k_blocks = short_multi_k / 16;
+  auto make_short_tile_only = [&](
+                                  const std::vector<std::uint8_t>& source_packed,
+                                  const std::vector<std::uint8_t>& source_scales,
+                                  int tile_index)
+      -> std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>> {
+    std::vector<std::uint8_t> packed(
+        source_packed.size() / static_cast<std::size_t>(multi_k_row_bytes) *
+            static_cast<std::size_t>(short_multi_k_row_bytes),
+        0u);
+    std::vector<std::uint8_t> scales(
+        source_scales.size() / static_cast<std::size_t>(multi_k_blocks) *
+            static_cast<std::size_t>(short_multi_k_blocks),
+        0u);
+    const std::size_t packed_src_tile_offset =
+        static_cast<std::size_t>(tile_index * short_multi_k_row_bytes);
+    const std::size_t scale_src_tile_offset =
+        static_cast<std::size_t>(tile_index * short_multi_k_blocks);
+    const std::size_t row_count_packed =
+        source_packed.size() / static_cast<std::size_t>(multi_k_row_bytes);
+    const std::size_t row_count_scales =
+        source_scales.size() / static_cast<std::size_t>(multi_k_blocks);
+    for (std::size_t row = 0; row < row_count_packed; ++row) {
+      const std::size_t src_row_offset = row * static_cast<std::size_t>(multi_k_row_bytes);
+      const std::size_t dst_row_offset = row * static_cast<std::size_t>(short_multi_k_row_bytes);
+      std::copy_n(
+          source_packed.begin() + static_cast<std::ptrdiff_t>(src_row_offset + packed_src_tile_offset),
+          static_cast<std::size_t>(short_multi_k_row_bytes),
+          packed.begin() + static_cast<std::ptrdiff_t>(dst_row_offset));
+    }
+    for (std::size_t row = 0; row < row_count_scales; ++row) {
+      const std::size_t src_row_offset = row * static_cast<std::size_t>(multi_k_blocks);
+      const std::size_t dst_row_offset = row * static_cast<std::size_t>(short_multi_k_blocks);
+      std::copy_n(
+          source_scales.begin() + static_cast<std::ptrdiff_t>(src_row_offset + scale_src_tile_offset),
+          static_cast<std::size_t>(short_multi_k_blocks),
+          scales.begin() + static_cast<std::ptrdiff_t>(dst_row_offset));
+    }
+    return {std::move(packed), std::move(scales)};
+  };
+
+  {
+    auto scale_bytes_to_words = [&](const std::vector<std::uint8_t>& scale_bytes, int rows)
+        -> std::vector<std::uint32_t> {
+      std::vector<std::uint32_t> words(static_cast<std::size_t>(rows), 0u);
+      for (int row = 0; row < rows; ++row) {
+        const std::size_t row_offset =
+            static_cast<std::size_t>(row) * static_cast<std::size_t>(short_multi_k_blocks);
+        words[static_cast<std::size_t>(row)] =
+            nemotron::p15_scale_runtime::pack_scale_word4_bytes(
+                scale_bytes[row_offset + 0],
+                scale_bytes[row_offset + 1],
+                scale_bytes[row_offset + 2],
+                scale_bytes[row_offset + 3]);
+      }
+      return words;
+    };
+
+    auto [h_a_multi_tile0, h_a_multi_scales_tile0] =
+        make_short_tile_only(h_a_multi, h_a_multi_scale_bytes, 0);
+    auto [h_b_multi_rows2_tile0, h_b_multi_rows2_scales_tile0] =
+        make_short_tile_only(h_b_multi_rows2, h_b_multi_scale_rows2, 0);
+    if (RunRuntimeLikeExecScaleCaseMultiK(
+            "dispatch_rows_2_runtime_like_multi_k_tile0_only",
+            h_a_multi_tile0,
+            h_b_multi_rows2_tile0,
+            h_a_multi_scales_tile0,
+            h_b_multi_rows2_scales_tile0,
+            short_multi_k,
+            kShortMultiKTolerance) != 0) {
+      return 1;
+    }
+
+    auto [h_a_multi_tile1, h_a_multi_scales_tile1] =
+        make_short_tile_only(h_a_multi, h_a_multi_scale_bytes, 1);
+    auto [h_b_multi_rows2_tile1, h_b_multi_rows2_scales_tile1] =
+        make_short_tile_only(h_b_multi_rows2, h_b_multi_scale_rows2, 1);
+    if (RunExecScaleCase(
+            "dispatch_rows_2_exec_scales_tile1_only",
+            h_a_multi_tile1,
+            h_b_multi_rows2_tile1,
+            scale_bytes_to_words(h_a_multi_scales_tile1, kRows),
+            scale_bytes_to_words(h_b_multi_rows2_scales_tile1, kCols),
+            kShortMultiKTolerance) != 0) {
+      return 1;
+    }
+    if (RunRuntimeLikeExecScaleCaseMultiK(
+            "dispatch_rows_2_runtime_like_multi_k_tile1_only",
+            h_a_multi_tile1,
+            h_b_multi_rows2_tile1,
+            h_a_multi_scales_tile1,
+            h_b_multi_rows2_scales_tile1,
+            short_multi_k,
+            kShortMultiKTolerance) != 0) {
+      return 1;
+    }
+
+    std::fill(
+        h_a_multi_scales_tile1.begin(),
+        h_a_multi_scales_tile1.end(),
+        EncodeScaleByte(1.0f));
+    std::fill(
+        h_b_multi_rows2_scales_tile1.begin(),
+        h_b_multi_rows2_scales_tile1.end(),
+        EncodeScaleByte(1.0f));
+    if (RunRuntimeLikeExecScaleCaseMultiK(
+            "dispatch_rows_2_runtime_like_multi_k_tile1_only_unit_scales",
+            h_a_multi_tile1,
+            h_b_multi_rows2_tile1,
+            h_a_multi_scales_tile1,
+            h_b_multi_rows2_scales_tile1,
+            short_multi_k,
+            kShortMultiKTolerance) != 0) {
+      return 1;
+    }
+  }
+
   const auto nano_routed_down =
       MakePatternedValuesLocal(kRows, static_cast<std::size_t>(multi_k), 53, 0.0078125f);
   const auto nano_routed_up =

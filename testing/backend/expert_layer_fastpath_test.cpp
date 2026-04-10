@@ -20,14 +20,17 @@ using nemotron::CublasLtHandle;
 using nemotron::DeviceTensorFp32;
 using nemotron::ExpertLayerBindings;
 using nemotron::ExpertLayerConfig;
+using nemotron::ExpertLayerExecutionCounters;
 using nemotron::ExpertLayerSlice;
 using nemotron::GemmDescriptor;
 using nemotron::GemmHeuristicCache;
 using nemotron::GemmKernelFamily;
 using nemotron::GetExpertStagingCounters;
+using nemotron::GetExpertLayerExecutionCounters;
 using nemotron::HostNvfp4Matrix;
 using nemotron::KernelTensorDescriptor;
 using nemotron::PackRowMajorFp32ToNvfp4;
+using nemotron::ResetExpertLayerExecutionCounters;
 using nemotron::ResetExpertStagingCounters;
 
 class ScopedEnvVar {
@@ -93,6 +96,55 @@ float max_abs_diff(const std::vector<float>& lhs, const std::vector<float>& rhs)
     diff = std::max(diff, std::fabs(lhs[i] - rhs[i]));
   }
   return diff;
+}
+
+void print_top_diffs(
+    const std::vector<float>& safe_values,
+    const std::vector<float>& unsafe_values,
+    std::size_t rows,
+    std::size_t cols,
+    int limit) {
+  struct DiffEntry {
+    float abs_diff = 0.0f;
+    std::size_t index = 0;
+  };
+
+  std::vector<DiffEntry> top_entries;
+  top_entries.reserve(static_cast<std::size_t>(limit));
+  for (std::size_t index = 0; index < safe_values.size() && index < unsafe_values.size(); ++index) {
+    const float abs_diff = std::fabs(safe_values[index] - unsafe_values[index]);
+    if (abs_diff == 0.0f) {
+      continue;
+    }
+    if (top_entries.size() < static_cast<std::size_t>(limit)) {
+      top_entries.push_back({abs_diff, index});
+      continue;
+    }
+    auto min_it = std::min_element(
+        top_entries.begin(),
+        top_entries.end(),
+        [](const DiffEntry& lhs, const DiffEntry& rhs) { return lhs.abs_diff < rhs.abs_diff; });
+    if (abs_diff > min_it->abs_diff) {
+      *min_it = {abs_diff, index};
+    }
+  }
+
+  std::sort(
+      top_entries.begin(),
+      top_entries.end(),
+      [](const DiffEntry& lhs, const DiffEntry& rhs) { return lhs.abs_diff > rhs.abs_diff; });
+
+  for (const auto& entry : top_entries) {
+    const std::size_t row = cols == 0 ? 0 : entry.index / cols;
+    const std::size_t col = cols == 0 ? entry.index : entry.index % cols;
+    std::cout << "expert_layer_fastpath_test: diff"
+              << " row=" << row
+              << " col=" << col
+              << " safe=" << safe_values[entry.index]
+              << " unsafe=" << unsafe_values[entry.index]
+              << " abs_diff=" << entry.abs_diff
+              << "\n";
+  }
 }
 
 KernelTensorDescriptor make_fp32_descriptor(
@@ -544,6 +596,381 @@ bool test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging()
   return true;
 }
 
+bool test_direct_moe_prefill_compare_if_requested() {
+  if (std::getenv("NEMOTRON_RUN_DIRECT_MOE_PREFILL_COMPARE") == nullptr) {
+    return true;
+  }
+  if (!has_cuda_device()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
+  ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
+  ScopedEnvVar scoped_unsafe_prefill("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+  setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "1", 1);
+  setenv("NEMOTRON_EXPERT_MONOLITHIC", "1", 1);
+  unsetenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+
+  const auto cublas = CublasLtHandle::Create();
+  if (!cublas || !cublas->valid()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  constexpr std::size_t kHiddenSize = 64;
+  constexpr std::size_t kIntermediateSize = 64;
+  constexpr std::size_t kRoutedExperts = 8;
+  constexpr std::size_t kTopK = 2;
+  constexpr std::size_t kTokenCount = 2;
+
+  const std::string layer_prefix = "backbone.layers.4";
+  const std::string mixer_prefix = layer_prefix + ".mixer";
+
+  std::vector<float> input_norm_weight(kHiddenSize, 1.0f);
+  std::vector<float> gate_bias = {0.02f, -0.04f, 0.03f, 0.00f, -0.01f, 0.05f, -0.02f, 0.01f};
+  std::vector<float> gate_weight = make_patterned_values(kRoutedExperts, kHiddenSize, 11, 0.0125f);
+  std::vector<float> shared_up_values = make_patterned_values(kIntermediateSize, kHiddenSize, 43, 0.02f);
+  std::vector<float> shared_down_values = make_patterned_values(kHiddenSize, kIntermediateSize, 59, 0.02f);
+
+  const auto input_norm_descriptor =
+      make_fp32_descriptor(layer_prefix + ".norm.weight", input_norm_weight, {kHiddenSize});
+  const auto gate_bias_descriptor =
+      make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
+  const auto gate_weight_descriptor =
+      make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
+  auto shared_up_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.up_proj.weight",
+          shared_up_values,
+          kIntermediateSize,
+          kHiddenSize);
+  auto shared_down_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.down_proj.weight",
+          shared_down_values,
+          kHiddenSize,
+          kIntermediateSize);
+  if (!expect(shared_up_descriptor.has_value(), "shared up NVFP4 descriptor should build") ||
+      !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
+    return false;
+  }
+  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
+
+  std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
+  std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
+  ExpertLayerBindings bindings;
+  bindings.input_norm_weight = &input_norm_descriptor;
+  bindings.gate_weight = &gate_weight_descriptor;
+  bindings.gate_score_correction_bias = &gate_bias_descriptor;
+  bindings.shared_up_gemm_weight = &shared_up_descriptor->descriptor;
+  bindings.shared_down_gemm_weight = &shared_down_descriptor->descriptor;
+  bindings.routed_experts.resize(kRoutedExperts);
+  for (std::size_t expert_index = 0; expert_index < kRoutedExperts; ++expert_index) {
+    const std::string expert_prefix =
+        mixer_prefix + ".experts." + std::to_string(expert_index);
+    const auto up_values = make_patterned_values(
+        kIntermediateSize,
+        kHiddenSize,
+        67 + static_cast<int>(expert_index * 2),
+        0.0175f);
+    const auto down_values = make_patterned_values(
+        kHiddenSize,
+        kIntermediateSize,
+        101 + static_cast<int>(expert_index * 3),
+        0.0175f);
+    const auto up_descriptor =
+        make_owned_nvfp4_descriptor(
+            expert_prefix + ".up_proj.weight",
+            up_values,
+            kIntermediateSize,
+            kHiddenSize);
+    const auto down_descriptor =
+        make_owned_nvfp4_descriptor(
+            expert_prefix + ".down_proj.weight",
+            down_values,
+            kHiddenSize,
+            kIntermediateSize);
+    if (!expect(up_descriptor.has_value(), "routed up NVFP4 descriptor should build") ||
+        !expect(down_descriptor.has_value(), "routed down NVFP4 descriptor should build")) {
+      return false;
+    }
+    routed_up_descriptors[expert_index] = std::move(*up_descriptor);
+    routed_down_descriptors[expert_index] = std::move(*down_descriptor);
+    RebindOwnedNvfp4Descriptor(&routed_up_descriptors[expert_index]);
+    RebindOwnedNvfp4Descriptor(&routed_down_descriptors[expert_index]);
+    bindings.routed_experts[expert_index].up_proj =
+        &routed_up_descriptors[expert_index].descriptor;
+    bindings.routed_experts[expert_index].down_proj =
+        &routed_down_descriptors[expert_index].descriptor;
+  }
+
+  ExpertLayerConfig config;
+  config.layer_index = 4;
+  config.hidden_size = kHiddenSize;
+  config.moe_latent_size = 0;
+  config.routed_expert_intermediate_size = kIntermediateSize;
+  config.shared_expert_intermediate_size = kIntermediateSize;
+  config.n_routed_experts = kRoutedExperts;
+  config.top_k = kTopK;
+  config.max_token_count = kTokenCount;
+  config.n_group = 1;
+  config.topk_group = 1;
+  config.rms_epsilon = 1.0e-5f;
+  config.routed_scaling_factor = 5.0f;
+  config.norm_topk_prob = true;
+
+  auto slice = ExpertLayerSlice::Create(config, bindings);
+  if (!expect(slice != nullptr && slice->valid(), "resident expert layer slice should create")) {
+    return false;
+  }
+
+  std::vector<float> input_values(kTokenCount * kHiddenSize, 0.0f);
+  for (std::size_t token = 0; token < kTokenCount; ++token) {
+    for (std::size_t dim = 0; dim < kHiddenSize; ++dim) {
+      input_values[token * kHiddenSize + dim] =
+          (static_cast<float>(((token + 1) * 19 + (dim * 5)) % 41) - 20.0f) * 0.03125f;
+    }
+  }
+
+  auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto safe_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto unsafe_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  if (!expect(batch_input != nullptr && safe_output != nullptr && unsafe_output != nullptr,
+              "batched tensors should allocate") ||
+      !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
+              "batched input should upload")) {
+    return false;
+  }
+
+  GemmHeuristicCache heuristic_cache;
+  ResetExpertLayerExecutionCounters();
+  unsetenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+  if (!expect(
+          slice->Run(*cublas, &heuristic_cache, *batch_input, safe_output.get(), nullptr),
+          "safe row-replay run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "safe row-replay run should synchronize")) {
+    return false;
+  }
+  const ExpertLayerExecutionCounters safe_counters = GetExpertLayerExecutionCounters();
+
+  ResetExpertLayerExecutionCounters();
+  setenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL", "1", 1);
+  if (!expect(
+          slice->Run(*cublas, &heuristic_cache, *batch_input, unsafe_output.get(), nullptr),
+          "unsafe native prefill run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "unsafe native prefill run should synchronize")) {
+    return false;
+  }
+  const ExpertLayerExecutionCounters unsafe_counters = GetExpertLayerExecutionCounters();
+
+  std::vector<float> safe_host(safe_output->numel(), 0.0f);
+  std::vector<float> unsafe_host(unsafe_output->numel(), 0.0f);
+  if (!expect(safe_output->CopyToHost(safe_host.data(), safe_host.size()),
+              "safe output should copy to host") ||
+      !expect(unsafe_output->CopyToHost(unsafe_host.data(), unsafe_host.size()),
+              "unsafe output should copy to host")) {
+    return false;
+  }
+
+  const float diff = max_abs_diff(safe_host, unsafe_host);
+  std::cout << "expert_layer_fastpath_test: direct_moe_prefill_compare"
+            << " token_count=" << kTokenCount
+            << " safe_native_runs=" << safe_counters.native_multi_token_runs
+            << " safe_row_replay_runs=" << safe_counters.row_replay_runs
+            << " unsafe_native_runs=" << unsafe_counters.native_multi_token_runs
+            << " unsafe_row_replay_runs=" << unsafe_counters.row_replay_runs
+            << " max_abs_diff=" << diff
+            << "\n";
+
+  if (diff > 0.0f) {
+    print_top_diffs(safe_host, unsafe_host, kTokenCount, kHiddenSize, 12);
+    std::cerr << "expert_layer_fastpath_test: direct_moe_prefill_compare mismatch\n";
+    return false;
+  }
+  return true;
+}
+
+bool test_nano_p13_compare_if_requested() {
+  if (std::getenv("NEMOTRON_RUN_NANO_P13_COMPARE") == nullptr) {
+    return true;
+  }
+  if (!has_cuda_device()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
+  ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
+  ScopedEnvVar scoped_unsafe_prefill("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+  ScopedEnvVar scoped_force_legacy_p13("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "1", 1);
+  setenv("NEMOTRON_EXPERT_MONOLITHIC", "1", 1);
+  setenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL", "1", 1);
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+
+  const auto cublas = CublasLtHandle::Create();
+  if (!cublas || !cublas->valid()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  constexpr std::size_t kHiddenSize = 2688;
+  constexpr std::size_t kRoutedIntermediateSize = 1856;
+  constexpr std::size_t kSharedIntermediateSize = 3712;
+  constexpr std::size_t kRoutedExperts = 128;
+  constexpr std::size_t kTopK = 6;
+  constexpr std::size_t kTokenCount = 24;
+
+  const std::string layer_prefix = "backbone.layers.4";
+  const std::string mixer_prefix = layer_prefix + ".mixer";
+
+  std::vector<float> input_norm_weight(kHiddenSize, 1.0f);
+  std::vector<float> gate_bias(kRoutedExperts, 0.0f);
+  std::vector<float> gate_weight =
+      make_patterned_values(kRoutedExperts, kHiddenSize, 11, 0.0025f);
+  std::vector<float> shared_up_values =
+      make_patterned_values(kSharedIntermediateSize, kHiddenSize, 43, 0.0068359375f);
+  std::vector<float> shared_down_values =
+      make_patterned_values(kHiddenSize, kSharedIntermediateSize, 59, 0.0068359375f);
+  std::vector<float> routed_up_values =
+      make_patterned_values(kRoutedIntermediateSize, kHiddenSize, 67, 0.0078125f);
+  std::vector<float> routed_down_values =
+      make_patterned_values(kHiddenSize, kRoutedIntermediateSize, 101, 0.0078125f);
+
+  const auto input_norm_descriptor =
+      make_fp32_descriptor(layer_prefix + ".norm.weight", input_norm_weight, {kHiddenSize});
+  const auto gate_bias_descriptor =
+      make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
+  const auto gate_weight_descriptor =
+      make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
+  auto shared_up_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.up_proj.weight",
+          shared_up_values,
+          kSharedIntermediateSize,
+          kHiddenSize);
+  auto shared_down_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.down_proj.weight",
+          shared_down_values,
+          kHiddenSize,
+          kSharedIntermediateSize);
+  auto routed_up_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".experts.shared_up_proj.weight",
+          routed_up_values,
+          kRoutedIntermediateSize,
+          kHiddenSize);
+  auto routed_down_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".experts.shared_down_proj.weight",
+          routed_down_values,
+          kHiddenSize,
+          kRoutedIntermediateSize);
+  if (!expect(shared_up_descriptor.has_value(), "nano shared up NVFP4 descriptor should build") ||
+      !expect(shared_down_descriptor.has_value(), "nano shared down NVFP4 descriptor should build") ||
+      !expect(routed_up_descriptor.has_value(), "nano routed up NVFP4 descriptor should build") ||
+      !expect(routed_down_descriptor.has_value(), "nano routed down NVFP4 descriptor should build")) {
+    return false;
+  }
+  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
+  RebindOwnedNvfp4Descriptor(&*routed_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*routed_down_descriptor);
+
+  ExpertLayerBindings bindings;
+  bindings.input_norm_weight = &input_norm_descriptor;
+  bindings.gate_weight = &gate_weight_descriptor;
+  bindings.gate_score_correction_bias = &gate_bias_descriptor;
+  bindings.shared_up_gemm_weight = &shared_up_descriptor->descriptor;
+  bindings.shared_down_gemm_weight = &shared_down_descriptor->descriptor;
+  bindings.routed_experts.resize(kRoutedExperts);
+  for (std::size_t expert_index = 0; expert_index < kRoutedExperts; ++expert_index) {
+    bindings.routed_experts[expert_index].up_proj = &routed_up_descriptor->descriptor;
+    bindings.routed_experts[expert_index].down_proj = &routed_down_descriptor->descriptor;
+  }
+
+  ExpertLayerConfig config;
+  config.layer_index = 4;
+  config.hidden_size = kHiddenSize;
+  config.moe_latent_size = 0;
+  config.routed_expert_intermediate_size = kRoutedIntermediateSize;
+  config.shared_expert_intermediate_size = kSharedIntermediateSize;
+  config.n_routed_experts = kRoutedExperts;
+  config.top_k = kTopK;
+  config.max_token_count = kTokenCount;
+  config.n_group = 1;
+  config.topk_group = 1;
+  config.rms_epsilon = 1.0e-5f;
+  config.routed_scaling_factor = 5.0f;
+  config.norm_topk_prob = true;
+
+  auto slice = ExpertLayerSlice::Create(config, bindings);
+  if (!expect(slice != nullptr && slice->valid(), "nano resident expert layer slice should create")) {
+    return false;
+  }
+
+  std::vector<float> input_values(kTokenCount * kHiddenSize, 0.0f);
+  for (std::size_t token = 0; token < kTokenCount; ++token) {
+    for (std::size_t dim = 0; dim < kHiddenSize; ++dim) {
+      input_values[token * kHiddenSize + dim] =
+          (static_cast<float>(((token + 1) * 19 + (dim * 5)) % 41) - 20.0f) * 0.03125f;
+    }
+  }
+
+  auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto native_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto legacy_p13_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  if (!expect(
+          batch_input != nullptr && native_output != nullptr && legacy_p13_output != nullptr,
+          "nano batched tensors should allocate") ||
+      !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
+              "nano batched input should upload")) {
+    return false;
+  }
+
+  GemmHeuristicCache heuristic_cache;
+  unsetenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13");
+  if (!expect(
+          slice->Run(*cublas, &heuristic_cache, *batch_input, native_output.get(), nullptr),
+          "nano native P13 run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "nano native P13 run should synchronize")) {
+    return false;
+  }
+
+  setenv("NEMOTRON_DEBUG_FORCE_LEGACY_P13", "1", 1);
+  if (!expect(
+          slice->Run(*cublas, &heuristic_cache, *batch_input, legacy_p13_output.get(), nullptr),
+          "nano forced-legacy P13 run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess,
+              "nano forced-legacy P13 run should synchronize")) {
+    return false;
+  }
+
+  std::vector<float> native_host(native_output->numel(), 0.0f);
+  std::vector<float> legacy_host(legacy_p13_output->numel(), 0.0f);
+  if (!expect(native_output->CopyToHost(native_host.data(), native_host.size()),
+              "nano native output should copy to host") ||
+      !expect(legacy_p13_output->CopyToHost(legacy_host.data(), legacy_host.size()),
+              "nano legacy P13 output should copy to host")) {
+    return false;
+  }
+
+  const float diff = max_abs_diff(native_host, legacy_host);
+  std::cout << "expert_layer_fastpath_test: nano_p13_compare"
+            << " token_count=" << kTokenCount
+            << " max_abs_diff=" << diff
+            << "\n";
+  if (diff > 0.0f) {
+    print_top_diffs(legacy_host, native_host, kTokenCount, kHiddenSize, 12);
+    std::cerr << "expert_layer_fastpath_test: nano_p13_compare mismatch\n";
+    return false;
+  }
+  return true;
+}
+
 bool test_direct_moe_rejects_non_nvfp4_configuration() {
   if (!has_cuda_device()) {
     std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
@@ -682,6 +1109,8 @@ bool test_direct_moe_rejects_non_nvfp4_configuration() {
 int main() {
   return test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() &&
                  test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging() &&
+                 test_direct_moe_prefill_compare_if_requested() &&
+                 test_nano_p13_compare_if_requested() &&
                  test_direct_moe_rejects_non_nvfp4_configuration()
              ? 0
              : 1;

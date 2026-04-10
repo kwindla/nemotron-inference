@@ -704,13 +704,14 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
 #pragma unroll
         for (int n_fragment = 0; n_fragment < kTracedP13NFragments; ++n_fragment) {
           const int physical = n_fragment * 8 + m_fragment * 4 + reg;
-          const int row = row_coords[physical];
-          const int col = col_coords[physical];
-          if (row >= valid_rows || col >= output_rows_this_tile) {
+          const int output_col_offset = row_coords[physical];
+          const int token_row = col_coords[physical];
+          if (token_row >= valid_rows || output_col_offset >= output_rows_this_tile) {
             continue;
           }
-          const std::size_t input_row = row_start + static_cast<std::size_t>(row);
-          const std::size_t output_col = static_cast<std::size_t>(output_row_base + col);
+          const std::size_t input_row = row_start + static_cast<std::size_t>(token_row);
+          const std::size_t output_col =
+              static_cast<std::size_t>(output_row_base + output_col_offset);
           const float value = accum_tensor(reg, m_fragment, n_fragment) * alpha;
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + output_col] = __float2bfloat16(value);
@@ -1235,24 +1236,24 @@ __device__ __forceinline__ void CopyActivationRow64(
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 template <class ScaleTensor>
 __device__ __forceinline__ void ZeroTracedP5ScaleRow(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     int row);
 
 template <class ScaleTensor>
 __device__ __forceinline__ void StoreTracedP5ScaleWordK64(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     std::uint32_t scale_word,
     int row);
 
 template <class ScaleTensor, int kScaleByteCount>
 __device__ __forceinline__ void StoreTracedScaleBytes(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     const std::uint8_t (&scale_bytes)[kScaleByteCount],
     int row);
 
 template <class ScaleTensor>
 __device__ __forceinline__ void StoreTracedScaleWordsK128(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     std::uint32_t scale_word_lo,
     std::uint32_t scale_word_hi,
     int row);
@@ -1501,10 +1502,45 @@ struct P5ScaleTrace {
   std::uint32_t b_fragment_words[2] = {0, 0};
 };
 
+struct P13ScaleTrace {
+  int valid = 0;
+  int row_start = -1;
+  int valid_rows = -1;
+  int output_row_base = -1;
+  int a_base_rows[2] = {-1, -1};
+  int b_base_rows[2] = {-1, -1};
+  std::uint32_t a_source_words[2] = {0, 0};
+  std::uint32_t b_source_words[2] = {0, 0};
+  std::uint32_t a_smem_words[2] = {0, 0};
+  std::uint32_t b_smem_words[2] = {0, 0};
+  std::uint32_t a_fragment_words[2] = {0, 0};
+  std::uint32_t b_fragment_words[2] = {0, 0};
+  std::uint32_t a_loaded_words[2] = {0, 0};
+  std::uint32_t b_loaded_words[2] = {0, 0};
+  int a_scale_rows[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  int a_scale_cols[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  int b_scale_rows[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  int b_scale_cols[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  std::uint8_t a_scale_raw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  std::uint8_t b_scale_raw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  std::uint8_t a_post_store_raw[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  std::uint8_t b_post_store_raw[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  std::uint8_t a_logical_raw[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  std::uint8_t b_logical_raw[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+};
+
 __device__ __managed__ P15ScaleTrace g_p15_scale_trace;
 __device__ __managed__ P5ScaleTrace g_p5_scale_trace;
+__device__ __managed__ P13ScaleTrace g_p13_scale_trace;
+__device__ __managed__ P13DebugTrace g_p13_debug_trace;
 __device__ __managed__ int g_enable_p15_scale_trace = 0;
 __device__ __managed__ int g_enable_p5_scale_trace = 0;
+__device__ __managed__ int g_enable_p13_scale_trace = 0;
+__device__ __managed__ int g_enable_p13_scale_map_probe = 0;
+__device__ __managed__ int g_enable_p13_debug_trace = 0;
+__device__ __managed__ int g_p13_debug_trace_target_valid_rows = -1;
+__device__ __managed__ int g_p13_debug_trace_claimed = 0;
+__device__ __managed__ int g_p13_debug_trace_target_thread_id = -1;
 
 template <class ScaleAtomTensor>
 __device__ std::uint32_t PackP15ScaleFragmentWord(ScaleAtomTensor const& scale_atom) {
@@ -1600,6 +1636,11 @@ bool CheckCuda(cudaError_t status) {
     std::fprintf(stderr, "fused_moe_prefill cuda error: %s\n", cudaGetErrorString(status));
   }
   return status == cudaSuccess;
+}
+
+bool RoutedEnvEnabled(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
 bool RoutedProfileDebugEnabled() {
@@ -1762,6 +1803,9 @@ int SelectContiguousOutputTile(std::size_t output_rows, std::size_t input_row_co
 }
 
 RoutedGemm1Profile SelectRoutedGemm1Profile(std::size_t num_rows) {
+  if (RoutedEnvEnabled("NEMOTRON_DEBUG_FORCE_LEGACY_P1")) {
+    return RoutedGemm1Profile::kLegacy;
+  }
   if (num_rows == 1u) {
     return RoutedGemm1Profile::kP0_128x128x128_SwapFalse;
   }
@@ -1791,6 +1835,9 @@ RoutedGemm1Profile SelectRoutedGemm1Profile(std::size_t num_rows) {
 }
 
 RoutedGemm2Profile SelectRoutedGemm2Profile(std::size_t num_rows) {
+  if (RoutedEnvEnabled("NEMOTRON_DEBUG_FORCE_LEGACY_P13")) {
+    return RoutedGemm2Profile::kLegacy;
+  }
   if (num_rows >= 2u && num_rows <= 7u) {
     return RoutedGemm2Profile::kP15_256x128x64_SwapTrue;
   }
@@ -2378,6 +2425,44 @@ __device__ __forceinline__ std::uint32_t PackScaleWord4(
   return reg;
 }
 
+__device__ __forceinline__ std::uint32_t MakeP13ProbeScaleWord(int row) {
+  const std::uint8_t base = static_cast<std::uint8_t>(row & 0xff);
+  return PackScaleWord4(
+      base,
+      static_cast<std::uint8_t>(base + 1u),
+      static_cast<std::uint8_t>(base + 2u),
+      static_cast<std::uint8_t>(base + 3u));
+}
+
+template <class T>
+__device__ __forceinline__ std::uint8_t ScaleByteValue(T const& value) {
+  using ValueType = std::remove_cvref_t<T>;
+  if constexpr (std::is_integral_v<ValueType>) {
+    return static_cast<std::uint8_t>(value);
+  } else {
+    return static_cast<std::uint8_t>(value.raw());
+  }
+}
+
+template <class ScaleTensor>
+__device__ __forceinline__ void FindScaleTensorCoordByRaw(
+    ScaleTensor const& scale_tensor,
+    std::uint8_t raw,
+    int& row_out,
+    int& col_out) {
+  row_out = -1;
+  col_out = -1;
+  for (int row = 0; row < static_cast<int>(cute::size<0>(ScaleTensor{})); ++row) {
+    for (int col = 0; col < static_cast<int>(cute::size<1>(ScaleTensor{})); ++col) {
+      if (ScaleByteValue(scale_tensor(row, col, cute::Int<0>{})) == raw) {
+        row_out = row;
+        col_out = col;
+        return;
+      }
+    }
+  }
+}
+
 __device__ __forceinline__ void ApplySm120Fp4ShiftA(
     std::uint32_t& a0,
     std::uint32_t& a1,
@@ -2825,21 +2910,35 @@ __device__ __forceinline__ void nvfp4_bridge::CopyActivationRow64(
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 template <class ScaleTensor>
+__device__ __forceinline__ void StoreScaleTensorByte(
+    ScaleTensor& scale_tensor,
+    int row,
+    int scale_col,
+    std::uint8_t value) {
+  auto elem = scale_tensor(row, scale_col, cute::Int<0>{});
+  if constexpr (requires { elem.storage; }) {
+    scale_tensor(row, scale_col, cute::Int<0>{}).storage = value;
+  } else {
+    scale_tensor(row, scale_col, cute::Int<0>{}) = value;
+  }
+}
+
+template <class ScaleTensor>
 __device__ __forceinline__ void nvfp4_bridge::ZeroTracedP5ScaleRow(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     int row) {
   if (row < 0 || row >= static_cast<int>(cute::size<0>(scale_tensor))) {
     return;
   }
 #pragma unroll
   for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(scale_tensor)); ++scale_col) {
-    scale_tensor(row, scale_col, cute::Int<0>{}) = nvfp4_bridge::MakeScaleElement(0u);
+    StoreScaleTensorByte(scale_tensor, row, scale_col, 0u);
   }
 }
 
 template <class ScaleTensor>
 __device__ __forceinline__ void nvfp4_bridge::StoreTracedP5ScaleWordK64(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     std::uint32_t scale_word,
     int row) {
   if (row < 0 || row >= static_cast<int>(cute::size<0>(scale_tensor))) {
@@ -2848,13 +2947,13 @@ __device__ __forceinline__ void nvfp4_bridge::StoreTracedP5ScaleWordK64(
 #pragma unroll
   for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(scale_tensor)); ++scale_col) {
     const std::uint8_t value = scale_col < 4 ? LoadScaleByte(scale_word, scale_col) : std::uint8_t{0};
-    scale_tensor(row, scale_col, cute::Int<0>{}) = nvfp4_bridge::MakeScaleElement(value);
+    StoreScaleTensorByte(scale_tensor, row, scale_col, value);
   }
 }
 
 template <class ScaleTensor, int kScaleByteCount>
 __device__ __forceinline__ void nvfp4_bridge::StoreTracedScaleBytes(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     const std::uint8_t (&scale_bytes)[kScaleByteCount],
     int row) {
   if (row < 0 || row >= static_cast<int>(cute::size<0>(scale_tensor))) {
@@ -2865,14 +2964,13 @@ __device__ __forceinline__ void nvfp4_bridge::StoreTracedScaleBytes(
 #pragma unroll
   for (int scale_col = 0; scale_col < logical_cols; ++scale_col) {
     const int byte_index = min(scale_col / segment_len, kScaleByteCount - 1);
-    scale_tensor(row, scale_col, cute::Int<0>{}) =
-        nvfp4_bridge::MakeScaleElement(scale_bytes[byte_index]);
+    StoreScaleTensorByte(scale_tensor, row, scale_col, scale_bytes[byte_index]);
   }
 }
 
 template <class ScaleTensor>
 __device__ __forceinline__ void nvfp4_bridge::StoreTracedScaleWordsK128(
-    const ScaleTensor& scale_tensor,
+    ScaleTensor& scale_tensor,
     std::uint32_t scale_word_lo,
     std::uint32_t scale_word_hi,
     int row) {
@@ -3444,13 +3542,14 @@ __device__ __forceinline__ void nvfp4_bridge::StoreTracedP13CFragmentsRowMajor(
 #pragma unroll
       for (int n_fragment = 0; n_fragment < kTracedP13NFragments; ++n_fragment) {
         const int physical = n_fragment * 8 + m_fragment * 4 + reg;
-        const int row = row_coords[physical];
-        const int col = col_coords[physical];
-        if (row >= valid_rows || col >= output_rows_this_tile) {
+        const int output_col_offset = row_coords[physical];
+        const int token_row = col_coords[physical];
+        if (token_row >= valid_rows || output_col_offset >= output_rows_this_tile) {
           continue;
         }
-        const std::size_t input_row = row_start + static_cast<std::size_t>(row);
-        const std::size_t output_col = static_cast<std::size_t>(output_row_base + col);
+        const std::size_t input_row = row_start + static_cast<std::size_t>(token_row);
+        const std::size_t output_col =
+            static_cast<std::size_t>(output_row_base + output_col_offset);
         if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
           output[input_row * output_rows_per_expert + output_col] =
               __float2bfloat16(accum[m_fragment][n_fragment].regs[reg] * alpha);
@@ -3795,6 +3894,88 @@ __device__ __forceinline__ void nvfp4_bridge::StoreFragmentC_Transpose16x8(
       output[input_row * output_rows_per_expert + static_cast<std::size_t>(output_row_base + row3)] =
           accum.regs[3] * alpha;
     }
+  }
+}
+
+void PrintP13ScaleTrace() {
+  const auto& trace = g_p13_scale_trace;
+  if (trace.valid == 0) {
+    std::fprintf(stderr, "p13_scale_trace: invalid\n");
+    return;
+  }
+  std::fprintf(
+      stderr,
+      "p13_scale_trace: row_start=%d valid_rows=%d output_row_base=%d\n",
+      trace.row_start,
+      trace.valid_rows,
+      trace.output_row_base);
+  for (int i = 0; i < 2; ++i) {
+    std::fprintf(
+        stderr,
+        "p13_scale_trace: A m=%d base_row=%d source=0x%08x loaded=0x%08x smem=0x%08x fragment=0x%08x\n",
+        i,
+        trace.a_base_rows[i],
+        trace.a_source_words[i],
+        trace.a_loaded_words[i],
+        trace.a_smem_words[i],
+        trace.a_fragment_words[i]);
+  }
+  for (int i = 0; i < 2; ++i) {
+    std::fprintf(
+        stderr,
+        "p13_scale_trace: B n=%d base_row=%d source=0x%08x loaded=0x%08x smem=0x%08x fragment=0x%08x\n",
+        i,
+        trace.b_base_rows[i],
+        trace.b_source_words[i],
+        trace.b_loaded_words[i],
+        trace.b_smem_words[i],
+        trace.b_fragment_words[i]);
+  }
+  for (int i = 0; i < 8; ++i) {
+    std::fprintf(
+        stderr,
+        "p13_scale_trace: A coord[%d]=(%d,%d) raw=0x%02x\n",
+        i,
+        trace.a_scale_rows[i],
+        trace.a_scale_cols[i],
+        static_cast<unsigned>(trace.a_scale_raw[i]));
+  }
+  for (int i = 0; i < 8; ++i) {
+    std::fprintf(
+        stderr,
+        "p13_scale_trace: B coord[%d]=(%d,%d) raw=0x%02x\n",
+        i,
+        trace.b_scale_rows[i],
+        trace.b_scale_cols[i],
+        static_cast<unsigned>(trace.b_scale_raw[i]));
+  }
+  for (int row = 0; row < 2; ++row) {
+    std::fprintf(stderr, "p13_scale_trace: A post-store row %d:", row);
+    for (int col = 0; col < 8; ++col) {
+      std::fprintf(stderr, " %02x", static_cast<unsigned>(trace.a_post_store_raw[row * 8 + col]));
+    }
+    std::fprintf(stderr, "\n");
+  }
+  for (int row = 0; row < 2; ++row) {
+    std::fprintf(stderr, "p13_scale_trace: B post-store row %d:", row);
+    for (int col = 0; col < 8; ++col) {
+      std::fprintf(stderr, " %02x", static_cast<unsigned>(trace.b_post_store_raw[row * 8 + col]));
+    }
+    std::fprintf(stderr, "\n");
+  }
+  for (int row = 0; row < 2; ++row) {
+    std::fprintf(stderr, "p13_scale_trace: A logical row %d:", row);
+    for (int col = 0; col < 8; ++col) {
+      std::fprintf(stderr, " %02x", static_cast<unsigned>(trace.a_logical_raw[row * 8 + col]));
+    }
+    std::fprintf(stderr, "\n");
+  }
+  for (int row = 0; row < 2; ++row) {
+    std::fprintf(stderr, "p13_scale_trace: B logical row %d:", row);
+    for (int col = 0; col < 8; ++col) {
+      std::fprintf(stderr, " %02x", static_cast<unsigned>(trace.b_logical_raw[row * 8 + col]));
+    }
+    std::fprintf(stderr, "\n");
   }
 }
 
@@ -4976,7 +5157,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64(
   for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += 64u) {
     const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
     const std::size_t packed_byte_offset = k_base / 2u;
-
     for (int row = tid; row < kPlannedWmmaTileM; row += blockDim.x) {
       if (row < valid_rows) {
         nvfp4_bridge::CopyActivationRow64(
@@ -5154,9 +5334,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSm
 #endif
       } else {
         nvfp4_bridge::ZeroRow(a_tile_view, row);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-        nvfp4_bridge::ZeroTracedP5ScaleRow(a_scale_tensor, row);
-#endif
       }
     }
     for (int row = tid; row < kOutputTile; row += blockDim.x) {
@@ -5181,9 +5358,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSm
 #endif
       } else {
         nvfp4_bridge::ZeroRow(b_tile_view, row);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-        nvfp4_bridge::ZeroTracedP5ScaleRow(b_scale_tensor, row);
-#endif
       }
     }
     __syncthreads();
@@ -5290,6 +5464,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   __shared__ alignas(16)
       cutlass::arch::ClusterBarrier::ValueType
           p5_tma_empty_mbar_storage[kP5PipelineStages];
+  __shared__ int p13_debug_capture_cta;
 
   auto* smem_swizzled_a = smem_swizzled_a_storage.data();
   auto* smem_swizzled_b = smem_swizzled_b_storage.data();
@@ -5324,6 +5499,19 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       static_cast<std::size_t>(output_row_base) >= output_rows_per_expert) {
     return;
   }
+  if (tid == 0) {
+    int capture = 0;
+    if (g_enable_p13_debug_trace != 0 &&
+        Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13 &&
+        blockIdx.x == 0 &&
+        (g_p13_debug_trace_target_valid_rows < 0 ||
+         valid_rows == g_p13_debug_trace_target_valid_rows) &&
+        atomicCAS(&g_p13_debug_trace_claimed, 0, 1) == 0) {
+      capture = 1;
+    }
+    p13_debug_capture_cta = capture;
+  }
+  __syncthreads();
 
   const FusedNvfp4WeightView weight = weights[expert_index];
   const bool use_p5_tma_a =
@@ -5811,12 +5999,26 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     const std::size_t block_base = macro_k_base / fused_decode::kNvfp4BlockWidth;
     const std::size_t packed_byte_offset = macro_k_base / 2u;
 
-    auto a_scale_tensor = cute::make_tensor(cute::make_smem_ptr(a_scale_smem), SmemLayoutSFA{});
-    auto b_scale_tensor = cute::make_tensor(cute::make_smem_ptr(b_scale_smem), SmemLayoutSFB{});
+    auto a_scale_tensor_raw = cute::make_tensor(cute::make_smem_ptr(a_scale_smem), SmemLayoutSFA{});
+    auto b_scale_tensor_raw = cute::make_tensor(cute::make_smem_ptr(b_scale_smem), SmemLayoutSFB{});
+    auto a_scale_tensor = cute::as_position_independent_swizzle_tensor(a_scale_tensor_raw);
+    auto b_scale_tensor = cute::as_position_independent_swizzle_tensor(b_scale_tensor_raw);
     auto stage0_A = SmemLayoutA{}(cute::_, cute::_, cute::Int<0>{});
     auto stage0_B = SmemLayoutB{}(cute::_, cute::_, cute::Int<0>{});
+    auto stage0_SFA = SmemLayoutSFA{}(cute::_, cute::_, cute::Int<0>{});
+    auto stage0_SFB = SmemLayoutSFB{}(cute::_, cute::_, cute::Int<0>{});
     auto* sw_a = reinterpret_cast<std::uint8_t*>(smem_swizzled_a);
     auto* sw_b = reinterpret_cast<std::uint8_t*>(smem_swizzled_b);
+
+    if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+      for (int i = tid; i < Traits::kScaleSmemCosizeA; i += blockDim.x) {
+        a_scale_smem[i] = nvfp4_bridge::MakeScaleElement(0u);
+      }
+      for (int i = tid; i < Traits::kScaleSmemCosizeB; i += blockDim.x) {
+        b_scale_smem[i] = nvfp4_bridge::MakeScaleElement(0u);
+      }
+      __syncthreads();
+    }
 
     if ((use_p5_tma_a || use_p5_tma_b) && is_p5_tma_thread) {
       p5_tma_full_mbar[0].init(1);
@@ -5988,7 +6190,34 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
                   Nvfp4ScaleLayout::kSwizzled128x4);
             }
           }
-          nvfp4_bridge::StoreTracedScaleBytes(a_scale_tensor, scale_bytes, row);
+          if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+            if (g_enable_p13_scale_trace != 0 &&
+                cta_index == 0 &&
+                blockIdx.x == 0 &&
+                block_base == 0 &&
+                row < 2) {
+              g_p13_scale_trace.a_loaded_words[row] = PackScaleWord4(
+                  scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]);
+            }
+            for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(a_scale_tensor));
+                 ++scale_col) {
+              const std::uint8_t value =
+                  scale_col < 4 ? scale_bytes[scale_col] : std::uint8_t{0};
+              StoreScaleTensorByte(a_scale_tensor, row, scale_col, value);
+            }
+            if (g_enable_p13_scale_trace != 0 &&
+                cta_index == 0 &&
+                blockIdx.x == 0 &&
+                block_base == 0 &&
+                row < 2) {
+              for (int col = 0; col < 8; ++col) {
+                g_p13_scale_trace.a_post_store_raw[row * 8 + col] = static_cast<std::uint8_t>(
+                    a_scale_tensor(row, col, cute::Int<0>{}).raw());
+              }
+            }
+          } else {
+            nvfp4_bridge::StoreTracedScaleBytes(a_scale_tensor, scale_bytes, row);
+          }
         } else if (!use_p5_tma_sfa) {
           nvfp4_bridge::ZeroTracedP5ScaleRow(a_scale_tensor, row);
         }
@@ -6024,8 +6253,36 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
                   input_scale_layout);
             }
           }
-          nvfp4_bridge::StoreTracedScaleBytes(b_scale_tensor, scale_bytes, row);
-        } else if (!use_p5_tma_sfb && !use_p5_direct_gmem_sfb) {
+          if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+            if (g_enable_p13_scale_trace != 0 &&
+                cta_index == 0 &&
+                blockIdx.x == 0 &&
+                block_base == 0 &&
+                row < 2) {
+              g_p13_scale_trace.b_loaded_words[row] = PackScaleWord4(
+                  scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]);
+            }
+            for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(b_scale_tensor));
+                 ++scale_col) {
+              const std::uint8_t value =
+                  scale_col < 4 ? scale_bytes[scale_col] : std::uint8_t{0};
+              StoreScaleTensorByte(b_scale_tensor, row, scale_col, value);
+            }
+            if (g_enable_p13_scale_trace != 0 &&
+                cta_index == 0 &&
+                blockIdx.x == 0 &&
+                block_base == 0 &&
+                row < 2) {
+              for (int col = 0; col < 8; ++col) {
+                g_p13_scale_trace.b_post_store_raw[row * 8 + col] = static_cast<std::uint8_t>(
+                    b_scale_tensor(row, col, cute::Int<0>{}).raw());
+              }
+            }
+          } else {
+            nvfp4_bridge::StoreTracedScaleBytes(b_scale_tensor, scale_bytes, row);
+          }
+        } else if (!use_p5_tma_sfb &&
+                   !use_p5_direct_gmem_sfb) {
           nvfp4_bridge::ZeroTracedP5ScaleRow(b_scale_tensor, row);
         }
       }
@@ -6040,7 +6297,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       auto p5_sSFB_tma = cute::make_tensor(
           cute::make_smem_ptr(p5_sfb_tma_smem), SmemLayoutSFB{});
       auto p5_sSFB_tma_logical = cute::as_position_independent_swizzle_tensor(p5_sSFB_tma);
-      auto b_scale_logical = cute::as_position_independent_swizzle_tensor(b_scale_tensor);
+      auto b_scale_logical = cute::as_position_independent_swizzle_tensor(b_scale_tensor_raw);
       constexpr int kLogicalCols = cute::size<1>(SmemLayoutSFB{});
       for (int row = tid; row < kProfileTokenRows; row += blockDim.x) {
         if (row < valid_rows) {
@@ -6121,7 +6378,55 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
 
       cute::copy(s2r_copy_A, tCsA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrA_cv);
       cute::copy(s2r_copy_B, tCsB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrB_cv);
-      cute::copy(tCsSFA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFA_cv);
+      if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+        auto dense_c = cute::make_identity_tensor(
+            cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}));
+        auto part_c = thread_mma.partition_C(dense_c);
+        constexpr int SfaMTiles = cute::size<1>(decltype(tCrSFA){});
+        constexpr int SfaKBlocks = cute::size<2>(decltype(tCrSFA){});
+        constexpr int SfbNTiles = cute::size<1>(decltype(tCrSFB){});
+        constexpr int SfbKBlocks = cute::size<2>(decltype(tCrSFB){});
+        const int sfa_blocks_per_k_block = static_cast<int>(available_blocks / SfaKBlocks);
+        const int sfb_blocks_per_k_block = static_cast<int>(available_blocks / SfbKBlocks);
+        auto scale_coords_sfa = cute::make_identity_tensor(cute::shape(sScaleA));
+        auto tCsSFA_coords = s2r_thr_SFA.partition_S(scale_coords_sfa);
+        auto scale_coords_sfb = cute::make_identity_tensor(cute::shape(sScaleB));
+        auto tCsSFB_coords = s2r_thr_SFB.partition_S(scale_coords_sfb);
+        for (int k = 0; k < SfaKBlocks; ++k) {
+          for (int m = 0; m < SfaMTiles; ++m) {
+            auto row_anchor = tCsSFA_coords(cute::_, m, 0, cute::Int<0>{});
+            const int local_row0 = nvfp4_bridge::CoordGet0(row_anchor(0));
+            std::uint32_t packed_scale_word = 0u;
+            if (local_row0 >= 0 && local_row0 < output_rows_this_tile) {
+              packed_scale_word = LoadExecutionScaleWord(
+                  weight.matmul_block_scales_data,
+                  static_cast<std::size_t>(output_row_base + local_row0),
+                  block_base + static_cast<std::size_t>(k * sfa_blocks_per_k_block),
+                  padded_blocks_per_row,
+                  Nvfp4ScaleLayout::kSwizzled128x4);
+            }
+            FillP15ScaleFragmentWord(tCrSFA(cute::_, m, k), packed_scale_word);
+          }
+        }
+        for (int k = 0; k < SfbKBlocks; ++k) {
+          for (int n = 0; n < SfbNTiles; ++n) {
+            auto row_anchor = tCsSFB_coords(cute::_, n, 0, cute::Int<0>{});
+            const int local_row0 = nvfp4_bridge::CoordGet0(row_anchor(0));
+            std::uint32_t packed_scale_word = 0u;
+            if (local_row0 >= 0 && local_row0 < valid_rows) {
+              packed_scale_word = LoadExecutionScaleWord(
+                  input_matmul_block_scales,
+                  static_cast<std::size_t>(row_start + local_row0),
+                  block_base + static_cast<std::size_t>(k * sfb_blocks_per_k_block),
+                  padded_blocks_per_row,
+                  input_scale_layout);
+            }
+            FillP15ScaleFragmentWord(tCrSFB(cute::_, n, k), packed_scale_word);
+          }
+        }
+      } else {
+        cute::copy(tCsSFA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFA_cv);
+      }
       if (use_p5_direct_gmem_sfb) {
         auto scale_coords = cute::make_identity_tensor(cute::shape(sScaleB));
         auto tCsSFB_coords = s2r_thr_SFB.partition_S(scale_coords);
@@ -6135,13 +6440,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
           for (int n = 0; n < SfbNTiles; ++n) {
             auto sfb_atom = tCrSFB(cute::_, n, k);
             auto row_anchor = tCsSFB_coords(cute::_, n, 0, cute::Int<0>{});
-            auto c_atom_coords = part_c(cute::_, 0, n);
-            auto coord0 = c_atom_coords(0);
-            const int b_base_row = static_cast<int>(cute::get<1>(coord0));
             const int local_row0 = nvfp4_bridge::CoordGet0(row_anchor(0));
             std::uint32_t packed_scale_word = 0u;
-            if (b_base_row >= 0 && b_base_row < valid_rows &&
-                local_row0 >= 0 && local_row0 < valid_rows) {
+            if (local_row0 >= 0 && local_row0 < valid_rows) {
               packed_scale_word = LoadExecutionScaleWord(
                   input_matmul_block_scales,
                   static_cast<std::size_t>(row_start + local_row0),
@@ -6188,7 +6489,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
             }
           }
         }
-      } else {
+      } else if constexpr (Profile != nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
         auto tCsSFB = s2r_thr_SFB.partition_S(sScaleB);
         cute::copy(tCsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_cv);
       }
@@ -6240,6 +6541,211 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
                 padded_blocks_per_row,
                 input_scale_layout);
             g_p5_scale_trace.b_fragment_words[n] =
+                PackP15ScaleFragmentWord(tCrSFB(cute::_, n, 0));
+          }
+        }
+      } else if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+        if (g_enable_p13_scale_trace != 0 &&
+            cta_index == 0 &&
+            blockIdx.x == 0 &&
+            block_base == 0 &&
+            thread_id == 0) {
+          auto dense_c = cute::make_identity_tensor(
+              cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}));
+          auto part_c = thread_mma.partition_C(dense_c);
+          auto scale_coords_sfa = cute::make_identity_tensor(cute::shape(sScaleA));
+          auto scale_coords_sfb = cute::make_identity_tensor(cute::shape(sScaleB));
+          auto tCsSFA_coords = s2r_thr_SFA.partition_S(scale_coords_sfa);
+          auto tCsSFB_coords = s2r_thr_SFB.partition_S(scale_coords_sfb);
+          auto tCsSFA_coords_stage0 =
+              tCsSFA_coords(cute::_, cute::_, cute::_, cute::Int<0>{});
+          auto tCsSFB_coords_stage0 =
+              tCsSFB_coords(cute::_, cute::_, cute::_, cute::Int<0>{});
+          int a_scale_rows[nvfp4_bridge::kTracedP13ScaleFragmentCosizeA];
+          int a_scale_cols[nvfp4_bridge::kTracedP13ScaleFragmentCosizeA];
+          int b_scale_rows[nvfp4_bridge::kTracedP13ScaleFragmentCosizeB];
+          int b_scale_cols[nvfp4_bridge::kTracedP13ScaleFragmentCosizeB];
+          {
+            int physical = 0;
+            for (int i = 0;
+                 i < cute::size<0>(tCsSFA_coords_stage0) &&
+                 physical < nvfp4_bridge::kTracedP13ScaleFragmentCosizeA;
+                 ++i) {
+              for (int j = 0;
+                   j < cute::size<1>(tCsSFA_coords_stage0) &&
+                   physical < nvfp4_bridge::kTracedP13ScaleFragmentCosizeA;
+                   ++j) {
+                for (int k = 0;
+                     k < cute::size<2>(tCsSFA_coords_stage0) &&
+                     physical < nvfp4_bridge::kTracedP13ScaleFragmentCosizeA;
+                     ++k) {
+                  auto coord = tCsSFA_coords_stage0(cute::make_coord(i, j, k));
+                  a_scale_rows[physical] = nvfp4_bridge::CoordGet0(coord);
+                  a_scale_cols[physical] = nvfp4_bridge::CoordGet1(coord);
+                  ++physical;
+                }
+              }
+            }
+          }
+          {
+            int physical = 0;
+            for (int i = 0;
+                 i < cute::size<0>(tCsSFB_coords_stage0) &&
+                 physical < nvfp4_bridge::kTracedP13ScaleFragmentCosizeB;
+                 ++i) {
+              for (int j = 0;
+                   j < cute::size<1>(tCsSFB_coords_stage0) &&
+                   physical < nvfp4_bridge::kTracedP13ScaleFragmentCosizeB;
+                   ++j) {
+                for (int k = 0;
+                     k < cute::size<2>(tCsSFB_coords_stage0) &&
+                     physical < nvfp4_bridge::kTracedP13ScaleFragmentCosizeB;
+                     ++k) {
+                  auto coord = tCsSFB_coords_stage0(cute::make_coord(i, j, k));
+                  b_scale_rows[physical] = nvfp4_bridge::CoordGet0(coord);
+                  b_scale_cols[physical] = nvfp4_bridge::CoordGet1(coord);
+                  ++physical;
+                }
+              }
+            }
+          }
+          g_p13_scale_trace.valid = 1;
+          g_p13_scale_trace.row_start = row_start;
+          g_p13_scale_trace.valid_rows = valid_rows;
+          g_p13_scale_trace.output_row_base = output_row_base;
+          for (int row = 0; row < 2; ++row) {
+            for (int col = 0; col < 8; ++col) {
+              g_p13_scale_trace.a_logical_raw[row * 8 + col] = static_cast<std::uint8_t>(
+                  sScaleA(row, col, cute::Int<0>{}).raw());
+              g_p13_scale_trace.b_logical_raw[row * 8 + col] = static_cast<std::uint8_t>(
+                  sScaleB(row, col, cute::Int<0>{}).raw());
+            }
+          }
+          constexpr int M_tiles = cute::size<1>(decltype(tCrA){});
+          constexpr int N_tiles = cute::size<1>(decltype(tCrB){});
+          for (int m = 0; m < min(M_tiles, 2); ++m) {
+            const int a_base_row = a_scale_rows[m * 4];
+            g_p13_scale_trace.a_base_rows[m] = a_base_row;
+            g_p13_scale_trace.a_source_words[m] = LoadExecutionScaleWord(
+                weight.matmul_block_scales_data,
+                static_cast<std::size_t>(output_row_base + a_base_row),
+                block_base,
+                padded_blocks_per_row,
+                Nvfp4ScaleLayout::kSwizzled128x4);
+            std::uint32_t packed_from_smem = 0u;
+            for (int elem = 0; elem < 4; ++elem) {
+              const int physical = m * 4 + elem;
+              const int scale_row = a_scale_rows[physical];
+              const int scale_col = a_scale_cols[physical];
+              const auto raw = static_cast<std::uint8_t>(
+                  sScaleA(scale_row, scale_col, cute::Int<0>{}).raw());
+              g_p13_scale_trace.a_scale_rows[physical] = scale_row;
+              g_p13_scale_trace.a_scale_cols[physical] = scale_col;
+              g_p13_scale_trace.a_scale_raw[physical] = raw;
+              packed_from_smem |= static_cast<std::uint32_t>(raw) << (elem * 8);
+            }
+            g_p13_scale_trace.a_smem_words[m] = packed_from_smem;
+            g_p13_scale_trace.a_fragment_words[m] =
+                PackP15ScaleFragmentWord(tCrSFA(cute::_, m, 0));
+          }
+          for (int n = 0; n < min(N_tiles, 2); ++n) {
+            const int b_base_row = b_scale_rows[n * 4];
+            g_p13_scale_trace.b_base_rows[n] = b_base_row;
+            g_p13_scale_trace.b_source_words[n] = LoadExecutionScaleWord(
+                input_matmul_block_scales,
+                static_cast<std::size_t>(row_start + b_base_row),
+                block_base,
+                padded_blocks_per_row,
+                input_scale_layout);
+            std::uint32_t packed_from_smem = 0u;
+            for (int elem = 0; elem < 4; ++elem) {
+              const int physical = n * 4 + elem;
+              const int scale_row = b_scale_rows[physical];
+              const int scale_col = b_scale_cols[physical];
+              const auto raw = static_cast<std::uint8_t>(
+                  sScaleB(scale_row, scale_col, cute::Int<0>{}).raw());
+              g_p13_scale_trace.b_scale_rows[physical] = scale_row;
+              g_p13_scale_trace.b_scale_cols[physical] = scale_col;
+              g_p13_scale_trace.b_scale_raw[physical] = raw;
+              packed_from_smem |= static_cast<std::uint32_t>(raw) << (elem * 8);
+            }
+            g_p13_scale_trace.b_smem_words[n] = packed_from_smem;
+            g_p13_scale_trace.b_fragment_words[n] =
+                PackP15ScaleFragmentWord(tCrSFB(cute::_, n, 0));
+          }
+        }
+        if (p13_debug_capture_cta != 0 &&
+            block_base == 0 &&
+            ((g_p13_debug_trace_target_thread_id < 0 && thread_id == 0) ||
+             thread_id == g_p13_debug_trace_target_thread_id)) {
+          auto dense_c = cute::make_identity_tensor(
+              cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kProfileTokenRows>{}));
+          auto part_c = thread_mma.partition_C(dense_c);
+          auto a_coords = cute::make_identity_tensor(cute::shape(sA));
+          auto tCsA_coords = s2r_thr_A.partition_S(a_coords);
+          auto tCsA_coords_stage0 =
+              tCsA_coords(cute::_, cute::_, cute::_, cute::Int<0>{});
+          auto b_coords = cute::make_identity_tensor(cute::shape(sB));
+          auto tCsB_coords = s2r_thr_B.partition_S(b_coords);
+          auto tCsB_coords_stage0 =
+              tCsB_coords(cute::_, cute::_, cute::_, cute::Int<0>{});
+          int row_coords[nvfp4_bridge::kTracedP13CCopyCoordCapacity];
+          int col_coords[nvfp4_bridge::kTracedP13CCopyCoordCapacity];
+          int a_copy_rows[32];
+          int a_copy_cols[32];
+          int b_copy_rows[16];
+          int b_copy_cols[16];
+          nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
+              part_c,
+              nvfp4_bridge::kTracedP13CCopyCoordCapacity,
+              row_coords,
+              col_coords);
+          nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
+              tCsA_coords_stage0,
+              32,
+              a_copy_rows,
+              a_copy_cols);
+          nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
+              tCsB_coords_stage0,
+              16,
+              b_copy_rows,
+              b_copy_cols);
+          g_p13_debug_trace.valid = 1;
+          g_p13_debug_trace.row_start = row_start;
+          g_p13_debug_trace.valid_rows = valid_rows;
+          g_p13_debug_trace.output_row_base = output_row_base;
+          constexpr int M_tiles = cute::size<1>(decltype(tCrA){});
+          constexpr int N_tiles = cute::size<1>(decltype(tCrB){});
+          for (int physical = 0; physical < nvfp4_bridge::kTracedP13CCopyCoordCapacity; ++physical) {
+            g_p13_debug_trace.store_rows[physical] = row_coords[physical];
+            g_p13_debug_trace.store_cols[physical] = col_coords[physical];
+          }
+          for (int physical = 0; physical < 32; ++physical) {
+            g_p13_debug_trace.a_copy_rows[physical] = a_copy_rows[physical];
+            g_p13_debug_trace.a_copy_cols[physical] = a_copy_cols[physical];
+            std::uint8_t raw = 0u;
+            if (a_copy_rows[physical] >= 0 &&
+                a_copy_rows[physical] < valid_rows &&
+                a_copy_cols[physical] >= 0 &&
+                a_copy_cols[physical] < static_cast<int>(weight.input_cols)) {
+              raw = LoadPackedFp4Nibble(
+                  packed_input +
+                      (static_cast<std::size_t>(row_start + a_copy_rows[physical]) *
+                       packed_row_bytes),
+                  a_copy_cols[physical]);
+            }
+            g_p13_debug_trace.a_copy_raw[physical] = raw;
+          }
+          for (int physical = 0; physical < 16; ++physical) {
+            g_p13_debug_trace.b_copy_rows[physical] = b_copy_rows[physical];
+            g_p13_debug_trace.b_copy_cols[physical] = b_copy_cols[physical];
+          }
+          for (int m = 0; m < min(M_tiles, 2); ++m) {
+            g_p13_debug_trace.a_scale_words[m] =
+                PackP15ScaleFragmentWord(tCrSFA(cute::_, m, 0));
+          }
+          for (int n = 0; n < min(N_tiles, 2); ++n) {
+            g_p13_debug_trace.b_scale_words[n] =
                 PackP15ScaleFragmentWord(tCrSFB(cute::_, n, 0));
           }
         }
@@ -6307,12 +6813,44 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
           }
         }
       }
+      if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+        if (p13_debug_capture_cta != 0 &&
+            block_base == 0 &&
+            ((g_p13_debug_trace_target_thread_id < 0 && thread_id == 0) ||
+             thread_id == g_p13_debug_trace_target_thread_id)) {
+          for (int m = 0; m < 2; ++m) {
+            for (int n = 0; n < 2; ++n) {
+              for (int reg = 0; reg < 4; ++reg) {
+                g_p13_debug_trace.block0_accum_regs[m][n][reg] =
+                    accum_tensor(reg, m, n);
+              }
+            }
+          }
+        }
+      }
     }
     __syncthreads();
   }
   }
 
   if (warp_id < kFp4ConsumerWarps) {
+      if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
+        if (p13_debug_capture_cta != 0 &&
+            ((g_p13_debug_trace_target_thread_id < 0 && warp_id == 0 && lane_id == 0) ||
+             tid == g_p13_debug_trace_target_thread_id)) {
+          auto accum_tensor = cute::make_tensor(
+            reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
+            typename Traits::AccumLayout{});
+        for (int m = 0; m < 2; ++m) {
+          for (int n = 0; n < 2; ++n) {
+            for (int reg = 0; reg < 4; ++reg) {
+              g_p13_debug_trace.accum_regs[m][n][reg] =
+                  accum_tensor(reg, m, n);
+            }
+          }
+        }
+      }
+    }
     nvfp4_bridge::StoreUnifiedRoutedFp4Output<Profile>(
         output_alpha,
         &accum_storage[0],
@@ -6347,6 +6885,8 @@ template <typename OutputType, int kOutputTile>
 __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmem(
     const std::uint8_t* packed_input,
     const std::uint8_t* input_block_scales,
+    const std::uint8_t* input_matmul_block_scales,
+    Nvfp4ScaleLayout input_scale_layout,
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
@@ -6367,10 +6907,12 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
   const auto b_tile_view =
       nvfp4_bridge::MakePackedTile64<kOutputTile>(&b_packed[0][0], nullptr);
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-  auto a_scale_tensor =
+  auto a_scale_tensor_raw =
       cute::make_tensor(cute::make_smem_ptr(&a_scale_smem[0]), nvfp4_bridge::TracedP13SmemLayoutSFA{});
-  auto b_scale_tensor =
+  auto b_scale_tensor_raw =
       cute::make_tensor(cute::make_smem_ptr(&b_scale_smem[0]), nvfp4_bridge::TracedP13SmemLayoutSFB{});
+  auto a_scale_tensor = cute::as_position_independent_swizzle_tensor(a_scale_tensor_raw);
+  auto b_scale_tensor = cute::as_position_independent_swizzle_tensor(b_scale_tensor_raw);
 #endif
 
   const int cta_index = static_cast<int>(blockIdx.y);
@@ -6409,6 +6951,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
                                                    : *input_tensor_scale_data)
           : 1.0f;
   const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
+  const bool p13_scale_map_probe = (g_enable_p13_scale_map_probe != 0);
 
   nvfp4_bridge::CFragment64 accum[nvfp4_bridge::kTracedP13MFragments][nvfp4_bridge::kTracedP13NFragments];
   if (warp_id < kFp4ConsumerWarps) {
@@ -6479,22 +7022,177 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
 #endif
       }
     }
+    if (p13_scale_map_probe) {
+      for (int logical_row = tid;
+           logical_row < static_cast<int>(cute::size<0>(a_scale_tensor));
+           logical_row += blockDim.x) {
+        const std::uint8_t value = static_cast<std::uint8_t>((logical_row + 1) & 0xff);
+        for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(a_scale_tensor)); ++scale_col) {
+          StoreScaleTensorByte(a_scale_tensor, logical_row, scale_col, value);
+        }
+      }
+      for (int logical_row = tid;
+           logical_row < static_cast<int>(cute::size<0>(b_scale_tensor));
+           logical_row += blockDim.x) {
+        const std::uint8_t value = static_cast<std::uint8_t>((logical_row + 1) & 0xff);
+        for (int scale_col = 0; scale_col < static_cast<int>(cute::size<1>(b_scale_tensor)); ++scale_col) {
+          StoreScaleTensorByte(b_scale_tensor, logical_row, scale_col, value);
+        }
+      }
+    }
     __syncthreads();
 
     if (warp_id < kFp4ConsumerWarps) {
       nvfp4_bridge::AFragment64 a_fragments[nvfp4_bridge::kTracedP13MFragments];
       nvfp4_bridge::BFragment64 b_fragments[nvfp4_bridge::kTracedP13NFragments];
-      nvfp4_bridge::LoadTracedP13AFragmentsRowMajor16x64<nvfp4_bridge::TracedP13TiledMma, kPlannedWmmaTileM>(
-          &a_packed[0][0],
-          a_scale_smem,
-          warp_id * 32 + lane_id,
-          0,
-          a_fragments);
-      nvfp4_bridge::LoadTracedP13BFragmentsColMajor64x8<nvfp4_bridge::TracedP13TiledMma, kOutputTile>(
-          &b_packed[0][0],
-          b_scale_smem,
-          warp_id * 32 + lane_id,
-          b_fragments);
+      if (p13_scale_map_probe) {
+        nvfp4_bridge::LoadTracedP13AFragmentsRowMajor16x64<nvfp4_bridge::TracedP13TiledMma, kPlannedWmmaTileM>(
+            &a_packed[0][0],
+            a_scale_smem,
+            warp_id * 32 + lane_id,
+            0,
+            a_fragments);
+        nvfp4_bridge::LoadTracedP13BFragmentsColMajor64x8<nvfp4_bridge::TracedP13TiledMma, kOutputTile>(
+            &b_packed[0][0],
+            b_scale_smem,
+            warp_id * 32 + lane_id,
+            b_fragments);
+        if (g_enable_p13_scale_trace != 0 &&
+            cta_index == 0 &&
+            blockIdx.x == 0 &&
+            block_base == 0 &&
+            warp_id == 0 &&
+            lane_id == 0) {
+          g_p13_scale_trace.valid = 1;
+          g_p13_scale_trace.row_start = row_start;
+          g_p13_scale_trace.valid_rows = valid_rows;
+          g_p13_scale_trace.output_row_base = output_row_base;
+          for (int row = 0; row < 2; ++row) {
+            for (int col = 0; col < 8; ++col) {
+              g_p13_scale_trace.a_logical_raw[row * 8 + col] = static_cast<std::uint8_t>(
+                  ScaleByteValue(a_scale_tensor(row, col, cute::Int<0>{})));
+              g_p13_scale_trace.b_logical_raw[row * 8 + col] = static_cast<std::uint8_t>(
+                  ScaleByteValue(b_scale_tensor(row, col, cute::Int<0>{})));
+              g_p13_scale_trace.a_post_store_raw[row * 8 + col] =
+                  g_p13_scale_trace.a_logical_raw[row * 8 + col];
+              g_p13_scale_trace.b_post_store_raw[row * 8 + col] =
+                  g_p13_scale_trace.b_logical_raw[row * 8 + col];
+            }
+          }
+          for (int m = 0; m < 2; ++m) {
+            const std::uint32_t packed =
+                static_cast<std::uint32_t>(a_fragments[m].scale[0]);
+            g_p13_scale_trace.a_fragment_words[m] = packed;
+            g_p13_scale_trace.a_smem_words[m] = packed;
+            for (int elem = 0; elem < 4; ++elem) {
+              const int physical = m * 4 + elem;
+              const std::uint8_t raw =
+                  static_cast<std::uint8_t>((packed >> (elem * 8)) & 0xffu);
+              g_p13_scale_trace.a_scale_raw[physical] = raw;
+              FindScaleTensorCoordByRaw(
+                  a_scale_tensor,
+                  raw,
+                  g_p13_scale_trace.a_scale_rows[physical],
+                  g_p13_scale_trace.a_scale_cols[physical]);
+            }
+            g_p13_scale_trace.a_base_rows[m] = g_p13_scale_trace.a_scale_rows[m * 4];
+          }
+          for (int n = 0; n < 2; ++n) {
+            const std::uint32_t packed =
+                static_cast<std::uint32_t>(b_fragments[n].scale[0]);
+            g_p13_scale_trace.b_fragment_words[n] = packed;
+            g_p13_scale_trace.b_smem_words[n] = packed;
+            for (int elem = 0; elem < 4; ++elem) {
+              const int physical = n * 4 + elem;
+              const std::uint8_t raw =
+                  static_cast<std::uint8_t>((packed >> (elem * 8)) & 0xffu);
+              g_p13_scale_trace.b_scale_raw[physical] = raw;
+              FindScaleTensorCoordByRaw(
+                  b_scale_tensor,
+                  raw,
+                  g_p13_scale_trace.b_scale_rows[physical],
+                  g_p13_scale_trace.b_scale_cols[physical]);
+            }
+            g_p13_scale_trace.b_base_rows[n] = g_p13_scale_trace.b_scale_rows[n * 4];
+          }
+        }
+      } else {
+#pragma unroll
+        for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP13MFragments; ++m_fragment) {
+          const int row_base = m_fragment * 64;
+          a_fragments[m_fragment] =
+              nvfp4_bridge::LoadFragmentA_RowMajor16x64Tiled<
+                  nvfp4_bridge::TracedP13TiledMma,
+                  kPlannedWmmaTileM>(&a_packed[0][0], nullptr, row_base, warp_id * 32 + lane_id);
+          a_fragments[m_fragment].scale[0] = static_cast<nvfp4_bridge::SFRegister>(
+              LoadExecutionScaleWord(
+                  weight.matmul_block_scales_data,
+                  static_cast<std::size_t>(output_row_base),
+                  block_base,
+                  padded_blocks_per_row,
+                  Nvfp4ScaleLayout::kSwizzled128x4));
+        }
+#pragma unroll
+        for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP13NFragments; ++n_fragment) {
+          const int n_base = n_fragment * 8;
+          b_fragments[n_fragment] =
+              nvfp4_bridge::LoadFragmentB_ColMajor64x8Tiled<
+                  nvfp4_bridge::TracedP13TiledMma,
+                  kOutputTile>(&b_packed[0][0], nullptr, warp_id * 32 + lane_id, n_base);
+          std::uint32_t packed_scale_word = 0u;
+          if (valid_rows > 0) {
+            packed_scale_word = LoadExecutionScaleWord(
+                input_matmul_block_scales,
+                static_cast<std::size_t>(row_start),
+                block_base,
+                padded_blocks_per_row,
+                input_scale_layout);
+          }
+          b_fragments[n_fragment].scale[0] =
+              static_cast<nvfp4_bridge::SFRegister>(packed_scale_word);
+        }
+      }
+      if (g_enable_p13_debug_trace != 0 &&
+          cta_index == 0 &&
+          blockIdx.x == 0 &&
+          block_base == 0 &&
+          warp_id == 0 &&
+          lane_id == 0) {
+        auto mma = nvfp4_bridge::TracedP13TiledMma{};
+        auto thr_mma = mma.get_thread_slice(warp_id * 32 + lane_id);
+        auto ref_c = cute::make_identity_tensor(
+            cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
+        auto part_c = thr_mma.partition_C(ref_c);
+        int row_coords[nvfp4_bridge::kTracedP13CCopyCoordCapacity];
+        int col_coords[nvfp4_bridge::kTracedP13CCopyCoordCapacity];
+        nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
+            part_c,
+            nvfp4_bridge::kTracedP13CCopyCoordCapacity,
+            row_coords,
+            col_coords);
+        g_p13_debug_trace.valid = 1;
+        g_p13_debug_trace.row_start = row_start;
+        g_p13_debug_trace.valid_rows = valid_rows;
+        g_p13_debug_trace.output_row_base = output_row_base;
+        for (int physical = 0; physical < nvfp4_bridge::kTracedP13CCopyCoordCapacity; ++physical) {
+          g_p13_debug_trace.store_rows[physical] = row_coords[physical];
+          g_p13_debug_trace.store_cols[physical] = col_coords[physical];
+        }
+        for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP13MFragments; ++m_fragment) {
+          for (int reg = 0; reg < 4; ++reg) {
+            g_p13_debug_trace.a_regs[m_fragment][reg] = a_fragments[m_fragment].regs[reg];
+          }
+          g_p13_debug_trace.a_scale_words[m_fragment] =
+              static_cast<std::uint32_t>(a_fragments[m_fragment].scale[0]);
+        }
+        for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP13NFragments; ++n_fragment) {
+          for (int reg = 0; reg < 2; ++reg) {
+            g_p13_debug_trace.b_regs[n_fragment][reg] = b_fragments[n_fragment].regs[reg];
+          }
+          g_p13_debug_trace.b_scale_words[n_fragment] =
+              static_cast<std::uint32_t>(b_fragments[n_fragment].scale[0]);
+        }
+      }
 #pragma unroll
       for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP13MFragments; ++m_fragment) {
 #pragma unroll
@@ -6502,11 +7200,40 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSme
           nvfp4_bridge::Gemm(accum[m_fragment][n_fragment], a_fragments[m_fragment], b_fragments[n_fragment]);
         }
       }
+      if (g_enable_p13_debug_trace != 0 &&
+          cta_index == 0 &&
+          blockIdx.x == 0 &&
+          block_base == 0 &&
+          warp_id == 0 &&
+          lane_id == 0) {
+        for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP13MFragments; ++m_fragment) {
+          for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP13NFragments; ++n_fragment) {
+            for (int reg = 0; reg < 4; ++reg) {
+              g_p13_debug_trace.block0_accum_regs[m_fragment][n_fragment][reg] =
+                  accum[m_fragment][n_fragment].regs[reg];
+            }
+          }
+        }
+      }
     }
     __syncthreads();
   }
 
   if (warp_id < kFp4ConsumerWarps) {
+    if (g_enable_p13_debug_trace != 0 &&
+        cta_index == 0 &&
+        blockIdx.x == 0 &&
+        warp_id == 0 &&
+        lane_id == 0) {
+      for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP13MFragments; ++m_fragment) {
+        for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP13NFragments; ++n_fragment) {
+          for (int reg = 0; reg < 4; ++reg) {
+            g_p13_debug_trace.accum_regs[m_fragment][n_fragment][reg] =
+                accum[m_fragment][n_fragment].regs[reg];
+          }
+        }
+      }
+    }
     nvfp4_bridge::StoreTracedP13CFragmentsRowMajor<nvfp4_bridge::TracedP13TiledMma>(
         output_alpha,
         accum,
@@ -8593,24 +9320,71 @@ bool LaunchPlannedPackedInputMatVec(
             output);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm2Profile::kP13_128x128x64_SwapTrue:
-        Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
-            nvfp4_bridge::UnifiedRoutedFp4Profile::kP13,
-            float><<<grid, block>>>(
-            input_pack.packed_data(),
-            input_pack.matmul_block_scales_data(),
-            input_pack.scale_layout(),
-            input_pack.device_tensor_scale_ptr(),
-            input_expert_tensor_scales,
-            input_dq_scales,
-            launch_plan->num_non_exiting_ctas(),
-            launch_plan->cta_idx_xy_to_batch_idx(),
-            launch_plan->cta_row_starts(),
-            launch_plan->cta_valid_rows(),
-            nullptr,
-            nullptr,
-            weights,
-            output_rows_per_expert,
-            output);
+        g_enable_p13_scale_trace = std::getenv("NEMOTRON_P13_SCALE_DEBUG") != nullptr ? 1 : 0;
+        g_enable_p13_scale_map_probe =
+            std::getenv("NEMOTRON_P13_SCALE_MAP_PROBE") != nullptr ? 1 : 0;
+        g_enable_p13_debug_trace = std::getenv("NEMOTRON_P13_DEBUG_TRACE") != nullptr ? 1 : 0;
+        g_p13_debug_trace_target_valid_rows = -1;
+        g_p13_debug_trace_target_thread_id = -1;
+        if (const char* target_valid_rows_env =
+                std::getenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_VALID_ROWS")) {
+          g_p13_debug_trace_target_valid_rows = std::atoi(target_valid_rows_env);
+        }
+        if (const char* target_thread_env =
+                std::getenv("NEMOTRON_P13_DEBUG_TRACE_TARGET_THREAD_ID")) {
+          g_p13_debug_trace_target_thread_id = std::atoi(target_thread_env);
+        }
+        if (g_enable_p13_scale_trace != 0 ||
+            g_enable_p13_scale_map_probe != 0 ||
+            g_enable_p13_debug_trace != 0) {
+          g_p13_scale_trace = {};
+          g_p13_debug_trace = {};
+          g_p13_debug_trace_claimed = 0;
+        }
+        if (RoutedEnvEnabled("NEMOTRON_DEBUG_USE_OLD_P13_KERNEL")) {
+          Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapTrueK64ScaleSmem<
+              float,
+              128><<<grid, block>>>(
+              input_pack.packed_data(),
+              input_pack.block_scales_data(),
+              input_pack.matmul_block_scales_data(),
+              input_pack.scale_layout(),
+              input_pack.device_tensor_scale_ptr(),
+              input_expert_tensor_scales,
+              input_dq_scales,
+              launch_plan->num_non_exiting_ctas(),
+              launch_plan->cta_idx_xy_to_batch_idx(),
+              launch_plan->cta_row_starts(),
+              launch_plan->cta_valid_rows(),
+              weights,
+              output_rows_per_expert,
+              output);
+        } else {
+          Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
+              nvfp4_bridge::UnifiedRoutedFp4Profile::kP13,
+              float><<<grid, block>>>(
+              input_pack.packed_data(),
+              input_pack.matmul_block_scales_data(),
+              input_pack.scale_layout(),
+              input_pack.device_tensor_scale_ptr(),
+              input_expert_tensor_scales,
+              input_dq_scales,
+              launch_plan->num_non_exiting_ctas(),
+              launch_plan->cta_idx_xy_to_batch_idx(),
+              launch_plan->cta_row_starts(),
+              launch_plan->cta_valid_rows(),
+              nullptr,
+              nullptr,
+              weights,
+              output_rows_per_expert,
+              output);
+        }
+        if (g_enable_p13_scale_trace != 0) {
+          if (!CheckCuda(cudaDeviceSynchronize())) {
+            return false;
+          }
+          PrintP13ScaleTrace();
+        }
         return CheckCuda(cudaGetLastError());
       case RoutedGemm2Profile::kP15_256x128x64_SwapTrue:
         g_enable_p15_scale_trace = std::getenv("NEMOTRON_P15_SCALE_DEBUG") != nullptr ? 1 : 0;
@@ -9048,6 +9822,21 @@ bool LaunchAccumulateSharedOutput(
 
 }  // namespace
 
+bool CopyP13DebugTrace(P13DebugTrace* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    return false;
+  }
+  *out = g_p13_debug_trace;
+  return true;
+}
+
+void ResetP13DebugTrace() {
+  g_p13_debug_trace = {};
+}
+
 bool RunGroupedNvfp4ExpertMatVec(
     const float* input,
     const int* expert_offsets,
@@ -9235,7 +10024,6 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   if (!current_padded_row_capacity.has_value()) {
     return false;
   }
-
   if (!RunDeviceExpertRouting(
           params.selected_indices,
           params.selected_weights,
@@ -9248,6 +10036,11 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       !LaunchZeroBuffer(params.shared_output, token_hidden_count)) {
     return false;
   }
+
+  const std::size_t packed_dispatch_rows =
+      RoutedEnvEnabled("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH")
+          ? params.launch_plan->selected_token_tile()
+          : params.token_count;
 
   if ((!use_packed_fc1_source &&
        !LaunchGatherRows(
@@ -9299,7 +10092,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                     nullptr,
                     nullptr,
                     params.launch_plan,
-                    params.token_count,
+                    packed_dispatch_rows,
                     selection_count,
                     params.routed_up_device,
                     params.routed_expert_intermediate_size,
@@ -9327,7 +10120,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
             nullptr,
             activation_output_scale,
             params.launch_plan,
-            params.token_count,
+            packed_dispatch_rows,
             selection_count,
             params.routed_down_device,
             params.hidden_size,
@@ -9344,7 +10137,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                     fc1_input_expert_scales,
                     nullptr,
                     params.launch_plan,
-                    params.token_count,
+                    packed_dispatch_rows,
                     selection_count,
                     params.routed_up_device,
                     params.routed_expert_intermediate_size,
@@ -9392,7 +10185,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
                     params.fc2_expert_activation_scales,
                     nullptr,
                     params.launch_plan,
-                    params.token_count,
+                    packed_dispatch_rows,
                     selection_count,
                     params.routed_down_device,
                     params.hidden_size,
