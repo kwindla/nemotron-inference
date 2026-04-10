@@ -151,6 +151,13 @@ struct TmaCopyOnlySharedStorageSFB {
   alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType ab_full_mbar[1];
 };
 
+struct TmaCopyOnlySharedStorageSFBHybrid {
+  alignas(128) cute::TmaDescriptor smem_tensormap_SFB;
+  alignas(1024) cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB_tma;
+  alignas(1024) cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB_local;
+  alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType ab_full_mbar[1];
+};
+
 template <class TmaCopyA>
 struct P5ATmaCopyOnlyParams {
   TmaCopyA tma_load_a;
@@ -206,6 +213,14 @@ struct P5SfbTmaGroupedDescriptorParams {
   ElementSF const* execution_scales;
   int total_rows;
   int row_start;
+  std::uint8_t* logical_tma_bytes;
+};
+
+template <class TmaCopySFB>
+struct P5SfbTmaHybridRemapParams {
+  TmaCopySFB tma_load_sfb;
+  int row_offset;
+  int valid_rows;
   std::uint8_t* logical_tma_bytes;
 };
 
@@ -2041,6 +2056,281 @@ int RunP5SfbTmaOffsetLogicalSmoke() {
   return status;
 }
 
+template <class TmaCopySFB>
+__global__ void P5SfbTmaHybridRemapLogicalKernel(
+    __grid_constant__ P5SfbTmaHybridRemapParams<TmaCopySFB> const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<TmaCopyOnlySharedStorageSFBHybrid*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int lane_predicate = cute::elect_one_sync();
+  const bool is_tma_thread = (warp_idx == 0) && lane_predicate;
+
+  using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using ProducerBarrierType = typename FullBarrier::ValueType;
+  auto* ab_full_mbar = cute::recast_ptr<FullBarrier>(&shared.ab_full_mbar[0]);
+
+  if (is_tma_thread) {
+    cute::prefetch_tma_descriptor(params.tma_load_sfb.get_tma_descriptor());
+  }
+  __syncthreads();
+
+  if (is_tma_thread) {
+    ab_full_mbar[0].init(1);
+    cutlass::arch::fence_barrier_init();
+  }
+
+  auto* smem_sfb_tma_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_tma.data());
+  auto* smem_sfb_local_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_local.data());
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemSfbBytes; i += blockDim.x) {
+    smem_sfb_tma_bytes[i] = 0u;
+    smem_sfb_local_bytes[i] = 0u;
+  }
+  __syncthreads();
+
+  using X = cute::Underscore;
+  auto mSFB_nkl = params.tma_load_sfb.get_tma_tensor(cute::shape(
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK)));
+  auto gSFB_nkl = cute::local_tile(
+      mSFB_nkl,
+      MmaTileShape{},
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<X, cute::_1, cute::_1>{});
+  auto block_tma_sfb = params.tma_load_sfb.get_slice(0);
+  auto gSFB = gSFB_nkl(cute::_, cute::_, 0, cute::_, 0);
+  auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+  auto sSFB_tma_raw = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_tma.data()), SmemLayoutSFB{});
+  auto tBsSFB = block_tma_sfb.partition_D(sSFB_tma_raw);
+
+  if (is_tma_thread) {
+    auto& ab_full_barrier = ab_full_mbar[0];
+    auto tma_copy_sfb =
+        params.tma_load_sfb.with(*cute::recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+    cute::copy(
+        tma_copy_sfb,
+        tBgSFB(cute::_, cute::_, cute::_, cute::Int<0>{}),
+        tBsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}));
+    ab_full_mbar[0].arrive_and_expect_tx(
+        static_cast<uint32_t>(
+            cutlass::bits_to_bytes(
+                cute::cosize(cute::take<0, 2>(SmemLayoutSFB{})) *
+                cute::sizeof_bits_v<ElementSF>)));
+  }
+
+  ab_full_mbar[0].wait(0);
+  __syncthreads();
+
+  auto sSFB_tma = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_tma.data()), SmemLayoutSFB{});
+  auto sSFB_local = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_local.data()), SmemLayoutSFB{});
+  auto sSFB_tma_logical = cute::as_position_independent_swizzle_tensor(sSFB_tma);
+  auto sSFB_local_logical = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  constexpr int kLogicalCols = cute::size<1>(SmemLayoutSFB{});
+  for (int row = tid; row < kTmaCopyOnlyTileN; row += blockDim.x) {
+    if (row < params.valid_rows) {
+#pragma unroll
+      for (int col = 0; col < kLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}) =
+            sSFB_tma_logical(params.row_offset + row, col, cute::Int<0>{});
+      }
+    } else {
+#pragma unroll
+      for (int col = 0; col < kLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}).storage = 0u;
+      }
+    }
+  }
+  __syncthreads();
+
+  auto sSFB_logical = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  for (int linear = tid; linear < kTmaCopyOnlyTileN * kSfbLogicalCols; linear += blockDim.x) {
+    const int row = linear / kSfbLogicalCols;
+    const int col = linear % kSfbLogicalCols;
+    params.logical_tma_bytes[linear] = sSFB_logical(row, col, cute::Int<0>{}).storage;
+  }
+}
+
+int RunP5SfbTmaHybridRemapSmoke() {
+  constexpr std::string_view label = "tma_copy_only_sfb_hybrid_row8_valid8";
+  constexpr int total_rows = 256;
+  constexpr int row_start = 8;
+  constexpr int valid_rows = 8;
+  constexpr int aligned_row_base = 0;
+  constexpr int row_offset = row_start - aligned_row_base;
+  constexpr int kLogicalBlocksPerRow = kTmaCopyOnlyTileK / 16;
+
+  std::vector<std::uint8_t> row_major_scales(
+      static_cast<std::size_t>(total_rows * kLogicalBlocksPerRow),
+      std::uint8_t{0});
+  for (int row = 0; row < total_rows; ++row) {
+    for (int block = 0; block < kLogicalBlocksPerRow; ++block) {
+      row_major_scales[static_cast<std::size_t>(row * kLogicalBlocksPerRow + block)] =
+          static_cast<std::uint8_t>((19 * row + 11 * block + 3) & 0xFF);
+    }
+  }
+  std::vector<std::uint8_t> execution_scales = SwizzleRowMajorScalesForExecutionLocal(
+      row_major_scales.data(),
+      total_rows,
+      kTmaCopyOnlyTileK,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+
+  std::uint8_t* d_execution_scales = nullptr;
+  std::uint8_t* d_logical_tma = nullptr;
+  const std::size_t logical_bytes =
+      static_cast<std::size_t>(kTmaCopyOnlyTileN * kSfbLogicalCols);
+  if (!CheckCuda(cudaMalloc(&d_execution_scales, execution_scales.size()), "malloc sfb hybrid execution scales") ||
+      !CheckCuda(cudaMalloc(&d_logical_tma, logical_bytes), "malloc sfb hybrid logical readback")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_logical_tma);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          d_execution_scales,
+          execution_scales.data(),
+          execution_scales.size(),
+          cudaMemcpyHostToDevice),
+          "copy sfb hybrid execution scales") ||
+      !CheckCuda(cudaMemset(d_logical_tma, 0, logical_bytes), "memset sfb hybrid logical readback")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_logical_tma);
+    return 1;
+  }
+
+  const auto aligned_offset = [&]() {
+    const std::size_t row = static_cast<std::size_t>(aligned_row_base);
+    const std::size_t padded_blocks_per_row = static_cast<std::size_t>(kLogicalBlocksPerRow);
+    const std::size_t num_k_tiles = padded_blocks_per_row / 4u;
+    const std::size_t m_tile = row / 128u;
+    const std::size_t outer_m = row & 31u;
+    const std::size_t inner_m = (row >> 5u) & 3u;
+    return ((((m_tile * num_k_tiles) + 0u) << 9u) |
+            (outer_m << 4u) |
+            (inner_m << 2u) |
+            0u);
+  }();
+  auto tensor_sfb = cute::make_tensor(
+      cute::make_gmem_ptr(reinterpret_cast<ElementSF const*>(d_execution_scales + aligned_offset)),
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK));
+  auto tma_load_sfb = cute::make_tma_copy<uint16_t>(
+      cute::SM90_TMA_LOAD{},
+      tensor_sfb,
+      SmemLayoutSFB{}(cute::_, cute::_, cute::Int<0>{}),
+      cute::make_shape(cute::Int<kTmaCopyOnlyTileN>{}, cute::Int<kTmaCopyOnlyTileK>{}),
+      cute::_1{});
+
+  using TmaCopySFB = decltype(tma_load_sfb);
+  using Params = P5SfbTmaHybridRemapParams<TmaCopySFB>;
+  auto kernel_typed = P5SfbTmaHybridRemapLogicalKernel<TmaCopySFB>;
+  if (!CheckCuda(cudaFuncSetAttribute(
+          kernel_typed,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          sizeof(TmaCopyOnlySharedStorageSFBHybrid)),
+          "func attr p5 sfb hybrid remap")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_logical_tma);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kTmaThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(TmaCopyOnlySharedStorageSFBHybrid);
+  config.stream = nullptr;
+  cudaLaunchAttribute attrs[1]{};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+
+  alignas(64) Params params{tma_load_sfb, row_offset, valid_rows, d_logical_tma};
+  if (!CheckCuda(
+          cudaLaunchKernelEx(&config, kernel_typed, params),
+          "launch p5 sfb hybrid remap") ||
+      !CheckCuda(cudaDeviceSynchronize(), "sync p5 sfb hybrid remap")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_logical_tma);
+    return 1;
+  }
+
+  std::vector<std::uint8_t> h_logical_tma(logical_bytes, 0);
+  if (!CheckCuda(cudaMemcpy(
+          h_logical_tma.data(),
+          d_logical_tma,
+          logical_bytes,
+          cudaMemcpyDeviceToHost),
+          "copy sfb hybrid logical readback")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_logical_tma);
+    return 1;
+  }
+  cudaFree(d_execution_scales);
+  cudaFree(d_logical_tma);
+
+  auto host_tensor_sfb = cute::make_tensor(
+      reinterpret_cast<ElementSF const*>(execution_scales.data() + aligned_offset),
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK));
+  auto host_block_tma_sfb = tma_load_sfb.get_slice(0);
+  std::vector<ElementSF> expected_tma_smem(cute::cosize_v<SmemLayoutSFB>, ElementSF{});
+  auto host_sSFB_tma_raw = cute::make_tensor(expected_tma_smem.data(), SmemLayoutSFB{});
+  auto host_tBsSFB = host_block_tma_sfb.partition_D(host_sSFB_tma_raw);
+  using X = cute::Underscore;
+  auto host_gSFB_nkl = cute::local_tile(
+      host_tensor_sfb,
+      MmaTileShape{},
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<X, cute::_1, cute::_1>{});
+  auto host_gSFB = host_gSFB_nkl(cute::_, cute::_, 0, cute::_, 0);
+  auto host_tBgSFB = host_block_tma_sfb.partition_S(host_gSFB);
+  cute::copy(
+      host_tBgSFB(cute::_, cute::_, cute::_, cute::Int<0>{}),
+      host_tBsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}));
+
+  std::vector<ElementSF> expected_smem(cute::cosize_v<SmemLayoutSFB>, ElementSF{});
+  auto host_sSFB_local = cute::make_tensor(expected_smem.data(), SmemLayoutSFB{});
+  for (int row = 0; row < kTmaCopyOnlyTileN; ++row) {
+    for (int col = 0; col < kSfbLogicalCols; ++col) {
+      host_sSFB_local(row, col, cute::Int<0>{}).storage =
+          row < valid_rows
+              ? host_sSFB_tma_raw(row_offset + row, col, cute::Int<0>{}).storage
+              : 0u;
+    }
+  }
+
+  std::vector<std::uint8_t> expected(logical_bytes, 0);
+  for (int row = 0; row < kTmaCopyOnlyTileN; ++row) {
+    for (int col = 0; col < kSfbLogicalCols; ++col) {
+      expected[static_cast<std::size_t>(row * kSfbLogicalCols + col)] =
+          host_sSFB_local(row, col, cute::Int<0>{}).storage;
+    }
+  }
+
+  std::size_t mismatch_index = logical_bytes;
+  for (std::size_t i = 0; i < logical_bytes; ++i) {
+    if (h_logical_tma[i] != expected[i]) {
+      mismatch_index = i;
+      break;
+    }
+  }
+
+  std::cout << "  " << label;
+  if (mismatch_index == logical_bytes) {
+    std::cout << " PASS\n";
+    return 0;
+  }
+
+  const int row = static_cast<int>(mismatch_index / static_cast<std::size_t>(kSfbLogicalCols));
+  const int col = static_cast<int>(mismatch_index % static_cast<std::size_t>(kSfbLogicalCols));
+  std::cerr << " FAIL row=" << row
+            << " col=" << col
+            << " tma=" << static_cast<unsigned>(h_logical_tma[mismatch_index])
+            << " ref=" << static_cast<unsigned>(expected[mismatch_index])
+            << "\n";
+  return 1;
+}
+
 int RunP5SfbTmaPartitionVerifySmoke() {
   std::cout << "  tma_partition_sfb_tileindex_row128 SKIP (SM120 array mainloop uses make_tma_copy/local_tile, not tma_partition)\n";
   return 0;
@@ -3326,6 +3616,7 @@ int RunTest() {
       tma_status |= RunP5SfbExecutionLayoutContractSmoke();
       tma_status |= RunP5SfbExactLayoutAliasSmoke();
       tma_status |= RunP5SfbTmaOffsetLogicalSmoke();
+      tma_status |= RunP5SfbTmaHybridRemapSmoke();
       tma_status |= RunP5SfbTmaPartitionVerifySmoke();
       tma_status |= RunP5SfbTmaGroupedDescriptorSmoke();
       tma_status |= RunP5ATmaFragmentSmoke();
@@ -3358,6 +3649,7 @@ int RunTest() {
     std::cout << "  tma_copy_only_sfb_execution_layout_contract SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_copy_only_sfb_exact_layout_alias_contract SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_copy_only_sfb_tileindex_row0 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
+    std::cout << "  tma_copy_only_sfb_hybrid_row8_valid8 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_copy_only_sfb_grouped_tileindex_row128 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_fragment_a SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_single_tile_k64_dispatch_rows_5 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";

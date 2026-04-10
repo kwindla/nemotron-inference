@@ -5250,6 +5250,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   constexpr int kMacroTileBytes = kMacroTileK / 2;
   constexpr int kMacroScaleBytes = kMacroTileK / fused_decode::kNvfp4BlockWidth;
   constexpr int kFp4ConsumerWarps = cute::size(TiledMma{}) / 32;
+  constexpr int kP5ScaleTmaRowTile = 128;
+  constexpr int kP5SfbTmaStageElems =
+      Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 ? Traits::kScaleSmemCosizeB : 1;
 
   __shared__ alignas(1024) cute::array_aligned<typename Traits::SmemAllocA, Traits::kSwizzledAElems>
       smem_swizzled_a_storage;
@@ -5259,12 +5262,15 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       a_scale_smem_storage;
   __shared__ alignas(1024) cute::array_aligned<nvfp4_cute::ElementSFCompute, Traits::kScaleSmemCosizeB>
       b_scale_smem_storage;
+  __shared__ alignas(128) cute::array_aligned<nvfp4_cute::ElementSFCompute, kP5SfbTmaStageElems>
+      p5_sfb_tma_smem_storage;
   __shared__ alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType p5_tma_full_mbar_storage[1];
 
   auto* smem_swizzled_a = smem_swizzled_a_storage.data();
   auto* smem_swizzled_b = smem_swizzled_b_storage.data();
   auto* a_scale_smem = a_scale_smem_storage.data();
   auto* b_scale_smem = b_scale_smem_storage.data();
+  auto* p5_sfb_tma_smem = p5_sfb_tma_smem_storage.data();
   auto* p5_tma_full_mbar =
       cute::recast_ptr<cutlass::arch::ClusterTransactionBarrier>(&p5_tma_full_mbar_storage[0]);
 
@@ -5313,7 +5319,13 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   const bool use_p5_tma_sfb =
       use_p5_tma_b &&
       p5_tma_load_sfb_descriptors != nullptr &&
-      input_scale_layout == Nvfp4ScaleLayout::kSwizzled128x4;
+      input_scale_layout == Nvfp4ScaleLayout::kSwizzled128x4 &&
+      (row_start >= 0) &&
+      ((row_start & (kP5ScaleTmaRowTile - 1)) + valid_rows <= kP5ScaleTmaRowTile);
+  const int p5_sfb_row_offset =
+      use_p5_tma_sfb ? (row_start & (kP5ScaleTmaRowTile - 1)) : 0;
+  const bool use_p5_tma_sfb_direct = use_p5_tma_sfb && p5_sfb_row_offset == 0;
+  const bool use_p5_tma_sfb_remap = use_p5_tma_sfb && !use_p5_tma_sfb_direct;
   const int lane_predicate = cute::elect_one_sync();
   const bool is_p5_tma_thread =
       (use_p5_tma_a || use_p5_tma_b) &&
@@ -5481,7 +5493,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
           const auto& tma_load_sfb = p5_tma_load_sfb_descriptors[cta_index];
           auto mSFB_nkl = tma_load_sfb.get_tma_tensor(cute::shape(
               routed_p5_tma::MakeP5ScaleLayoutSFB(
-                  static_cast<int32_t>(valid_rows),
+                  static_cast<int32_t>(kP5ScaleTmaRowTile),
                   static_cast<int32_t>(weight.input_cols))));
           auto gSFB_nkl = cute::local_tile(
               mSFB_nkl,
@@ -5491,7 +5503,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
           auto block_tma_sfb = tma_load_sfb.get_slice(0);
           auto gSFB = gSFB_nkl(cute::_, cute::_, 0, cute::_, 0);
           auto tBgSFB = block_tma_sfb.partition_S(gSFB);
-          auto sSFB_ = cute::make_tensor(cute::make_smem_ptr(b_scale_smem), SmemLayoutSFB{});
+          auto sSFB_ = cute::make_tensor(
+              cute::make_smem_ptr(use_p5_tma_sfb_direct ? b_scale_smem : p5_sfb_tma_smem),
+              SmemLayoutSFB{});
           auto sSFB = cute::as_position_independent_swizzle_tensor(sSFB_);
           auto tBsSFB = block_tma_sfb.partition_D(sSFB);
           auto tma_copy_sfb =
@@ -5583,8 +5597,30 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
         }
       }
     }
-    if ((use_p5_tma_a || use_p5_tma_b) && is_fp4_consumer_thread) {
+    const bool need_p5_tma_wait =
+        (use_p5_tma_a || use_p5_tma_b) &&
+        (is_fp4_consumer_thread || use_p5_tma_sfb_remap);
+    if (need_p5_tma_wait) {
       p5_tma_full_mbar[0].wait(0);
+    }
+    if (use_p5_tma_sfb_remap) {
+      auto b_scale_tensor = cute::make_tensor(cute::make_smem_ptr(b_scale_smem), SmemLayoutSFB{});
+      auto p5_sfb_tma_tensor =
+          cute::make_tensor(cute::make_smem_ptr(p5_sfb_tma_smem), SmemLayoutSFB{});
+      auto b_scale_logical = cute::as_position_independent_swizzle_tensor(b_scale_tensor);
+      auto p5_sfb_tma_logical = cute::as_position_independent_swizzle_tensor(p5_sfb_tma_tensor);
+      const int logical_scale_cols = static_cast<int>(cute::size<1>(b_scale_tensor));
+      for (int row = tid; row < kProfileTokenRows; row += blockDim.x) {
+        if (row < valid_rows) {
+#pragma unroll
+          for (int scale_col = 0; scale_col < logical_scale_cols; ++scale_col) {
+            b_scale_logical(row, scale_col, cute::Int<0>{}) =
+                p5_sfb_tma_logical(p5_sfb_row_offset + row, scale_col, cute::Int<0>{});
+          }
+        } else {
+          nvfp4_bridge::ZeroTracedP5ScaleRow(b_scale_logical, row);
+        }
+      }
     }
     __syncthreads();
 

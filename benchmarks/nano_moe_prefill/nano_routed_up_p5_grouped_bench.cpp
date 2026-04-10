@@ -314,13 +314,17 @@ Bf16SampleStats InspectBf16Samples(const DeviceTensorBf16& tensor, std::size_t c
 }
 
 bool LaunchPlanSupportsP5SfbTma(const DeviceMoeLaunchPlan& launch_plan) {
-  if (launch_plan.selected_token_tile() != 128 ||
-      launch_plan.exact_cta_count_host() <= 0 ||
-      launch_plan.cta_row_starts_host() == nullptr) {
+  constexpr int kScaleTileRows = 128;
+  if (launch_plan.exact_cta_count_host() <= 0 ||
+      launch_plan.cta_row_starts_host() == nullptr ||
+      launch_plan.cta_valid_rows_host() == nullptr) {
     return false;
   }
   for (int cta_index = 0; cta_index < launch_plan.exact_cta_count_host(); ++cta_index) {
-    if ((launch_plan.cta_row_starts_host()[cta_index] % 128) != 0) {
+    const int row_start = launch_plan.cta_row_starts_host()[cta_index];
+    const int valid_rows = launch_plan.cta_valid_rows_host()[cta_index];
+    const int row_offset = row_start & (kScaleTileRows - 1);
+    if (row_start < 0 || valid_rows <= 0 || row_offset + valid_rows > kScaleTileRows) {
       return false;
     }
   }

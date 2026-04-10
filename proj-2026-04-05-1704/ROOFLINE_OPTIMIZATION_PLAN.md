@@ -380,21 +380,16 @@ Runtime `P5` TMA descriptor-ownership status:
   - scales are now split the same way as operands:
     - `SFA`/weight scales use resident per-expert host-built CUTE TMA
       descriptors, published through `FusedNvfp4WeightView::p5_tma_load_sfa`
-    - `SFB`/activation scales do not have a live routed fast path yet:
-      - the first exact-source attempt cached per-CTA host-built CUTE TMA
-        descriptors keyed by `(packed_input allocation, launch_plan,
-        build_epoch)`
-      - removing the old guard proved that path is structurally incompatible
-        with the current routed launch geometry: `make_tma_copy<uint16_t>(...)`
-        fails immediately for the active grouped launch slices
-        (`selected_token_tile=8/16`, non-128-aligned `cta_row_start`)
-      - CUTLASS/TRT build `TMA_SFB` from the full grouped scale tensor plus
-        block coordinates, not from tiny per-CTA row-sliced descriptors
-      - keep `SFB` on the thread-coded fallback path until the grouped launch
-        geometry is rebuilt around 128-row slabs or the live kernel is
-        reworked to consume a full-tensor `SFB` descriptor
+    - `SFB`/activation scales now use the aligned-slab hybrid fast path:
+      - descriptors are still built from the full grouped execution-scale
+        tensor, not tiny per-CTA row-sliced descriptors
+      - each active CTA aligns its `SFB` transport base down to the enclosing
+        `128`-row slab, TMA-loads that slab, then remaps only the local
+        `valid_rows` window into the small-row shared tensor the consumer uses
+      - this preserves the cheap `8/16`-row compute geometry for `A/B` while
+        honoring the tile-aligned `SFB` contract CUTLASS expects
     - the live `P5` kernel now issues `A+SFA` on the A-side producer barrier;
-      `B` is on TMA, while `SFB` still falls back
+      `B+SFB` now share the aligned-slab TMA path too
   - decisive probe result behind that landing:
     - CUTLASS `Sm1xxBlockScaledConfig<16>::tile_atom_to_shape_SFA/SFB(...)`
       matches our runtime `matmul_block_scales_data` execution layout exactly
@@ -586,6 +581,35 @@ Runtime `P5` TMA descriptor-ownership status:
         registers plus shared memory
       - the next optimization target is warp eligibility / consumer-side stall
         reduction, not another descriptor-ownership tweak
+  - first post-hybrid-`SFB` direct grouped-kernel `ncu` read:
+    - profile artifact set:
+      - `artifacts/profiles/p5_hybrid_sfb_20260410T031056Z/ncu_p5_grouped_prefix128.ncu-rep`
+      - `artifacts/profiles/p5_hybrid_sfb_20260410T031056Z/ncu_p5_grouped_prefix128.csv`
+      - `artifacts/profiles/p5_hybrid_sfb_20260410T031056Z/ncu_p5_grouped_prefix128.summary.txt`
+    - measured facts:
+      - `launch__registers_per_thread = 168`
+      - `launch__shared_mem_per_block_allocated = 46.21 KiB`
+      - `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed = 56.48%`
+      - `lts__t_sector_hit_rate.pct = 59.09%`
+      - `sm__warps_active.avg.pct_of_peak_sustained_active = 25.40%`
+      - `smsp__warps_eligible.avg.per_cycle_active = 0.193`
+      - `smsp__issue_active.avg.pct_of_peak_sustained_active = 14.47%`
+      - `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed = 11.91%`
+    - conclusion:
+      - the hybrid `SFB` path improves transport utilization a bit, but it
+        does not materially change the scheduler-limited shape of the kernel
+      - relative to the pre-hybrid isolated read, DRAM throughput is up a few
+        points, while eligible warps and issue activity are effectively flat
+      - the next leverage remains consumer-side wait/copy/store and warp
+        eligibility, not more scale-transport legality work
+      - dominant post-hybrid stall buckets are now:
+        - `sleeping = 6.83`
+        - `barrier = 3.83`
+        - `wait = 2.81`
+        - `long_scoreboard = 1.72`
+        - `short_scoreboard = 1.22`
+      - that points directly at pipeline structure and synchronization as the
+        next code target
   - first direct grouped-kernel source-counter read on the same harness:
     - `706560` excessive global sectors (`40%` of `1788480`)
     - `1532160` excessive shared wavefronts (`10%` of `15240960`)
@@ -593,13 +617,13 @@ Runtime `P5` TMA descriptor-ownership status:
       dominant issue
     - implication:
       - with `A`, `B`, and `SFA` already on TMA in this harness, the remaining
-        obvious uncoalesced hot-path traffic is the `SFB` fallback plus the
+        obvious uncoalesced hot-path traffic was the `SFB` fallback plus the
         surrounding consumer/store scaffolding
-      - do not spend more time trying to force per-CTA `SFB` descriptors onto
-        the current 8/16-row launch plan
-      - the next structural win is to move the grouped launch geometry toward
-        128-row slabs or an equivalent full-tensor `SFB` contract that lets
-        the scale path become coalesced/TMA-driven too
+      - that profiler snapshot is now historical context: `SFB` no longer
+        falls back on the default `P5` launch geometry after the aligned-slab
+        hybrid remap landed
+      - the next structural win is now consumer/store-side eligibility work,
+        not more `SFB` descriptor archaeology
   - source-counter result for the forced `128`-row slab:
     - excessive global sectors drop from `40%` (`706560 / 1788480`) to `8%`
       (`61440 / 807300`)
@@ -659,19 +683,27 @@ Runtime `P5` TMA descriptor-ownership status:
           missing fix
         - the aligned `SFB` gmem contract is now proven correct for the
           swizzled execution-scale buffer
-        - the remaining failure is the intentionally unaligned path:
+        - the remaining failure in the old harness is the intentionally
+          unaligned direct-offset path:
           `tma_copy_only_sfb_offset_row8 FAIL row=24 col=0 tma=0 ref=33`
-        - so the blocker has narrowed back to launch geometry:
-          `SFB` TMA works for tile-aligned `128`-row slices, but not for the
-          active `8/16`-row grouped slices
-        - the corrected runtime helper also reaches the direct grouped live
-          path:
-          - `nano_routed_up_p5_grouped_bench --prefix-tokens 128
-            --force-token-tile 128`
+        - the new hybrid smoke now proves the right fix for the active routed
+          launch geometry:
+          - `tma_copy_only_sfb_hybrid_row8_valid8 PASS`
+          - aligned slab load + logical-row remap is sufficient
+        - the corrected runtime helper now reaches the default grouped live
+          path too:
+          - `nano_routed_up_p5_grouped_bench --prefix-tokens 128`
+          - `selected_token_tile=8`
+          - `sfb_tma_cached=yes`
+          - `sfb_tma_launch_compatible=yes`
+          - hot-path reruns are currently around
+            `hot_mean_ms=0.536..0.649`, `hot_median_ms=0.410..0.457`
+        - the forced-slab path is still slower even though it is fully legal:
+          - `--force-token-tile 128`
           - `selected_token_tile=128`
           - `sfb_tma_cached=yes`
           - `sfb_tma_launch_compatible=yes`
-          - `hot_mean_ms=0.589`
+          - `hot_mean_ms=0.630`, `hot_median_ms=0.479`
   - traced thread-shape fact from the existing transport-contract dump:
     - `math_threads = 256`
     - `math_warps = 8`
@@ -679,10 +711,8 @@ Runtime `P5` TMA descriptor-ownership status:
     - `total_threads_per_block_ref = 384`
     - this means the traced `384`-thread P5 shape is not arbitrary padding; it
       is a `256`-thread math block plus `128` reference TMA threads
-    - our current live kernel uses the A/B transport subset of that TMA budget
-      on the active routed launch geometry; `SFB` still rides the older
-      thread-coded path because the current 8/16-row grouped launch slices are
-      not `TMA_SFB` compatible
+    - our current live kernel now uses that TMA budget for `A/B/SFA/SFB`; the
+      active routed geometry reaches `SFB` through the aligned-slab remap path
   - rejected shortcut:
     - a targeted occupancy experiment that combined:
       - `__launch_bounds__(384, 2)` on the unified routed kernel, and

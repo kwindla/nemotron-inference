@@ -727,11 +727,6 @@ const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
       scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4 ||
       cols() == 0 ||
       (cols() % 128u) != 0 ||
-      // The current per-CTA SFB descriptor path only works for 128-row,
-      // tile-aligned grouped slices. The active routed launch plan uses
-      // 8/16-row token tiles, so keep SFB on the fallback path until the
-      // launch geometry is rebuilt around full 128-row slabs.
-      launch_plan.selected_token_tile() != kP5ScaleTmaRowTile ||
       launch_plan.exact_cta_count_host() <= 0 ||
       launch_plan.cta_row_starts_host() == nullptr ||
       launch_plan.cta_valid_rows_host() == nullptr) {
@@ -746,23 +741,29 @@ const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
 
   const std::size_t blocks_per_row = cols() / kBlockWidth;
   const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kScaleBlockTile);
-  const std::size_t tile_rows = launch_plan.selected_token_tile();
+  const std::size_t padded_scale_rows = RoundUp(rows(), static_cast<std::size_t>(kP5ScaleTmaRowTile));
   std::vector<routed_p5_tma::P5TmaLoadSFB> host_descriptors;
   host_descriptors.reserve(static_cast<std::size_t>(launch_plan.exact_cta_count_host()));
   for (int cta_index = 0; cta_index < launch_plan.exact_cta_count_host(); ++cta_index) {
     const int row_start = launch_plan.cta_row_starts_host()[cta_index];
     const int valid_rows = launch_plan.cta_valid_rows_host()[cta_index];
+    const int aligned_row_base =
+        row_start >= 0 ? (row_start / static_cast<int>(kP5ScaleTmaRowTile)) * static_cast<int>(kP5ScaleTmaRowTile)
+                       : row_start;
+    const int row_offset_in_tile = row_start - aligned_row_base;
     if (row_start < 0 ||
         valid_rows <= 0 ||
-        (row_start % static_cast<int>(kP5ScaleTmaRowTile)) != 0 ||
-        static_cast<std::size_t>(row_start) + tile_rows > rows() ||
+        row_offset_in_tile < 0 ||
+        row_offset_in_tile + valid_rows > static_cast<int>(kP5ScaleTmaRowTile) ||
+        static_cast<std::size_t>(aligned_row_base) + static_cast<std::size_t>(kP5ScaleTmaRowTile) >
+            padded_scale_rows ||
         static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > rows()) {
       return nullptr;
     }
 
     const std::size_t scale_offset =
         ExecutionScaleOffset(
-            static_cast<std::size_t>(row_start),
+            static_cast<std::size_t>(aligned_row_base),
             0u,
             padded_blocks_per_row,
             scale_layout());
@@ -771,7 +772,7 @@ const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
     auto tensor_sfb = cute::make_tensor(
         cute::make_gmem_ptr(cta_scales),
         routed_p5_tma::MakeP5ScaleLayoutSFB(
-            static_cast<int32_t>(tile_rows),
+            static_cast<int32_t>(kP5ScaleTmaRowTile),
             static_cast<int32_t>(cols())));
     host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadSFB(tensor_sfb));
   }
