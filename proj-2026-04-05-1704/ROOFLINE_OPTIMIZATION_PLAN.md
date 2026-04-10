@@ -704,6 +704,60 @@ Runtime `P5` TMA descriptor-ownership status:
           - `sfb_tma_cached=yes`
           - `sfb_tma_launch_compatible=yes`
           - `hot_mean_ms=0.630`, `hot_median_ms=0.479`
+  - standalone `SFB` consumer-copy probe on the aligned slab:
+    - added a separate gated probe under
+      `NEMOTRON_RUN_P5_SFB_DIRECT_SLICE_PROBE=1` in
+      `p5_swizzled_pipeline_test_120f`
+    - exact question:
+      - after loading the aligned `128`-row `SFB` slab with TMA, can the live
+        `SmemCopyAtomSFB` consumer path read a row-offset source view directly
+        from that slab, without the shared-memory remap step?
+    - definitive result:
+      - yes, but only inside the first `32`-row chunk of the aligned slab
+      - exact passing cases:
+        - `offset=0, valid_rows=8`: `PASS`
+        - `offset=1,2,4,8,16,17,24`, `valid_rows=8`: `PASS`
+      - exact failing cases:
+        - `offset=25, valid_rows=8`: fragment mismatches
+        - `offset=30, valid_rows=8`: fragment mismatches
+        - `offset=31, valid_rows=8`: fragment mismatches
+        - `offset=24, valid_rows=9`: fragment mismatches
+        - `offset=32, valid_rows=8`: `ERROR misaligned address`
+        - `offset=64, valid_rows=8`: `ERROR misaligned address`
+    - implication:
+      - the direct-slice path is not generically illegal; the live failure was
+        not caused by "any nonzero row offset"
+      - the current source-view legality rule is empirical and narrow:
+        - safe only when `row_offset < 32` and `row_offset + valid_rows <= 32`
+      - outside that first `32`-row chunk, the current
+        `domain_offset(...) -> partition_S(...) -> copy(...)` source path is
+        not usable for `SmemCopyAtomSFB`
+    - live-kernel follow-up:
+      - the architectural branch in `fused_moe_prefill.cu` now keeps the
+        direct-slice experiment only for that proven-safe window and restores
+        the old shared-memory remap everywhere else
+      - correctness is green again:
+        - `fused_moe_prefill_test`: PASS
+        - `multi_turn_prefix_reuse_test`: PASS
+      - direct grouped `P5` bench after the guard:
+        - `selected_token_tile=8`
+        - `sfb_tma_cached=yes`
+        - `sfb_tma_launch_compatible=yes`
+        - `sfb_direct_ctas=8`
+        - `sfb_direct_slice_safe_ctas=24`
+        - `sfb_remap_fallback_ctas=96`
+        - `hot_mean_ms=0.553`
+        - `hot_median_ms=0.374`
+    - consequence:
+      - this is real architectural progress, but it does not remove the
+        dominant `SFB` remap/sync cost on the current `prefix128` grouped
+        surface because `96 / 128` CTAs still require the fallback path
+      - the next exact target is no longer "is direct slice legal?" but "how
+        do we eliminate the remap for row offsets beyond the first `32`
+        rows?" The most plausible next approaches are:
+        - a consumer-local register assembly path from the aligned slab, or
+        - a rebased/chunked source-view construction that respects the
+          swizzle-period boundary instead of crossing it
   - traced thread-shape fact from the existing transport-contract dump:
     - `math_threads = 256`
     - `math_warps = 8`
@@ -972,6 +1026,138 @@ profile-specific expansion only where the measured storage budget allows it.
 
 **Expected impact:** Hides most K-tile load latency behind MMA.  Exact gain is
 measurement-gated.
+
+Phase 1b should now proceed with an explicit software-pipelined K-loop
+checklist on the isolated grouped `P5` surface before any profile fan-out:
+
+1. Use the direct grouped harness as the canonical measurement loop:
+   - kernel: `Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel`
+   - bench:
+     `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench`
+   - do not use whole-model `ncu` as the primary read for this step
+
+2. Start from the current single-stage `P5` body in
+   `runtime/src/backend/fused_moe_prefill.cu` and split the K-loop into three
+   explicit regions:
+   - prologue: issue the first stage load only
+   - steady state: issue stage `next` while consumers drain stage `curr`
+   - epilogue: drain the final loaded stage after producer issue stops
+
+3. Introduce a `2`-entry stage ring for the compressed runtime transport:
+   - operand/storage state for `A`, `B`, `SFA`, `SFB`
+   - per-stage full/empty barrier state
+   - stage index rotation `curr = iter & 1`, `next = (iter + 1) & 1`
+   - confirm first whether the current `SmemLayout*` types already carry a
+     pipeline-stage mode and the runtime allocation is merely using one live
+     stage, or whether the collective/builder parameters must be changed to
+     request `2` stages explicitly
+   - keep `kMacroTileK = 128` for the first pipeline attempt unless the
+     measured runtime stage footprint changes; the current `34816` bytes/stage
+     number implies `2` stages at `K=128` still fit (`69632` bytes) and do not
+     require halving `K` to `64`
+
+4. Keep the current proven transport contract intact while changing only the
+   schedule:
+   - `A/B/SFA/SFB` continue to use the existing CUTE TMA objects
+   - the hybrid `SFB` aligned-slab remap remains the legal small-row path
+   - do not re-open descriptor/layout questions during the pipeline step
+
+5. Move all TMA issue responsibility into producer warps/threads only:
+   - consumers never issue transport
+   - producers prefetch descriptors once, then loop over stage issue
+   - producers call `arrive_and_expect_tx(...)` per stage, not per full-K body
+   - start from the current single elected async producer thread; only widen to
+     a dedicated producer warp if measurement shows the single-thread issue path
+     is insufficient for the `2`-stage steady state
+
+6. Convert the consumer side from whole-body waits to per-stage waits:
+   - wait only on `curr`
+   - copy fragments from the current stage into registers
+   - run the MMA micro-loop for the current stage
+   - signal stage completion so the producer can safely reuse that slot
+
+7. Remove whole-CTA synchronization from the steady-state K-loop where the
+   staged barriers already provide ordering:
+   - `__syncthreads()` should remain only where required for non-pipelined
+     shared state, not as the main stage boundary
+   - the steady-state target is zero whole-CTA syncs; at most one prologue
+     fence may remain before the first stage is made visible to consumers
+   - the post-hybrid `ncu` stall read says `sleeping`, `barrier`, and `wait`
+     are the first synchronization targets to reduce
+
+8. Validate each substep before proceeding:
+   - correctness:
+     `testing/fused_moe_prefill_test`
+   - runtime regression:
+     `testing/multi_turn_prefix_reuse_test`
+   - direct grouped perf surface:
+     `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench --prefix-tokens 128`
+   - if transport legality is touched, rerun
+     `NEMOTRON_RUN_P5_TMA_SMOKE=1 testing/p5_swizzled_pipeline_test_120f`
+
+9. Reprofile after the first working `2`-stage pipeline lands:
+   - compare against the current post-hybrid baseline:
+     - `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed = 56.48%`
+     - `smsp__warps_eligible.avg.per_cycle_active = 0.193`
+     - `smsp__issue_active.avg.pct_of_peak_sustained_active = 14.47%`
+   - success criterion for Phase 1b is not just more DRAM throughput; it must
+     reduce the dominant `sleeping` / `barrier` / `wait` stall buckets too
+
+10. Only after the `P5` `2`-stage loop is stable and measurably better should
+    the same structure be ported to `P12/P13/P15`
+
+Current Phase 1b experiment record:
+- Attempt A: coarse `2`-stage ring on the live `P5` body, with producer
+  pre-issuing stage `next` and consumers draining stage `curr`
+  - result: correctness passed, but the direct grouped bench did not show a
+    stable win and `ncu` stayed effectively flat against the post-hybrid
+    baseline
+  - baseline vs Attempt A (`prefix128`, isolated grouped `P5`, direct `ncu`):
+    - eligible warps/cycle: `0.193180 -> 0.193126`
+    - issue active: `14.471734% -> 14.467279%`
+    - sleeping stall ratio: `6.833301 -> 6.757392`
+    - barrier stall ratio: `3.829301 -> 3.829051`
+    - wait stall ratio: `2.813678 -> 2.813553`
+  - conclusion: stage-ring transport alone did not buy a meaningful pipeline
+    win; the dominant synchronization picture was unchanged
+- Attempt B: add CUTLASS-style intra-stage `copy(next_kblock) / gemm(curr_kblock)`
+  to the consumer path and then move the empty-slot release earlier, before the
+  final gemm on the current stage
+  - result: correctness still passed, but the direct grouped bench regressed
+    and the aggressive early-release variant regressed further
+  - representative direct grouped bench reads on this machine:
+    - accepted post-hybrid baseline body: `hot_mean_ms ~= 0.549`
+    - Attempt B with k-block pipelining: `hot_mean_ms ~= 0.605`
+    - Attempt B plus early empty-slot release: `hot_mean_ms ~= 0.570`
+  - conclusion: these first manual CUTLASS-inspired consumer rewrites did not
+    outperform the accepted baseline body and were reverted
+- Attempt C: port the grouped `P5` body to an explicit `cutlass::PipelineTmaAsync<2>`
+  schedule with producer `acquire/get_barrier/tail`, consumer
+  `wait/release`, and CUTLASS-style intra-stage `copy_kblock/gemm_kblock`
+  sequencing
+  - result: correctness still passed, but after rebuilding the statically
+    linked grouped bench target the direct `P5` surface regressed sharply
+  - rebuilt isolated grouped `P5` bench read on this machine:
+    - accepted post-hybrid baseline body: `hot_mean_ms ~= 0.549`
+    - Attempt C exact `PipelineTmaAsync` port: `hot_mean_ms = 1.098`
+  - conclusion: the exact pipeline object port is not a drop-in win for the
+    current grouped `P5` body; it was reverted
+
+Phase 1b measurement hygiene note:
+- `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench` is statically
+  linked. Rebuilding only `fused_moe_prefill_test` is not sufficient after
+  runtime kernel edits; the grouped bench target itself must be rebuilt before
+  trusting wall-clock or `ncu` results.
+
+Phase 1b next-step constraint:
+- do not reintroduce Attempts A, B, or C as-is
+- the next consumer-side experiment must explain the `~2x` slowdown from the
+  exact `PipelineTmaAsync` port before trying another full grouped-kernel
+  rewrite
+- the most likely next diagnostic target is not transport legality, but the
+  extra producer/consumer participation cost inside the current grouped body
+  (for example the hybrid `SFB` remap and stage-local copy structure) under the
+  pipeline object schedule
 
 #### 1c. Warp-Specialized Producer/Consumer
 
@@ -1273,6 +1459,53 @@ Phase 5 (Mamba) ← independent, can start after Phase 0
   ↓
 Phase 6 (system) ← independent, can start anytime
 ```
+
+## Current P5 Status
+
+- The branch moved one architectural step further than the old hybrid-TMA
+  `SFB` path:
+  - `SFB` is now loaded directly from global execution-scale memory into the
+    consumer fragment on the live grouped `P5` path
+  - there is no `SFB` shared-memory remap or CTA-wide sync on that path
+- The standalone proof for that direct-global path is green:
+  - `tma_fragment_sfb_global_assembly offset=25 PASS`
+  - the fragment now uses sparse physical writes, not a 64-element logical
+    splat
+- The first direct-global live result was correctness-green but instruction
+  heavy:
+  - `hot_mean_ms=0.619`
+  - `sleeping` dropped sharply versus the post-hybrid baseline, which confirms
+    the CTA-wide `SFB` sync/remap was removed from the critical path
+- The next direct-global optimization was the real win:
+  - writing only the 4 physical scale bytes per atom instead of all 64 logical
+    aliases improved the grouped `P5` bench to:
+    - `hot_mean_ms=0.575`
+    - `hot_median_ms=0.577`
+  - that is still slightly slower than the older remap-free chunked path
+    (`~0.556 ms`), but it preserves the cleaner direct-global architecture
+- A definitive warp-sharing probe now explains the remaining load shape:
+  - for each active `SFB` slot, warp 0 sees exactly
+    `warp0_unique=0,1,2,3,4,5,6,7`
+  - lane pattern is contiguous 4-lane groups:
+    `0,0,0,0,1,1,1,1,...,7,7,7,7`
+  - implication:
+    - only an 8-word-per-warp reduction is available
+    - the scale loads are shareable, but not “one word per warp” shareable
+- I tested the obvious subgroup optimization on that pattern:
+  - one loader lane per contiguous 4-lane subgroup plus `__shfl_sync`
+  - correctness remained green
+  - live grouped `P5` performance regressed slightly:
+    - `hot_mean_ms=0.593`
+    - `hot_median_ms=0.588`
+  - targeted `ncu` comparison says the saved global loads are not paying for
+    the added shuffle/control overhead on this kernel
+- Current conclusion:
+  - direct-global `SFB` is still the right architectural base
+  - sparse 4-byte fragment fill is worth keeping
+  - 4-lane subgroup broadcast is not currently worth keeping
+  - the next profitable work should go back to the unified `P5` consumer /
+    software-pipelined `K` loop on top of the direct-global `SFB` base, rather
+    than more `SFB` transport micro-optimizations
 
 ## What We're NOT Doing (and why)
 

@@ -331,6 +331,16 @@ bool LaunchPlanSupportsP5SfbTma(const DeviceMoeLaunchPlan& launch_plan) {
   return true;
 }
 
+struct P5SfbPathStats {
+  int global_fragment_ctas = 0;
+};
+
+P5SfbPathStats SummarizeP5SfbPaths(const DeviceMoeLaunchPlan& launch_plan) {
+  P5SfbPathStats stats;
+  stats.global_fragment_ctas = std::max(0, launch_plan.exact_cta_count_host());
+  return stats;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -524,6 +534,7 @@ int main(int argc, char** argv) {
   const void* b_tma_descriptors = grouped_pack->p5_tma_load_b_descriptors(*launch_plan);
   const void* sfb_tma_descriptors = grouped_pack->p5_tma_load_sfb_descriptors(*launch_plan);
   const bool sfb_tma_launch_compatible = LaunchPlanSupportsP5SfbTma(*launch_plan);
+  const P5SfbPathStats sfb_path_stats = SummarizeP5SfbPaths(*launch_plan);
 
             std::cout << "nano_routed_up_p5_grouped_bench: prefix_tokens=" << options.prefix_tokens
             << " top_k=" << kTopK
@@ -537,7 +548,9 @@ int main(int argc, char** argv) {
             << " b_tma_cached=" << (b_tma_descriptors != nullptr ? "yes" : "no")
             << " sfb_tma_cached=" << (sfb_tma_descriptors != nullptr ? "yes" : "no")
             << " sfb_tma_launch_compatible="
-            << (sfb_tma_launch_compatible ? "yes" : "no") << "\n";
+            << (sfb_tma_launch_compatible ? "yes" : "no")
+            << " sfb_global_fragment_ctas=" << sfb_path_stats.global_fragment_ctas
+            << "\n";
   if (launch_plan->exact_cta_count_host() > 0 &&
       launch_plan->cta_row_starts_host() != nullptr &&
       launch_plan->cta_valid_rows_host() != nullptr) {

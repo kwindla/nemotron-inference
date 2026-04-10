@@ -11,6 +11,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -158,6 +159,10 @@ struct TmaCopyOnlySharedStorageSFBHybrid {
   alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType ab_full_mbar[1];
 };
 
+struct GlobalScaleSharedStorageSFB {
+  alignas(1024) cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB_local;
+};
+
 template <class TmaCopyA>
 struct P5ATmaCopyOnlyParams {
   TmaCopyA tma_load_a;
@@ -224,6 +229,37 @@ struct P5SfbTmaHybridRemapParams {
   std::uint8_t* logical_tma_bytes;
 };
 
+template <class TmaCopySFB>
+struct P5SfbConsumerDirectSliceParams {
+  TmaCopySFB tma_load_sfb;
+  int row_offset;
+  int valid_rows;
+  int* mismatch_counts;
+  int* first_n;
+  int* first_k;
+  std::uint32_t* first_direct_words;
+  std::uint32_t* first_ref_words;
+};
+
+struct P5SfbConsumerGlobalAssemblyParams {
+  const std::uint8_t* execution_scales;
+  int row_offset;
+  int valid_rows;
+  int* mismatch_counts;
+  int* first_n;
+  int* first_k;
+  std::uint32_t* first_direct_words;
+  std::uint32_t* first_ref_words;
+};
+
+struct P5SfbGlobalSharingParams {
+  int valid_rows;
+  int* local_rows;
+  int* base_rows;
+};
+
+constexpr int kP5SfbSharingSlots = 16;
+
 struct TmaRuntimeLikeSharedStorageA {
   SharedStorage gemm;
   alignas(16) cutlass::arch::ClusterTransactionBarrier::ValueType ab_full_mbar[1];
@@ -247,6 +283,80 @@ constexpr std::size_t kTmaCopyOnlySmemBBytes =
 constexpr std::size_t kTmaCopyOnlySmemSfbBytes =
     sizeof(ElementSF) * static_cast<std::size_t>(cute::cosize_v<SmemLayoutSFB>);
 constexpr int kSfbLogicalCols = cute::size<1>(SmemLayoutSFB{});
+
+template <class ScaleAtomTensor>
+CUTE_HOST_DEVICE std::uint32_t PackScaleFragmentWordLocal(ScaleAtomTensor const& scale_atom) {
+  constexpr int kGroupSize = 16;
+  const auto raw0 = static_cast<std::uint8_t>(scale_atom(0).raw());
+  const auto raw1 = static_cast<std::uint8_t>(scale_atom(kGroupSize).raw());
+  const auto raw2 = static_cast<std::uint8_t>(scale_atom(2 * kGroupSize).raw());
+  const auto raw3 = static_cast<std::uint8_t>(scale_atom(3 * kGroupSize).raw());
+  return static_cast<std::uint32_t>(raw0) |
+         (static_cast<std::uint32_t>(raw1) << 8) |
+         (static_cast<std::uint32_t>(raw2) << 16) |
+         (static_cast<std::uint32_t>(raw3) << 24);
+}
+
+template <class ScaleLogicalTensor>
+CUTE_HOST_DEVICE std::uint32_t LoadScaleWordFromLogicalTensorRowBlockLocal(
+    ScaleLogicalTensor const& scale_tensor,
+    int row,
+    int k_block,
+    int k_blocks,
+    int logical_cols_per_scale_byte) {
+  constexpr int kScaleBytesPerWord = 4;
+  auto load_byte_at = [&](int byte_index) {
+    const int col =
+        ((byte_index * k_blocks) + k_block) * logical_cols_per_scale_byte;
+    return static_cast<std::uint8_t>(scale_tensor(row, col, cute::Int<0>{}).raw());
+  };
+  return nemotron::p15_scale_runtime::pack_scale_word4_bytes(
+      load_byte_at(0),
+      load_byte_at(1),
+      load_byte_at(2),
+      load_byte_at(3));
+}
+
+template <class ScaleAtomTensor>
+CUTE_HOST_DEVICE void FillScaleFragmentWordLocal(
+    ScaleAtomTensor const& scale_atom,
+    std::uint32_t packed_scale_word) {
+  constexpr int kGroupSize = 16;
+  static_assert(cute::size(ScaleAtomTensor{}) == 64);
+  for (int elem = 0; elem < static_cast<int>(cute::size(scale_atom)); ++elem) {
+    const int byte_index = min(elem / kGroupSize, 3);
+    scale_atom(elem) = nemotron::p15_scale_runtime::make_scale_element(
+        nemotron::p15_scale_runtime::load_scale_byte(packed_scale_word, byte_index));
+  }
+}
+
+template <class ScaleAtomTensor>
+CUTE_HOST_DEVICE void FillScaleFragmentWordSparseLocal(
+    ScaleAtomTensor const& scale_atom,
+    std::uint32_t packed_scale_word) {
+  constexpr int kGroupSize = 16;
+  static_assert(cute::size(ScaleAtomTensor{}) == 64);
+#pragma unroll
+  for (int byte_index = 0; byte_index < 4; ++byte_index) {
+    scale_atom(byte_index * kGroupSize) =
+        nemotron::p15_scale_runtime::make_scale_element(
+            nemotron::p15_scale_runtime::load_scale_byte(packed_scale_word, byte_index));
+  }
+}
+
+template <class ScaleAtomTensorA, class ScaleAtomTensorB>
+CUTE_HOST_DEVICE bool ScaleFragmentsEqualLocal(
+    ScaleAtomTensorA const& lhs,
+    ScaleAtomTensorB const& rhs) {
+  static_assert(cute::size(ScaleAtomTensorA{}) == cute::size(ScaleAtomTensorB{}));
+#pragma unroll
+  for (int elem = 0; elem < static_cast<int>(cute::size(lhs)); ++elem) {
+    if (lhs(elem).raw() != rhs(elem).raw()) {
+      return false;
+    }
+  }
+  return true;
+}
 
 std::vector<float> MakePatternedValuesLocal(
     std::size_t rows,
@@ -364,6 +474,40 @@ __device__ std::uint32_t LoadExecutionScaleWordTest(
       scale_bytes[execution_scale_offset(row, block_base + 1u)],
       scale_bytes[execution_scale_offset(row, block_base + 2u)],
       scale_bytes[execution_scale_offset(row, block_base + 3u)]);
+}
+
+__device__ std::uint8_t LoadExecutionScaleByteTest(
+    const std::uint8_t* scale_bytes,
+    std::size_t row,
+    std::size_t block_col,
+    std::size_t padded_blocks_per_row,
+    nemotron::Nvfp4ScaleLayout scale_layout) {
+  constexpr std::size_t kBlockTile = 4;
+  const std::size_t num_k_tiles = padded_blocks_per_row / kBlockTile;
+  const std::size_t k_tile = block_col / kBlockTile;
+  const std::size_t inner_k = block_col & 3u;
+  std::size_t offset = 0;
+  switch (scale_layout) {
+    case nemotron::Nvfp4ScaleLayout::kSwizzled128x4: {
+      const std::size_t m_tile = row / 128u;
+      const std::size_t outer_m = row & 31u;
+      const std::size_t inner_m = (row >> 5u) & 3u;
+      offset = ((((m_tile * num_k_tiles) + k_tile) << 9u) |
+                (outer_m << 4u) |
+                (inner_m << 2u) |
+                inner_k);
+      break;
+    }
+    case nemotron::Nvfp4ScaleLayout::kSwizzled8x4: {
+      const std::size_t m_tile = row / 8u;
+      const std::size_t inner_m = row & 7u;
+      offset = (((m_tile * num_k_tiles) + k_tile) << 5u) |
+               (inner_m << 2u) |
+               inner_k;
+      break;
+    }
+  }
+  return scale_bytes[offset];
 }
 
 template <class ScaleTensor>
@@ -2331,6 +2475,1484 @@ int RunP5SfbTmaHybridRemapSmoke() {
   return 1;
 }
 
+template <class TmaCopySFB>
+__global__ void P5SfbConsumerDirectSliceKernel(
+    __grid_constant__ P5SfbConsumerDirectSliceParams<TmaCopySFB> const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<TmaCopyOnlySharedStorageSFBHybrid*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int lane_predicate = cute::elect_one_sync();
+  const bool is_tma_thread = (warp_idx == 0) && lane_predicate;
+
+  using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using ProducerBarrierType = typename FullBarrier::ValueType;
+  auto* ab_full_mbar = cute::recast_ptr<FullBarrier>(&shared.ab_full_mbar[0]);
+
+  if (is_tma_thread) {
+    cute::prefetch_tma_descriptor(params.tma_load_sfb.get_tma_descriptor());
+  }
+  __syncthreads();
+
+  if (is_tma_thread) {
+    ab_full_mbar[0].init(1);
+    cutlass::arch::fence_barrier_init();
+  }
+
+  auto* smem_sfb_tma_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_tma.data());
+  auto* smem_sfb_local_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_local.data());
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemSfbBytes; i += blockDim.x) {
+    smem_sfb_tma_bytes[i] = 0u;
+    smem_sfb_local_bytes[i] = 0u;
+  }
+  __syncthreads();
+
+  using X = cute::Underscore;
+  auto mSFB_nkl = params.tma_load_sfb.get_tma_tensor(cute::shape(
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK)));
+  auto gSFB_nkl = cute::local_tile(
+      mSFB_nkl,
+      MmaTileShape{},
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<X, cute::_1, cute::_1>{});
+  auto block_tma_sfb = params.tma_load_sfb.get_slice(0);
+  auto gSFB = gSFB_nkl(cute::_, cute::_, 0, cute::_, 0);
+  auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+  auto sSFB_tma = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_tma.data()), SmemLayoutSFB{});
+  auto sSFB_local = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_local.data()), SmemLayoutSFB{});
+  auto tBsSFB = block_tma_sfb.partition_D(sSFB_tma);
+
+  if (is_tma_thread) {
+    auto& ab_full_barrier = ab_full_mbar[0];
+    auto tma_copy_sfb =
+        params.tma_load_sfb.with(*cute::recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+    cute::copy(
+        tma_copy_sfb,
+        tBgSFB(cute::_, cute::_, cute::_, cute::Int<0>{}),
+        tBsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}));
+    ab_full_mbar[0].arrive_and_expect_tx(
+        static_cast<uint32_t>(
+            cutlass::bits_to_bytes(
+                cute::cosize(cute::take<0, 2>(SmemLayoutSFB{})) *
+                cute::sizeof_bits_v<ElementSF>)));
+  }
+
+  ab_full_mbar[0].wait(0);
+  __syncthreads();
+
+  auto sSFB_tma_logical = cute::as_position_independent_swizzle_tensor(sSFB_tma);
+  auto sSFB_local_logical = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  for (int row = tid; row < kTmaCopyOnlyTileN; row += blockDim.x) {
+    if (row < params.valid_rows) {
+#pragma unroll
+      for (int col = 0; col < kSfbLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}) =
+            sSFB_tma_logical(params.row_offset + row, col, cute::Int<0>{});
+      }
+    } else {
+#pragma unroll
+      for (int col = 0; col < kSfbLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}).storage = 0u;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kThreadCount) {
+    return;
+  }
+
+  TiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(tid);
+  auto tCrSFB_direct = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_tma(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+  auto tCrSFB_ref = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+
+  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+  auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+      SmemCopyAtomSFB{},
+      CollectiveMainloop{}.get_layoutSFB_TV(tiled_mma),
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+  auto tCrSFB_direct_cv = s2r_thr_SFB.retile_D(tCrSFB_direct);
+  auto tCrSFB_ref_cv = s2r_thr_SFB.retile_D(tCrSFB_ref);
+
+  auto sScaleB_direct_base = cute::as_position_independent_swizzle_tensor(sSFB_tma);
+  auto sScaleB_direct = cute::domain_offset(
+      cute::make_coord(params.row_offset, 0, 0),
+      sScaleB_direct_base);
+  auto sScaleB_ref = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  auto tCsSFB_direct = s2r_thr_SFB.partition_S(sScaleB_direct);
+  auto tCsSFB_ref = s2r_thr_SFB.partition_S(sScaleB_ref);
+
+  cute::copy(tCsSFB_ref(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_ref_cv);
+  cute::copy(tCsSFB_direct(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_direct_cv);
+
+  constexpr int N_tiles = cute::size<1>(decltype(tCrSFB_ref){});
+  constexpr int K_blocks = cute::size<2>(decltype(tCrSFB_ref){});
+  int mismatch_count = 0;
+  int first_n = -1;
+  int first_k = -1;
+  std::uint32_t first_direct_word = 0u;
+  std::uint32_t first_ref_word = 0u;
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      const std::uint32_t direct_word =
+          PackScaleFragmentWordLocal(tCrSFB_direct(cute::_, n, k));
+      const std::uint32_t ref_word =
+          PackScaleFragmentWordLocal(tCrSFB_ref(cute::_, n, k));
+      if (direct_word != ref_word) {
+        if (mismatch_count == 0) {
+          first_n = n;
+          first_k = k;
+          first_direct_word = direct_word;
+          first_ref_word = ref_word;
+        }
+        ++mismatch_count;
+      }
+    }
+  }
+
+  params.mismatch_counts[tid] = mismatch_count;
+  params.first_n[tid] = first_n;
+  params.first_k[tid] = first_k;
+  params.first_direct_words[tid] = first_direct_word;
+  params.first_ref_words[tid] = first_ref_word;
+}
+
+template <class TmaCopySFB>
+__global__ void P5SfbConsumerChunkRebasedSliceKernel(
+    __grid_constant__ P5SfbConsumerDirectSliceParams<TmaCopySFB> const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<TmaCopyOnlySharedStorageSFBHybrid*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int lane_predicate = cute::elect_one_sync();
+  const bool is_tma_thread = (warp_idx == 0) && lane_predicate;
+
+  using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using ProducerBarrierType = typename FullBarrier::ValueType;
+  auto* ab_full_mbar = cute::recast_ptr<FullBarrier>(&shared.ab_full_mbar[0]);
+
+  if (is_tma_thread) {
+    cute::prefetch_tma_descriptor(params.tma_load_sfb.get_tma_descriptor());
+  }
+  __syncthreads();
+
+  if (is_tma_thread) {
+    ab_full_mbar[0].init(1);
+    cutlass::arch::fence_barrier_init();
+  }
+
+  auto* smem_sfb_tma_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_tma.data());
+  auto* smem_sfb_local_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_local.data());
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemSfbBytes; i += blockDim.x) {
+    smem_sfb_tma_bytes[i] = 0u;
+    smem_sfb_local_bytes[i] = 0u;
+  }
+  __syncthreads();
+
+  using X = cute::Underscore;
+  auto mSFB_nkl = params.tma_load_sfb.get_tma_tensor(cute::shape(
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK)));
+  auto gSFB_nkl = cute::local_tile(
+      mSFB_nkl,
+      MmaTileShape{},
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<X, cute::_1, cute::_1>{});
+  auto block_tma_sfb = params.tma_load_sfb.get_slice(0);
+  auto gSFB = gSFB_nkl(cute::_, cute::_, 0, cute::_, 0);
+  auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+  auto sSFB_tma = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_tma.data()), SmemLayoutSFB{});
+  auto sSFB_local = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_local.data()), SmemLayoutSFB{});
+  auto tBsSFB = block_tma_sfb.partition_D(sSFB_tma);
+
+  if (is_tma_thread) {
+    auto& ab_full_barrier = ab_full_mbar[0];
+    auto tma_copy_sfb =
+        params.tma_load_sfb.with(*cute::recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+    cute::copy(
+        tma_copy_sfb,
+        tBgSFB(cute::_, cute::_, cute::_, cute::Int<0>{}),
+        tBsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}));
+    ab_full_mbar[0].arrive_and_expect_tx(
+        static_cast<uint32_t>(
+            cutlass::bits_to_bytes(
+                cute::cosize(cute::take<0, 2>(SmemLayoutSFB{})) *
+                cute::sizeof_bits_v<ElementSF>)));
+  }
+
+  ab_full_mbar[0].wait(0);
+  __syncthreads();
+
+  auto sSFB_tma_logical = cute::as_position_independent_swizzle_tensor(sSFB_tma);
+  auto sSFB_local_logical = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  for (int row = tid; row < kTmaCopyOnlyTileN; row += blockDim.x) {
+    if (row < params.valid_rows) {
+#pragma unroll
+      for (int col = 0; col < kSfbLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}) =
+            sSFB_tma_logical(params.row_offset + row, col, cute::Int<0>{});
+      }
+    } else {
+#pragma unroll
+      for (int col = 0; col < kSfbLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}).storage = 0u;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kThreadCount) {
+    return;
+  }
+
+  TiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(tid);
+  auto tCrSFB_direct = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_tma(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+  auto tCrSFB_ref = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+
+  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+  auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+      SmemCopyAtomSFB{},
+      CollectiveMainloop{}.get_layoutSFB_TV(tiled_mma),
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+  auto tCrSFB_direct_cv = s2r_thr_SFB.retile_D(tCrSFB_direct);
+  auto tCrSFB_ref_cv = s2r_thr_SFB.retile_D(tCrSFB_ref);
+
+  constexpr int kChunkRows = 32;
+  const int chunk_base = (params.row_offset / kChunkRows) * kChunkRows;
+  const int local_offset = params.row_offset - chunk_base;
+  auto sSFB_tma_chunk = cute::domain_offset(
+      cute::make_coord(chunk_base, 0, 0),
+      sSFB_tma);
+  auto sScaleB_direct_base = cute::as_position_independent_swizzle_tensor(sSFB_tma_chunk);
+  auto sScaleB_direct = cute::domain_offset(
+      cute::make_coord(local_offset, 0, 0),
+      sScaleB_direct_base);
+  auto sScaleB_ref = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  auto tCsSFB_direct = s2r_thr_SFB.partition_S(sScaleB_direct);
+  auto tCsSFB_ref = s2r_thr_SFB.partition_S(sScaleB_ref);
+
+  cute::copy(tCsSFB_ref(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_ref_cv);
+  cute::copy(tCsSFB_direct(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_direct_cv);
+
+  constexpr int N_tiles = cute::size<1>(decltype(tCrSFB_ref){});
+  constexpr int K_blocks = cute::size<2>(decltype(tCrSFB_ref){});
+  int mismatch_count = 0;
+  int first_n = -1;
+  int first_k = -1;
+  std::uint32_t first_direct_word = 0u;
+  std::uint32_t first_ref_word = 0u;
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      const std::uint32_t direct_word =
+          PackScaleFragmentWordLocal(tCrSFB_direct(cute::_, n, k));
+      const std::uint32_t ref_word =
+          PackScaleFragmentWordLocal(tCrSFB_ref(cute::_, n, k));
+      if (direct_word != ref_word) {
+        if (mismatch_count == 0) {
+          first_n = n;
+          first_k = k;
+          first_direct_word = direct_word;
+          first_ref_word = ref_word;
+        }
+        ++mismatch_count;
+      }
+    }
+  }
+
+  params.mismatch_counts[tid] = mismatch_count;
+  params.first_n[tid] = first_n;
+  params.first_k[tid] = first_k;
+  params.first_direct_words[tid] = first_direct_word;
+  params.first_ref_words[tid] = first_ref_word;
+}
+
+template <class TmaCopySFB>
+__global__ void P5SfbConsumerRegisterAssemblyKernel(
+    __grid_constant__ P5SfbConsumerDirectSliceParams<TmaCopySFB> const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<TmaCopyOnlySharedStorageSFBHybrid*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int lane_predicate = cute::elect_one_sync();
+  const bool is_tma_thread = (warp_idx == 0) && lane_predicate;
+
+  using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+  using ProducerBarrierType = typename FullBarrier::ValueType;
+  auto* ab_full_mbar = cute::recast_ptr<FullBarrier>(&shared.ab_full_mbar[0]);
+
+  if (is_tma_thread) {
+    cute::prefetch_tma_descriptor(params.tma_load_sfb.get_tma_descriptor());
+  }
+  __syncthreads();
+
+  if (is_tma_thread) {
+    ab_full_mbar[0].init(1);
+    cutlass::arch::fence_barrier_init();
+  }
+
+  auto* smem_sfb_tma_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_tma.data());
+  auto* smem_sfb_local_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_SFB_local.data());
+  for (std::size_t i = static_cast<std::size_t>(tid); i < kTmaCopyOnlySmemSfbBytes; i += blockDim.x) {
+    smem_sfb_tma_bytes[i] = 0u;
+    smem_sfb_local_bytes[i] = 0u;
+  }
+  __syncthreads();
+
+  using X = cute::Underscore;
+  auto mSFB_nkl = params.tma_load_sfb.get_tma_tensor(cute::shape(
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK)));
+  auto gSFB_nkl = cute::local_tile(
+      mSFB_nkl,
+      MmaTileShape{},
+      cute::make_coord(cute::_, cute::_, cute::_),
+      cute::Step<X, cute::_1, cute::_1>{});
+  auto block_tma_sfb = params.tma_load_sfb.get_slice(0);
+  auto gSFB = gSFB_nkl(cute::_, cute::_, 0, cute::_, 0);
+  auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+  auto sSFB_tma = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_tma.data()), SmemLayoutSFB{});
+  auto sSFB_local = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_local.data()), SmemLayoutSFB{});
+  auto tBsSFB = block_tma_sfb.partition_D(sSFB_tma);
+
+  if (is_tma_thread) {
+    auto& ab_full_barrier = ab_full_mbar[0];
+    auto tma_copy_sfb =
+        params.tma_load_sfb.with(*cute::recast_ptr<ProducerBarrierType>(&ab_full_barrier));
+    cute::copy(
+        tma_copy_sfb,
+        tBgSFB(cute::_, cute::_, cute::_, cute::Int<0>{}),
+        tBsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}));
+    ab_full_mbar[0].arrive_and_expect_tx(
+        static_cast<uint32_t>(
+            cutlass::bits_to_bytes(
+                cute::cosize(cute::take<0, 2>(SmemLayoutSFB{})) *
+                cute::sizeof_bits_v<ElementSF>)));
+  }
+
+  ab_full_mbar[0].wait(0);
+  __syncthreads();
+
+  auto sSFB_tma_logical = cute::as_position_independent_swizzle_tensor(sSFB_tma);
+  auto sSFB_local_logical = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  for (int row = tid; row < kTmaCopyOnlyTileN; row += blockDim.x) {
+    if (row < params.valid_rows) {
+#pragma unroll
+      for (int col = 0; col < kSfbLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}) =
+            sSFB_tma_logical(params.row_offset + row, col, cute::Int<0>{});
+      }
+    } else {
+#pragma unroll
+      for (int col = 0; col < kSfbLogicalCols; ++col) {
+        sSFB_local_logical(row, col, cute::Int<0>{}).storage = 0u;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kThreadCount) {
+    return;
+  }
+
+  TiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(tid);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<kOutputRows>{}, cute::Int<kTokenRows>{}));
+  auto part_c = thread_mma.partition_C(dense_c);
+  auto tCrSFB_manual = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+  auto tCrSFB_ref = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+
+  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+  auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+      SmemCopyAtomSFB{},
+      CollectiveMainloop{}.get_layoutSFB_TV(tiled_mma),
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+  auto tCrSFB_ref_cv = s2r_thr_SFB.retile_D(tCrSFB_ref);
+  auto sScaleB_ref = cute::as_position_independent_swizzle_tensor(sSFB_local);
+  auto sScaleB_direct_scalar = cute::domain_offset(
+      cute::make_coord(params.row_offset, 0, 0),
+      sSFB_tma_logical);
+  auto scale_coords = cute::make_identity_tensor(cute::shape(sScaleB_ref));
+  auto tCsSFB_ref = s2r_thr_SFB.partition_S(sScaleB_ref);
+  auto tCsSFB_ref_coords = s2r_thr_SFB.partition_S(scale_coords);
+  cute::copy(tCsSFB_ref(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_ref_cv);
+
+  constexpr int N_tiles = cute::size<1>(decltype(tCrSFB_ref){});
+  constexpr int K_blocks = cute::size<2>(decltype(tCrSFB_ref){});
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      auto tCrSFB_manual_atom = tCrSFB_manual(cute::_, n, k);
+      auto tCsSFB_ref_atom_coords = tCsSFB_ref_coords(cute::_, n, k, cute::Int<0>{});
+      auto c_atom_coords = part_c(cute::_, 0, n);
+      auto coord0 = c_atom_coords(0);
+      const int b_base_row = static_cast<int>(cute::get<1>(coord0));
+      const bool atom_in_bounds = b_base_row >= 0 && b_base_row < params.valid_rows;
+      if (tid == 0 && n == 0 && k == 0) {
+        for (int probe_elem : {0, 16, 32, 48}) {
+          auto probe_coord = tCsSFB_ref_atom_coords(probe_elem);
+          const int linear_idx = static_cast<int>(cute::crd2idx(probe_coord, cute::shape(sScaleB_ref)));
+          printf(
+              "    register_assembly_coords offset=%d elem=%d linear=%d row=%d col=%d\n",
+              params.row_offset,
+              probe_elem,
+              linear_idx,
+              linear_idx / kSfbLogicalCols,
+              linear_idx % kSfbLogicalCols);
+        }
+      }
+      for (int elem = 0; elem < static_cast<int>(cute::size(tCrSFB_manual_atom)); ++elem) {
+        if (atom_in_bounds) {
+          auto coord = tCsSFB_ref_atom_coords(elem);
+          tCrSFB_manual_atom(elem) = sScaleB_direct_scalar(coord);
+        } else {
+          tCrSFB_manual_atom(elem) = ElementSF::bitcast(std::uint8_t{0});
+        }
+      }
+    }
+  }
+
+  int mismatch_count = 0;
+  int first_n = -1;
+  int first_k = -1;
+  std::uint32_t first_direct_word = 0u;
+  std::uint32_t first_ref_word = 0u;
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      const std::uint32_t direct_word =
+          PackScaleFragmentWordLocal(tCrSFB_manual(cute::_, n, k));
+      const std::uint32_t ref_word =
+          PackScaleFragmentWordLocal(tCrSFB_ref(cute::_, n, k));
+      if (direct_word != ref_word) {
+        if (mismatch_count == 0) {
+          first_n = n;
+          first_k = k;
+          first_direct_word = direct_word;
+          first_ref_word = ref_word;
+        }
+        ++mismatch_count;
+      }
+    }
+  }
+
+  params.mismatch_counts[tid] = mismatch_count;
+  params.first_n[tid] = first_n;
+  params.first_k[tid] = first_k;
+  params.first_direct_words[tid] = first_direct_word;
+  params.first_ref_words[tid] = first_ref_word;
+}
+
+__global__ void P5SfbConsumerGlobalAssemblyKernel(
+    __grid_constant__ P5SfbConsumerGlobalAssemblyParams const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<GlobalScaleSharedStorageSFB*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  auto sSFB_local = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_local.data()), SmemLayoutSFB{});
+  auto sScaleB_ref = cute::as_position_independent_swizzle_tensor(sSFB_local);
+
+  for (int row = tid; row < kTmaCopyOnlyTileN; row += blockDim.x) {
+    if (row < params.valid_rows) {
+      constexpr int kScaleByteCount = kTmaCopyOnlyTileK / 16;
+      constexpr std::size_t kPaddedBlocksPerRow =
+          ((static_cast<std::size_t>(kScaleByteCount) + 3u) / 4u) * 4u;
+      const std::uint32_t scale_word_lo = LoadExecutionScaleWordTest(
+          params.execution_scales,
+          static_cast<std::size_t>(params.row_offset + row),
+          0,
+          kPaddedBlocksPerRow,
+          nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+      const std::uint32_t scale_word_hi = LoadExecutionScaleWordTest(
+          params.execution_scales,
+          static_cast<std::size_t>(params.row_offset + row),
+          4,
+          kPaddedBlocksPerRow,
+          nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+      const std::uint8_t scale_bytes[8] = {
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_lo, 0),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_lo, 1),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_lo, 2),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_lo, 3),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_hi, 0),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_hi, 1),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_hi, 2),
+          nemotron::p15_scale_runtime::load_scale_byte(scale_word_hi, 3),
+      };
+      StoreScaleBytesTest(sSFB_local, scale_bytes, kScaleByteCount, row);
+    } else {
+      for (int scale_col = 0; scale_col < kSfbLogicalCols; ++scale_col) {
+        sScaleB_ref(row, scale_col, cute::Int<0>{}).storage = 0u;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid >= kThreadCount) {
+    return;
+  }
+
+  TiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(tid);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<kOutputRows>{}, cute::Int<kTokenRows>{}));
+  auto part_c = thread_mma.partition_C(dense_c);
+  auto tCrSFB_manual = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+  auto tCrSFB_ref = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+
+  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+  auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+      SmemCopyAtomSFB{},
+      CollectiveMainloop{}.get_layoutSFB_TV(tiled_mma),
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+  auto tCrSFB_ref_cv = s2r_thr_SFB.retile_D(tCrSFB_ref);
+  auto scale_coords = cute::make_identity_tensor(cute::shape(sScaleB_ref));
+  auto tCsSFB_ref = s2r_thr_SFB.partition_S(sScaleB_ref);
+  auto tCsSFB_ref_coords = s2r_thr_SFB.partition_S(scale_coords);
+  cute::copy(tCsSFB_ref(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_ref_cv);
+
+  constexpr int N_tiles = cute::size<1>(decltype(tCrSFB_ref){});
+  constexpr int K_blocks = cute::size<2>(decltype(tCrSFB_ref){});
+  constexpr int kScaleByteCount = kTmaCopyOnlyTileK / 16;
+  constexpr std::size_t kPaddedBlocksPerRow =
+      ((static_cast<std::size_t>(kScaleByteCount) + 3u) / 4u) * 4u;
+  constexpr int kBlocksPerKBlock = kScaleByteCount / K_blocks;
+  const int lane = tid & 31;
+  const int subgroup_leader = lane & ~3;
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      auto tCrSFB_manual_atom = tCrSFB_manual(cute::_, n, k);
+      auto tCsSFB_ref_atom_coords = tCsSFB_ref_coords(cute::_, n, k, cute::Int<0>{});
+      auto tCsSFB_ref_row_anchor = tCsSFB_ref_coords(cute::_, n, 0, cute::Int<0>{});
+      auto c_atom_coords = part_c(cute::_, 0, n);
+      auto coord0 = c_atom_coords(0);
+      const int b_base_row = static_cast<int>(cute::get<1>(coord0));
+      const int local_row0 = CoordGet0(tCsSFB_ref_row_anchor(0));
+      std::uint32_t packed_scale_word = 0u;
+      if ((lane & 3) == 0 &&
+          b_base_row >= 0 && b_base_row < params.valid_rows &&
+          local_row0 >= 0 && local_row0 < params.valid_rows) {
+        packed_scale_word = LoadExecutionScaleWordTest(
+            params.execution_scales,
+            static_cast<std::size_t>(params.row_offset + local_row0),
+            static_cast<std::size_t>(k * kBlocksPerKBlock),
+            kPaddedBlocksPerRow,
+            nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+      }
+      packed_scale_word = __shfl_sync(0xffffffffu, packed_scale_word, subgroup_leader);
+      FillScaleFragmentWordSparseLocal(tCrSFB_manual_atom, packed_scale_word);
+    }
+  }
+
+  int mismatch_count = 0;
+  int first_n = -1;
+  int first_k = -1;
+  std::uint32_t first_direct_word = 0u;
+  std::uint32_t first_ref_word = 0u;
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      const auto direct_atom = tCrSFB_manual(cute::_, n, k);
+      const auto ref_atom = tCrSFB_ref(cute::_, n, k);
+      const std::uint32_t direct_word = PackScaleFragmentWordLocal(direct_atom);
+      const std::uint32_t ref_word = PackScaleFragmentWordLocal(ref_atom);
+      if (!ScaleFragmentsEqualLocal(direct_atom, ref_atom)) {
+        if (mismatch_count == 0) {
+          first_n = n;
+          first_k = k;
+          first_direct_word = direct_word;
+          first_ref_word = ref_word;
+        }
+        ++mismatch_count;
+      }
+    }
+  }
+
+  params.mismatch_counts[tid] = mismatch_count;
+  params.first_n[tid] = first_n;
+  params.first_k[tid] = first_k;
+  params.first_direct_words[tid] = first_direct_word;
+  params.first_ref_words[tid] = first_ref_word;
+}
+
+__global__ void P5SfbGlobalSharingKernel(
+    __grid_constant__ P5SfbGlobalSharingParams const params) {
+  extern __shared__ char smem_raw[];
+  auto& shared = *reinterpret_cast<GlobalScaleSharedStorageSFB*>(smem_raw);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  auto sSFB_local = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB_local.data()), SmemLayoutSFB{});
+  auto sScaleB_ref = cute::as_position_independent_swizzle_tensor(sSFB_local);
+
+  if (tid >= kThreadCount) {
+    return;
+  }
+
+  TiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(tid);
+  auto tCrSFB = CollectiveMainloop{}.partition_fragment_SFB(
+      sSFB_local(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+  auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+      SmemCopyAtomSFB{},
+      CollectiveMainloop{}.get_layoutSFB_TV(tiled_mma),
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+  auto scale_coords = cute::make_identity_tensor(cute::shape(sScaleB_ref));
+  auto tCsSFB_coords = s2r_thr_SFB.partition_S(scale_coords);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<kOutputRows>{}, cute::Int<kTokenRows>{}));
+  auto part_c = thread_mma.partition_C(dense_c);
+
+  constexpr int N_tiles = cute::size<1>(decltype(tCrSFB){});
+  constexpr int K_blocks = cute::size<2>(decltype(tCrSFB){});
+
+  for (int k = 0; k < K_blocks; ++k) {
+    for (int n = 0; n < N_tiles; ++n) {
+      auto row_anchor = tCsSFB_coords(cute::_, n, 0, cute::Int<0>{});
+      auto c_atom_coords = part_c(cute::_, 0, n);
+      auto coord0 = c_atom_coords(0);
+      const int b_base_row = static_cast<int>(cute::get<1>(coord0));
+      const int local_row0 = CoordGet0(row_anchor(0));
+      const int slot = n * K_blocks + k;
+      params.base_rows[tid * kP5SfbSharingSlots + slot] = b_base_row;
+      params.local_rows[tid * kP5SfbSharingSlots + slot] =
+          (b_base_row >= 0 && b_base_row < params.valid_rows) ? local_row0 : -1;
+    }
+  }
+}
+
+int RunP5SfbConsumerDirectSliceProbeCase(int row_offset, int valid_rows) {
+  constexpr std::string_view label = "tma_fragment_sfb_direct_slice";
+  if (row_offset < 0 || row_offset + valid_rows > kTmaCopyOnlyTileN) {
+    std::cerr << "  " << label << " offset=" << row_offset
+              << " valid_rows=" << valid_rows << " invalid shape\n";
+    return 1;
+  }
+
+  constexpr int kLogicalBlocksPerRow = kTmaCopyOnlyTileK / 16;
+  std::vector<std::uint8_t> row_major_scales(
+      static_cast<std::size_t>(kTmaCopyOnlyTileN * kLogicalBlocksPerRow),
+      std::uint8_t{0});
+  for (int row = 0; row < valid_rows; ++row) {
+    const int source_row = row_offset + row;
+    for (int block = 0; block < kLogicalBlocksPerRow; ++block) {
+      row_major_scales[static_cast<std::size_t>(source_row * kLogicalBlocksPerRow + block)] =
+          static_cast<std::uint8_t>((17 * source_row + 13 * block + 9) & 0xFF);
+    }
+  }
+  std::vector<std::uint8_t> execution_scales = SwizzleRowMajorScalesForExecutionLocal(
+      row_major_scales.data(),
+      kTmaCopyOnlyTileN,
+      kTmaCopyOnlyTileK,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+
+  std::uint8_t* d_execution_scales = nullptr;
+  int* d_mismatch_counts = nullptr;
+  int* d_first_n = nullptr;
+  int* d_first_k = nullptr;
+  std::uint32_t* d_first_direct_words = nullptr;
+  std::uint32_t* d_first_ref_words = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_execution_scales, execution_scales.size()), "malloc sfb direct slice execution") ||
+      !CheckCuda(cudaMalloc(&d_mismatch_counts, kThreadCount * sizeof(int)), "malloc sfb direct slice mismatches") ||
+      !CheckCuda(cudaMalloc(&d_first_n, kThreadCount * sizeof(int)), "malloc sfb direct slice first_n") ||
+      !CheckCuda(cudaMalloc(&d_first_k, kThreadCount * sizeof(int)), "malloc sfb direct slice first_k") ||
+      !CheckCuda(cudaMalloc(&d_first_direct_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb direct slice first_direct") ||
+      !CheckCuda(cudaMalloc(&d_first_ref_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb direct slice first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          d_execution_scales,
+          execution_scales.data(),
+          execution_scales.size(),
+          cudaMemcpyHostToDevice),
+          "copy sfb direct slice execution") ||
+      !CheckCuda(cudaMemset(d_mismatch_counts, 0, kThreadCount * sizeof(int)), "memset sfb direct slice mismatches") ||
+      !CheckCuda(cudaMemset(d_first_n, 0xff, kThreadCount * sizeof(int)), "memset sfb direct slice first_n") ||
+      !CheckCuda(cudaMemset(d_first_k, 0xff, kThreadCount * sizeof(int)), "memset sfb direct slice first_k") ||
+      !CheckCuda(cudaMemset(d_first_direct_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb direct slice first_direct") ||
+      !CheckCuda(cudaMemset(d_first_ref_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb direct slice first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  auto tensor_sfb = cute::make_tensor(
+      cute::make_gmem_ptr(reinterpret_cast<ElementSF const*>(d_execution_scales)),
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK));
+  auto tma_load_sfb = cute::make_tma_copy<uint16_t>(
+      cute::SM90_TMA_LOAD{},
+      tensor_sfb,
+      SmemLayoutSFB{}(cute::_, cute::_, cute::Int<0>{}),
+      cute::make_shape(cute::Int<kTmaCopyOnlyTileN>{}, cute::Int<kTmaCopyOnlyTileK>{}),
+      cute::_1{});
+
+  using TmaCopySFB = decltype(tma_load_sfb);
+  using Params = P5SfbConsumerDirectSliceParams<TmaCopySFB>;
+  auto kernel_typed = P5SfbConsumerDirectSliceKernel<TmaCopySFB>;
+  if (!CheckCuda(cudaFuncSetAttribute(
+          kernel_typed,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          sizeof(TmaCopyOnlySharedStorageSFBHybrid)),
+          "func attr p5 sfb direct slice")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kTmaThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(TmaCopyOnlySharedStorageSFBHybrid);
+  config.stream = nullptr;
+  cudaLaunchAttribute attrs[1]{};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+
+  alignas(64) Params params{
+      tma_load_sfb,
+      row_offset,
+      valid_rows,
+      d_mismatch_counts,
+      d_first_n,
+      d_first_k,
+      d_first_direct_words,
+      d_first_ref_words};
+  const cudaError_t launch_status =
+      cudaLaunchKernelEx(&config, kernel_typed, params);
+  const cudaError_t sync_status =
+      (launch_status == cudaSuccess) ? cudaDeviceSynchronize() : launch_status;
+
+  std::cout << "  " << label << " offset=" << row_offset;
+  if (sync_status != cudaSuccess) {
+    std::cout << " ERROR " << cudaGetErrorString(sync_status) << "\n";
+    cudaGetLastError();
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  std::vector<int> h_mismatch_counts(kThreadCount, 0);
+  std::vector<int> h_first_n(kThreadCount, -1);
+  std::vector<int> h_first_k(kThreadCount, -1);
+  std::vector<std::uint32_t> h_first_direct_words(kThreadCount, 0);
+  std::vector<std::uint32_t> h_first_ref_words(kThreadCount, 0);
+  if (!CheckCuda(cudaMemcpy(h_mismatch_counts.data(), d_mismatch_counts, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb direct slice mismatches") ||
+      !CheckCuda(cudaMemcpy(h_first_n.data(), d_first_n, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb direct slice first_n") ||
+      !CheckCuda(cudaMemcpy(h_first_k.data(), d_first_k, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb direct slice first_k") ||
+      !CheckCuda(cudaMemcpy(h_first_direct_words.data(), d_first_direct_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb direct slice first_direct") ||
+      !CheckCuda(cudaMemcpy(h_first_ref_words.data(), d_first_ref_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb direct slice first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  cudaFree(d_execution_scales);
+  cudaFree(d_mismatch_counts);
+  cudaFree(d_first_n);
+  cudaFree(d_first_k);
+  cudaFree(d_first_direct_words);
+  cudaFree(d_first_ref_words);
+
+  int total_mismatches = 0;
+  int failing_thread = -1;
+  for (int tid = 0; tid < kThreadCount; ++tid) {
+    total_mismatches += h_mismatch_counts[tid];
+    if (failing_thread < 0 && h_mismatch_counts[tid] != 0) {
+      failing_thread = tid;
+    }
+  }
+  if (total_mismatches == 0) {
+    std::cout << " PASS\n";
+    return 0;
+  }
+
+  std::cout << " FAIL total_mismatches=" << total_mismatches
+            << " thread=" << failing_thread
+            << " n=" << h_first_n[failing_thread]
+            << " k=" << h_first_k[failing_thread]
+            << " direct=0x" << std::hex << h_first_direct_words[failing_thread]
+            << " ref=0x" << h_first_ref_words[failing_thread]
+            << std::dec << "\n";
+  return 1;
+}
+
+int RunP5SfbConsumerChunkRebasedProbeCase(int row_offset, int valid_rows) {
+  constexpr std::string_view label = "tma_fragment_sfb_chunk_rebased_slice";
+  if (row_offset < 0 || row_offset + valid_rows > kTmaCopyOnlyTileN) {
+    std::cerr << "  " << label << " offset=" << row_offset
+              << " valid_rows=" << valid_rows << " invalid shape\n";
+    return 1;
+  }
+
+  constexpr int kLogicalBlocksPerRow = kTmaCopyOnlyTileK / 16;
+  std::vector<std::uint8_t> row_major_scales(
+      static_cast<std::size_t>(kTmaCopyOnlyTileN * kLogicalBlocksPerRow),
+      std::uint8_t{0});
+  for (int row = 0; row < valid_rows; ++row) {
+    const int source_row = row_offset + row;
+    for (int block = 0; block < kLogicalBlocksPerRow; ++block) {
+      row_major_scales[static_cast<std::size_t>(source_row * kLogicalBlocksPerRow + block)] =
+          static_cast<std::uint8_t>((17 * source_row + 13 * block + 9) & 0xFF);
+    }
+  }
+  std::vector<std::uint8_t> execution_scales = SwizzleRowMajorScalesForExecutionLocal(
+      row_major_scales.data(),
+      kTmaCopyOnlyTileN,
+      kTmaCopyOnlyTileK,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+
+  std::uint8_t* d_execution_scales = nullptr;
+  int* d_mismatch_counts = nullptr;
+  int* d_first_n = nullptr;
+  int* d_first_k = nullptr;
+  std::uint32_t* d_first_direct_words = nullptr;
+  std::uint32_t* d_first_ref_words = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_execution_scales, execution_scales.size()), "malloc sfb chunk rebased execution") ||
+      !CheckCuda(cudaMalloc(&d_mismatch_counts, kThreadCount * sizeof(int)), "malloc sfb chunk rebased mismatches") ||
+      !CheckCuda(cudaMalloc(&d_first_n, kThreadCount * sizeof(int)), "malloc sfb chunk rebased first_n") ||
+      !CheckCuda(cudaMalloc(&d_first_k, kThreadCount * sizeof(int)), "malloc sfb chunk rebased first_k") ||
+      !CheckCuda(cudaMalloc(&d_first_direct_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb chunk rebased first_direct") ||
+      !CheckCuda(cudaMalloc(&d_first_ref_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb chunk rebased first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          d_execution_scales,
+          execution_scales.data(),
+          execution_scales.size(),
+          cudaMemcpyHostToDevice),
+          "copy sfb chunk rebased execution") ||
+      !CheckCuda(cudaMemset(d_mismatch_counts, 0, kThreadCount * sizeof(int)), "memset sfb chunk rebased mismatches") ||
+      !CheckCuda(cudaMemset(d_first_n, 0xff, kThreadCount * sizeof(int)), "memset sfb chunk rebased first_n") ||
+      !CheckCuda(cudaMemset(d_first_k, 0xff, kThreadCount * sizeof(int)), "memset sfb chunk rebased first_k") ||
+      !CheckCuda(cudaMemset(d_first_direct_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb chunk rebased first_direct") ||
+      !CheckCuda(cudaMemset(d_first_ref_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb chunk rebased first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  auto tensor_sfb = cute::make_tensor(
+      cute::make_gmem_ptr(reinterpret_cast<ElementSF const*>(d_execution_scales)),
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK));
+  auto tma_load_sfb = cute::make_tma_copy<uint16_t>(
+      cute::SM90_TMA_LOAD{},
+      tensor_sfb,
+      SmemLayoutSFB{}(cute::_, cute::_, cute::Int<0>{}),
+      cute::make_shape(cute::Int<kTmaCopyOnlyTileN>{}, cute::Int<kTmaCopyOnlyTileK>{}),
+      cute::_1{});
+
+  using TmaCopySFB = decltype(tma_load_sfb);
+  using Params = P5SfbConsumerDirectSliceParams<TmaCopySFB>;
+  auto kernel_typed = P5SfbConsumerChunkRebasedSliceKernel<TmaCopySFB>;
+  if (!CheckCuda(cudaFuncSetAttribute(
+          kernel_typed,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          sizeof(TmaCopyOnlySharedStorageSFBHybrid)),
+          "func attr p5 sfb chunk rebased slice")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kTmaThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(TmaCopyOnlySharedStorageSFBHybrid);
+  config.stream = nullptr;
+  cudaLaunchAttribute attrs[1]{};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+
+  alignas(64) Params params{
+      tma_load_sfb,
+      row_offset,
+      valid_rows,
+      d_mismatch_counts,
+      d_first_n,
+      d_first_k,
+      d_first_direct_words,
+      d_first_ref_words};
+  const cudaError_t launch_status =
+      cudaLaunchKernelEx(&config, kernel_typed, params);
+  const cudaError_t sync_status =
+      (launch_status == cudaSuccess) ? cudaDeviceSynchronize() : launch_status;
+
+  std::cout << "  " << label << " offset=" << row_offset;
+  if (sync_status != cudaSuccess) {
+    std::cout << " ERROR " << cudaGetErrorString(sync_status) << "\n";
+    cudaGetLastError();
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  std::vector<int> h_mismatch_counts(kThreadCount, 0);
+  std::vector<int> h_first_n(kThreadCount, -1);
+  std::vector<int> h_first_k(kThreadCount, -1);
+  std::vector<std::uint32_t> h_first_direct_words(kThreadCount, 0);
+  std::vector<std::uint32_t> h_first_ref_words(kThreadCount, 0);
+  if (!CheckCuda(cudaMemcpy(h_mismatch_counts.data(), d_mismatch_counts, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb chunk rebased mismatches") ||
+      !CheckCuda(cudaMemcpy(h_first_n.data(), d_first_n, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb chunk rebased first_n") ||
+      !CheckCuda(cudaMemcpy(h_first_k.data(), d_first_k, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb chunk rebased first_k") ||
+      !CheckCuda(cudaMemcpy(h_first_direct_words.data(), d_first_direct_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb chunk rebased first_direct") ||
+      !CheckCuda(cudaMemcpy(h_first_ref_words.data(), d_first_ref_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb chunk rebased first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  cudaFree(d_execution_scales);
+  cudaFree(d_mismatch_counts);
+  cudaFree(d_first_n);
+  cudaFree(d_first_k);
+  cudaFree(d_first_direct_words);
+  cudaFree(d_first_ref_words);
+
+  int total_mismatches = 0;
+  int failing_thread = -1;
+  for (int tid = 0; tid < kThreadCount; ++tid) {
+    total_mismatches += h_mismatch_counts[tid];
+    if (failing_thread < 0 && h_mismatch_counts[tid] != 0) {
+      failing_thread = tid;
+    }
+  }
+  if (total_mismatches == 0) {
+    std::cout << " PASS\n";
+    return 0;
+  }
+
+  std::cout << " FAIL total_mismatches=" << total_mismatches
+            << " thread=" << failing_thread
+            << " n=" << h_first_n[failing_thread]
+            << " k=" << h_first_k[failing_thread]
+            << " direct=0x" << std::hex << h_first_direct_words[failing_thread]
+            << " ref=0x" << h_first_ref_words[failing_thread]
+            << std::dec << "\n";
+  return 1;
+}
+
+int RunP5SfbConsumerRegisterAssemblyProbeCase(int row_offset, int valid_rows) {
+  constexpr std::string_view label = "tma_fragment_sfb_register_assembly";
+  if (row_offset < 0 || row_offset + valid_rows > kTmaCopyOnlyTileN) {
+    std::cerr << "  " << label << " offset=" << row_offset
+              << " valid_rows=" << valid_rows << " invalid shape\n";
+    return 1;
+  }
+
+  constexpr int kLogicalBlocksPerRow = kTmaCopyOnlyTileK / 16;
+  std::vector<std::uint8_t> row_major_scales(
+      static_cast<std::size_t>(kTmaCopyOnlyTileN * kLogicalBlocksPerRow),
+      std::uint8_t{0});
+  for (int row = 0; row < valid_rows; ++row) {
+    const int source_row = row_offset + row;
+    for (int block = 0; block < kLogicalBlocksPerRow; ++block) {
+      row_major_scales[static_cast<std::size_t>(source_row * kLogicalBlocksPerRow + block)] =
+          static_cast<std::uint8_t>((17 * source_row + 13 * block + 9) & 0xFF);
+    }
+  }
+  std::vector<std::uint8_t> execution_scales = SwizzleRowMajorScalesForExecutionLocal(
+      row_major_scales.data(),
+      kTmaCopyOnlyTileN,
+      kTmaCopyOnlyTileK,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+
+  std::uint8_t* d_execution_scales = nullptr;
+  int* d_mismatch_counts = nullptr;
+  int* d_first_n = nullptr;
+  int* d_first_k = nullptr;
+  std::uint32_t* d_first_direct_words = nullptr;
+  std::uint32_t* d_first_ref_words = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_execution_scales, execution_scales.size()), "malloc sfb register execution") ||
+      !CheckCuda(cudaMalloc(&d_mismatch_counts, kThreadCount * sizeof(int)), "malloc sfb register mismatches") ||
+      !CheckCuda(cudaMalloc(&d_first_n, kThreadCount * sizeof(int)), "malloc sfb register first_n") ||
+      !CheckCuda(cudaMalloc(&d_first_k, kThreadCount * sizeof(int)), "malloc sfb register first_k") ||
+      !CheckCuda(cudaMalloc(&d_first_direct_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb register first_direct") ||
+      !CheckCuda(cudaMalloc(&d_first_ref_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb register first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          d_execution_scales,
+          execution_scales.data(),
+          execution_scales.size(),
+          cudaMemcpyHostToDevice),
+          "copy sfb register execution") ||
+      !CheckCuda(cudaMemset(d_mismatch_counts, 0, kThreadCount * sizeof(int)), "memset sfb register mismatches") ||
+      !CheckCuda(cudaMemset(d_first_n, 0xff, kThreadCount * sizeof(int)), "memset sfb register first_n") ||
+      !CheckCuda(cudaMemset(d_first_k, 0xff, kThreadCount * sizeof(int)), "memset sfb register first_k") ||
+      !CheckCuda(cudaMemset(d_first_direct_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb register first_direct") ||
+      !CheckCuda(cudaMemset(d_first_ref_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb register first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  auto tensor_sfb = cute::make_tensor(
+      cute::make_gmem_ptr(reinterpret_cast<ElementSF const*>(d_execution_scales)),
+      MakeP5ScaleLayoutSFBLocal(kTmaCopyOnlyTileN, kTmaCopyOnlyTileK));
+  auto tma_load_sfb = cute::make_tma_copy<uint16_t>(
+      cute::SM90_TMA_LOAD{},
+      tensor_sfb,
+      SmemLayoutSFB{}(cute::_, cute::_, cute::Int<0>{}),
+      cute::make_shape(cute::Int<kTmaCopyOnlyTileN>{}, cute::Int<kTmaCopyOnlyTileK>{}),
+      cute::_1{});
+
+  using TmaCopySFB = decltype(tma_load_sfb);
+  using Params = P5SfbConsumerDirectSliceParams<TmaCopySFB>;
+  auto kernel_typed = P5SfbConsumerRegisterAssemblyKernel<TmaCopySFB>;
+  if (!CheckCuda(cudaFuncSetAttribute(
+          kernel_typed,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          sizeof(TmaCopyOnlySharedStorageSFBHybrid)),
+          "func attr p5 sfb register assembly")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kTmaThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(TmaCopyOnlySharedStorageSFBHybrid);
+  config.stream = nullptr;
+  cudaLaunchAttribute attrs[1]{};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+
+  alignas(64) Params params{
+      tma_load_sfb,
+      row_offset,
+      valid_rows,
+      d_mismatch_counts,
+      d_first_n,
+      d_first_k,
+      d_first_direct_words,
+      d_first_ref_words};
+  const cudaError_t launch_status =
+      cudaLaunchKernelEx(&config, kernel_typed, params);
+  const cudaError_t sync_status =
+      (launch_status == cudaSuccess) ? cudaDeviceSynchronize() : launch_status;
+
+  std::cout << "  " << label << " offset=" << row_offset;
+  if (sync_status != cudaSuccess) {
+    std::cout << " ERROR " << cudaGetErrorString(sync_status) << "\n";
+    cudaGetLastError();
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  std::vector<int> h_mismatch_counts(kThreadCount, 0);
+  std::vector<int> h_first_n(kThreadCount, -1);
+  std::vector<int> h_first_k(kThreadCount, -1);
+  std::vector<std::uint32_t> h_first_direct_words(kThreadCount, 0);
+  std::vector<std::uint32_t> h_first_ref_words(kThreadCount, 0);
+  if (!CheckCuda(cudaMemcpy(h_mismatch_counts.data(), d_mismatch_counts, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb register mismatches") ||
+      !CheckCuda(cudaMemcpy(h_first_n.data(), d_first_n, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb register first_n") ||
+      !CheckCuda(cudaMemcpy(h_first_k.data(), d_first_k, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb register first_k") ||
+      !CheckCuda(cudaMemcpy(h_first_direct_words.data(), d_first_direct_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb register first_direct") ||
+      !CheckCuda(cudaMemcpy(h_first_ref_words.data(), d_first_ref_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb register first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  cudaFree(d_execution_scales);
+  cudaFree(d_mismatch_counts);
+  cudaFree(d_first_n);
+  cudaFree(d_first_k);
+  cudaFree(d_first_direct_words);
+  cudaFree(d_first_ref_words);
+
+  int total_mismatches = 0;
+  int failing_thread = -1;
+  for (int tid = 0; tid < kThreadCount; ++tid) {
+    total_mismatches += h_mismatch_counts[tid];
+    if (failing_thread < 0 && h_mismatch_counts[tid] != 0) {
+      failing_thread = tid;
+    }
+  }
+  if (total_mismatches == 0) {
+    std::cout << " PASS\n";
+    return 0;
+  }
+
+  std::cout << " FAIL total_mismatches=" << total_mismatches
+            << " thread=" << failing_thread
+            << " n=" << h_first_n[failing_thread]
+            << " k=" << h_first_k[failing_thread]
+            << " direct=0x" << std::hex << h_first_direct_words[failing_thread]
+            << " ref=0x" << h_first_ref_words[failing_thread]
+            << std::dec << "\n";
+  return 1;
+}
+
+int RunP5SfbConsumerGlobalAssemblyProbeCase(int row_offset, int valid_rows) {
+  constexpr std::string_view label = "tma_fragment_sfb_global_assembly";
+  if (row_offset < 0 || row_offset + valid_rows > kTmaCopyOnlyTileN) {
+    std::cerr << "  " << label << " offset=" << row_offset
+              << " valid_rows=" << valid_rows << " invalid shape\n";
+    return 1;
+  }
+
+  constexpr int kLogicalBlocksPerRow = kTmaCopyOnlyTileK / 16;
+  std::vector<std::uint8_t> row_major_scales(
+      static_cast<std::size_t>(kTmaCopyOnlyTileN * kLogicalBlocksPerRow),
+      std::uint8_t{0});
+  for (int row = 0; row < valid_rows; ++row) {
+    const int source_row = row_offset + row;
+    for (int block = 0; block < kLogicalBlocksPerRow; ++block) {
+      row_major_scales[static_cast<std::size_t>(source_row * kLogicalBlocksPerRow + block)] =
+          static_cast<std::uint8_t>((17 * source_row + 13 * block + 9) & 0xFF);
+    }
+  }
+  std::vector<std::uint8_t> execution_scales = SwizzleRowMajorScalesForExecutionLocal(
+      row_major_scales.data(),
+      kTmaCopyOnlyTileN,
+      kTmaCopyOnlyTileK,
+      nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
+
+  std::uint8_t* d_execution_scales = nullptr;
+  int* d_mismatch_counts = nullptr;
+  int* d_first_n = nullptr;
+  int* d_first_k = nullptr;
+  std::uint32_t* d_first_direct_words = nullptr;
+  std::uint32_t* d_first_ref_words = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_execution_scales, execution_scales.size()), "malloc sfb global execution") ||
+      !CheckCuda(cudaMalloc(&d_mismatch_counts, kThreadCount * sizeof(int)), "malloc sfb global mismatches") ||
+      !CheckCuda(cudaMalloc(&d_first_n, kThreadCount * sizeof(int)), "malloc sfb global first_n") ||
+      !CheckCuda(cudaMalloc(&d_first_k, kThreadCount * sizeof(int)), "malloc sfb global first_k") ||
+      !CheckCuda(cudaMalloc(&d_first_direct_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb global first_direct") ||
+      !CheckCuda(cudaMalloc(&d_first_ref_words, kThreadCount * sizeof(std::uint32_t)), "malloc sfb global first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          d_execution_scales,
+          execution_scales.data(),
+          execution_scales.size(),
+          cudaMemcpyHostToDevice),
+          "copy sfb global execution") ||
+      !CheckCuda(cudaMemset(d_mismatch_counts, 0, kThreadCount * sizeof(int)), "memset sfb global mismatches") ||
+      !CheckCuda(cudaMemset(d_first_n, 0xff, kThreadCount * sizeof(int)), "memset sfb global first_n") ||
+      !CheckCuda(cudaMemset(d_first_k, 0xff, kThreadCount * sizeof(int)), "memset sfb global first_k") ||
+      !CheckCuda(cudaMemset(d_first_direct_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb global first_direct") ||
+      !CheckCuda(cudaMemset(d_first_ref_words, 0, kThreadCount * sizeof(std::uint32_t)), "memset sfb global first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  using Params = P5SfbConsumerGlobalAssemblyParams;
+  auto kernel_typed = P5SfbConsumerGlobalAssemblyKernel;
+  if (!CheckCuda(cudaFuncSetAttribute(
+          kernel_typed,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          sizeof(GlobalScaleSharedStorageSFB)),
+          "func attr p5 sfb global assembly")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(GlobalScaleSharedStorageSFB);
+  config.stream = nullptr;
+
+  alignas(64) Params params{
+      d_execution_scales,
+      row_offset,
+      valid_rows,
+      d_mismatch_counts,
+      d_first_n,
+      d_first_k,
+      d_first_direct_words,
+      d_first_ref_words};
+  const cudaError_t launch_status =
+      cudaLaunchKernelEx(&config, kernel_typed, params);
+  const cudaError_t sync_status =
+      (launch_status == cudaSuccess) ? cudaDeviceSynchronize() : launch_status;
+
+  std::cout << "  " << label << " offset=" << row_offset;
+  if (sync_status != cudaSuccess) {
+    std::cout << " ERROR " << cudaGetErrorString(sync_status) << "\n";
+    cudaGetLastError();
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+
+  std::vector<int> h_mismatch_counts(kThreadCount, 0);
+  std::vector<int> h_first_n(kThreadCount, -1);
+  std::vector<int> h_first_k(kThreadCount, -1);
+  std::vector<std::uint32_t> h_first_direct_words(kThreadCount, 0);
+  std::vector<std::uint32_t> h_first_ref_words(kThreadCount, 0);
+  if (!CheckCuda(cudaMemcpy(h_mismatch_counts.data(), d_mismatch_counts, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb global mismatches") ||
+      !CheckCuda(cudaMemcpy(h_first_n.data(), d_first_n, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb global first_n") ||
+      !CheckCuda(cudaMemcpy(h_first_k.data(), d_first_k, kThreadCount * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb global first_k") ||
+      !CheckCuda(cudaMemcpy(h_first_direct_words.data(), d_first_direct_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb global first_direct") ||
+      !CheckCuda(cudaMemcpy(h_first_ref_words.data(), d_first_ref_words, kThreadCount * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy sfb global first_ref")) {
+    cudaFree(d_execution_scales);
+    cudaFree(d_mismatch_counts);
+    cudaFree(d_first_n);
+    cudaFree(d_first_k);
+    cudaFree(d_first_direct_words);
+    cudaFree(d_first_ref_words);
+    return 1;
+  }
+  cudaFree(d_execution_scales);
+  cudaFree(d_mismatch_counts);
+  cudaFree(d_first_n);
+  cudaFree(d_first_k);
+  cudaFree(d_first_direct_words);
+  cudaFree(d_first_ref_words);
+
+  int total_mismatches = 0;
+  int failing_thread = -1;
+  for (int tid = 0; tid < kThreadCount; ++tid) {
+    total_mismatches += h_mismatch_counts[tid];
+    if (failing_thread < 0 && h_mismatch_counts[tid] != 0) {
+      failing_thread = tid;
+    }
+  }
+  if (total_mismatches == 0) {
+    std::cout << " PASS\n";
+    return 0;
+  }
+
+  std::cout << " FAIL total_mismatches=" << total_mismatches
+            << " thread=" << failing_thread
+            << " n=" << h_first_n[failing_thread]
+            << " k=" << h_first_k[failing_thread]
+            << " direct=0x" << std::hex << h_first_direct_words[failing_thread]
+            << " ref=0x" << h_first_ref_words[failing_thread]
+            << std::dec << "\n";
+  return 1;
+}
+
+int RunP5SfbGlobalSharingProbeCase(int valid_rows) {
+  constexpr std::string_view label = "tma_fragment_sfb_global_sharing";
+  constexpr int kSlots = kP5SfbSharingSlots;
+
+  int* d_local_rows = nullptr;
+  int* d_base_rows = nullptr;
+  if (!CheckCuda(cudaMalloc(&d_local_rows, kThreadCount * kSlots * sizeof(int)), "malloc sfb sharing local_rows") ||
+      !CheckCuda(cudaMalloc(&d_base_rows, kThreadCount * kSlots * sizeof(int)), "malloc sfb sharing base_rows")) {
+    cudaFree(d_local_rows);
+    cudaFree(d_base_rows);
+    return 1;
+  }
+  if (!CheckCuda(cudaMemset(d_local_rows, 0xff, kThreadCount * kSlots * sizeof(int)), "memset sfb sharing local_rows") ||
+      !CheckCuda(cudaMemset(d_base_rows, 0xff, kThreadCount * kSlots * sizeof(int)), "memset sfb sharing base_rows")) {
+    cudaFree(d_local_rows);
+    cudaFree(d_base_rows);
+    return 1;
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(1, 1, 1);
+  config.blockDim = dim3(kThreadCount, 1, 1);
+  config.dynamicSmemBytes = sizeof(GlobalScaleSharedStorageSFB);
+  config.stream = nullptr;
+
+  P5SfbGlobalSharingParams params{valid_rows, d_local_rows, d_base_rows};
+  const cudaError_t launch_status =
+      cudaLaunchKernelEx(&config, P5SfbGlobalSharingKernel, params);
+  const cudaError_t sync_status =
+      (launch_status == cudaSuccess) ? cudaDeviceSynchronize() : launch_status;
+  if (sync_status != cudaSuccess) {
+    std::cout << "  " << label << " ERROR " << cudaGetErrorString(sync_status) << "\n";
+    cudaGetLastError();
+    cudaFree(d_local_rows);
+    cudaFree(d_base_rows);
+    return 1;
+  }
+
+  std::vector<int> h_local_rows(kThreadCount * kSlots, -1);
+  std::vector<int> h_base_rows(kThreadCount * kSlots, -1);
+  if (!CheckCuda(cudaMemcpy(h_local_rows.data(), d_local_rows, h_local_rows.size() * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb sharing local_rows") ||
+      !CheckCuda(cudaMemcpy(h_base_rows.data(), d_base_rows, h_base_rows.size() * sizeof(int), cudaMemcpyDeviceToHost), "copy sfb sharing base_rows")) {
+    cudaFree(d_local_rows);
+    cudaFree(d_base_rows);
+    return 1;
+  }
+  cudaFree(d_local_rows);
+  cudaFree(d_base_rows);
+
+  std::cout << "  " << label << " valid_rows=" << valid_rows << "\n";
+  for (int slot = 0; slot < kSlots; ++slot) {
+    int max_unique = 0;
+    int total_unique = 0;
+    int active_warps = 0;
+    std::array<int, 32> warp0_values{};
+    int warp0_count = 0;
+    for (int warp = 0; warp < kThreadCount / 32; ++warp) {
+      std::array<int, 32> unique_rows{};
+      int unique_count = 0;
+      for (int lane = 0; lane < 32; ++lane) {
+        const int tid = warp * 32 + lane;
+        const int row = h_local_rows[tid * kSlots + slot];
+        if (row < 0) {
+          continue;
+        }
+        bool seen = false;
+        for (int i = 0; i < unique_count; ++i) {
+          if (unique_rows[i] == row) {
+            seen = true;
+            break;
+          }
+        }
+        if (!seen) {
+          unique_rows[unique_count++] = row;
+        }
+      }
+      if (unique_count == 0) {
+        continue;
+      }
+      if (warp == 0) {
+        warp0_count = unique_count;
+        for (int i = 0; i < unique_count; ++i) {
+          warp0_values[i] = unique_rows[i];
+        }
+      }
+      max_unique = std::max(max_unique, unique_count);
+      total_unique += unique_count;
+      ++active_warps;
+    }
+    if (active_warps == 0) {
+      continue;
+    }
+    const double mean_unique =
+        active_warps > 0 ? static_cast<double>(total_unique) / active_warps : 0.0;
+    std::cout << "    slot=" << slot
+              << " warp0_unique=";
+    for (int i = 0; i < warp0_count; ++i) {
+      if (i != 0) {
+        std::cout << ",";
+      }
+      std::cout << warp0_values[i];
+    }
+    std::cout << " warp0_lanes=";
+    for (int lane = 0; lane < 32; ++lane) {
+      if (lane != 0) {
+        std::cout << ",";
+      }
+      std::cout << h_local_rows[lane * kSlots + slot];
+    }
+    std::cout << " mean_unique_per_warp=" << mean_unique
+              << " max_unique_per_warp=" << max_unique << "\n";
+  }
+  return 0;
+}
+
 int RunP5SfbTmaPartitionVerifySmoke() {
   std::cout << "  tma_partition_sfb_tileindex_row128 SKIP (SM120 array mainloop uses make_tma_copy/local_tile, not tma_partition)\n";
   return 0;
@@ -3655,6 +5277,88 @@ int RunTest() {
     std::cout << "  tma_single_tile_k64_dispatch_rows_5 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_single_tile_k64_dispatch_rows_4 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
     std::cout << "  tma_single_tile_k128_dispatch_rows_5 SKIP (set NEMOTRON_RUN_P5_TMA_SMOKE=1 to enable)\n";
+  }
+  if (const char* run_sfb_direct_probe = std::getenv("NEMOTRON_RUN_P5_SFB_DIRECT_SLICE_PROBE")) {
+    if (run_sfb_direct_probe[0] != '\0' && run_sfb_direct_probe[0] != '0') {
+      int row_offset = 8;
+      int valid_rows = 8;
+      if (const char* row_offset_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_ROW_OFFSET")) {
+        row_offset = std::atoi(row_offset_env);
+      }
+      if (const char* valid_rows_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_VALID_ROWS")) {
+        valid_rows = std::atoi(valid_rows_env);
+      }
+      return RunP5SfbConsumerDirectSliceProbeCase(row_offset, valid_rows);
+    } else {
+      std::cout << "  tma_fragment_sfb_direct_slice SKIP (env disabled)\n";
+    }
+  } else {
+    std::cout << "  tma_fragment_sfb_direct_slice SKIP (set NEMOTRON_RUN_P5_SFB_DIRECT_SLICE_PROBE=1 to enable)\n";
+  }
+  if (const char* run_sfb_chunk_probe = std::getenv("NEMOTRON_RUN_P5_SFB_CHUNK_REBASED_SLICE_PROBE")) {
+    if (run_sfb_chunk_probe[0] != '\0' && run_sfb_chunk_probe[0] != '0') {
+      int row_offset = 32;
+      int valid_rows = 8;
+      if (const char* row_offset_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_ROW_OFFSET")) {
+        row_offset = std::atoi(row_offset_env);
+      }
+      if (const char* valid_rows_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_VALID_ROWS")) {
+        valid_rows = std::atoi(valid_rows_env);
+      }
+      return RunP5SfbConsumerChunkRebasedProbeCase(row_offset, valid_rows);
+    } else {
+      std::cout << "  tma_fragment_sfb_chunk_rebased_slice SKIP (env disabled)\n";
+    }
+  } else {
+    std::cout << "  tma_fragment_sfb_chunk_rebased_slice SKIP (set NEMOTRON_RUN_P5_SFB_CHUNK_REBASED_SLICE_PROBE=1 to enable)\n";
+  }
+  if (const char* run_sfb_register_probe = std::getenv("NEMOTRON_RUN_P5_SFB_REGISTER_ASSEMBLY_PROBE")) {
+    if (run_sfb_register_probe[0] != '\0' && run_sfb_register_probe[0] != '0') {
+      int row_offset = 32;
+      int valid_rows = 8;
+      if (const char* row_offset_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_ROW_OFFSET")) {
+        row_offset = std::atoi(row_offset_env);
+      }
+      if (const char* valid_rows_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_VALID_ROWS")) {
+        valid_rows = std::atoi(valid_rows_env);
+      }
+      return RunP5SfbConsumerRegisterAssemblyProbeCase(row_offset, valid_rows);
+    } else {
+      std::cout << "  tma_fragment_sfb_register_assembly SKIP (env disabled)\n";
+    }
+  } else {
+    std::cout << "  tma_fragment_sfb_register_assembly SKIP (set NEMOTRON_RUN_P5_SFB_REGISTER_ASSEMBLY_PROBE=1 to enable)\n";
+  }
+  if (const char* run_sfb_global_probe = std::getenv("NEMOTRON_RUN_P5_SFB_GLOBAL_ASSEMBLY_PROBE")) {
+    if (run_sfb_global_probe[0] != '\0' && run_sfb_global_probe[0] != '0') {
+      int row_offset = 32;
+      int valid_rows = 8;
+      if (const char* row_offset_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_ROW_OFFSET")) {
+        row_offset = std::atoi(row_offset_env);
+      }
+      if (const char* valid_rows_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_VALID_ROWS")) {
+        valid_rows = std::atoi(valid_rows_env);
+      }
+      return RunP5SfbConsumerGlobalAssemblyProbeCase(row_offset, valid_rows);
+    } else {
+      std::cout << "  tma_fragment_sfb_global_assembly SKIP (env disabled)\n";
+    }
+  } else {
+    std::cout << "  tma_fragment_sfb_global_assembly SKIP (set NEMOTRON_RUN_P5_SFB_GLOBAL_ASSEMBLY_PROBE=1 to enable)\n";
+  }
+  if (const char* run_sfb_global_sharing_probe =
+          std::getenv("NEMOTRON_RUN_P5_SFB_GLOBAL_SHARING_PROBE")) {
+    if (run_sfb_global_sharing_probe[0] != '\0' && run_sfb_global_sharing_probe[0] != '0') {
+      int valid_rows = 8;
+      if (const char* valid_rows_env = std::getenv("NEMOTRON_P5_SFB_DIRECT_SLICE_VALID_ROWS")) {
+        valid_rows = std::atoi(valid_rows_env);
+      }
+      return RunP5SfbGlobalSharingProbeCase(valid_rows);
+    } else {
+      std::cout << "  tma_fragment_sfb_global_sharing SKIP (env disabled)\n";
+    }
+  } else {
+    std::cout << "  tma_fragment_sfb_global_sharing SKIP (set NEMOTRON_RUN_P5_SFB_GLOBAL_SHARING_PROBE=1 to enable)\n";
   }
   if (RunPackedCase("single_tile_valid_rows_full_tile", kMacroTileK, kTokenRows, kSingleTileTolerance) != 0) {
     return 1;
