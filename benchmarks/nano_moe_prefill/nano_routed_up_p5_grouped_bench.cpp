@@ -341,6 +341,19 @@ P5SfbPathStats SummarizeP5SfbPaths(const DeviceMoeLaunchPlan& launch_plan) {
   return stats;
 }
 
+std::string_view DetermineP5SfbLiveMode(
+    const DeviceNvfp4Matrix& grouped_pack,
+    bool sfb_tma_launch_compatible) {
+  if (grouped_pack.matmul_block_scales_data() != nullptr &&
+      grouped_pack.scale_layout() == Nvfp4ScaleLayout::kSwizzled128x4) {
+    return "direct_gmem_sparse";
+  }
+  if (sfb_tma_launch_compatible) {
+    return "tma";
+  }
+  return "thread_smem";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -535,6 +548,8 @@ int main(int argc, char** argv) {
   const void* sfb_tma_descriptors = grouped_pack->p5_tma_load_sfb_descriptors(*launch_plan);
   const bool sfb_tma_launch_compatible = LaunchPlanSupportsP5SfbTma(*launch_plan);
   const P5SfbPathStats sfb_path_stats = SummarizeP5SfbPaths(*launch_plan);
+  const std::string_view sfb_live_mode =
+      DetermineP5SfbLiveMode(*grouped_pack, sfb_tma_launch_compatible);
 
             std::cout << "nano_routed_up_p5_grouped_bench: prefix_tokens=" << options.prefix_tokens
             << " top_k=" << kTopK
@@ -549,6 +564,7 @@ int main(int argc, char** argv) {
             << " sfb_tma_cached=" << (sfb_tma_descriptors != nullptr ? "yes" : "no")
             << " sfb_tma_launch_compatible="
             << (sfb_tma_launch_compatible ? "yes" : "no")
+            << " sfb_live_mode=" << sfb_live_mode
             << " sfb_global_fragment_ctas=" << sfb_path_stats.global_fragment_ctas
             << "\n";
   if (launch_plan->exact_cta_count_host() > 0 &&

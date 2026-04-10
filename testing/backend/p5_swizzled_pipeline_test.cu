@@ -3037,8 +3037,6 @@ __global__ void P5SfbConsumerGlobalAssemblyKernel(
   constexpr std::size_t kPaddedBlocksPerRow =
       ((static_cast<std::size_t>(kScaleByteCount) + 3u) / 4u) * 4u;
   constexpr int kBlocksPerKBlock = kScaleByteCount / K_blocks;
-  const int lane = tid & 31;
-  const int subgroup_leader = lane & ~3;
   for (int k = 0; k < K_blocks; ++k) {
     for (int n = 0; n < N_tiles; ++n) {
       auto tCrSFB_manual_atom = tCrSFB_manual(cute::_, n, k);
@@ -3049,8 +3047,7 @@ __global__ void P5SfbConsumerGlobalAssemblyKernel(
       const int b_base_row = static_cast<int>(cute::get<1>(coord0));
       const int local_row0 = CoordGet0(tCsSFB_ref_row_anchor(0));
       std::uint32_t packed_scale_word = 0u;
-      if ((lane & 3) == 0 &&
-          b_base_row >= 0 && b_base_row < params.valid_rows &&
+      if (b_base_row >= 0 && b_base_row < params.valid_rows &&
           local_row0 >= 0 && local_row0 < params.valid_rows) {
         packed_scale_word = LoadExecutionScaleWordTest(
             params.execution_scales,
@@ -3059,7 +3056,6 @@ __global__ void P5SfbConsumerGlobalAssemblyKernel(
             kPaddedBlocksPerRow,
             nemotron::Nvfp4ScaleLayout::kSwizzled128x4);
       }
-      packed_scale_word = __shfl_sync(0xffffffffu, packed_scale_word, subgroup_leader);
       FillScaleFragmentWordSparseLocal(tCrSFB_manual_atom, packed_scale_word);
     }
   }
@@ -5345,6 +5341,9 @@ int RunTest() {
     }
   } else {
     std::cout << "  tma_fragment_sfb_global_assembly SKIP (set NEMOTRON_RUN_P5_SFB_GLOBAL_ASSEMBLY_PROBE=1 to enable)\n";
+  }
+  if (RunP5SfbConsumerGlobalAssemblyProbeCase(25, 8) != 0) {
+    return 1;
   }
   if (const char* run_sfb_global_sharing_probe =
           std::getenv("NEMOTRON_RUN_P5_SFB_GLOBAL_SHARING_PROBE")) {

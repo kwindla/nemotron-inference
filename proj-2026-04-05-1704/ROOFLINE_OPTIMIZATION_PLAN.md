@@ -1142,6 +1142,53 @@ Current Phase 1b experiment record:
     - Attempt C exact `PipelineTmaAsync` port: `hot_mean_ms = 1.098`
   - conclusion: the exact pipeline object port is not a drop-in win for the
     current grouped `P5` body; it was reverted
+- Attempt D: keep the existing grouped `P5` body, but add a lighter-weight
+  two-slot barrier ring on top of the direct-global `SFB` base
+  - producer-side invariant hoist:
+    - move `get_tma_tensor/local_tile/partition_S/partition_D` setup for
+      `A/B/SFA` out of the per-tile issue lambda and prebuild stage-0/stage-1
+      source/destination partitions once
+  - consumer-side overlap:
+    - prime `k_block=0`
+    - then run `copy(next_kblock)` before `gemm(curr_kblock)` inside each
+      macro-`K` tile
+    - keep `SFB` direct-global and sync-free
+  - result: correctness passed and the isolated grouped `P5` bench showed the
+    first clear Phase `1b` win on this branch
+  - direct grouped bench progression on this machine:
+    - cleaned direct-global `SFB` baseline: `hot_mean_ms=0.578`,
+      `hot_median_ms=0.580`
+    - first barrier-ring landing before hoists: `hot_mean_ms=0.591`
+    - after producer invariant hoist: `hot_mean_ms=0.560`,
+      `hot_median_ms=0.359`
+    - after inner `copy(next_kblock) / gemm(curr_kblock)` overlap:
+      `hot_mean_ms=0.436`, `hot_median_ms=0.342`, `hot_tflops=18.167`
+    - immediate reruns on the same rebuilt binary are noisy but stay well below
+      the cleaned baseline:
+      - `hot_mean_ms=0.449`, `hot_median_ms=0.363`
+      - `hot_mean_ms=0.411`, `hot_median_ms=0.342`
+    - one later read regressed to `hot_mean_ms=0.601`, so grouped-bench wall
+      clock should be treated as machine-state-sensitive; the scheduler metrics
+      below are the stronger signal for this attempt
+  - targeted isolated-kernel `ncu` read after Attempt D:
+    - profile artifact set:
+      - `artifacts/profiles/p5_pipeline_overlap_20260410T103111Z/ncu_p5_grouped_prefix128.csv`
+    - averaged key metrics across captured launches:
+      - `launch__registers_per_thread = 166`
+      - `launch__shared_mem_per_block_allocated = 83072 B`
+      - `gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed = 54.75%`
+      - `lts__t_sector_hit_rate.pct = 57.32%`
+      - `sm__warps_active.avg.pct_of_peak_sustained_active = 18.77%`
+      - `smsp__warps_eligible.avg.per_cycle_active = 0.44`
+      - `smsp__issue_active.avg.pct_of_peak_sustained_active = 36.04%`
+      - `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed = 11.55%`
+  - conclusion:
+    - the win is not a DRAM-throughput story; it is a scheduler/issue story
+    - compared with the post-hybrid baseline (`eligible=0.193`,
+      `issue_active=14.47%`), the new grouped `P5` body is issuing far more
+      work despite lower occupancy from the `2`-stage footprint
+    - the direct-global `SFB` base plus intra-stage copy/MMA overlap is the
+      first Phase `1b` structure worth keeping and extending
 
 Phase 1b measurement hygiene note:
 - `benchmarks/nano_moe_prefill/nano_routed_up_p5_grouped_bench` is statically
@@ -1151,13 +1198,10 @@ Phase 1b measurement hygiene note:
 
 Phase 1b next-step constraint:
 - do not reintroduce Attempts A, B, or C as-is
-- the next consumer-side experiment must explain the `~2x` slowdown from the
-  exact `PipelineTmaAsync` port before trying another full grouped-kernel
-  rewrite
-- the most likely next diagnostic target is not transport legality, but the
-  extra producer/consumer participation cost inside the current grouped body
-  (for example the hybrid `SFB` remap and stage-local copy structure) under the
-  pipeline object schedule
+- Attempt D is now the active Phase `1b` base
+- next work should keep the direct-global `SFB` and inner `k_block` overlap,
+  then target the remaining stage-transition / producer-side overhead from that
+  stronger base instead of revisiting transport legality
 
 #### 1c. Warp-Specialized Producer/Consumer
 
@@ -1499,13 +1543,35 @@ Phase 6 (system) ← independent, can start anytime
     - `hot_median_ms=0.588`
   - targeted `ncu` comparison says the saved global loads are not paying for
     the added shuffle/control overhead on this kernel
+- Cleaned-base status as of the current `P5` checkpoint:
+  - the subgroup broadcast optimization has been removed from the live kernel
+  - the grouped `P5` bench now reports the actual active scale path:
+    - `sfb_live_mode=direct_gmem_sparse`
+    - `sfb_tma_cached=yes`
+    - `sfb_tma_launch_compatible=yes`
+    - `sfb_global_fragment_ctas=128`
+  - the canonical direct-global proof is now a default regression in
+    `p5_swizzled_pipeline_test_120f`, not an opt-in env probe:
+    - `tma_fragment_sfb_global_assembly offset=25 PASS`
+  - current validated grouped `P5` baseline on this cleaned base:
+    - `cold_ms=0.600`
+    - `hot_mean_ms=0.578`
+    - `hot_median_ms=0.580`
+    - `hot_p90_ms=0.589`
+    - `hot_tflops=13.715`
 - Current conclusion:
   - direct-global `SFB` is still the right architectural base
   - sparse 4-byte fragment fill is worth keeping
-  - 4-lane subgroup broadcast is not currently worth keeping
-  - the next profitable work should go back to the unified `P5` consumer /
-    software-pipelined `K` loop on top of the direct-global `SFB` base, rather
-    than more `SFB` transport micro-optimizations
+  - 4-lane subgroup broadcast is not worth keeping and is no longer live code
+  - Phase `1b` is now live on the isolated grouped `P5` surface:
+    - `cold_ms=0.395`
+    - `hot_mean_ms=0.436`
+    - `hot_median_ms=0.342`
+    - `hot_p90_ms=0.344`
+    - `hot_tflops=18.167`
+  - the next profitable work should stay on this pipeline branch:
+    clean up remaining stage-transition overhead and only then consider porting
+    the same structure to the other routed profiles
 
 ## What We're NOT Doing (and why)
 
