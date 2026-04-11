@@ -5,6 +5,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -174,6 +175,10 @@ using TracedP5AccumProfileLayout = decltype(
         cute::make_shape(cute::Int<128>{}, cute::Int<128>{}))
         .layout());
 constexpr int kTracedP5AccumProfileCosize = cute::cosize_v<TracedP5AccumProfileLayout>;
+static_assert(fused_decode::kNvfp4BlockWidth == 16, "FP4 block width must be 16");
+static_assert(
+    kTracedP5DirectStageCols == 128 && kTracedP5DirectStageRows == 32,
+    "P5 direct stage tile must be 128x32");
 using TracedP1MmaTileShape = cute::Shape<cute::Int<128>, cute::Int<128>, cute::Int<64>>;
 using TracedP1ClusterShape = cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>;
 using TracedP1Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -706,6 +711,9 @@ __device__ __forceinline__ void StageUnifiedRoutedFp4DirectActivated(
   auto ref_c = cute::make_identity_tensor(
       cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
   auto part_c = thr_mma.partition_C(ref_c);
+  static_assert(
+      decltype(cute::size(part_c))::value == 16,
+      "P5 partition_C must have exactly 16 valid elements per thread");
   auto accum_tensor = cute::make_tensor(
       reinterpret_cast<CRegister*>(const_cast<CRegister*>(accum_storage)),
       TracedP5AccumProfileLayout{});
@@ -739,6 +747,103 @@ __device__ __forceinline__ void StageUnifiedRoutedFp4DirectActivated(
     staged_activated[n_coord][m_coord] = activated;
   }
 }
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
+__device__ __forceinline__ void ValidateP5WarpLocalInvariants(int thread_idx) {
+  constexpr int kLogicalCoords = 16;
+  auto mma = TracedP5TiledMma{};
+  auto thr_mma = mma.get_thread_slice(thread_idx);
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
+  auto part_c = thr_mma.partition_C(ref_c);
+  const int warp_id = thread_idx / 32;
+  const int lane_id = thread_idx & 31;
+  const int lane_group = lane_id & 3;
+  const int n_half = warp_id / 4;
+  const int expected_n_coords[4] = {
+      16 * n_half + 2 * lane_group,
+      16 * n_half + 2 * lane_group + 1,
+      16 * n_half + 8 + 2 * lane_group,
+      16 * n_half + 9 + 2 * lane_group};
+  const unsigned int expected_lane_mask = 0x11111111u << lane_group;
+  int block_ids[kLogicalCoords];
+  int n_coords[kLogicalCoords];
+  int token_row_counts[4] = {0, 0, 0, 0};
+  int low_block = -1;
+  int high_block = -1;
+
+#pragma unroll
+  for (int logical = 0; logical < kLogicalCoords; ++logical) {
+    auto coord = part_c(logical);
+    const int m_coord = static_cast<int>(cute::get<0>(coord));
+    const int n_coord = static_cast<int>(cute::get<1>(coord));
+    assert(m_coord >= 0);
+    assert(m_coord < kTracedP5DirectStageCols);
+    assert(n_coord >= 0);
+    assert(n_coord < kTracedP5DirectStageRows);
+    const int block_id =
+        ((m_coord & 63) / static_cast<int>(fused_decode::kNvfp4BlockWidth)) +
+        (m_coord >= 64 ? 4 : 0);
+    block_ids[logical] = block_id;
+    n_coords[logical] = n_coord;
+    if (m_coord < 64) {
+      if (low_block < 0) {
+        low_block = block_id;
+      } else {
+        assert(block_id == low_block);
+      }
+    } else {
+      if (high_block < 0) {
+        high_block = block_id;
+      } else {
+        assert(block_id == high_block);
+      }
+    }
+    int n_slot = -1;
+#pragma unroll
+    for (int token_row = 0; token_row < 4; ++token_row) {
+      if (n_coord == expected_n_coords[token_row]) {
+        n_slot = token_row;
+      }
+    }
+    assert(n_slot >= 0);
+    ++token_row_counts[n_slot];
+  }
+
+  assert(low_block >= 0);
+  assert(low_block < 4);
+  assert(high_block >= 4);
+  assert(high_block < 8);
+  assert(high_block == low_block + 4);
+
+#pragma unroll
+  for (int token_row = 0; token_row < 4; ++token_row) {
+    assert(token_row_counts[token_row] == 4);
+    bool owns_low_block = false;
+    bool owns_high_block = false;
+#pragma unroll
+    for (int logical = 0; logical < kLogicalCoords; ++logical) {
+      if (n_coords[logical] != expected_n_coords[token_row]) {
+        continue;
+      }
+      if (block_ids[logical] == low_block) {
+        owns_low_block = true;
+      }
+      if (block_ids[logical] == high_block) {
+        owns_high_block = true;
+      }
+    }
+    assert(owns_low_block);
+    assert(owns_high_block);
+    const unsigned int low_block_mask = __ballot_sync(0xffffffffu, owns_low_block);
+    const unsigned int high_block_mask = __ballot_sync(0xffffffffu, owns_high_block);
+    assert(__popc(low_block_mask) == 8);
+    assert(__popc(high_block_mask) == 8);
+    assert(low_block_mask == expected_lane_mask);
+    assert(high_block_mask == expected_lane_mask);
+  }
+}
+#endif
 
 __device__ __forceinline__ void PackUnifiedRoutedFp4DirectStaged(
     int thread_idx,
@@ -1728,6 +1833,15 @@ template <class TiledMma>
 __device__ __noinline__ void DumpP5PartitionCLayout(int thread_idx);
 #endif
 
+#if defined(NEMOTRON_P5_LINEAR_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+template <class TiledMma>
+__device__ __noinline__ void DumpP5LinearPartitionCLayout(int thread_idx);
+#endif
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
+__device__ __forceinline__ void ValidateP5WarpLocalInvariants(int thread_idx);
+#endif
+
 __device__ __forceinline__ void Clear(CFragment64& fragment);
 
 __device__ __forceinline__ void Gemm(
@@ -1807,6 +1921,14 @@ static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
 
 #if defined(NEMOTRON_P5_PARTITION_DEBUG)
 __device__ int g_p5_partition_debug_dump_once = 0;
+#endif
+
+#if defined(NEMOTRON_P5_LINEAR_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+__device__ int g_p5_linear_partition_debug_dump_once = 0;
+#endif
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
+__device__ int g_p5_warp_local_invariants_validate_once = 0;
 #endif
 
 enum class RoutedGemm1Profile {
@@ -4569,6 +4691,31 @@ __device__ __noinline__ void nvfp4_bridge::DumpP5PartitionCLayout(int thread_idx
         n_coords[physical]);
   }
   printf("\n");
+}
+#endif
+
+#if defined(NEMOTRON_P5_LINEAR_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+template <class TiledMma>
+__device__ __noinline__ void nvfp4_bridge::DumpP5LinearPartitionCLayout(int thread_idx) {
+  static_assert(cute::size(TiledMma{}) == 256);
+  auto mma = TiledMma{};
+  auto thr_mma = mma.get_thread_slice(thread_idx);
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
+  auto part_c = thr_mma.partition_C(ref_c);
+
+#pragma unroll
+  for (int linear = 0; linear < static_cast<int>(cute::size(part_c)); ++linear) {
+    auto coord = part_c(linear);
+    printf(
+        "p5_linear_partition_c thread_id=%d warp_id=%d lane_id=%d linear_idx=%02d m_coord=%d n_coord=%d\n",
+        thread_idx,
+        thread_idx / 32,
+        thread_idx & 31,
+        linear,
+        static_cast<int>(cute::get<0>(coord)),
+        static_cast<int>(cute::get<1>(coord)));
+  }
 }
 #endif
 
@@ -7721,9 +7868,53 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   }
 #endif
 
+#if defined(NEMOTRON_P5_LINEAR_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
+    __shared__ int dump_p5_linear_partition_layout;
+    if (tid == 0) {
+      dump_p5_linear_partition_layout =
+          (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+           atomicCAS(&g_p5_linear_partition_debug_dump_once, 0, 1) == 0)
+              ? 1
+              : 0;
+    }
+    __syncthreads();
+    if (dump_p5_linear_partition_layout != 0) {
+      for (int debug_thread = 0; debug_thread < 32; ++debug_thread) {
+        if (tid == debug_thread) {
+          nvfp4_bridge::DumpP5LinearPartitionCLayout<TiledMma>(tid);
+        }
+        __syncthreads();
+      }
+      for (int debug_thread = 128; debug_thread < 160; ++debug_thread) {
+        if (tid == debug_thread) {
+          nvfp4_bridge::DumpP5LinearPartitionCLayout<TiledMma>(tid);
+        }
+        __syncthreads();
+      }
+    }
+    __syncthreads();
+  }
+#endif
+
   if constexpr (
       Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 &&
       P5Mode == nvfp4_bridge::P5EpilogueMode::kFp4Direct) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
+    __shared__ int validate_p5_warp_local_invariants;
+    if (tid == 0) {
+      validate_p5_warp_local_invariants =
+          (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+           atomicCAS(&g_p5_warp_local_invariants_validate_once, 0, 1) == 0)
+              ? 1
+              : 0;
+    }
+    __syncthreads();
+    if (validate_p5_warp_local_invariants != 0 && (warp_id == 0 || warp_id == 4)) {
+      nvfp4_bridge::ValidateP5WarpLocalInvariants(warp_id * 32 + lane_id);
+    }
+    __syncthreads();
+#endif
     // Zero-initialize the staging tile — shared memory has undefined initial
     // contents on CUDA, and positions not covered by partition_C (e.g., partial
     // output tiles) must read as zero during the cooperative packing phase.

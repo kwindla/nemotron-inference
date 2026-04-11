@@ -199,6 +199,109 @@ __global__ void TestStagedFp4PackKernel(
   }
 }
 
+__device__ inline void run_scaled_staged_pack(
+    SharedStagingStorage& staging,
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+  constexpr float weight_tensor_scale = 1.0f;
+
+  for (std::size_t row = threadIdx.x; row < kTileRows; row += blockDim.x) {
+    const float row_scale =
+        per_row_tensor_scales_input != nullptr ? per_row_tensor_scales_input[row] : 1.0f;
+    per_row_tensor_scales[row] = row_scale;
+  }
+  if (threadIdx.x == 0) {
+    *tensor_scale_data = weight_tensor_scale;
+  }
+  __syncthreads();
+
+  for (std::size_t index = threadIdx.x; index < kTileElements; index += blockDim.x) {
+    const std::size_t row = index / kTileCols;
+    const float row_scale =
+        per_row_tensor_scales_input != nullptr ? per_row_tensor_scales_input[row] : 1.0f;
+    staging.activated[index] = static_cast<int>(row) < valid_rows
+                                   ? relu2(input[index] * row_scale * weight_tensor_scale)
+                                   : 0.0f;
+  }
+  __syncthreads();
+
+  for (std::size_t row_block = threadIdx.x; row_block < kScaleCount; row_block += blockDim.x) {
+    const std::size_t row = row_block / kBlocksPerRow;
+    const std::size_t block = row_block % kBlocksPerRow;
+    pack_block_outputs<false>(
+        staging.activated + (row * kTileCols) + (block * kBlockWidth),
+        row,
+        block,
+        valid_rows,
+        padded_blocks_per_row,
+        activation_output_scale,
+        packed_data,
+        block_scales_data,
+        matmul_block_scales_data);
+  }
+}
+
+__global__ void TestScaledStagedFp4PackKernel(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+  __shared__ SharedStagingStorage staging;
+  run_scaled_staged_pack(
+      staging,
+      input,
+      per_row_tensor_scales_input,
+      valid_rows,
+      padded_blocks_per_row,
+      activation_output_scale,
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data,
+      per_row_tensor_scales);
+}
+
+__global__ void TestWarpLocalFp4PackKernel(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+  __shared__ SharedStagingStorage staging;
+  // PLACEHOLDER: step 2 will replace this with warp-local shuffle packing
+  run_scaled_staged_pack(
+      staging,
+      input,
+      per_row_tensor_scales_input,
+      valid_rows,
+      padded_blocks_per_row,
+      activation_output_scale,
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data,
+      per_row_tensor_scales);
+}
+
 __global__ void TestLegacyBf16Relu2PackKernel(
     const __nv_bfloat16* input,
     int valid_rows,
@@ -447,6 +550,64 @@ HostPackOutputs compute_reference_outputs(
   return output;
 }
 
+HostPackOutputs compute_reference_outputs_with_per_row_scales(
+    const std::vector<float>& input,
+    const std::vector<float>& per_row_tensor_scales,
+    int valid_rows,
+    bool legacy_zero_block_scale) {
+  HostPackOutputs output;
+  output.packed.assign(kTileRows * kPackedBytesPerRow, 0u);
+  output.block_scales.assign(kScaleCount, 0u);
+  output.activation_output_scale.assign(kScaleCount, 0.0f);
+  output.per_row_tensor_scales = per_row_tensor_scales;
+  output.tensor_scale = 1.0f;
+
+  for (int row = 0; row < kTileRows; ++row) {
+    if (row >= valid_rows) {
+      continue;
+    }
+    for (std::size_t block = 0; block < kBlocksPerRow; ++block) {
+      const std::size_t input_offset =
+          static_cast<std::size_t>(row) * kTileCols + block * kBlockWidth;
+      const std::size_t scale_index = static_cast<std::size_t>(row) * kBlocksPerRow + block;
+      const std::size_t packed_offset =
+          static_cast<std::size_t>(row) * kPackedBytesPerRow + block * kPackedBytesPerBlock;
+      float activated_block[kBlockWidth];
+      float block_max_abs = 0.0f;
+      for (std::size_t i = 0; i < kBlockWidth; ++i) {
+        activated_block[i] =
+            relu2(input[input_offset + i] * output.per_row_tensor_scales[row] * output.tensor_scale);
+        block_max_abs = std::max(block_max_abs, activated_block[i]);
+      }
+
+      float dequant_scale = 0.0f;
+      if (legacy_zero_block_scale) {
+        dequant_scale =
+            block_max_abs > 0.0f ? clamp_nvfp4_scale(block_max_abs / kNvfp4Fp4MaxFinite) : 1.0f;
+      } else {
+        dequant_scale = clamp_nvfp4_scale(block_max_abs / kNvfp4Fp4MaxFinite);
+      }
+      output.activation_output_scale[scale_index] = dequant_scale;
+      output.block_scales[scale_index] = encode_fp8_scale_reference(dequant_scale);
+
+      for (std::size_t pair = 0; pair < kPackedBytesPerBlock; ++pair) {
+        const std::uint8_t lhs = encode_fp4_reference(activated_block[pair * 2u] / dequant_scale);
+        const std::uint8_t rhs =
+            encode_fp4_reference(activated_block[pair * 2u + 1u] / dequant_scale);
+        output.packed[packed_offset + pair] =
+            static_cast<std::uint8_t>((lhs & 0x0Fu) | ((rhs & 0x0Fu) << 4u));
+      }
+    }
+  }
+
+  output.matmul_block_scales = SwizzleRowMajorNvfp4ScalesForExecution(
+      output.block_scales.data(),
+      kTileRows,
+      kTileCols,
+      kScaleLayout);
+  return output;
+}
+
 std::vector<float> make_mixed_input(bool bf16_exact) {
   std::vector<float> values(kTileElements, 0.0f);
   for (int row = 0; row < kTileRows; ++row) {
@@ -559,6 +720,14 @@ std::vector<float> make_large_input(bool bf16_exact) {
   return values;
 }
 
+std::vector<float> make_non_uniform_per_row_scales() {
+  std::vector<float> values(kTileRows, 1.0f);
+  for (int row = 0; row < kTileRows; ++row) {
+    values[row] = 0.5f + 0.1f * static_cast<float>(row % 8);
+  }
+  return values;
+}
+
 bool copy_per_row_scales(const DeviceNvfp4Matrix& pack, std::vector<float>* output) {
   output->assign(kTileRows, 0.0f);
   return check_cuda(
@@ -603,6 +772,124 @@ HostPackOutputs run_staged_kernel(
       const_cast<float*>(device_pack->per_row_tensor_scales()));
   if (!check_cuda(cudaGetLastError(), "TestStagedFp4PackKernel launch") ||
       !check_cuda(cudaDeviceSynchronize(), "TestStagedFp4PackKernel sync")) {
+    return output;
+  }
+
+  output.activation_output_scale.assign(kScaleCount, 0.0f);
+  if (!device_pack->CopyPackedToHost(&output.packed) ||
+      !device_pack->CopyBlockScalesToHost(&output.block_scales) ||
+      !device_pack->CopyMatmulBlockScalesToHost(&output.matmul_block_scales) ||
+      !device_pack->CopyTensorScaleToHost(&output.tensor_scale) ||
+      !device_activation_scales->CopyToHost(
+          output.activation_output_scale.data(),
+          output.activation_output_scale.size()) ||
+      !copy_per_row_scales(*device_pack, &output.per_row_tensor_scales)) {
+    return output;
+  }
+
+  *ok = true;
+  return output;
+}
+
+HostPackOutputs run_staged_kernel_with_per_row_scales(
+    const std::vector<float>& input,
+    const std::vector<float>& per_row_tensor_scales_input,
+    int valid_rows,
+    const Nvfp4ExecutionScaleLayout& scale_layout,
+    bool* ok) {
+  HostPackOutputs output;
+  *ok = false;
+
+  auto device_input = DeviceTensorFp32::Create({kTileRows, kTileCols});
+  auto device_per_row_tensor_scales = DeviceTensorFp32::Create({kTileRows});
+  auto device_activation_scales = DeviceTensorFp32::Create({kTileRows, kBlocksPerRow});
+  auto device_pack = DeviceNvfp4Matrix::Create(kTileRows, kTileCols, kScaleLayout);
+  if (!device_input || !device_input->valid() ||
+      !device_per_row_tensor_scales || !device_per_row_tensor_scales->valid() ||
+      !device_activation_scales || !device_activation_scales->valid() ||
+      !device_pack || !device_pack->valid()) {
+    return output;
+  }
+
+  if (!device_input->CopyFromHost(input.data(), input.size()) ||
+      !device_per_row_tensor_scales->CopyFromHost(
+          per_row_tensor_scales_input.data(),
+          per_row_tensor_scales_input.size())) {
+    return output;
+  }
+
+  TestScaledStagedFp4PackKernel<<<1, kThreadsPerBlock>>>(
+      device_input->data(),
+      device_per_row_tensor_scales->data(),
+      valid_rows,
+      scale_layout.padded_blocks_per_row,
+      device_activation_scales->data(),
+      const_cast<std::uint8_t*>(device_pack->packed_data()),
+      const_cast<std::uint8_t*>(device_pack->block_scales_data()),
+      const_cast<std::uint8_t*>(device_pack->matmul_block_scales_data()),
+      const_cast<float*>(device_pack->device_tensor_scale_ptr()),
+      const_cast<float*>(device_pack->per_row_tensor_scales()));
+  if (!check_cuda(cudaGetLastError(), "TestScaledStagedFp4PackKernel launch") ||
+      !check_cuda(cudaDeviceSynchronize(), "TestScaledStagedFp4PackKernel sync")) {
+    return output;
+  }
+
+  output.activation_output_scale.assign(kScaleCount, 0.0f);
+  if (!device_pack->CopyPackedToHost(&output.packed) ||
+      !device_pack->CopyBlockScalesToHost(&output.block_scales) ||
+      !device_pack->CopyMatmulBlockScalesToHost(&output.matmul_block_scales) ||
+      !device_pack->CopyTensorScaleToHost(&output.tensor_scale) ||
+      !device_activation_scales->CopyToHost(
+          output.activation_output_scale.data(),
+          output.activation_output_scale.size()) ||
+      !copy_per_row_scales(*device_pack, &output.per_row_tensor_scales)) {
+    return output;
+  }
+
+  *ok = true;
+  return output;
+}
+
+HostPackOutputs run_warp_local_kernel(
+    const std::vector<float>& input,
+    const std::vector<float>& per_row_tensor_scales_input,
+    int valid_rows,
+    const Nvfp4ExecutionScaleLayout& scale_layout,
+    bool* ok) {
+  HostPackOutputs output;
+  *ok = false;
+
+  auto device_input = DeviceTensorFp32::Create({kTileRows, kTileCols});
+  auto device_per_row_tensor_scales = DeviceTensorFp32::Create({kTileRows});
+  auto device_activation_scales = DeviceTensorFp32::Create({kTileRows, kBlocksPerRow});
+  auto device_pack = DeviceNvfp4Matrix::Create(kTileRows, kTileCols, kScaleLayout);
+  if (!device_input || !device_input->valid() ||
+      !device_per_row_tensor_scales || !device_per_row_tensor_scales->valid() ||
+      !device_activation_scales || !device_activation_scales->valid() ||
+      !device_pack || !device_pack->valid()) {
+    return output;
+  }
+
+  if (!device_input->CopyFromHost(input.data(), input.size()) ||
+      !device_per_row_tensor_scales->CopyFromHost(
+          per_row_tensor_scales_input.data(),
+          per_row_tensor_scales_input.size())) {
+    return output;
+  }
+
+  TestWarpLocalFp4PackKernel<<<1, kThreadsPerBlock>>>(
+      device_input->data(),
+      device_per_row_tensor_scales->data(),
+      valid_rows,
+      scale_layout.padded_blocks_per_row,
+      device_activation_scales->data(),
+      const_cast<std::uint8_t*>(device_pack->packed_data()),
+      const_cast<std::uint8_t*>(device_pack->block_scales_data()),
+      const_cast<std::uint8_t*>(device_pack->matmul_block_scales_data()),
+      const_cast<float*>(device_pack->device_tensor_scale_ptr()),
+      const_cast<float*>(device_pack->per_row_tensor_scales()));
+  if (!check_cuda(cudaGetLastError(), "TestWarpLocalFp4PackKernel launch") ||
+      !check_cuda(cudaDeviceSynchronize(), "TestWarpLocalFp4PackKernel sync")) {
     return output;
   }
 
@@ -702,6 +989,33 @@ bool verify_phase1_contract_outputs(
              label + " per_row_tensor_scales");
 }
 
+bool compare_all_outputs_bitwise(
+    const HostPackOutputs& actual,
+    const HostPackOutputs& expected,
+    const std::string& label) {
+  return compare_byte_vectors(actual.packed, expected.packed, label + " packed_data") &&
+         compare_byte_vectors(
+             actual.block_scales,
+             expected.block_scales,
+             label + " block_scales_data") &&
+         compare_byte_vectors(
+             actual.matmul_block_scales,
+             expected.matmul_block_scales,
+             label + " matmul_block_scales_data") &&
+         compare_float_vectors_bitwise(
+             actual.activation_output_scale,
+             expected.activation_output_scale,
+             label + " activation_output_scale") &&
+         compare_float_scalar_bitwise(
+             actual.tensor_scale,
+             expected.tensor_scale,
+             label + " tensor_scale_data") &&
+         compare_float_vectors_bitwise(
+             actual.per_row_tensor_scales,
+             expected.per_row_tensor_scales,
+             label + " per_row_tensor_scales");
+}
+
 bool test_staged_matches_cpu_reference(
     const std::vector<float>& input,
     int valid_rows,
@@ -743,6 +1057,47 @@ bool test_direct_output_compare(
              staged.activation_output_scale,
              legacy.activation_output_scale,
              label + " activation_output_scale");
+}
+
+bool test_warp_local_matches_staged(const Nvfp4ExecutionScaleLayout& scale_layout) {
+  const std::vector<float> input = make_mixed_input(false);
+  const std::vector<float> per_row_tensor_scales = make_non_uniform_per_row_scales();
+  const std::vector<int> valid_rows_cases = {kTileRows, 1, 7, 64, 127};
+
+  for (int valid_rows : valid_rows_cases) {
+    const std::string label = "warp_local_matches_staged_valid_rows_" + std::to_string(valid_rows);
+    bool staged_ok = false;
+    bool warp_local_ok = false;
+    const HostPackOutputs staged = run_staged_kernel_with_per_row_scales(
+        input,
+        per_row_tensor_scales,
+        valid_rows,
+        scale_layout,
+        &staged_ok);
+    const HostPackOutputs warp_local = run_warp_local_kernel(
+        input,
+        per_row_tensor_scales,
+        valid_rows,
+        scale_layout,
+        &warp_local_ok);
+    if (!expect(staged_ok, label + " staged kernel execution should succeed") ||
+        !expect(warp_local_ok, label + " warp-local kernel execution should succeed")) {
+      return false;
+    }
+
+    const HostPackOutputs reference = compute_reference_outputs_with_per_row_scales(
+        input,
+        per_row_tensor_scales,
+        valid_rows,
+        false);
+    if (!compare_all_outputs_bitwise(staged, reference, label + " staged_reference") ||
+        !compare_all_outputs_bitwise(warp_local, reference, label + " warp_local_reference") ||
+        !compare_all_outputs_bitwise(warp_local, staged, label + " warp_local_staged")) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 }  // namespace
@@ -812,6 +1167,9 @@ int main() {
           kTileRows,
           "direct_compare_full_bf16_exact_large",
           *scale_layout)) {
+    return 1;
+  }
+  if (!test_warp_local_matches_staged(*scale_layout)) {
     return 1;
   }
 
