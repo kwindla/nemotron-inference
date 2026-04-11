@@ -22,6 +22,9 @@ namespace {
 constexpr std::size_t kBlockWidth = 16;
 constexpr std::size_t kScaleBlockTile = 4;
 constexpr std::size_t kP5ScaleTmaRowTile = 128;
+constexpr std::size_t kReductionThreadsPerBlock = 128;
+constexpr std::size_t kPackThreadsPerBlock = 128;
+constexpr std::size_t kLinearCopyThreadsPerBlock = 256;
 constexpr float kFp4MaxFinite = 6.0f;
 constexpr float kFp8E4M3MaxFinite = 448.0f;
 constexpr float kMinScale = 1.0f / 1024.0f;
@@ -115,6 +118,50 @@ __global__ void WriteTensorScaleKernel(
   *tensor_scale_data = tensor_scale;
 }
 
+__global__ void ComputePerRowMaxAbsKernel(
+    const float* source,
+    std::size_t rows,
+    std::size_t cols,
+    unsigned int* per_row_max_bits) {
+  const std::size_t numel = rows * cols;
+  std::size_t index = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (; index < numel; index += stride) {
+    const float value = source[index];
+    const float abs_value = fabsf(value);
+    const std::size_t row = index / cols;
+    atomicMax(per_row_max_bits + row, __float_as_uint(abs_value));
+  }
+}
+
+__global__ void WritePerRowTensorScalesKernel(
+    const unsigned int* per_row_max_bits,
+    std::size_t rows,
+    float* per_row_tensor_scales) {
+  const std::size_t row = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  const float row_max_abs = __uint_as_float(per_row_max_bits[row]);
+  float tensor_scale = 1.0f;
+  if (row_max_abs > kFp4MaxFinite * kFp8E4M3MaxFinite) {
+    tensor_scale = ClampScale(row_max_abs / (kFp4MaxFinite * kFp8E4M3MaxFinite));
+  }
+  per_row_tensor_scales[row] = tensor_scale;
+}
+
+__global__ void WriteUniformPerRowTensorScalesKernel(
+    const float* tensor_scale_data,
+    std::size_t rows,
+    float* per_row_tensor_scales) {
+  const std::size_t row = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  per_row_tensor_scales[row] = *tensor_scale_data;
+}
+
 __global__ void MultiplyTensorScalesKernel(
     const float* activation_tensor_scale_device,
     const float* weight_tensor_scale_device,
@@ -206,6 +253,72 @@ __global__ void PackAndSwizzleRowMajorFp32ToNvfp4Kernel(
       
   block_scales[block_index] = block_scale_fp8;
 
+  matmul_scales[destination_offset] = block_scale_fp8;
+
+  const float scale = tensor_scale * block_scale;
+  for (std::size_t i = 0; i < kBlockWidth; i += 2) {
+    const float lhs = source[input_offset + i] / scale;
+    const float rhs = source[input_offset + i + 1] / scale;
+    const std::uint8_t lhs_fp4 = static_cast<std::uint8_t>(
+                                     __nv_cvt_float_to_fp4(lhs, __NV_E2M1, cudaRoundNearest)) &
+                                 0x0fu;
+    const std::uint8_t rhs_fp4 = static_cast<std::uint8_t>(
+                                     __nv_cvt_float_to_fp4(rhs, __NV_E2M1, cudaRoundNearest)) &
+                                 0x0fu;
+    packed[packed_offset + (i / 2u)] = static_cast<std::uint8_t>(lhs_fp4 | (rhs_fp4 << 4));
+  }
+}
+
+__global__ void PackAndSwizzleRowMajorFp32ToNvfp4PerRowScaleKernel(
+    const float* source,
+    std::size_t rows,
+    std::size_t cols,
+    std::size_t padded_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    const float* per_row_tensor_scales,
+    std::uint8_t* packed,
+    std::uint8_t* block_scales,
+    std::uint8_t* matmul_scales) {
+  const std::size_t blocks_per_row = cols / kBlockWidth;
+  const std::size_t swizzled_index =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
+  if (swizzled_index >= total_scale_entries) {
+    return;
+  }
+
+  const std::size_t row = swizzled_index / padded_blocks_per_row;
+  const std::size_t block = swizzled_index % padded_blocks_per_row;
+  const std::size_t destination_offset =
+      ExecutionScaleOffset(row, block, padded_blocks_per_row, scale_layout);
+  if (row >= rows || block >= blocks_per_row) {
+    matmul_scales[destination_offset] = 0u;
+    return;
+  }
+
+  const std::size_t block_index = row * blocks_per_row + block;
+  const std::size_t input_offset = row * cols + (block * kBlockWidth);
+  const std::size_t packed_offset = row * (cols / 2u) + (block * (kBlockWidth / 2u));
+  const float tensor_scale = per_row_tensor_scales[row];
+
+  float block_max_abs = 0.0f;
+  for (std::size_t i = 0; i < kBlockWidth; ++i) {
+    const float value = source[input_offset + i];
+    const float abs_value = value >= 0.0f ? value : -value;
+    if (abs_value > block_max_abs) {
+      block_max_abs = abs_value;
+    }
+  }
+
+  float block_scale = 1.0f;
+  if (block_max_abs > 0.0f) {
+    block_scale = ClampScale(block_max_abs / (kFp4MaxFinite * tensor_scale));
+  }
+  const std::uint8_t block_scale_fp8 = static_cast<std::uint8_t>(
+      __nv_cvt_float_to_fp8(block_scale, __NV_SATFINITE, __NV_E4M3));
+
+  block_scales[block_index] = block_scale_fp8;
   matmul_scales[destination_offset] = block_scale_fp8;
 
   const float scale = tensor_scale * block_scale;
@@ -485,6 +598,26 @@ __global__ void GatherBlockScalesRowsKernel(
   output_matmul_scales[destination_offset] = block_scale;
 }
 
+__global__ void GatherPerRowTensorScalesKernel(
+    const float* source_per_row_tensor_scales,
+    std::size_t source_rows,
+    const int* source_row_indices,
+    std::size_t row_count,
+    float* output_per_row_tensor_scales) {
+  const std::size_t row = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (row >= row_count) {
+    return;
+  }
+
+  const int source_row_index = source_row_indices[row];
+  if (source_row_index < 0 || static_cast<std::size_t>(source_row_index) >= source_rows) {
+    return;
+  }
+
+  output_per_row_tensor_scales[row] =
+      source_per_row_tensor_scales[static_cast<std::size_t>(source_row_index)];
+}
+
 }  // namespace
 
 struct DeviceNvfp4Matrix::Impl {
@@ -499,6 +632,7 @@ struct DeviceNvfp4Matrix::Impl {
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scale_data = nullptr;
+  float* per_row_tensor_scales = nullptr;
   const DeviceMoeLaunchPlan* cached_p5_tma_b_launch_plan = nullptr;
   std::size_t cached_p5_tma_b_build_epoch = 0;
   void* cached_p5_tma_b_descriptors = nullptr;
@@ -527,7 +661,11 @@ std::unique_ptr<DeviceNvfp4Matrix> DeviceNvfp4Matrix::Create(
   if (!CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->packed_data), impl->packed_nbytes)) ||
       !CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->block_scales_data), impl->block_scales_nbytes)) ||
       !CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->matmul_block_scales_data), impl->matmul_block_scales_nbytes)) ||
-      !CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->tensor_scale_data), impl->tensor_scale_nbytes))) {
+      !CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->tensor_scale_data), impl->tensor_scale_nbytes)) ||
+      !CheckCuda(cudaMalloc(reinterpret_cast<void**>(&impl->per_row_tensor_scales), rows * sizeof(float)))) {
+    if (impl->per_row_tensor_scales != nullptr) {
+      cudaFree(impl->per_row_tensor_scales);
+    }
     if (impl->tensor_scale_data != nullptr) {
       cudaFree(impl->tensor_scale_data);
     }
@@ -559,6 +697,9 @@ DeviceNvfp4Matrix::~DeviceNvfp4Matrix() {
   if (impl_->tensor_scale_data != nullptr) {
     cudaFree(impl_->tensor_scale_data);
   }
+  if (impl_->per_row_tensor_scales != nullptr) {
+    cudaFree(impl_->per_row_tensor_scales);
+  }
   if (impl_->cached_p5_tma_b_descriptors != nullptr) {
     cudaFree(impl_->cached_p5_tma_b_descriptors);
   }
@@ -583,7 +724,8 @@ bool DeviceNvfp4Matrix::valid() const {
          impl_->packed_data != nullptr &&
          impl_->block_scales_data != nullptr &&
          impl_->matmul_block_scales_data != nullptr &&
-         impl_->tensor_scale_data != nullptr;
+         impl_->tensor_scale_data != nullptr &&
+         impl_->per_row_tensor_scales != nullptr;
 }
 
 std::size_t DeviceNvfp4Matrix::rows() const {
@@ -620,6 +762,10 @@ float DeviceNvfp4Matrix::host_tensor_scale() const {
 
 const float* DeviceNvfp4Matrix::device_tensor_scale_ptr() const {
   return impl_ ? reinterpret_cast<const float*>(impl_->tensor_scale_data) : nullptr;
+}
+
+const float* DeviceNvfp4Matrix::per_row_tensor_scales() const {
+  return impl_ ? impl_->per_row_tensor_scales : nullptr;
 }
 
 const float* DeviceNvfp4Matrix::effective_device_tensor_scale_ptr(
@@ -839,18 +985,23 @@ bool DeviceNvfp4Matrix::PackInto(
 
   auto* tensor_scale_data = reinterpret_cast<float*>(impl_->tensor_scale_data);
   const float* tensor_scale_data_for_pack = tensor_scale_data;
+  if (!CheckCuda(cudaMemset(
+          impl_->per_row_tensor_scales,
+          0,
+          impl_->rows * sizeof(*impl_->per_row_tensor_scales)))) {
+    return false;
+  }
   if (fixed_tensor_scale.has_value()) {
+    const float host_tensor_scale = *fixed_tensor_scale;
+    if (!CheckCuda(cudaMemcpy(
+            tensor_scale_data,
+            &host_tensor_scale,
+            sizeof(host_tensor_scale),
+            cudaMemcpyHostToDevice))) {
+      return false;
+    }
     if (options.fixed_tensor_scale_device != nullptr) {
       tensor_scale_data_for_pack = options.fixed_tensor_scale_device;
-    } else {
-      const float host_tensor_scale = *fixed_tensor_scale;
-      if (!CheckCuda(cudaMemcpy(
-              tensor_scale_data,
-              &host_tensor_scale,
-              sizeof(host_tensor_scale),
-              cudaMemcpyHostToDevice))) {
-        return false;
-      }
     }
   } else {
     auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
@@ -859,7 +1010,6 @@ bool DeviceNvfp4Matrix::PackInto(
     }
 
     const std::size_t numel = rows * cols;
-    constexpr std::size_t kReductionThreadsPerBlock = 128;
     const std::size_t reduction_grid_size =
         (numel + kReductionThreadsPerBlock - 1u) / kReductionThreadsPerBlock;
     ComputeGlobalMaxAbsKernel<<<static_cast<unsigned int>(reduction_grid_size), kReductionThreadsPerBlock>>>(
@@ -878,11 +1028,27 @@ bool DeviceNvfp4Matrix::PackInto(
     }
   }
 
-  constexpr std::size_t kThreadsPerBlock = 128;
-  const std::size_t total_scale_entries = layout->padded_rows * layout->padded_blocks_per_row;
-  const std::size_t grid_size = (total_scale_entries + kThreadsPerBlock - 1u) / kThreadsPerBlock;
+  const std::size_t per_row_grid_size =
+      (rows + kPackThreadsPerBlock - 1u) / kPackThreadsPerBlock;
+  if (per_row_grid_size > 0) {
+    WriteUniformPerRowTensorScalesKernel<<<
+        static_cast<unsigned int>(per_row_grid_size),
+        kPackThreadsPerBlock>>>(
+        tensor_scale_data_for_pack,
+        rows,
+        impl_->per_row_tensor_scales);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+  }
 
-  PackAndSwizzleRowMajorFp32ToNvfp4Kernel<<<static_cast<unsigned int>(grid_size), kThreadsPerBlock>>>(
+  const std::size_t total_scale_entries = layout->padded_rows * layout->padded_blocks_per_row;
+  const std::size_t grid_size =
+      (total_scale_entries + kPackThreadsPerBlock - 1u) / kPackThreadsPerBlock;
+
+  PackAndSwizzleRowMajorFp32ToNvfp4Kernel<<<
+      static_cast<unsigned int>(grid_size),
+      kPackThreadsPerBlock>>>(
       source.data(),
       rows,
       cols,
@@ -890,6 +1056,126 @@ bool DeviceNvfp4Matrix::PackInto(
       layout->padded_blocks_per_row,
       scale_layout,
       tensor_scale_data_for_pack,
+      impl_->packed_data,
+      impl_->block_scales_data,
+      impl_->matmul_block_scales_data);
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  return true;
+}
+
+bool DeviceNvfp4Matrix::PackIntoPerRow(
+    const DeviceTensorFp32& source,
+    const Nvfp4PackOptions& options) {
+  if (!valid() || !source.valid() || source.shape().size() != 2) {
+    return false;
+  }
+
+  const std::size_t rows = source.shape()[0];
+  const std::size_t cols = source.shape()[1];
+  const Nvfp4ScaleLayout scale_layout =
+      ResolveActivationNvfp4ScaleLayout(rows, options.execution_scale_layout);
+  if (rows > impl_->rows ||
+      cols != impl_->cols ||
+      scale_layout != impl_->scale_layout) {
+    return false;
+  }
+
+  const auto layout = BuildNvfp4ExecutionScaleLayout(rows, cols, scale_layout);
+  if (!layout.has_value()) {
+    return false;
+  }
+
+  const std::optional<float> fixed_tensor_scale = NormalizeFixedTensorScale(options);
+  if (options.fixed_tensor_scale.has_value() && !fixed_tensor_scale.has_value()) {
+    return false;
+  }
+
+  auto* tensor_scale_data = reinterpret_cast<float*>(impl_->tensor_scale_data);
+  if (fixed_tensor_scale.has_value()) {
+    const float host_tensor_scale = *fixed_tensor_scale;
+    if (!CheckCuda(cudaMemcpy(
+            tensor_scale_data,
+            &host_tensor_scale,
+            sizeof(host_tensor_scale),
+            cudaMemcpyHostToDevice))) {
+      return false;
+    }
+  } else {
+    auto* global_max_bits = reinterpret_cast<unsigned int*>(tensor_scale_data);
+    if (!CheckCuda(cudaMemset(global_max_bits, 0, impl_->tensor_scale_nbytes))) {
+      return false;
+    }
+
+    const std::size_t numel = rows * cols;
+    const std::size_t reduction_grid_size =
+        (numel + kReductionThreadsPerBlock - 1u) / kReductionThreadsPerBlock;
+    ComputeGlobalMaxAbsKernel<<<
+        static_cast<unsigned int>(reduction_grid_size),
+        kReductionThreadsPerBlock>>>(
+        source.data(),
+        numel,
+        global_max_bits);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+
+    WriteTensorScaleKernel<<<1, 1>>>(
+        global_max_bits,
+        tensor_scale_data);
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+  }
+
+  if (!CheckCuda(cudaMemset(
+          impl_->per_row_tensor_scales,
+          0,
+          impl_->rows * sizeof(*impl_->per_row_tensor_scales)))) {
+    return false;
+  }
+
+  const std::size_t numel = rows * cols;
+  const std::size_t reduction_grid_size =
+      (numel + kReductionThreadsPerBlock - 1u) / kReductionThreadsPerBlock;
+  ComputePerRowMaxAbsKernel<<<
+      static_cast<unsigned int>(reduction_grid_size),
+      kReductionThreadsPerBlock>>>(
+      source.data(),
+      rows,
+      cols,
+      reinterpret_cast<unsigned int*>(impl_->per_row_tensor_scales));
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const std::size_t per_row_grid_size =
+      (rows + kPackThreadsPerBlock - 1u) / kPackThreadsPerBlock;
+  WritePerRowTensorScalesKernel<<<
+      static_cast<unsigned int>(per_row_grid_size),
+      kPackThreadsPerBlock>>>(
+      reinterpret_cast<const unsigned int*>(impl_->per_row_tensor_scales),
+      rows,
+      impl_->per_row_tensor_scales);
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  const std::size_t total_scale_entries = layout->padded_rows * layout->padded_blocks_per_row;
+  const std::size_t grid_size =
+      (total_scale_entries + kPackThreadsPerBlock - 1u) / kPackThreadsPerBlock;
+  PackAndSwizzleRowMajorFp32ToNvfp4PerRowScaleKernel<<<
+      static_cast<unsigned int>(grid_size),
+      kPackThreadsPerBlock>>>(
+      source.data(),
+      rows,
+      cols,
+      layout->padded_rows,
+      layout->padded_blocks_per_row,
+      scale_layout,
+      impl_->per_row_tensor_scales,
       impl_->packed_data,
       impl_->block_scales_data,
       impl_->matmul_block_scales_data);
@@ -989,7 +1275,11 @@ bool PackDeviceRowMajorFp32ToNvfp4PerExpert(
       !CheckCuda(cudaMemset(
           const_cast<std::uint8_t*>(output->matmul_block_scales_data()),
           0,
-          output->matmul_block_scales_nbytes()))) {
+          output->matmul_block_scales_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<float*>(output->per_row_tensor_scales()),
+          0,
+          output->rows() * sizeof(float)))) {
     return false;
   }
 
@@ -1005,7 +1295,7 @@ bool PackDeviceRowMajorFp32ToNvfp4PerExpert(
   const std::size_t padded_rows = RoundUp(output->rows(), RowTile(output->scale_layout()));
   const std::size_t padded_blocks_per_row = RoundUp(cols / kBlockWidth, kScaleBlockTile);
   const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
-  const dim3 block(256);
+  const dim3 block(kLinearCopyThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((total_scale_entries + block.x - 1u) / block.x));
   PackAndSwizzleRowMajorFp32ToNvfp4PerExpertKernel<<<grid, block>>>(
       source,
@@ -1057,6 +1347,10 @@ bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
           const_cast<std::uint8_t*>(output->matmul_block_scales_data()),
           0,
           output->matmul_block_scales_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<float*>(output->per_row_tensor_scales()),
+          0,
+          output->rows() * sizeof(float))) ||
       (output_dequant_scales != nullptr &&
        !CheckCuda(cudaMemset(
            output_dequant_scales,
@@ -1077,7 +1371,7 @@ bool PackDeviceRowMajorBf16ToNvfp4PerExpert(
   const std::size_t padded_rows = RoundUp(output->rows(), RowTile(output->scale_layout()));
   const std::size_t padded_blocks_per_row = RoundUp(cols / kBlockWidth, kScaleBlockTile);
   const std::size_t total_scale_entries = padded_rows * padded_blocks_per_row;
-  const dim3 block(256);
+  const dim3 block(kLinearCopyThreadsPerBlock);
   const dim3 grid(static_cast<unsigned int>((total_scale_entries + block.x - 1u) / block.x));
   PackAndSwizzleRowMajorBf16ToNvfp4PerExpertKernel<<<grid, block>>>(
       source,
@@ -1124,6 +1418,10 @@ bool GatherDeviceNvfp4Rows(
           const_cast<std::uint8_t*>(output->matmul_block_scales_data()),
           0,
           output->matmul_block_scales_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<float*>(output->per_row_tensor_scales()),
+          0,
+          output->rows() * sizeof(float))) ||
       !CheckCuda(cudaMemcpy(
           const_cast<std::uint8_t*>(output->tensor_scale_data()),
           source.tensor_scale_data(),
@@ -1135,7 +1433,7 @@ bool GatherDeviceNvfp4Rows(
   const std::size_t cols = source.cols();
   const std::size_t pairs_per_row = cols / 2u;
   const std::size_t total_pairs = row_count * pairs_per_row;
-  const dim3 block(256);
+  const dim3 block(kLinearCopyThreadsPerBlock);
   if (total_pairs > 0) {
     const dim3 grid(static_cast<unsigned int>((total_pairs + block.x - 1u) / block.x));
     GatherPackedRowsKernel<<<grid, block>>>(
@@ -1165,7 +1463,25 @@ bool GatherDeviceNvfp4Rows(
       row_count,
       const_cast<std::uint8_t*>(output->block_scales_data()),
       const_cast<std::uint8_t*>(output->matmul_block_scales_data()));
-  return CheckCuda(cudaGetLastError());
+  if (!CheckCuda(cudaGetLastError())) {
+    return false;
+  }
+
+  if (source.per_row_tensor_scales() != nullptr && output->per_row_tensor_scales() != nullptr) {
+    const dim3 row_scale_grid(
+        static_cast<unsigned int>((row_count + block.x - 1u) / block.x));
+    GatherPerRowTensorScalesKernel<<<row_scale_grid, block>>>(
+        source.per_row_tensor_scales(),
+        source.rows(),
+        source_row_indices,
+        row_count,
+        const_cast<float*>(output->per_row_tensor_scales()));
+    if (!CheckCuda(cudaGetLastError())) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool MultiplyDeviceTensorScales(
