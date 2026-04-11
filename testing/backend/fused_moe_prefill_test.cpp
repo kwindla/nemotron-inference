@@ -5,6 +5,7 @@
 #include "nemotron/monolithic_expert_weights.h"
 #include "nemotron/nvfp4_packing.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -30,10 +31,14 @@ using nemotron::DeviceExpertRouting;
 using nemotron::DeviceMoeLaunchPlan;
 using nemotron::FusedMoePrefillParams;
 using nemotron::FusedNvfp4WeightView;
+using nemotron::GatherDeviceNvfp4Rows;
 using nemotron::HostNvfp4Matrix;
 using nemotron::MonolithicNvfp4ExpertWeights;
 using nemotron::PackRowMajorFp32ToNvfp4;
+using nemotron::BuildDeviceMoeLaunchPlan;
+using nemotron::RunDeviceExpertRouting;
 using nemotron::RunFusedMoePrefill;
+using nemotron::RunLaunchPlannedPackedNvfp4ExpertMatVecBf16;
 
 constexpr float kMaxAbsDiffTolerance = 5.0e-4f;
 constexpr float kRoutedGroupedBf16Tolerance = 1.0e-1f;
@@ -102,6 +107,49 @@ float MaxAbsDiff(const float (&lhs)[N], const float (&rhs)[N]) {
     max_diff = std::max(max_diff, std::fabs(lhs[i] - rhs[i]));
   }
   return max_diff;
+}
+
+template <typename T>
+bool CopyDeviceValues(const T* device_data, std::size_t count, std::vector<T>* host_values) {
+  if (device_data == nullptr || host_values == nullptr) {
+    return false;
+  }
+  host_values->assign(count, T{});
+  return cudaMemcpy(
+             host_values->data(),
+             device_data,
+             count * sizeof(T),
+             cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+template <typename T>
+std::vector<T> SliceValues(
+    const std::vector<T>& values,
+    std::size_t offset,
+    std::size_t count) {
+  if (offset > values.size() || count > (values.size() - offset)) {
+    return {};
+  }
+  return std::vector<T>(
+      values.begin() + static_cast<std::ptrdiff_t>(offset),
+      values.begin() + static_cast<std::ptrdiff_t>(offset + count));
+}
+
+bool CopyBf16TensorToFloatHost(
+    const DeviceTensorBf16& tensor,
+    std::vector<float>* output) {
+  if (!tensor.valid() || output == nullptr) {
+    return false;
+  }
+  std::vector<__nv_bfloat16> host_bf16(tensor.numel());
+  if (!tensor.CopyToHost(host_bf16.data(), host_bf16.size())) {
+    return false;
+  }
+  output->assign(host_bf16.size(), 0.0f);
+  for (std::size_t i = 0; i < host_bf16.size(); ++i) {
+    (*output)[i] = __bfloat162float(host_bf16[i]);
+  }
+  return true;
 }
 
 float DecodeFp4(std::uint8_t raw_nibble) {
@@ -1543,6 +1591,442 @@ void DumpNanoP15GroupedPackDebug(
               << " permuted_row=" << permuted_row
               << " missing_like_dims=" << missing_like_count << "\n";
   }
+}
+
+bool TestDeviceNvfp4MatrixPerRowTensorScalesGatherWithPermutation() {
+  if (!HasCudaDevice()) {
+    std::cout << "fused_moe_prefill_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  constexpr std::size_t kRows = 8;
+  constexpr std::size_t kCols = 128;
+  constexpr std::size_t kGatherRows = 5;
+  constexpr std::size_t kPackedBytesPerRow = kCols / 2;
+  constexpr std::size_t kBlockScalesPerRow = kCols / 16;
+  constexpr float kScaleTolerance = 1.0e-6f;
+  const float row_magnitudes[kRows] = {
+      1.0f,
+      4096.0f,
+      0.25f,
+      8192.0f,
+      64.0f,
+      16384.0f,
+      2.0f,
+      12288.0f,
+  };
+
+  auto source = DeviceTensorFp32::Create({kRows, kCols});
+  auto source_pack = DeviceNvfp4Matrix::Create(
+      kRows,
+      kCols,
+      nemotron::Nvfp4ScaleLayout::kSwizzled8x4);
+  auto gather_indices = DeviceTensorInt32::Create({kGatherRows});
+  auto gathered_pack = DeviceNvfp4Matrix::Create(
+      kGatherRows,
+      kCols,
+      nemotron::Nvfp4ScaleLayout::kSwizzled8x4);
+  if (!Expect(
+          source != nullptr &&
+              source->valid() &&
+              source_pack != nullptr &&
+              source_pack->valid() &&
+              gather_indices != nullptr &&
+              gather_indices->valid() &&
+              gathered_pack != nullptr &&
+              gathered_pack->valid(),
+          "per-row pack/gather tensors should allocate")) {
+    return false;
+  }
+
+  std::vector<float> host_values(kRows * kCols, 0.0f);
+  for (std::size_t row = 0; row < kRows; ++row) {
+    for (std::size_t col = 0; col < kCols; ++col) {
+      const float sign = ((row + col) % 2 == 0) ? 1.0f : -1.0f;
+      const float coarse =
+          static_cast<float>((static_cast<int>((row * 11u) + (col * 7u)) % 29) - 14);
+      const float fine = 0.25f * static_cast<float>(static_cast<int>((col + row) % 5u) - 2);
+      host_values[row * kCols + col] =
+          row_magnitudes[row] * sign * ((0.125f * coarse) + fine);
+    }
+  }
+  const std::vector<int> host_gather_indices = {5, 1, 7, 3, 0};
+  if (!Expect(
+          source->CopyFromHost(host_values.data(), host_values.size()),
+          "per-row pack/gather source should upload") ||
+      !Expect(
+          gather_indices->CopyFromHost(
+              host_gather_indices.data(),
+              host_gather_indices.size()),
+          "per-row gather indices should upload") ||
+      !Expect(
+          source_pack->PackIntoPerRow(*source),
+          "per-row source pack should succeed") ||
+      !Expect(
+          GatherDeviceNvfp4Rows(
+              *source_pack,
+              gather_indices->data(),
+              kGatherRows,
+              gathered_pack.get()),
+          "per-row gathered pack should succeed") ||
+      !Expect(
+          cudaDeviceSynchronize() == cudaSuccess,
+          "per-row pack/gather kernels should synchronize")) {
+    return false;
+  }
+
+  std::vector<float> source_scales;
+  std::vector<float> gathered_scales;
+  std::vector<std::uint8_t> source_packed;
+  std::vector<std::uint8_t> source_block_scales;
+  std::vector<std::uint8_t> gathered_packed;
+  std::vector<std::uint8_t> gathered_block_scales;
+  if (!Expect(
+          CopyDeviceValues(source_pack->per_row_tensor_scales(), kRows, &source_scales),
+          "source per-row tensor scales should copy to host") ||
+      !Expect(
+          CopyDeviceValues(
+              gathered_pack->per_row_tensor_scales(),
+              kGatherRows,
+              &gathered_scales),
+          "gathered per-row tensor scales should copy to host") ||
+      !Expect(
+          source_pack->CopyPackedToHost(&source_packed),
+          "source packed bytes should copy to host") ||
+      !Expect(
+          source_pack->CopyBlockScalesToHost(&source_block_scales),
+          "source block scales should copy to host") ||
+      !Expect(
+          gathered_pack->CopyPackedToHost(&gathered_packed),
+          "gathered packed bytes should copy to host") ||
+      !Expect(
+          gathered_pack->CopyBlockScalesToHost(&gathered_block_scales),
+          "gathered block scales should copy to host")) {
+    return false;
+  }
+
+  std::vector<float> expected_row_scales(kRows, 0.0f);
+  for (std::size_t row = 0; row < kRows; ++row) {
+    const std::vector<float> host_row = SliceValues(host_values, row * kCols, kCols);
+    const auto packed_row = PackRowMajorFp32ToNvfp4(host_row.data(), 1, kCols);
+    if (!Expect(
+            packed_row.has_value(),
+            "host per-row tensor-scale oracle should pack successfully")) {
+      return false;
+    }
+    expected_row_scales[row] = packed_row->tensor_scale;
+    if (!Expect(
+            std::fabs(source_scales[row] - expected_row_scales[row]) <= kScaleTolerance,
+            "device per-row tensor scales should match the host single-row packer")) {
+      std::cerr << "per_row_scale_row=" << row
+                << " actual=" << source_scales[row]
+                << " expected=" << expected_row_scales[row] << "\n";
+      return false;
+    }
+  }
+
+  if (!Expect(
+          std::fabs(source_scales[0] - 1.0f) <= kScaleTolerance &&
+              std::fabs(source_scales[2] - 1.0f) <= kScaleTolerance,
+          "rows below the FP4 tensor-scale threshold should keep a unit tensor scale") ||
+      !Expect(
+          source_scales[5] > source_scales[7] &&
+              source_scales[7] > source_scales[3] &&
+              source_scales[3] > source_scales[1] &&
+              source_scales[1] > source_scales[0],
+          "rows with larger magnitudes should receive larger per-row tensor scales")) {
+    return false;
+  }
+
+  for (std::size_t gathered_row = 0; gathered_row < kGatherRows; ++gathered_row) {
+    const std::size_t source_row = static_cast<std::size_t>(host_gather_indices[gathered_row]);
+    if (!Expect(
+            gathered_scales[gathered_row] == source_scales[source_row],
+            "gathered rows should preserve source row-to-scale pairing exactly") ||
+        !Expect(
+            SliceValues(gathered_packed, gathered_row * kPackedBytesPerRow, kPackedBytesPerRow) ==
+                SliceValues(source_packed, source_row * kPackedBytesPerRow, kPackedBytesPerRow),
+            "gathered rows should preserve packed payload bytes exactly") ||
+        !Expect(
+            SliceValues(
+                gathered_block_scales,
+                gathered_row * kBlockScalesPerRow,
+                kBlockScalesPerRow) ==
+                SliceValues(
+                    source_block_scales,
+                    source_row * kBlockScalesPerRow,
+                    kBlockScalesPerRow),
+            "gathered rows should preserve block scales exactly")) {
+      std::cerr << "gather_row=" << gathered_row
+                << " source_row=" << source_row << "\n";
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool TestFusedFc1GroupedPackedInputUsesPerRowTensorScales() {
+  if (!HasCudaDevice()) {
+    std::cout << "fused_moe_prefill_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  constexpr std::size_t kTokenCount = 4;
+  constexpr std::size_t kTopK = 1;
+  constexpr std::size_t kSelectionCount = kTokenCount * kTopK;
+  constexpr std::size_t kExperts = 2;
+  constexpr std::size_t kHiddenSize = 128;
+  constexpr std::size_t kOutputRows = 16;
+  constexpr float kOutputDiffThreshold = 0.1f;
+  const float row_magnitudes[kTokenCount] = {
+      0.75f,
+      8192.0f,
+      1.25f,
+      16384.0f,
+  };
+
+  auto normalized = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
+  auto selected_indices = DeviceTensorInt32::Create({kTokenCount, kTopK});
+  auto selected_weights = DeviceTensorFp32::Create({kTokenCount, kTopK});
+  auto routing = DeviceExpertRouting::Create(kExperts, kSelectionCount);
+  auto launch_plan = DeviceMoeLaunchPlan::Create(kExperts, kSelectionCount, kOutputRows);
+  const auto padded_selection_count =
+      DeviceMoeLaunchPlan::PaddedRowCapacity(kExperts, kSelectionCount);
+  auto source_per_row_pack = DeviceNvfp4Matrix::Create(
+      kTokenCount,
+      kHiddenSize,
+      nemotron::Nvfp4ScaleLayout::kSwizzled8x4);
+  auto source_global_pack = DeviceNvfp4Matrix::Create(
+      kTokenCount,
+      kHiddenSize,
+      nemotron::Nvfp4ScaleLayout::kSwizzled8x4);
+  auto grouped_per_row_pack = DeviceNvfp4Matrix::Create(
+      padded_selection_count.value_or(0),
+      kHiddenSize,
+      nemotron::Nvfp4ScaleLayout::kSwizzled8x4);
+  auto grouped_global_pack = DeviceNvfp4Matrix::Create(
+      padded_selection_count.value_or(0),
+      kHiddenSize,
+      nemotron::Nvfp4ScaleLayout::kSwizzled8x4);
+  auto per_row_output_bf16 =
+      DeviceTensorBf16::Create({padded_selection_count.value_or(0), kOutputRows});
+  auto global_output_bf16 =
+      DeviceTensorBf16::Create({padded_selection_count.value_or(0), kOutputRows});
+
+  const std::vector<float> weight_matrix = MakePatternedValues(
+      kOutputRows,
+      kHiddenSize,
+      211,
+      0.0625f);
+  auto uploaded_weights =
+      UploadRepeatedWeights(weight_matrix, kExperts, kOutputRows, kHiddenSize);
+  if (!Expect(
+          normalized != nullptr &&
+              normalized->valid() &&
+              selected_indices != nullptr &&
+              selected_indices->valid() &&
+              selected_weights != nullptr &&
+              selected_weights->valid() &&
+              routing != nullptr &&
+              routing->valid() &&
+              launch_plan != nullptr &&
+              launch_plan->valid() &&
+              padded_selection_count.has_value() &&
+              source_per_row_pack != nullptr &&
+              source_per_row_pack->valid() &&
+              source_global_pack != nullptr &&
+              source_global_pack->valid() &&
+              grouped_per_row_pack != nullptr &&
+              grouped_per_row_pack->valid() &&
+              grouped_global_pack != nullptr &&
+              grouped_global_pack->valid() &&
+              per_row_output_bf16 != nullptr &&
+              per_row_output_bf16->valid() &&
+              global_output_bf16 != nullptr &&
+              global_output_bf16->valid() &&
+              uploaded_weights.has_value(),
+          "FC1 per-row-scale oracle allocations should succeed")) {
+    return false;
+  }
+
+  auto routed_weight_views_device =
+      DeviceArray<FusedNvfp4WeightView>::CopyFromHost(uploaded_weights->views);
+  if (!Expect(
+          routed_weight_views_device != nullptr,
+          "FC1 per-row-scale oracle weight views should upload")) {
+    return false;
+  }
+
+  std::vector<float> normalized_host(kTokenCount * kHiddenSize, 0.0f);
+  for (std::size_t row = 0; row < kTokenCount; ++row) {
+    for (std::size_t col = 0; col < kHiddenSize; ++col) {
+      const float sign = ((row + col) % 2 == 0) ? 1.0f : -1.0f;
+      const float coarse =
+          static_cast<float>((static_cast<int>((row * 13u) + (col * 9u)) % 31) - 15);
+      const float fine = 0.125f * static_cast<float>(static_cast<int>((col + 2u * row) % 7u) - 3);
+      normalized_host[row * kHiddenSize + col] =
+          row_magnitudes[row] * sign * ((0.0625f * coarse) + fine);
+    }
+  }
+  const std::vector<int> selected_indices_host = {0, 1, 0, 1};
+  const std::vector<float> selected_weights_host(kSelectionCount, 1.0f);
+  if (!Expect(
+          normalized->CopyFromHost(normalized_host.data(), normalized_host.size()),
+          "FC1 per-row-scale oracle input should upload") ||
+      !Expect(
+          selected_indices->CopyFromHost(
+              selected_indices_host.data(),
+              selected_indices_host.size()),
+          "FC1 per-row-scale oracle selected indices should upload") ||
+      !Expect(
+          selected_weights->CopyFromHost(
+              selected_weights_host.data(),
+              selected_weights_host.size()),
+          "FC1 per-row-scale oracle selected weights should upload") ||
+      !Expect(
+          RunDeviceExpertRouting(
+              selected_indices->data(),
+              selected_weights->data(),
+              kTokenCount,
+              kTopK,
+              routing.get()),
+          "FC1 per-row-scale oracle routing should build") ||
+      !Expect(
+          BuildDeviceMoeLaunchPlan(*routing, kSelectionCount, launch_plan.get()),
+          "FC1 per-row-scale oracle launch plan should build") ||
+      !Expect(
+          source_per_row_pack->PackIntoPerRow(*normalized),
+          "FC1 per-row source pack should build") ||
+      !Expect(
+          source_global_pack->PackInto(*normalized),
+          "FC1 global source pack should build") ||
+      !Expect(
+          GatherDeviceNvfp4Rows(
+              *source_per_row_pack,
+              launch_plan->permuted_idx_to_token_idx(),
+              launch_plan->padded_row_capacity(),
+              grouped_per_row_pack.get()),
+          "FC1 per-row grouped pack should build") ||
+      !Expect(
+          GatherDeviceNvfp4Rows(
+              *source_global_pack,
+              launch_plan->permuted_idx_to_token_idx(),
+              launch_plan->padded_row_capacity(),
+              grouped_global_pack.get()),
+          "FC1 global grouped pack should build") ||
+      !Expect(
+          per_row_output_bf16->FillZero() && global_output_bf16->FillZero(),
+          "FC1 BF16 outputs should zero-initialize") ||
+      !Expect(
+          RunLaunchPlannedPackedNvfp4ExpertMatVecBf16(
+              *grouped_per_row_pack,
+              launch_plan.get(),
+              kTokenCount,
+              kSelectionCount,
+              routed_weight_views_device->data(),
+              kOutputRows,
+              per_row_output_bf16->data()),
+          "FC1 per-row packed matvec should launch") ||
+      !Expect(
+          RunLaunchPlannedPackedNvfp4ExpertMatVecBf16(
+              *grouped_global_pack,
+              launch_plan.get(),
+              kTokenCount,
+              kSelectionCount,
+              routed_weight_views_device->data(),
+              kOutputRows,
+              global_output_bf16->data()),
+          "FC1 global packed matvec should launch") ||
+      !Expect(
+          cudaDeviceSynchronize() == cudaSuccess,
+          "FC1 per-row-scale oracle kernels should synchronize")) {
+    return false;
+  }
+
+  std::vector<int> permuted_token_indices;
+  std::vector<float> grouped_per_row_scales;
+  std::vector<float> grouped_global_scales;
+  std::vector<float> actual_per_row_output;
+  std::vector<float> actual_global_output;
+  if (!Expect(
+          CopyDeviceValues(
+              launch_plan->permuted_idx_to_token_idx(),
+              launch_plan->padded_row_capacity(),
+              &permuted_token_indices),
+          "FC1 permuted token indices should copy to host") ||
+      !Expect(
+          CopyDeviceValues(
+              grouped_per_row_pack->per_row_tensor_scales(),
+              launch_plan->padded_row_capacity(),
+              &grouped_per_row_scales),
+          "FC1 per-row grouped tensor scales should copy to host") ||
+      !Expect(
+          CopyDeviceValues(
+              grouped_global_pack->per_row_tensor_scales(),
+              launch_plan->padded_row_capacity(),
+              &grouped_global_scales),
+          "FC1 global grouped tensor scales should copy to host") ||
+      !Expect(
+          CopyBf16TensorToFloatHost(*per_row_output_bf16, &actual_per_row_output),
+          "FC1 per-row BF16 output should copy to host") ||
+      !Expect(
+          CopyBf16TensorToFloatHost(*global_output_bf16, &actual_global_output),
+          "FC1 global BF16 output should copy to host")) {
+    return false;
+  }
+  const float actual_contract_diff =
+      MaxAbsDiff(actual_per_row_output, actual_global_output);
+
+  std::size_t small_grouped_row = launch_plan->padded_row_capacity();
+  std::size_t large_grouped_row = launch_plan->padded_row_capacity();
+  for (std::size_t grouped_row = 0; grouped_row < permuted_token_indices.size(); ++grouped_row) {
+    if (permuted_token_indices[grouped_row] == 0 && small_grouped_row == launch_plan->padded_row_capacity()) {
+      small_grouped_row = grouped_row;
+    }
+    if (permuted_token_indices[grouped_row] == 3 && large_grouped_row == launch_plan->padded_row_capacity()) {
+      large_grouped_row = grouped_row;
+    }
+  }
+
+  if (!Expect(
+          small_grouped_row < launch_plan->padded_row_capacity() &&
+              large_grouped_row < launch_plan->padded_row_capacity(),
+          "FC1 grouped permutation should retain both a small row and a large row")) {
+    return false;
+  }
+
+  float small_row_actual_diff = 0.0f;
+  for (std::size_t col = 0; col < kOutputRows; ++col) {
+    const std::size_t index = (small_grouped_row * kOutputRows) + col;
+    small_row_actual_diff = std::max(
+        small_row_actual_diff,
+        std::fabs(actual_per_row_output[index] - actual_global_output[index]));
+  }
+
+  if (!Expect(
+          grouped_per_row_scales[small_grouped_row] < grouped_per_row_scales[large_grouped_row],
+          "FC1 grouped per-row tensor scales should retain small-vs-large row differences") ||
+      !Expect(
+          grouped_global_scales[small_grouped_row] == grouped_global_scales[large_grouped_row],
+          "FC1 grouped global pack should keep one shared tensor scale across rows") ||
+      !Expect(
+          actual_contract_diff > kOutputDiffThreshold,
+          "FC1 per-row and global packed outputs should differ materially") ||
+      !Expect(
+          small_row_actual_diff > kOutputDiffThreshold,
+          "FC1 small-row packed output should change materially under a shared global scale")) {
+    std::cerr << "fc1_actual_contract_diff=" << actual_contract_diff << "\n";
+    std::cerr << "fc1_small_row_actual_diff=" << small_row_actual_diff << "\n";
+    std::cerr << "fc1_small_grouped_row=" << small_grouped_row
+              << " scale=" << grouped_per_row_scales[small_grouped_row] << "\n";
+    std::cerr << "fc1_large_grouped_row=" << large_grouped_row
+              << " scale=" << grouped_per_row_scales[large_grouped_row] << "\n";
+    std::cerr << "fc1_global_scale=" << grouped_global_scales[small_grouped_row] << "\n";
+    return false;
+  }
+
+  return true;
 }
 
 bool TestFusedMoePrefillRejectsMissingSelectionContract() {
@@ -3367,6 +3851,8 @@ bool TestFusedMoePrefillNanoExpertLayerRoutingNativeVsLegacyIfRequested() {
 
 int main() {
   const bool ok =
+      TestDeviceNvfp4MatrixPerRowTensorScalesGatherWithPermutation() &&
+      TestFusedFc1GroupedPackedInputUsesPerRowTensorScales() &&
       TestFusedMoePrefillRejectsMissingSelectionContract() &&
       TestP5TmaDescriptorViewsReachDeviceWeightTable() &&
       TestFusedMoePrefillMatchesReferenceAndOptionalOutputs() &&

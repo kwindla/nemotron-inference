@@ -50,7 +50,7 @@ The fused MoE prefill path packs all tokens' activations with a single global te
   Do not change the generic decode path, cublasLt direct-decode path, or FC2 repack sites in this step. Those remain on the old contract until explicitly upgraded.
   Key files: `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **5. Add exact low-level tests for the new contract**
+- [x] **5. Add exact low-level tests for the new contract**
   Add a focused `DeviceNvfp4Matrix` pack/gather test:
   - pack several rows with deliberately different max-abs magnitudes via `PackIntoPerRow()`
   - assert gathered `per_row_tensor_scales` match the selected source rows exactly after `GatherDeviceNvfp4Rows`
@@ -72,6 +72,6 @@ The fused MoE prefill path packs all tokens' activations with a single global te
 | 1 | Per-row packing infrastructure | done | 93f3a03 | |
 | 2 | Add parameter to all FC1 kernels | done | 053d64d | |
 | 3 | Wire through launch functions | done | 15b8041 | build + fused_moe_prefill_test |
-| 4 | Wire PackIntoPerRow in expert layer | done | — | fused_moe_prefill_test PASS |
-| 5 | Add exact low-level tests | pending | — | |
+| 4 | Wire PackIntoPerRow in expert layer | done | a218519 | fused_moe_prefill_test PASS |
+| 5 | Add exact low-level tests | done | — | 68/71 pass, 3 pre-existing |
 | 6 | Validate and test | pending | — | |
