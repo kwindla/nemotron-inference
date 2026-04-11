@@ -55,7 +55,7 @@ For implementation structure, the closer precedent is the existing local direct-
   The goal is to make future tile-shape tuning and profile expansion straightforward instead of hard-coding a single launcher path.
   Key files: `runtime/include/nemotron/gemm_catalog.h`, `runtime/include/nemotron/gemm_execution.h`, `runtime/include/nemotron/gemm_planner.h`, `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **4. Write a contiguous FP4 MMA shared GEMM kernel**
+- [x] **4. Write a contiguous FP4 MMA shared GEMM kernel**
   Add `LaunchContiguousFp4MatVec` to replace `LaunchContiguousMatVec` for shared experts. Inputs: packed `DeviceNvfp4Matrix` activations plus `FusedNvfp4WeightView`; output: FP32. The kernel should reuse the local routed P5 FP4 MMA conventions where they actually apply:
   - native SM120 block-scaled MMA atoms
   - weight-side cached A/SFA TMA descriptors
@@ -92,8 +92,8 @@ For implementation structure, the closer precedent is the existing local direct-
 |---|------|--------|--------|-------|
 | 1 | Reuse existing shared activation packs | done | 6c3de5b | shared_fc1_pack/shared_fc2_pack aliases wired through params + validation |
 | 2 | Extend shared weight TMA descriptor caching | done | 3e9cf1c | DeviceNvfp4Weight owns descriptors; view borrows pointers |
-| 3 | Add shared planning/cache layer | done | — | kSm120ContiguousSharedNvfp4 family + cached B/SFB descriptors + token-bucket profiles |
-| 4 | Write contiguous FP4 MMA shared GEMM kernel | pending | — | Consume Step 3 dispatch/cache plumbing |
+| 3 | Add shared planning/cache layer | done | 3966209 | kSm120ContiguousSharedNvfp4 family + cached B/SFB descriptors + token-bucket profiles |
+| 4 | Write contiguous FP4 MMA shared GEMM kernel | done | — | Nvfp4ContiguousSharedFp4P5Kernel + LaunchContiguousFp4MatVec |
 | 5 | Replace shared prefill pipeline | pending | — | |
 | 6 | Validate correctness across multi-row shapes | pending | — | Include small-row and partial-tile coverage |
 | 7 | Benchmark end-to-end prefill latency | pending | — | Primary gate is end-to-end prefill latency |
