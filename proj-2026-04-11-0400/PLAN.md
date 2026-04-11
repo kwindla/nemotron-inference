@@ -166,7 +166,7 @@ Acceptance checks:
   Gate the new epilogue behind a template parameter or constexpr branch so the BF16 epilogue remains available for fallback.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **6. Add an FP4-direct FC1 launcher variant and wire it into `RunFusedMoePrefill`**
+- [x] **6. Add an FP4-direct FC1 launcher variant and wire it into `RunFusedMoePrefill`**
   Add `LaunchPlannedPackedInputMatVecFp4Direct` — a host-side launcher that instantiates the P5 kernel with the fused FP4 epilogue. It must:
   1. clear the full `DeviceNvfp4Matrix` payload coherently
   2. clear or initialize any auxiliary scale buffers required by the preserved routed contract
@@ -199,7 +199,7 @@ Acceptance checks:
 | 2 | Probe partition_C layout | done | 0baaf39 | 16-elem blocks are warp-local (8 lanes × 2 cols); only 16/32 physical slots populated; not quad-local |
 | 3 | Prove shared-memory story | completed | — | Current: `81956 B`; naive +64KB stage: compile failure; aliased union: `83968 B` |
 | 4 | Prototype staged FP4 pack | done | 6f0105f | GPU vs CPU byte-exact; FP32 vs BF16 legacy byte-exact; 69/72 pass |
-| 5 | Implement fused epilogue | done | — | Warp-local path, shfl_xor max-abs + shfl_down nibble pack; fixed reg loop OOB; 69/72 |
-| 6 | Add FP4-direct launcher + wire it in | pending | — | Direct path primary for P5, BF16 fallback remains |
+| 5 | Implement fused epilogue | done | d7e9bff | Warp-local path, shfl_xor max-abs + shfl_down nibble pack; fixed reg loop OOB; 69/72 |
+| 6 | Add FP4-direct launcher + wire it in | done | — | Wired, env-gated, BF16 default stable 69/72; direct path has correctness blocker (step 7 diagnosis) |
 | 7 | Validate, then remove BF16 workspace if safe | pending | — | No workspace removal before the direct path is proven |
 | 8 | Benchmark and compare | pending | — | TTFT + TPS + kernel timing + vLLM parity |

@@ -2287,6 +2287,15 @@ __global__ void ZeroBf16BufferKernel(__nv_bfloat16* data, std::size_t count) {
   data[index] = __float2bfloat16(0.0f);
 }
 
+__global__ void FillFloatBufferKernel(float* data, std::size_t count, float value) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  data[index] = value;
+}
+
 __global__ void GatherRowsKernel(
     const float* input,
     const int* row_indices,
@@ -5838,7 +5847,10 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSm
   }
 }
 
-template <nvfp4_bridge::UnifiedRoutedFp4Profile Profile, typename OutputType>
+template <
+    nvfp4_bridge::UnifiedRoutedFp4Profile Profile,
+    typename OutputType,
+    nvfp4_bridge::P5EpilogueMode P5Mode = nvfp4_bridge::P5EpilogueMode::kBf16>
 __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     const std::uint8_t* packed_input,
     const std::uint8_t* input_matmul_block_scales,
@@ -5855,8 +5867,18 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     const routed_p5_tma::P5TmaLoadSFB* p5_tma_load_sfb_descriptors,
     const FusedNvfp4WeightView* weights,
     std::size_t output_rows_per_expert,
-    OutputType* output) {
+    OutputType* output,
+    std::uint8_t* fp4_packed_data,
+    std::uint8_t* fp4_block_scales,
+    std::uint8_t* fp4_matmul_block_scales,
+    float* fp4_activation_output_scale,
+    std::size_t fp4_cols,
+    std::size_t fp4_padded_blocks_per_row,
+    Nvfp4ScaleLayout fp4_scale_layout) {
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr bool kUseFp4DirectOutput =
+      Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 &&
+      P5Mode == nvfp4_bridge::P5EpilogueMode::kFp4Direct;
   using Traits = nvfp4_bridge::UnifiedRoutedFp4Traits<Profile>;
   using TiledMma = typename Traits::TiledMma;
   using CollectiveMainloop = typename Traits::CollectiveMainloop;
@@ -5920,7 +5942,14 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       packed_input == nullptr ||
       input_matmul_block_scales == nullptr ||
       (input_tensor_scale_data == nullptr && input_dq_scales == nullptr) ||
-      output == nullptr) {
+      (!kUseFp4DirectOutput && output == nullptr) ||
+      (kUseFp4DirectOutput &&
+       (fp4_packed_data == nullptr ||
+        fp4_block_scales == nullptr ||
+        fp4_matmul_block_scales == nullptr ||
+        fp4_activation_output_scale == nullptr ||
+        fp4_cols == 0 ||
+        fp4_padded_blocks_per_row == 0))) {
     return;
   }
 
@@ -7314,7 +7343,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
         }
       }
     }
-    nvfp4_bridge::StoreUnifiedRoutedFp4Output<Profile>(
+    nvfp4_bridge::StoreUnifiedRoutedFp4Output<Profile, P5Mode>(
         output_alpha,
         &accum_storage[0],
         warp_id * 32 + lane_id,
@@ -7325,7 +7354,14 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
         output_rows_per_expert,
         output,
         input_per_row_tensor_scales,
-        weight_tensor_scale);
+        weight_tensor_scale,
+        fp4_packed_data,
+        fp4_block_scales,
+        fp4_matmul_block_scales,
+        fp4_activation_output_scale,
+        fp4_cols,
+        fp4_padded_blocks_per_row,
+        fp4_scale_layout);
   }
 #else
   (void) packed_input;
@@ -7344,6 +7380,13 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   (void) weights;
   (void) output_rows_per_expert;
   (void) output;
+  (void) fp4_packed_data;
+  (void) fp4_block_scales;
+  (void) fp4_matmul_block_scales;
+  (void) fp4_activation_output_scale;
+  (void) fp4_cols;
+  (void) fp4_padded_blocks_per_row;
+  (void) fp4_scale_layout;
 #endif
 }
 
@@ -9561,25 +9604,59 @@ bool LaunchZeroBf16Buffer(__nv_bfloat16* data, std::size_t count) {
   return CheckCuda(cudaGetLastError());
 }
 
-bool ClearDeviceNvfp4Matrix(DeviceNvfp4Matrix* matrix, float tensor_scale = 1.0f) {
+bool LaunchFillFloatBuffer(float* data, std::size_t count, float value) {
+  if (data == nullptr || count == 0) {
+    return true;
+  }
+  const dim3 block(fused_decode::kThreadsPerBlock);
+  const dim3 grid(static_cast<unsigned int>((count + block.x - 1u) / block.x));
+  FillFloatBufferKernel<<<grid, block>>>(data, count, value);
+  return CheckCuda(cudaGetLastError());
+}
+
+bool ClearDeviceNvfp4Matrix(
+    DeviceNvfp4Matrix* matrix,
+    float tensor_scale = 1.0f,
+    float per_row_tensor_scale = 0.0f) {
   if (matrix == nullptr || !matrix->valid()) {
     return false;
   }
-  return CheckCuda(cudaMemset(
-             const_cast<std::uint8_t*>(matrix->packed_data()), 0, matrix->packed_nbytes())) &&
-         CheckCuda(cudaMemset(
-             const_cast<std::uint8_t*>(matrix->block_scales_data()),
-             0,
-             matrix->block_scales_nbytes())) &&
-         CheckCuda(cudaMemset(
-             const_cast<std::uint8_t*>(matrix->matmul_block_scales_data()),
-             0,
-             matrix->matmul_block_scales_nbytes())) &&
-         CheckCuda(cudaMemcpy(
-             const_cast<std::uint8_t*>(matrix->tensor_scale_data()),
-             &tensor_scale,
-             sizeof(tensor_scale),
-             cudaMemcpyHostToDevice));
+  if (!CheckCuda(cudaMemset(
+          const_cast<std::uint8_t*>(matrix->packed_data()), 0, matrix->packed_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<std::uint8_t*>(matrix->block_scales_data()),
+          0,
+          matrix->block_scales_nbytes())) ||
+      !CheckCuda(cudaMemset(
+          const_cast<std::uint8_t*>(matrix->matmul_block_scales_data()),
+          0,
+          matrix->matmul_block_scales_nbytes()))) {
+    return false;
+  }
+
+  float* per_row_scales = const_cast<float*>(matrix->per_row_tensor_scales());
+  if (per_row_scales == nullptr) {
+    return false;
+  }
+  if (per_row_tensor_scale == 0.0f) {
+    if (!CheckCuda(cudaMemset(
+            per_row_scales,
+            0,
+            matrix->rows() * sizeof(float)))) {
+      return false;
+    }
+  } else if (!LaunchFillFloatBuffer(
+                 per_row_scales,
+                 matrix->rows(),
+                 per_row_tensor_scale)) {
+    return false;
+  }
+
+  return CheckCuda(cudaMemcpy(
+      const_cast<std::uint8_t*>(matrix->tensor_scale_data()),
+      &tensor_scale,
+      sizeof(tensor_scale),
+      cudaMemcpyHostToDevice));
 }
 
 bool LaunchGatherRows(
@@ -10226,7 +10303,14 @@ bool LaunchPlannedPackedInputMatVec(
             nullptr,
             weights,
             output_rows_per_expert,
-            output);
+            output,
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<float*>(nullptr),
+            static_cast<std::size_t>(0),
+            static_cast<std::size_t>(0),
+            Nvfp4ScaleLayout::kSwizzled128x4);
         return CheckCuda(cudaGetLastError());
       case RoutedGemm2Profile::kP13_128x128x64_SwapTrue:
         g_enable_p13_scale_trace = std::getenv("NEMOTRON_P13_SCALE_DEBUG") != nullptr ? 1 : 0;
@@ -10287,7 +10371,14 @@ bool LaunchPlannedPackedInputMatVec(
               nullptr,
               weights,
               output_rows_per_expert,
-              output);
+              output,
+              static_cast<std::uint8_t*>(nullptr),
+              static_cast<std::uint8_t*>(nullptr),
+              static_cast<std::uint8_t*>(nullptr),
+              static_cast<float*>(nullptr),
+              static_cast<std::size_t>(0),
+              static_cast<std::size_t>(0),
+              Nvfp4ScaleLayout::kSwizzled128x4);
         }
         if (g_enable_p13_scale_trace != 0) {
           if (!CheckCuda(cudaDeviceSynchronize())) {
@@ -10319,7 +10410,14 @@ bool LaunchPlannedPackedInputMatVec(
             nullptr,
             weights,
             output_rows_per_expert,
-            output);
+            output,
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<float*>(nullptr),
+            static_cast<std::size_t>(0),
+            static_cast<std::size_t>(0),
+            Nvfp4ScaleLayout::kSwizzled128x4);
         if (!CheckCuda(cudaGetLastError())) {
           return false;
         }
@@ -10508,7 +10606,14 @@ bool LaunchPlannedPackedInputMatVecBf16(
             p5_tma_load_sfb_descriptors,
             weights,
             output_rows_per_expert,
-            output)) {
+            output,
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<std::uint8_t*>(nullptr),
+            static_cast<float*>(nullptr),
+            static_cast<std::size_t>(0),
+            static_cast<std::size_t>(0),
+            Nvfp4ScaleLayout::kSwizzled128x4)) {
           return false;
         }
         if (g_enable_p5_scale_trace != 0) {
@@ -10580,6 +10685,129 @@ bool LaunchPlannedPackedInputMatVecBf16(
       output_rows_per_expert,
       output);
   return CheckCuda(cudaGetLastError());
+}
+
+bool LaunchPlannedPackedInputMatVecFp4Direct(
+    const DeviceNvfp4Matrix& input_pack,
+    const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
+    const DeviceMoeLaunchPlan* launch_plan,
+    std::size_t dispatch_rows,
+    std::size_t active_selection_count,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    DeviceNvfp4Matrix* output_pack,
+    float* activation_output_scale) {
+  if (!input_pack.valid() ||
+      launch_plan == nullptr ||
+      !launch_plan->valid() ||
+      active_selection_count == 0 ||
+      weights == nullptr ||
+      output_rows_per_expert == 0 ||
+      output_pack == nullptr ||
+      !output_pack->valid() ||
+      activation_output_scale == nullptr ||
+      output_pack->rows() < launch_plan->padded_row_capacity() ||
+      output_pack->cols() != output_rows_per_expert) {
+    return false;
+  }
+
+  const auto current_cta_capacity =
+      DeviceMoeLaunchPlan::CtaCapacity(
+          launch_plan->n_experts(),
+          active_selection_count,
+          launch_plan->selected_token_tile());
+  if (!current_cta_capacity.has_value() ||
+      *current_cta_capacity == 0 ||
+      *current_cta_capacity > launch_plan->cta_capacity()) {
+    return false;
+  }
+
+  if (RoutedProfileDebugEnabled()) {
+    std::fprintf(
+        stderr,
+        "routed_gemm1 dispatch_rows=%zu active_selection_count=%zu profile=%s mode=fp4_direct\n",
+        dispatch_rows,
+        active_selection_count,
+        RoutedGemm1ProfileName(RoutedGemm1Profile::kP5_128x128x64_SwapTrue));
+  }
+
+  const int output_tile =
+      RoutedOutputTile(RoutedGemm1Profile::kP5_128x128x64_SwapTrue);
+  const std::size_t output_row_tile_count =
+      (output_rows_per_expert + static_cast<std::size_t>(output_tile) - 1u) /
+      static_cast<std::size_t>(output_tile);
+  const std::size_t blocks_per_row =
+      output_pack->cols() / fused_decode::kNvfp4BlockWidth;
+  const std::size_t padded_blocks_per_row =
+      RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
+  const std::size_t scale_count =
+      launch_plan->padded_row_capacity() * blocks_per_row;
+  if (output_row_tile_count == 0 ||
+      blocks_per_row == 0 ||
+      !ClearDeviceNvfp4Matrix(output_pack, 1.0f, 1.0f) ||
+      !LaunchZeroBuffer(activation_output_scale, scale_count)) {
+    return false;
+  }
+
+  const dim3 block(kRoutedThreadsPerBlock);
+  const dim3 grid(
+      static_cast<unsigned int>(output_row_tile_count),
+      static_cast<unsigned int>(*current_cta_capacity));
+
+  g_enable_p5_scale_trace = std::getenv("NEMOTRON_P5_SCALE_DEBUG") != nullptr ? 1 : 0;
+  if (g_enable_p5_scale_trace != 0) {
+    g_p5_scale_trace = {};
+  }
+
+  const auto* p5_tma_load_b_descriptors =
+      reinterpret_cast<const routed_p5_tma::P5TmaLoadB*>(
+          input_pack.p5_tma_load_b_descriptors(*launch_plan));
+  const auto* p5_tma_load_sfb_descriptors =
+      reinterpret_cast<const routed_p5_tma::P5TmaLoadSFB*>(
+          input_pack.p5_tma_load_sfb_descriptors(*launch_plan));
+
+  if (!LaunchProgrammaticKernel(
+          grid,
+          block,
+          Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel<
+              nvfp4_bridge::UnifiedRoutedFp4Profile::kP5,
+              __nv_bfloat16,
+              nvfp4_bridge::P5EpilogueMode::kFp4Direct>,
+          input_pack.packed_data(),
+          input_pack.matmul_block_scales_data(),
+          input_pack.scale_layout(),
+          input_pack.device_tensor_scale_ptr(),
+          input_expert_tensor_scales,
+          input_dq_scales,
+          input_per_row_tensor_scales,
+          launch_plan->num_non_exiting_ctas(),
+          launch_plan->cta_idx_xy_to_batch_idx(),
+          launch_plan->cta_row_starts(),
+          launch_plan->cta_valid_rows(),
+          p5_tma_load_b_descriptors,
+          p5_tma_load_sfb_descriptors,
+          weights,
+          output_rows_per_expert,
+          static_cast<__nv_bfloat16*>(nullptr),
+          const_cast<std::uint8_t*>(output_pack->packed_data()),
+          const_cast<std::uint8_t*>(output_pack->block_scales_data()),
+          const_cast<std::uint8_t*>(output_pack->matmul_block_scales_data()),
+          activation_output_scale,
+          output_pack->cols(),
+          padded_blocks_per_row,
+          output_pack->scale_layout())) {
+    return false;
+  }
+
+  if (g_enable_p5_scale_trace != 0) {
+    if (!CheckCuda(cudaDeviceSynchronize())) {
+      return false;
+    }
+    PrintP5ScaleTrace();
+  }
+  return true;
 }
 
 [[maybe_unused]] bool LaunchPlannedPackedInputMatVecRelu2ExpertScales(
@@ -10912,7 +11140,6 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       params.launch_plan == nullptr ||
       params.routed_gather_scratch == nullptr ||
       (!use_grouped_gemm1_output && params.routed_up_scratch == nullptr) ||
-      (use_grouped_gemm1_output && params.gemm1_output_bf16 == nullptr) ||
       params.shared_up_scratch == nullptr ||
       params.output == nullptr) {
     return false;
@@ -10973,6 +11200,10 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       RoutedEnvEnabled("NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH")
           ? params.launch_plan->selected_token_tile()
           : params.token_count;
+  const bool use_fp4_direct_fc1 =
+      use_grouped_gemm1_output &&
+      use_packed_fc1_source &&
+      RoutedEnvEnabled("NEMOTRON_ENABLE_FP4_DIRECT_FC1");
 
   if ((!use_packed_fc1_source &&
        !LaunchGatherRows(
@@ -11014,52 +11245,83 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   }
 
   if (use_grouped_gemm1_output) {
-    if (!LaunchZeroBf16Buffer(
-            params.gemm1_output_bf16,
-            params.launch_plan->padded_row_capacity() *
-                params.routed_expert_intermediate_size) ||
-        !(use_packed_fc1_source
-              ? LaunchPlannedPackedInputMatVecBf16(
-                    *params.fc1_grouped_pack,
-                    nullptr,
-                    nullptr,
-                    params.fc1_grouped_pack->per_row_tensor_scales(),
-                    params.launch_plan,
-                    packed_dispatch_rows,
-                    selection_count,
-                    params.routed_up_device,
-                    params.routed_expert_intermediate_size,
-                    params.gemm1_output_bf16)
-              : RunLaunchPlannedNvfp4ExpertMatVecBf16(
-                    params.routed_gather_scratch,
-                    params.launch_plan,
-                    selection_count,
-                    params.routed_up_device,
-                    params.routed_expert_intermediate_size,
-                    params.gemm1_output_bf16)) ||
-        !LaunchRoutedBf16Relu2Pack(
-            params.gemm1_output_bf16,
-            params.routing,
-            params.launch_plan,
-            selection_count,
-            gemm1_output,
-            activation_output_scale
-        ) ||
-        !LaunchZeroBuffer(
-            params.routed_gather_scratch,
-            params.launch_plan->padded_row_capacity() * params.hidden_size) ||
-        !LaunchPlannedPackedInputMatVec(
-            *gemm1_output,
-            nullptr,
-            activation_output_scale,
-            nullptr,
-            params.launch_plan,
-            packed_dispatch_rows,
-            selection_count,
-            params.routed_down_device,
-            params.hidden_size,
-            params.routed_gather_scratch)) {
-      return false;
+    if (use_fp4_direct_fc1) {
+      if (!LaunchPlannedPackedInputMatVecFp4Direct(
+              *params.fc1_grouped_pack,
+              nullptr,
+              nullptr,
+              params.fc1_grouped_pack->per_row_tensor_scales(),
+              params.launch_plan,
+              packed_dispatch_rows,
+              selection_count,
+              params.routed_up_device,
+              params.routed_expert_intermediate_size,
+              gemm1_output,
+              activation_output_scale) ||
+          !LaunchZeroBuffer(
+              params.routed_gather_scratch,
+              params.launch_plan->padded_row_capacity() * params.hidden_size) ||
+          !LaunchPlannedPackedInputMatVec(
+              *gemm1_output,
+              nullptr,
+              activation_output_scale,
+              nullptr,
+              params.launch_plan,
+              packed_dispatch_rows,
+              selection_count,
+              params.routed_down_device,
+              params.hidden_size,
+              params.routed_gather_scratch)) {
+        return false;
+      }
+    } else {
+      if (params.gemm1_output_bf16 == nullptr ||
+          !LaunchZeroBf16Buffer(
+              params.gemm1_output_bf16,
+              params.launch_plan->padded_row_capacity() *
+                  params.routed_expert_intermediate_size) ||
+          !(use_packed_fc1_source
+                ? LaunchPlannedPackedInputMatVecBf16(
+                      *params.fc1_grouped_pack,
+                      nullptr,
+                      nullptr,
+                      params.fc1_grouped_pack->per_row_tensor_scales(),
+                      params.launch_plan,
+                      packed_dispatch_rows,
+                      selection_count,
+                      params.routed_up_device,
+                      params.routed_expert_intermediate_size,
+                      params.gemm1_output_bf16)
+                : RunLaunchPlannedNvfp4ExpertMatVecBf16(
+                      params.routed_gather_scratch,
+                      params.launch_plan,
+                      selection_count,
+                      params.routed_up_device,
+                      params.routed_expert_intermediate_size,
+                      params.gemm1_output_bf16)) ||
+          !LaunchRoutedBf16Relu2Pack(
+              params.gemm1_output_bf16,
+              params.routing,
+              params.launch_plan,
+              selection_count,
+              gemm1_output,
+              activation_output_scale) ||
+          !LaunchZeroBuffer(
+              params.routed_gather_scratch,
+              params.launch_plan->padded_row_capacity() * params.hidden_size) ||
+          !LaunchPlannedPackedInputMatVec(
+              *gemm1_output,
+              nullptr,
+              activation_output_scale,
+              nullptr,
+              params.launch_plan,
+              packed_dispatch_rows,
+              selection_count,
+              params.routed_down_device,
+              params.hidden_size,
+              params.routed_gather_scratch)) {
+        return false;
+      }
     }
   } else {
     if (!LaunchZeroBuffer(
