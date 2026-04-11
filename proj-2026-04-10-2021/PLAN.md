@@ -12,7 +12,12 @@ The shared expert path in `RunFusedMoePrefill` uses a lossy pipeline: `QuantizeD
 - The kernel must support arbitrary token counts (1–512+), handling partial tiles correctly.
 - The shared expert pipeline change must not affect the routed expert path.
 - TMA loads for the weight operand should follow the pattern established by the unified routed P5 kernel.
-- Validation: the per-layer max_abs_diff diagnostic (comparing fused prefill vs legacy decode) should show dramatically reduced error, and the prompt-length sweep should produce coherent output at all lengths.
+- Validation must use exact oracles:
+  - per-layer max_abs_diff diagnostic (comparing fused prefill vs legacy decode) must show dramatically reduced error
+  - prompt-length sweep (`tools/oracle/prompt_length_sweep.py`) must produce coherent output at all lengths, judged by Claude API
+  - constrained greedy parity against vLLM/TRT-LLM via `tools/oracle/compare_chat_runtimes.py`
+  - existing fused prefill/runtime tests (full ctest suite, 68/71 baseline)
+  Text that merely "looks non-repetitive" is not sufficient.
 
 ## Steps
 
