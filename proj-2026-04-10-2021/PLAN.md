@@ -42,7 +42,7 @@ For implementation structure, the closer precedent is the existing local direct-
   Update `FusedMoePrefillParams` and the prefill workspace wiring so the shared path explicitly consumes the existing packed buffers instead of introducing duplicate payloads. `normalized_pack` should be the default shared FC1 pack. `fused_prefill_shared_up_pack` should be the default shared FC2 pack. If the parameter surface is confusing, add clearly named aliases such as `shared_fc1_pack` and `shared_fc2_pack`, but keep storage ownership in the existing workspace objects.
   Key files: `runtime/include/nemotron/fused_moe_prefill.h`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/request_context.cpp`
 
-- [ ] **2. Extend shared weight views to retain cached TMA descriptors**
+- [x] **2. Extend shared weight views to retain cached TMA descriptors**
   Use the routed ownership pattern as the precedent: routed A/SFA descriptors are owned by `MonolithicNvfp4ExpertWeights`, and views only borrow pointers. For the shared path, extend `DeviceNvfp4Weight` so the long-lived shared weight objects own cached P5-style A/SFA descriptors, then expose borrowed pointers through `FusedNvfp4WeightView`. Immutable weight descriptors should be built once during weight preparation, not reconstructed every launch.
   Key files: `runtime/include/nemotron/nvfp4_weight.h`, `runtime/src/backend/nvfp4_weight.cpp`, `runtime/include/nemotron/fused_moe_decode.h`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/monolithic_expert_weights.cu`
 
@@ -90,8 +90,8 @@ For implementation structure, the closer precedent is the existing local direct-
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Reuse existing shared activation packs | done | — | shared_fc1_pack/shared_fc2_pack aliases wired through params + validation |
-| 2 | Extend shared weight TMA descriptor caching | pending | — | Owner should be `DeviceNvfp4Weight`, not the borrowed view |
+| 1 | Reuse existing shared activation packs | done | 6c3de5b | shared_fc1_pack/shared_fc2_pack aliases wired through params + validation |
+| 2 | Extend shared weight TMA descriptor caching | done | — | DeviceNvfp4Weight owns descriptors; view borrows pointers |
 | 3 | Add shared planning/cache layer | pending | — | Include contiguous activation descriptor ownership and profiling hooks |
 | 4 | Write contiguous FP4 MMA shared GEMM kernel | pending | — | Consume Step 3 dispatch/cache plumbing |
 | 5 | Replace shared prefill pipeline | pending | — | |

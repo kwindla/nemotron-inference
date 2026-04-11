@@ -10,6 +10,30 @@
 #include "nvfp4_routed_padding.h"
 #include "nemotron/nvfp4_scale_layout.h"
 
+namespace nemotron::routed_p5_tma {
+
+void* CreateDeviceP5TmaLoadAArray(
+    const std::uint8_t* packed_data,
+    std::size_t expert_count,
+    std::size_t expert_packed_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols);
+
+void* CreateDeviceP5TmaLoadSFAArray(
+    const std::uint8_t* scale_data,
+    std::size_t expert_count,
+    std::size_t expert_scale_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols);
+
+void DestroyDeviceP5TmaLoadAArray(void** descriptor_array);
+void DestroyDeviceP5TmaLoadSFAArray(void** descriptor_array);
+
+std::size_t P5TmaLoadABytes();
+std::size_t P5TmaLoadSFABytes();
+
+}  // namespace nemotron::routed_p5_tma
+
 namespace nemotron {
 
 struct DeviceNvfp4Weight::Impl {
@@ -23,6 +47,10 @@ struct DeviceNvfp4Weight::Impl {
   std::size_t matmul_block_scales_nbytes = 0;
   std::uint8_t* tensor_scale_data = nullptr;
   std::size_t tensor_scale_nbytes = 0;
+  void* p5_tma_load_a = nullptr;
+  std::size_t p5_tma_load_a_nbytes = 0;
+  void* p5_tma_load_sfa = nullptr;
+  std::size_t p5_tma_load_sfa_nbytes = 0;
   float host_tensor_scale = 0.0f;
 };
 
@@ -140,10 +168,29 @@ std::unique_ptr<DeviceNvfp4Weight> DeviceNvfp4Weight::Upload(const GemmDescripto
           descriptor.tensor_scale_nbytes,
           &impl->tensor_scale_data)) {
     ReleaseBuffer(&impl->tensor_scale_data);
-      ReleaseBuffer(&impl->matmul_block_scales_data);
-      ReleaseBuffer(&impl->block_scales_data);
-      ReleaseBuffer(&impl->packed_data);
+    ReleaseBuffer(&impl->matmul_block_scales_data);
+    ReleaseBuffer(&impl->block_scales_data);
+    ReleaseBuffer(&impl->packed_data);
     return debug_fail("device allocation/copy failed");
+  }
+
+  impl->p5_tma_load_a = routed_p5_tma::CreateDeviceP5TmaLoadAArray(
+      impl->packed_data,
+      1,
+      impl->packed_nbytes,
+      impl->output_rows,
+      impl->input_cols);
+  if (impl->p5_tma_load_a != nullptr) {
+    impl->p5_tma_load_a_nbytes = routed_p5_tma::P5TmaLoadABytes();
+  }
+  impl->p5_tma_load_sfa = routed_p5_tma::CreateDeviceP5TmaLoadSFAArray(
+      impl->matmul_block_scales_data,
+      1,
+      impl->matmul_block_scales_nbytes,
+      impl->output_rows,
+      impl->input_cols);
+  if (impl->p5_tma_load_sfa != nullptr) {
+    impl->p5_tma_load_sfa_nbytes = routed_p5_tma::P5TmaLoadSFABytes();
   }
 
   return std::unique_ptr<DeviceNvfp4Weight>(new DeviceNvfp4Weight(std::move(impl)));
@@ -159,6 +206,8 @@ DeviceNvfp4Weight::~DeviceNvfp4Weight() {
   if (!impl_) {
     return;
   }
+  routed_p5_tma::DestroyDeviceP5TmaLoadAArray(&impl_->p5_tma_load_a);
+  routed_p5_tma::DestroyDeviceP5TmaLoadSFAArray(&impl_->p5_tma_load_sfa);
   ReleaseBuffer(&impl_->tensor_scale_data);
   ReleaseBuffer(&impl_->matmul_block_scales_data);
   ReleaseBuffer(&impl_->block_scales_data);
@@ -203,6 +252,14 @@ std::size_t DeviceNvfp4Weight::tensor_scale_nbytes() const {
   return impl_ ? impl_->tensor_scale_nbytes : 0;
 }
 
+std::size_t DeviceNvfp4Weight::p5_tma_load_a_nbytes() const {
+  return impl_ ? impl_->p5_tma_load_a_nbytes : 0;
+}
+
+std::size_t DeviceNvfp4Weight::p5_tma_load_sfa_nbytes() const {
+  return impl_ ? impl_->p5_tma_load_sfa_nbytes : 0;
+}
+
 float DeviceNvfp4Weight::host_tensor_scale() const {
   return impl_ ? impl_->host_tensor_scale : 0.0f;
 }
@@ -221,6 +278,14 @@ const std::uint8_t* DeviceNvfp4Weight::matmul_block_scales_data() const {
 
 const std::uint8_t* DeviceNvfp4Weight::tensor_scale_data() const {
   return impl_ ? impl_->tensor_scale_data : nullptr;
+}
+
+const void* DeviceNvfp4Weight::p5_tma_load_a() const {
+  return impl_ ? impl_->p5_tma_load_a : nullptr;
+}
+
+const void* DeviceNvfp4Weight::p5_tma_load_sfa() const {
+  return impl_ ? impl_->p5_tma_load_sfa : nullptr;
 }
 
 }  // namespace nemotron

@@ -825,6 +825,8 @@ FusedNvfp4WeightView MakeFusedNvfp4WeightView(const DeviceNvfp4Weight& weight) {
       reinterpret_cast<const float*>(weight.tensor_scale_data()),
       weight.output_rows(),
       weight.input_cols(),
+      weight.p5_tma_load_a(),
+      weight.p5_tma_load_sfa(),
   };
 }
 
@@ -887,7 +889,9 @@ std::uint64_t TotalUploadedBytes(const DeviceNvfp4Weight& weight) {
   return static_cast<std::uint64_t>(weight.packed_nbytes()) +
          static_cast<std::uint64_t>(weight.block_scales_nbytes()) +
          static_cast<std::uint64_t>(weight.matmul_block_scales_nbytes()) +
-         static_cast<std::uint64_t>(weight.tensor_scale_nbytes());
+         static_cast<std::uint64_t>(weight.tensor_scale_nbytes()) +
+         static_cast<std::uint64_t>(weight.p5_tma_load_a_nbytes()) +
+         static_cast<std::uint64_t>(weight.p5_tma_load_sfa_nbytes());
 }
 
 std::uint64_t EstimatedUploadedBytes(const GemmDescriptor& descriptor) {

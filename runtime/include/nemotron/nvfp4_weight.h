@@ -26,11 +26,15 @@ class DeviceNvfp4Weight {
   std::size_t block_scales_nbytes() const;
   std::size_t matmul_block_scales_nbytes() const;
   std::size_t tensor_scale_nbytes() const;
+  std::size_t p5_tma_load_a_nbytes() const;
+  std::size_t p5_tma_load_sfa_nbytes() const;
   float host_tensor_scale() const;
   const std::uint8_t* packed_data() const;
   const std::uint8_t* block_scales_data() const;
   const std::uint8_t* matmul_block_scales_data() const;
   const std::uint8_t* tensor_scale_data() const;
+  const void* p5_tma_load_a() const;
+  const void* p5_tma_load_sfa() const;
 
  private:
   struct Impl;

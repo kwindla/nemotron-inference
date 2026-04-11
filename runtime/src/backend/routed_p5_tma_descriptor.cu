@@ -137,4 +137,12 @@ void DestroyDeviceP5TmaLoadSFAArray(void** descriptor_array) {
   DestroyDeviceP5TmaLoadAArray(descriptor_array);
 }
 
+std::size_t P5TmaLoadABytes() {
+  return sizeof(P5TmaLoadA);
+}
+
+std::size_t P5TmaLoadSFABytes() {
+  return sizeof(P5TmaLoadSFA);
+}
+
 }  // namespace nemotron::routed_p5_tma
