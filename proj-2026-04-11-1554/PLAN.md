@@ -112,7 +112,7 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
   Also add the invariants we expect to hold, using `static_assert` where possible and debug-only checks otherwise: 16 logical coords, one warp per 16-wide FP4 block, 8 participating lanes, stride-4 lane ownership, and token-row-local `row_alpha`.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `testing/backend/staged_fp4_pack_test.cpp`
 
-- [ ] **2. Build constexpr lookup tables and implement warp-local direct pack**
+- [x] **2. Build constexpr lookup tables and implement warp-local direct pack**
   Based on the probe results, build constexpr arrays indexed by linear index `i` (0..15):
   - `kLinearToBlock[16]`: 0 (m < 64) or 1 (m >= 64)
   - `kLinearToTokenGroup[16]`: 0..3 (which of the 4 token rows this element belongs to)
@@ -143,7 +143,7 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Lock probe + invariants + test seam | done | — | static_assert on part_c size==16; ValidateP5WarpLocalInvariants confirms ownership pattern; test seam passes with non-uniform per-row scales |
-| 2 | Build tables + warp-local implementation | pending | — | |
+| 1 | Lock probe + invariants + test seam | done | 7cf6f27 | static_assert on part_c size==16; ValidateP5WarpLocalInvariants confirms ownership pattern; test seam passes with non-uniform per-row scales |
+| 2 | Build tables + warp-local implementation | done | — | constexpr tables + StoreUnifiedRoutedFp4WarpLocalPack + kFp4WarpLocal dispatch; compile-clean, not wired yet |
 | 3 | Wire and validate | pending | — | |
 | 4 | Benchmark at 384/512 | pending | — | |
