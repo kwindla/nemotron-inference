@@ -135,7 +135,7 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
   5. Per-layer diagnostic → within envelope
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `testing/backend/staged_fp4_pack_test.cpp`
 
-- [ ] **4. Benchmark at 384/512 tokens and compare**
+- [x] **4. Benchmark at 384/512 tokens and compare**
   The current baseline is already captured at `proj-2026-04-11-1554/baseline_reference/manual_bench/`. After wiring the warp-local path, rerun the long-prompt benchmark at `384/512` and compare first against those recorded numbers and second against the BF16 baseline. Report hot prefill as the primary metric, with cold setup and TTFT as guardrails.
   Important: these long-prompt runs are integration guardrails, not direct P5-epilogue measurements, because the routed MoE window still dispatches `23` rows and selects `legacy`. Do not treat a flat `384/512` result as proof that the warp-local P5 epilogue failed to help.
   Key files: `benchmarks/nano_shared_prefill/run_default_bench.sh`, `tools/benchmark_analysis/compare_shared_prefill_benchmarks.py`
@@ -145,5 +145,5 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
 |---|------|--------|--------|-------|
 | 1 | Lock probe + invariants + test seam | done | 7cf6f27 | static_assert on part_c size==16; ValidateP5WarpLocalInvariants confirms ownership pattern; test seam passes with non-uniform per-row scales |
 | 2 | Build tables + warp-local implementation | done | ded3015 | constexpr tables + StoreUnifiedRoutedFp4WarpLocalPack + kFp4WarpLocal dispatch; compile-clean, not wired yet |
-| 3 | Wire and validate | done | — | Wired kFp4WarpLocal→kFp4Direct, removed staged path + 16KB smem, fixed shuffle mask (subgroup_mask), test seam passes, ctest 69/72, MoE PASS, forced-P5 compare still divergent (pre-existing) |
-| 4 | Benchmark at 384/512 | pending | — | |
+| 3 | Wire and validate | done | 36d071d | Wired kFp4WarpLocal→kFp4Direct, removed staged path + 16KB smem, fixed shuffle mask (subgroup_mask), test seam passes, ctest 69/72, MoE PASS, forced-P5 compare still divergent (pre-existing) |
+| 4 | Benchmark at 384/512 | done | — | Flat: 384 hot_prefill 783.6→784.2ms (+0.08%), 512 hot_prefill 1059.6→1068.1ms (+0.80%). Integration guardrails only (legacy profile, not P5). |
