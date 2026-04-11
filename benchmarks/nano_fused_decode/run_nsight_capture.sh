@@ -10,6 +10,8 @@ Usage: NEMOTRON_FORWARD_MANIFEST=/path/to/manifest.json run_nsight_capture.sh [-
    or: run_nsight_capture.sh /path/to/manifest.json [-- benchmark-args]
 
 Runs nano_fused_decode_bench under `nsys profile` with `--mode=profile-ready`.
+The benchmark now warms up first and brackets the measured region with
+`cudaProfilerStart/Stop`, so Nsight captures only the hot profile-ready run.
 Existing `NEMOTRON_*`, `CUDA_VISIBLE_DEVICES`, and `LD_LIBRARY_PATH` environment
 variables are passed through unchanged.
 EOF
@@ -81,6 +83,11 @@ export NEMOTRON_FORWARD_MANIFEST="${MANIFEST_PATH}"
 
 nsys profile \
   --force-overwrite true \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=stop \
+  --sample=none \
+  --cpuctxsw=none \
+  --trace=cuda \
   --output "${OUTPUT_PREFIX}" \
   "${BINARY}" \
   --manifest "${MANIFEST_PATH}" \

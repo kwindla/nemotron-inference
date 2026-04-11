@@ -8,6 +8,7 @@
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -53,10 +54,21 @@ const std::vector<std::int32_t>& FixedPromptTokenIds() {
   return kPrompt;
 }
 
+std::vector<std::int32_t> BuildPromptTokenIds(std::size_t prompt_token_count) {
+  const auto& base = FixedPromptTokenIds();
+  std::vector<std::int32_t> prompt_token_ids;
+  prompt_token_ids.reserve(prompt_token_count);
+  for (std::size_t i = 0; i < prompt_token_count; ++i) {
+    prompt_token_ids.push_back(base[i % base.size()]);
+  }
+  return prompt_token_ids;
+}
+
 struct BenchmarkOptions {
   std::optional<std::filesystem::path> manifest_path;
   std::optional<std::filesystem::path> json_output_path;
   BenchmarkMode mode = BenchmarkMode::kPhased;
+  std::size_t prompt_token_count = kPromptTokenCount;
   std::size_t decode_token_count = kDefaultDecodeTokenCount;
   std::size_t warmup_iterations = 1;
   std::size_t hot_iterations = 3;
@@ -339,6 +351,10 @@ bool ParsePositiveSizeT(const std::string& value, std::size_t* parsed_value) {
   }
 }
 
+bool ParsePromptTokenCount(const std::string& value, std::size_t* parsed_value) {
+  return ParsePositiveSizeT(value, parsed_value);
+}
+
 bool ParseNonNegativeSizeT(const std::string& value, std::size_t* parsed_value) {
   if (parsed_value == nullptr) {
     return false;
@@ -382,10 +398,12 @@ void PrintUsage(const char* argv0) {
       << "  --manifest <path>           Manifest path. Defaults to NEMOTRON_FORWARD_MANIFEST.\n"
       << "  --mode <phased|steady-state|cached-head|profile-ready>\n"
       << "                             Benchmark mode. Default: phased\n"
+      << "  --prompt-tokens <count>     Prompt token count. Default: 16\n"
       << "  --warmup <count>            Warmup iterations. Default: 1\n"
       << "  --iterations <count>        Timed hot iterations. Default: 3\n"
       << "  --decode-tokens <count>     Timed ContinueSingleToken steps for --mode=steady-state\n"
-      << "                             and --mode=cached-head. Default: 16\n"
+      << "                             and --mode=cached-head. Also used by phased runs.\n"
+      << "                             Default: 16\n"
       << "  --json-output <path>        Write JSON output.\n";
 }
 
@@ -414,6 +432,15 @@ bool ParseArgs(int argc, char** argv, BenchmarkOptions* options) {
         return false;
       }
       if (!ParseNonNegativeSizeT(argv[++i], &options->warmup_iterations)) {
+        return false;
+      }
+    } else if (TryParseInlineOptionValue(arg, "--prompt-tokens=", &inline_value)) {
+      if (!ParsePromptTokenCount(inline_value, &options->prompt_token_count)) {
+        return false;
+      }
+    } else if (arg == "--prompt-tokens") {
+      if (i + 1 >= argc ||
+          !ParsePromptTokenCount(argv[++i], &options->prompt_token_count)) {
         return false;
       }
     } else if (arg == "--iterations") {
@@ -486,6 +513,7 @@ struct TimedProfileReadyRun {
 std::optional<TimedPhasedRun> RunTimedPhasedDecode(
     nemotron::SingleTokenForwardModel& model,
     const std::vector<std::int32_t>& prompt_token_ids,
+    std::size_t decode_token_count,
     const std::string& run_label,
     std::int32_t* device_token_id) {
   auto request_context = model.CreateRequestContext();
@@ -506,9 +534,9 @@ std::optional<TimedPhasedRun> RunTimedPhasedDecode(
   }
 
   TimedPhasedRun run;
-  run.generated_token_ids.reserve(kDefaultDecodeTokenCount);
+  run.generated_token_ids.reserve(decode_token_count);
   run.steady_state_step_ms.reserve(
-      kDefaultDecodeTokenCount > 0 ? (kDefaultDecodeTokenCount - 1) : 0);
+      decode_token_count > 0 ? (decode_token_count - 1) : 0);
 
   std::cout << "nano_fused_decode_bench: " << run_label
             << " prefill start prompt_tokens=" << prompt_token_ids.size() << "\n";
@@ -551,9 +579,9 @@ std::optional<TimedPhasedRun> RunTimedPhasedDecode(
   std::cout.flush();
 
   std::int32_t token_id = *first_token;
-  for (std::size_t token_index = 1; token_index < kDefaultDecodeTokenCount; ++token_index) {
+  for (std::size_t token_index = 1; token_index < decode_token_count; ++token_index) {
     std::cout << "nano_fused_decode_bench: " << run_label
-              << " steady step " << token_index << "/" << (kDefaultDecodeTokenCount - 1)
+              << " steady step " << token_index << "/" << (decode_token_count - 1)
               << " start consume_token=" << token_id << "\n";
     std::cout.flush();
     if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before decode step failed")) {
@@ -577,7 +605,7 @@ std::optional<TimedPhasedRun> RunTimedPhasedDecode(
     run.steady_state_step_ms.push_back(step_ms);
     run.generated_token_ids.push_back(*next_token);
     std::cout << "nano_fused_decode_bench: " << run_label
-              << " steady step " << token_index << "/" << (kDefaultDecodeTokenCount - 1)
+              << " steady step " << token_index << "/" << (decode_token_count - 1)
               << " elapsed_ms=" << step_ms
               << " next_token=" << *next_token << "\n";
     std::cout.flush();
@@ -955,7 +983,7 @@ int main(int argc, char** argv) {
 
   auto runtime_options = make_options();
   runtime_options.service_target.target_context_tokens =
-      kPromptTokenCount + std::max(kDefaultDecodeTokenCount, options.decode_token_count);
+      options.prompt_token_count + std::max<std::size_t>(1, options.decode_token_count);
 
   auto runtime_environment = nemotron::RuntimeEnvironment::BuildFromManifestFile(
       *options.manifest_path, runtime_options);
@@ -967,7 +995,7 @@ int main(int argc, char** argv) {
   nemotron::SingleTokenForwardConfig config = *config_opt;
   config.max_tokens = std::max<std::size_t>(
       config.max_tokens,
-      kPromptTokenCount + std::max(kDefaultDecodeTokenCount, options.decode_token_count));
+      options.prompt_token_count + std::max<std::size_t>(1, options.decode_token_count));
 
   auto model = nemotron::SingleTokenForwardModel::Create(*runtime_environment, config);
   if (model == nullptr || !model->valid()) {
@@ -975,7 +1003,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const std::vector<std::int32_t>& prompt_token_ids = FixedPromptTokenIds();
+  const std::vector<std::int32_t> prompt_token_ids =
+      BuildPromptTokenIds(options.prompt_token_count);
   nemotron::ResetLinearOpCounters();
   nemotron::ResetLinearOpTrace();
   nemotron::ResetExpertStagingCounters();
@@ -991,9 +1020,9 @@ int main(int argc, char** argv) {
   result.prompt_token_count = prompt_token_ids.size();
   result.decode_token_count =
       (options.mode == BenchmarkMode::kSteadyState ||
-       options.mode == BenchmarkMode::kCachedHead)
+      options.mode == BenchmarkMode::kCachedHead)
           ? options.decode_token_count
-          : (options.mode == BenchmarkMode::kProfileReady ? 1 : kDefaultDecodeTokenCount);
+          : (options.mode == BenchmarkMode::kProfileReady ? 1 : options.decode_token_count);
   result.cudnn_fe_available = cudnn_fe_available;
 
   if (options.mode == BenchmarkMode::kSteadyState ||
@@ -1052,16 +1081,52 @@ int main(int argc, char** argv) {
               << " prompt_tokens=" << prompt_token_ids.size()
               << " decode_tokens=1\n";
     std::cout.flush();
+    for (std::size_t iteration = 0; iteration < options.warmup_iterations; ++iteration) {
+      const std::string run_label =
+          "profile-warmup " + std::to_string(iteration + 1) + "/" +
+          std::to_string(options.warmup_iterations);
+      std::cout << "nano_fused_decode_bench: " << run_label << " start\n";
+      std::cout.flush();
+      const auto warmup_run = RunTimedSteadyStateDecode(
+          *model,
+          prompt_token_ids,
+          1,
+          run_label,
+          device_token_buffer.data);
+      if (!warmup_run.has_value()) {
+        return 1;
+      }
+      std::cout << "nano_fused_decode_bench: " << run_label
+                << " prefill_ms=" << warmup_run->prefill_ms
+                << " decode_mean_ms=" << Mean(warmup_run->steady_state_step_ms)
+                << "\n";
+      std::cout.flush();
+    }
+    if (!CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before profiler start failed")) {
+      return 1;
+    }
+    const auto profiler_start_status = cudaProfilerStart();
+    if (profiler_start_status != cudaSuccess) {
+      std::cerr << "nano_fused_decode_bench: cudaProfilerStart failed: "
+                << cudaGetErrorString(profiler_start_status) << "\n";
+      return 1;
+    }
     const auto profile_ready_run = RunProfileReadyDecode(
         *model,
         prompt_token_ids,
         device_token_buffer.data);
+    const auto profiler_stop_status = cudaProfilerStop();
+    if (profiler_stop_status != cudaSuccess) {
+      std::cerr << "nano_fused_decode_bench: cudaProfilerStop failed: "
+                << cudaGetErrorString(profiler_stop_status) << "\n";
+      return 1;
+    }
     if (!profile_ready_run.has_value()) {
       return 1;
     }
 
     result.max_new_tokens = profile_ready_run->generated_token_ids.size();
-    result.warmup_iterations = 0;
+    result.warmup_iterations = options.warmup_iterations;
     result.hot_iterations = 0;
     result.generated_token_count = profile_ready_run->generated_token_ids.size();
     result.generated_token_ids = profile_ready_run->generated_token_ids;
@@ -1091,11 +1156,12 @@ int main(int argc, char** argv) {
   } else {
     std::cout << "nano_fused_decode_bench: starting cold run"
               << " prompt_tokens=" << prompt_token_ids.size()
-              << " max_new_tokens=" << kDefaultDecodeTokenCount << "\n";
+              << " max_new_tokens=" << options.decode_token_count << "\n";
     std::cout.flush();
     const auto cold_run = RunTimedPhasedDecode(
         *model,
         prompt_token_ids,
+        options.decode_token_count,
         "cold",
         device_token_buffer.data);
     if (!cold_run.has_value()) {
@@ -1118,6 +1184,7 @@ int main(int argc, char** argv) {
       const auto warmup_run = RunTimedPhasedDecode(
           *model,
           prompt_token_ids,
+          options.decode_token_count,
           run_label,
           device_token_buffer.data);
       if (!warmup_run.has_value()) {
@@ -1144,6 +1211,7 @@ int main(int argc, char** argv) {
       const auto hot_run = RunTimedPhasedDecode(
           *model,
           prompt_token_ids,
+          options.decode_token_count,
           run_label,
           device_token_buffer.data);
       if (!hot_run.has_value()) {
@@ -1167,9 +1235,10 @@ int main(int argc, char** argv) {
       std::cout.flush();
     }
 
-    result.max_new_tokens = kDefaultDecodeTokenCount;
+    result.max_new_tokens = options.decode_token_count;
     result.warmup_iterations = options.warmup_iterations;
     result.hot_iterations = options.hot_iterations;
+    result.decode_token_count = options.decode_token_count;
     result.generated_token_count =
         !last_generated_token_ids.empty() ? last_generated_token_ids.size()
                                           : cold_run->generated_token_ids.size();
