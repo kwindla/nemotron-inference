@@ -336,6 +336,7 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
           {*padded_selection_capacity, routed_expert_intermediate_size});
   workspace->fused_prefill_shared_up_scratch =
       DeviceTensorFp32::Create({token_capacity, config.shared_expert_intermediate_size});
+  // Reuse the normalized/source pack as the shared FC1 activation pack.
   workspace->fused_prefill_normalized_pack =
       DeviceNvfp4Matrix::Create(
           token_capacity,
@@ -350,6 +351,7 @@ std::unique_ptr<MoePrefillWorkspace> MoePrefillWorkspace::Create(
       *padded_selection_capacity,
       routed_expert_intermediate_size,
       pack_scale_layout);
+  // Reuse the shared-up activation pack as the shared FC2 activation pack.
   workspace->fused_prefill_shared_up_pack = DeviceNvfp4Matrix::Create(
       token_capacity,
       config.shared_expert_intermediate_size,

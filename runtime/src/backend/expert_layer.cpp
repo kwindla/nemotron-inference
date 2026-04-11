@@ -47,6 +47,10 @@ bool AllowUnsafeNativeDirectMoePrefillProfiling() {
   return EnvEnabled("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
 }
 
+bool DebugComparePrefillVsLegacy() {
+  return EnvEnabled("NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY");
+}
+
 std::size_t ExecutionRoutedExpertIntermediateSize(const ExpertLayerConfig& config) {
   return ResolveRoutedExpertIntermediateSizeExecution(
       config.routed_expert_intermediate_size,
@@ -1400,9 +1404,22 @@ bool ExpertLayerSlice::Impl::SupportsDirectMoePrefillPath(
     std::size_t token_count,
     int device_sm_version) const {
   (void)device_sm_version;
-  return direct_moe_execution_state.trace == nullptr &&
-         token_count > 1 &&
-         SupportsResidentPreparedMoePath(path_config, token_count);
+  const bool has_trace = direct_moe_execution_state.trace != nullptr;
+  const bool multi = token_count > 1;
+  const bool resident = SupportsResidentPreparedMoePath(path_config, token_count);
+  const bool supported = !has_trace && multi && resident;
+  if (!supported && DebugComparePrefillVsLegacy() && token_count > 1) {
+    std::cerr << "PREFILL_UNSUPPORTED layer=" << config.layer_index
+              << " tokens=" << token_count
+              << " trace=" << has_trace
+              << " fused_supported=" << fused_direct_moe_supported
+              << " capacity=" << ResolveMultiTokenCapacity()
+              << " has_resident=" << HasResidentPreparedRoutedWeights()
+              << " shared_up=" << (shared_up_nvfp4 != nullptr)
+              << " shared_down=" << (shared_down_nvfp4 != nullptr)
+              << "\n";
+  }
+  return supported;
 }
 
 bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
@@ -1444,7 +1461,9 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   DeviceTensorFp32* routed_output_scratch = ResolveFusedPrefillRoutedOutputScratch();
   DeviceTensorFp32* gather_scratch = ResolveFusedPrefillGatherScratch();
   DeviceNvfp4Matrix* normalized_pack = ResolveFusedPrefillNormalizedPack();
+  DeviceNvfp4Matrix* shared_fc1_pack = normalized_pack;
   DeviceNvfp4Matrix* gather_pack = ResolveFusedPrefillGatherPack();
+  DeviceNvfp4Matrix* shared_fc2_pack = ResolveFusedPrefillSharedUpPack();
   DeviceTensorBf16* gemm1_output_bf16 =
       direct_moe_execution_state.workspace != nullptr &&
               direct_moe_execution_state.workspace->fused_prefill_gemm1_output_bf16 != nullptr &&
@@ -1479,10 +1498,10 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       launch_plan->selection_count() < selection_count ||
       !routing->valid() ||
       routing->selection_count() < selection_count ||
-      normalized_pack == nullptr ||
-      !normalized_pack->valid() ||
-      normalized_pack->rows() < token_count ||
-      normalized_pack->cols() != config.hidden_size ||
+      shared_fc1_pack == nullptr ||
+      !shared_fc1_pack->valid() ||
+      shared_fc1_pack->rows() < token_count ||
+      shared_fc1_pack->cols() != config.hidden_size ||
       gather_pack == nullptr ||
       !gather_pack->valid() ||
       gather_pack->rows() < *padded_selection_count ||
@@ -1513,11 +1532,15 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       !shared_up_scratch->valid() ||
       shared_up_shape.size() != 2 ||
       shared_up_shape[0] < token_count ||
-      shared_up_shape[1] != config.shared_expert_intermediate_size) {
+      shared_up_shape[1] != config.shared_expert_intermediate_size ||
+      shared_fc2_pack == nullptr ||
+      !shared_fc2_pack->valid() ||
+      shared_fc2_pack->rows() < token_count ||
+      shared_fc2_pack->cols() != config.shared_expert_intermediate_size) {
     return false;
   }
 
-  if (!normalized_pack->PackIntoPerRow(normalized, RuntimeMoeNvfp4PackOptions())) {
+  if (!shared_fc1_pack->PackIntoPerRow(normalized, RuntimeMoeNvfp4PackOptions())) {
     return false;
   }
 
@@ -1555,7 +1578,8 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.selected_weights = topk_weights;
   params.input = input.data();
   params.normalized = normalized.data();
-  params.normalized_pack = normalized_pack;
+  params.normalized_pack = shared_fc1_pack;
+  params.shared_fc1_pack = shared_fc1_pack;
   params.routing = routing;
   params.launch_plan = launch_plan;
   params.routed_gather_scratch = gather_scratch->data();
@@ -1567,6 +1591,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     params.fc2_grouped_pack = expert_up_pack;
     params.gemm1_output = expert_up_pack;
   }
+  params.shared_fc2_pack = shared_fc2_pack;
   if (direct_moe_execution_state.workspace != nullptr &&
       direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales != nullptr &&
       direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales->valid()) {
@@ -2805,7 +2830,7 @@ bool ExpertLayerSlice::Run(
             : [&]() -> bool {
                 if (AllowUnsafeNativeDirectMoePrefillProfiling()) {
                   RecordExpertNativeMultiTokenExecution(token_count);
-                  return impl_->RunFusedMoePrefillPath(
+                  const bool prefill_ok = impl_->RunFusedMoePrefillPath(
                       cublas_handle,
                       heuristic_cache,
                       *input_fp32,
@@ -2814,6 +2839,69 @@ bool ExpertLayerSlice::Run(
                       topk_ids,
                       topk_weights,
                       output_fp32);
+                  if (prefill_ok && DebugComparePrefillVsLegacy()) {
+                    auto legacy_output = DeviceTensorFp32::Create(output_fp32->shape());
+                    if (legacy_output != nullptr && legacy_output->valid()) {
+                      bool legacy_ok = true;
+                      for (std::size_t row_index = 0; row_index < token_count && legacy_ok; ++row_index) {
+                        auto input_row =
+                            CreateTokenRowView(input_fp32, row_index, impl_->config.hidden_size);
+                        auto normalized_row =
+                            CreateTokenRowView(normalized, row_index, impl_->config.hidden_size);
+                        auto router_row =
+                            CreateTokenRowView(router_logits, row_index, impl_->config.n_routed_experts);
+                        auto output_row =
+                            CreateTokenRowView(legacy_output.get(), row_index, impl_->config.hidden_size);
+                        legacy_ok = input_row != nullptr &&
+                            normalized_row != nullptr &&
+                            router_row != nullptr &&
+                            output_row != nullptr &&
+                            impl_->RunDirectMoeDecodePath(
+                                cublas_handle,
+                                heuristic_cache,
+                                *input_row,
+                                *normalized_row,
+                                *router_row,
+                                topk_ids + (row_index * impl_->config.top_k),
+                                topk_weights + (row_index * impl_->config.top_k),
+                                output_row.get());
+                      }
+                      if (legacy_ok && cudaDeviceSynchronize() == cudaSuccess) {
+                        std::vector<float> prefill_host(token_count * impl_->config.hidden_size);
+                        std::vector<float> legacy_host(token_count * impl_->config.hidden_size);
+                        cudaMemcpy(prefill_host.data(), output_fp32->data(),
+                                   prefill_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(legacy_host.data(), legacy_output->data(),
+                                   legacy_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        float global_max_diff = 0.0f;
+                        for (std::size_t row = 0; row < token_count; ++row) {
+                          float row_max_diff = 0.0f;
+                          float row_max_abs = 0.0f;
+                          for (std::size_t col = 0; col < impl_->config.hidden_size; ++col) {
+                            const std::size_t idx = row * impl_->config.hidden_size + col;
+                            const float diff = std::fabs(prefill_host[idx] - legacy_host[idx]);
+                            const float abs_val = std::fabs(legacy_host[idx]);
+                            if (diff > row_max_diff) row_max_diff = diff;
+                            if (abs_val > row_max_abs) row_max_abs = abs_val;
+                          }
+                          if (row_max_diff > global_max_diff) global_max_diff = row_max_diff;
+                          std::cerr << "PREFILL_VS_LEGACY layer="
+                                    << impl_->config.layer_index
+                                    << " token=" << row
+                                    << " max_abs_diff=" << row_max_diff
+                                    << " legacy_max_abs=" << row_max_abs
+                                    << (row_max_diff > 1.0f ? " ***DIVERGENT***" : "")
+                                    << "\n";
+                        }
+                        std::cerr << "PREFILL_VS_LEGACY layer="
+                                  << impl_->config.layer_index
+                                  << " global_max_abs_diff=" << global_max_diff
+                                  << " tokens=" << token_count
+                                  << "\n";
+                      }
+                    }
+                  }
+                  return prefill_ok;
                 }
                 // The fused multi-row MoE prefill path uses batch-coupled activation
                 // scaling. Replaying rows through the single-row decode contract keeps

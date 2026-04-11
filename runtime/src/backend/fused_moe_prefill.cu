@@ -1820,13 +1820,12 @@ RoutedGemm1Profile SelectRoutedGemm1Profile(std::size_t num_rows) {
   if (RoutedEnvEnabled("NEMOTRON_DEBUG_FORCE_LEGACY_P1")) {
     return RoutedGemm1Profile::kLegacy;
   }
-  if (num_rows == 1u) {
-    return RoutedGemm1Profile::kP0_128x128x128_SwapFalse;
-  }
-  if (num_rows >= 2u && num_rows <= 3u) {
-    return RoutedGemm1Profile::kP7_256x128x64_SwapTrue;
-  }
-  if (num_rows >= 4u && num_rows <= 8u) {
+  if (num_rows >= 1u && num_rows <= 8u) {
+    // Use the unified FP4 MMA kernel for all small row counts.  The non-unified
+    // P0/P7 profiles decode FP4→BF16 before the WMMA multiply, which loses
+    // precision compared to the native block-scaled FP4 MMA used by P5.  At
+    // small dispatch sizes (1-3 rows per expert) this precision loss accumulates
+    // across layers and produces divergent output.
     return RoutedGemm1Profile::kP5_128x128x64_SwapTrue;
   }
   if ((num_rows >= 9u && num_rows <= 15u) || num_rows == 16u ||
@@ -9988,6 +9987,9 @@ bool RunLaunchPlannedNvfp4ExpertMatVecBf16(
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   const std::size_t selection_count = params.token_count * params.top_k;
+  const DeviceNvfp4Matrix* shared_fc1_pack =
+      params.shared_fc1_pack != nullptr ? params.shared_fc1_pack : params.normalized_pack;
+  DeviceNvfp4Matrix* shared_fc2_pack = params.shared_fc2_pack;
   const bool use_packed_fc1_source =
       params.normalized_pack != nullptr &&
       params.normalized_pack->valid() &&
@@ -10058,7 +10060,15 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       params.shared_up.input_cols != params.hidden_size ||
       params.shared_up.output_rows != params.shared_expert_intermediate_size ||
       params.shared_down.input_cols != params.shared_expert_intermediate_size ||
-      params.shared_down.output_rows != params.hidden_size) {
+      params.shared_down.output_rows != params.hidden_size ||
+      (shared_fc1_pack != nullptr &&
+       (!shared_fc1_pack->valid() ||
+        shared_fc1_pack->rows() < params.token_count ||
+        shared_fc1_pack->cols() != params.hidden_size)) ||
+      (shared_fc2_pack != nullptr &&
+       (!shared_fc2_pack->valid() ||
+        shared_fc2_pack->rows() < params.token_count ||
+        shared_fc2_pack->cols() != params.shared_expert_intermediate_size))) {
     return false;
   }
 

@@ -27,7 +27,8 @@ struct FusedMoePrefillParams {
   const float* selected_weights = nullptr;
   const float* input = nullptr;  // Reserved for future fused epilog variants.
   const float* normalized = nullptr;
-  const DeviceNvfp4Matrix* normalized_pack = nullptr;  // Optional legacy global-scale FC1 source pack.
+  const DeviceNvfp4Matrix* normalized_pack = nullptr;  // Default shared FC1 pack and optional packed routed FC1 source pack.
+  const DeviceNvfp4Matrix* shared_fc1_pack = nullptr;  // Alias for the shared FC1 input pack. Defaults to normalized_pack.
   DeviceExpertRouting* routing = nullptr;
   DeviceMoeLaunchPlan* launch_plan = nullptr;
   float* routed_gather_scratch = nullptr;  // padded_row_capacity x hidden_size
@@ -37,6 +38,7 @@ struct FusedMoePrefillParams {
   __nv_bfloat16* gemm1_output_bf16 = nullptr;  // TRT-style BF16 Gemm1 output buffer.
   float* fc2_expert_activation_scales = nullptr;  // Legacy alias for post-activation FC1 output scales.
   DeviceNvfp4Matrix* fc2_grouped_pack = nullptr;  // Legacy alias for packed routed FC2 input contract.
+  DeviceNvfp4Matrix* shared_fc2_pack = nullptr;  // Alias for the shared FC2 input pack.
   DeviceNvfp4Matrix* gemm1_output = nullptr;  // TRT-style routed Gemm1 output contract, post-activation for ReLU2.
   float* gemm1_output_scale = nullptr;       // TRT-style routed Gemm1 output scalar scale contract.
   float* activation_output_scale = nullptr;  // TRT-style activation output scales; ReLU2 path aliases gemm1_output_scale.
