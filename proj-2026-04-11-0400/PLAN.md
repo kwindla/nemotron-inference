@@ -175,7 +175,7 @@ Acceptance checks:
   In `RunFusedMoePrefill`, gate the direct path on a new `use_fp4_direct_fc1` condition, but do **not** change the routed FC2 consumer contract in phase 1.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **7. Validate, then remove BF16 workspace only if the contract is stable**
+- [x] **7. Validate, then remove BF16 workspace only if the contract is stable**
   First run full validation: `ctest -j1`, `nano_24_token_prefill_regression_test` with `NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL=1` and `NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY=1`, prompt-length sweep (`tools/oracle/prompt_length_sweep.py --runtimes native --skip-claude-eval`), and vLLM parity check (`tools/oracle/compare_chat_runtimes.py --runtimes native,vllm`). Compare per-layer diffs against the existing Phase 1 baseline. Only after the direct path is stable should we remove `fused_prefill_gemm1_output_bf16` and any now-dead scale scratch from `MoePrefillWorkspace`.
   Include one non-routed/generic consumer validation:
   - decode the produced `DeviceNvfp4Matrix` through a generic reader path that uses `block_scales_data` / `matmul_block_scales_data` and `per_row_tensor_scales`, without `input_dq_scales`
@@ -200,6 +200,6 @@ Acceptance checks:
 | 3 | Prove shared-memory story | completed | — | Current: `81956 B`; naive +64KB stage: compile failure; aliased union: `83968 B` |
 | 4 | Prototype staged FP4 pack | done | 6f0105f | GPU vs CPU byte-exact; FP32 vs BF16 legacy byte-exact; 69/72 pass |
 | 5 | Implement fused epilogue | done | d7e9bff | Warp-local path, shfl_xor max-abs + shfl_down nibble pack; fixed reg loop OOB; 69/72 |
-| 6 | Add FP4-direct launcher + wire it in | done | — | Wired, env-gated, BF16 default stable 69/72; direct path has correctness blocker (step 7 diagnosis) |
-| 7 | Validate, then remove BF16 workspace if safe | pending | — | No workspace removal before the direct path is proven |
+| 6 | Add FP4-direct launcher + wire it in | done | 802e05d | Wired, env-gated, BF16 default stable 69/72; direct path has correctness blocker (step 7 diagnosis) |
+| 7 | Validate, then remove BF16 workspace if safe | done | — | Smem staging fix + zero-fill; BF16 workspace NOT removed (P5 not naturally selected for nano test); 69/72 |
 | 8 | Benchmark and compare | pending | — | TTFT + TPS + kernel timing + vLLM parity |
