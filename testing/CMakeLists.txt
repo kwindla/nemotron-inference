@@ -522,6 +522,22 @@ target_compile_features(nvfp4_packing_test PRIVATE cxx_std_17)
 
 nemotron_add_test(nvfp4_packing_test)
 
+set_source_files_properties(
+  backend/staged_fp4_pack_test.cpp
+  PROPERTIES
+    LANGUAGE CUDA
+)
+
+add_executable(
+  staged_fp4_pack_test
+  backend/staged_fp4_pack_test.cpp
+)
+
+target_link_libraries(staged_fp4_pack_test PRIVATE nemotron_runtime_backend)
+target_compile_features(staged_fp4_pack_test PRIVATE cxx_std_17)
+
+nemotron_add_test(staged_fp4_pack_test)
+
 add_executable(
   nvfp4_pack_compare_test
   backend/nvfp4_pack_compare_test.cpp

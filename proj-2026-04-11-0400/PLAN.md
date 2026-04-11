@@ -144,7 +144,7 @@ Acceptance checks:
   This invalidates the original "no increase in per-CTA smem allocation" assumption and shifts the production target toward warp/quad-local reduction.
   Key files: `proj-2026-04-11-0400/p5_smem_probe.cu`, `proj-2026-04-11-0400/run_p5_smem_probe.sh`, `proj-2026-04-11-0400/smem_probe.md`
 
-- [ ] **4. Prototype a correctness-first fused pack kernel**
+- [x] **4. Prototype a correctness-first fused pack kernel**
   Based on the partition_C and smem probes, write a standalone test kernel `TestStagedFp4PackKernel` in a new test file. The kernel takes a 128×128 FP32 input tile (simulating accumulators after alpha scaling), applies squared ReLU, computes per-16-element scales, writes packed output plus both scale layouts, and materializes the absolute dequant-scale tensor expected by routed FC2. Validate against a CPU/reference implementation and against `PackDeviceRowMajorBf16ToNvfp4PerExpert` semantics for the selected contract. Also test partial tiles (`valid_rows < 128`).
   Because the smem probe ruled out a naive extra 64KB staging tile, this kernel is a correctness/reference tool. If it uses full-tile staging, it must do so through the proven aliased-storage model rather than through additional shared declarations.
   Add a direct-output compare harness that runs:
@@ -196,9 +196,9 @@ Acceptance checks:
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Lock routed contract + activation math | completed | — | `contract_notes.md` freezes activation, scales, and matrix invariants |
-| 2 | Probe partition_C layout | done | — | 16-elem blocks are warp-local (8 lanes × 2 cols); only 16/32 physical slots populated; not quad-local |
+| 2 | Probe partition_C layout | done | 0baaf39 | 16-elem blocks are warp-local (8 lanes × 2 cols); only 16/32 physical slots populated; not quad-local |
 | 3 | Prove shared-memory story | completed | — | Current: `81956 B`; naive +64KB stage: compile failure; aliased union: `83968 B` |
-| 4 | Prototype staged FP4 pack | pending | — | De-risk packing + scale swizzling under the preserved contract |
+| 4 | Prototype staged FP4 pack | done | — | GPU vs CPU byte-exact; FP32 vs BF16 legacy byte-exact; 69/72 pass |
 | 5 | Implement fused epilogue | pending | — | Core change: direct FP4 write in the P5 epilogue |
 | 6 | Add FP4-direct launcher + wire it in | pending | — | Direct path primary for P5, BF16 fallback remains |
 | 7 | Validate, then remove BF16 workspace if safe | pending | — | No workspace removal before the direct path is proven |
