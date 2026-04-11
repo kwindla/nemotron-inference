@@ -1,0 +1,14 @@
+case=short_exact anchor=vllm
+  native: turn=0 text_match=1 token_match=1 first_token_diff=None
+case=boundary_exact_reply anchor=vllm
+  native: turn=0 text_match=0 token_match=0 first_token_diff=0
+case=json_exact anchor=vllm
+  native: turn=0 text_match=0 token_match=0 first_token_diff=0
+case=multi_turn_codeword anchor=vllm
+  native: turn=0 text_match=0 token_match=0 first_token_diff=0
+  native: turn=1 text_match=1 token_match=1 first_token_diff=None
+case=multi_turn_recall_open anchor=vllm
+  native: turn=0 text_match=0 token_match=0 first_token_diff=0
+  native: turn=1 text_match=0 token_match=0 first_token_diff=0
+  native: turn=2 text_match=0 token_match=0 first_token_diff=0
+saved_artifact=proj-2026-04-11-0400/benchmark_results/chat_runtime_parity_native_vllm_fp4_direct_20260411T1528.json

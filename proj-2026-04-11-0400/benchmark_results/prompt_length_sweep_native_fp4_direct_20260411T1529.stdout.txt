@@ -1,0 +1,61 @@
+Generating prompts for 16 target lengths: [1, 2, 3, 4, 7, 8, 9, 16, 22, 23, 24, 33, 64, 117, 128, 261]
+  target=  1  actual=  1  total= 30  content='The'...
+  target=  2  actual=  2  total= 31  content='The quick'...
+  target=  3  actual=  3  total= 32  content='The quick brown'...
+  target=  4  actual=  4  total= 33  content='The quick brown fox'...
+  target=  7  actual=  7  total= 36  content='The quick brown fox jumps over the'...
+  target=  8  actual=  8  total= 37  content='The quick brown fox jumps over the lazy'...
+  target=  9  actual=  9  total= 38  content='The quick brown fox jumps over the lazy dog'...
+  target= 16  actual= 16  total= 45  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target= 22  actual= 22  total= 51  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target= 23  actual= 23  total= 52  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target= 24  actual= 24  total= 53  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target= 33  actual= 33  total= 62  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target= 64  actual= 64  total= 93  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target=117  actual=117  total=146  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target=128  actual=128  total=157  content='The quick brown fox jumps over the lazy dog near the riverba'...
+  target=261  actual=261  total=290  content='The quick brown fox jumps over the lazy dog near the riverba'...
+
+Running native...
+  native: user_content_tokens=1 ... OK unique=1/1
+  native: user_content_tokens=2 ... OK unique=69/156
+  native: user_content_tokens=3 ... OK unique=12/12
+  native: user_content_tokens=4 ... OK unique=12/13
+  native: user_content_tokens=7 ... OK unique=11/12
+  native: user_content_tokens=8 ... OK unique=11/12
+  native: user_content_tokens=9 ... OK unique=2/2
+  native: user_content_tokens=16 ... OK unique=142/267
+  native: user_content_tokens=22 ... OK unique=93/220
+  native: user_content_tokens=23 ... OK unique=26/27
+  native: user_content_tokens=24 ... OK unique=26/27
+  native: user_content_tokens=33 ... OK unique=24/34
+  native: user_content_tokens=64 ... OK unique=114/219
+  native: user_content_tokens=117 ... OK unique=110/149
+  native: user_content_tokens=128 ... OK unique=206/336
+  native: user_content_tokens=261 ... OK unique=63/91
+
+Results saved to proj-2026-04-11-0400/benchmark_results/prompt_length_sweep_native_fp4_direct_20260411T1529.json
+
+================================================================================
+SUMMARY
+================================================================================
+ len  total        native
+--------------------------
+   1     30           1/1
+   2     31        69/156
+   3     32         12/12
+   4     33         12/13
+   7     36         11/12
+   8     37         11/12
+   9     38           2/2
+  16     45       142/267
+  22     51        93/220
+  23     52         26/27
+  24     53         26/27
+  33     62         24/34
+  64     93       114/219
+ 117    146       110/149
+ 128    157       206/336
+ 261    290         63/91
+
+ALL CHECKS PASSED

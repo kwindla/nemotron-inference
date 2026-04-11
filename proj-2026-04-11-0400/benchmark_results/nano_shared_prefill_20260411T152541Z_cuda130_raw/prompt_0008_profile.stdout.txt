@@ -1,0 +1,28 @@
+nano_fused_decode_bench: starting mode=profile-ready prompt_tokens=8 decode_tokens=1
+nano_fused_decode_bench: profile-warmup 1/1 start
+nano_fused_decode_bench: profile-warmup 1/1 prefill start prompt_tokens=8 decode_tokens=1
+nano_fused_decode_bench: profile-warmup 1/1 prefill complete elapsed_ms=148.609 seed_token=2516
+nano_fused_decode_bench: profile-warmup 1/1 decode step 1/1 start consume_token=2516
+nano_fused_decode_bench: profile-warmup 1/1 decode step 1/1 elapsed_ms=20.8149 next_token=1261
+nano_fused_decode_bench: profile-warmup 1/1 prefill_ms=148.609 decode_mean_ms=20.8149
+Capture range started in the application.
+===PREFILL_START===
+===PREFILL_END===
+===DECODE_START===
+===DECODE_END===
+Capture range ended in the application.
+Generating '/tmp/nsys-report-4666.qdstrm'
+
+[1/1] [0%                          ] prompt_0008_profile.nsys-repProcessing events...
+
+[1/1] [0%                          ] prompt_0008_profile.nsys-rep
+[1/1] [7%                          ] prompt_0008_profile.nsys-rep
+[1/1] [14%                         ] prompt_0008_profile.nsys-rep
+[1/1] [=====================86%    ] prompt_0008_profile.nsys-rep
+[1/1] [========================100%] prompt_0008_profile.nsys-rep
+[1/1] [========================100%] prompt_0008_profile.nsys-rep
+Generated:
+	/home/khkramer/src/nemotron-inference/artifacts/benchmarks/nano_shared_prefill_20260411T152541Z_cuda130_raw/prompt_0008_profile.nsys-rep
+nano_fused_decode_bench: mode=profile-ready prompt_tokens=8 decode_tokens=1 prefill_ms=41.468 decode_ms=13.843
+linear_op_counters dense_fastpath_plan_success=240 dense_fastpath_plan_fail=0 dense_fastpath_execute=240 dense_fastpath_execute_fail=0 nvfp4_fastpath_plan_success=136 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=136 nvfp4_fastpath_execute_fail=0 scaled_fp8_fastpath_execute=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=46 monolithic_layers=46 staging_elapsed_us=0

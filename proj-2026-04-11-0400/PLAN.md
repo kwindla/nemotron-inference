@@ -182,7 +182,7 @@ Acceptance checks:
   - compare the reconstructed activations against the legacy grouped path
   Key files: `runtime/include/nemotron/request_context.h`, `runtime/src/backend/request_context.cpp`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **8. Benchmark and compare**
+- [x] **8. Benchmark and compare**
   Run `benchmarks/nano_shared_prefill/run_default_bench.sh` and compare against the Phase 1 baseline artifact using `tools/benchmark_analysis/compare_shared_prefill_benchmarks.py`. Record:
   1. end-to-end prefill latency
   2. short-prompt TTFT
@@ -201,5 +201,5 @@ Acceptance checks:
 | 4 | Prototype staged FP4 pack | done | 6f0105f | GPU vs CPU byte-exact; FP32 vs BF16 legacy byte-exact; 69/72 pass |
 | 5 | Implement fused epilogue | done | d7e9bff | Warp-local path, shfl_xor max-abs + shfl_down nibble pack; fixed reg loop OOB; 69/72 |
 | 6 | Add FP4-direct launcher + wire it in | done | 802e05d | Wired, env-gated, BF16 default stable 69/72; direct path has correctness blocker (step 7 diagnosis) |
-| 7 | Validate, then remove BF16 workspace if safe | done | — | Smem staging fix + zero-fill; BF16 workspace NOT removed (P5 not naturally selected for nano test); 69/72 |
-| 8 | Benchmark and compare | pending | — | TTFT + TPS + kernel timing + vLLM parity |
+| 7 | Validate, then remove BF16 workspace if safe | done | 6f6dee7 | Smem staging fix + zero-fill; BF16 workspace NOT removed (P5 not naturally selected for nano test); 69/72 |
+| 8 | Benchmark and compare | completed | — | `benchmark_results/step8_benchmark_summary.md`; hot prefill mostly flat, cold setup regressed up to `+5.54 ms`, routed Nsight traces still include `RoutedBf16Relu2PackKernel`, vLLM parity only `2/8` matching turns |

@@ -1,0 +1,1833 @@
+{
+  "tokenizer": "/home/khkramer/src/nemotron-inference/artifacts/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "shared_history_from": "vllm",
+  "cases": [
+    {
+      "name": "short_exact",
+      "turns": [
+        {
+          "user": "Return exactly the text NEMOTRON_TEST and nothing else.",
+          "max_tokens": 96
+        }
+      ],
+      "system": "You are a precise assistant. Follow instructions exactly."
+    },
+    {
+      "name": "boundary_exact_reply",
+      "turns": [
+        {
+          "user": "please Reply with exactly the single character 4 and nothing else.",
+          "max_tokens": 96
+        }
+      ],
+      "system": "You are a precise assistant. Follow instructions exactly."
+    },
+    {
+      "name": "json_exact",
+      "turns": [
+        {
+          "user": "Return exactly this JSON and nothing else: {\"answer\":4}",
+          "max_tokens": 128
+        }
+      ],
+      "system": "You are a precise assistant. Follow instructions exactly."
+    },
+    {
+      "name": "multi_turn_codeword",
+      "turns": [
+        {
+          "user": "Remember this codeword: ALPHA7. Reply exactly OK.",
+          "max_tokens": 64
+        },
+        {
+          "user": "What is the codeword? Reply exactly ALPHA7 and nothing else.",
+          "max_tokens": 64
+        }
+      ],
+      "system": "You are a precise assistant. Follow instructions exactly."
+    },
+    {
+      "name": "multi_turn_recall_open",
+      "turns": [
+        {
+          "user": "Tell me a joke.",
+          "max_tokens": 64
+        },
+        {
+          "user": "How about one about a scarecrow.",
+          "max_tokens": 64
+        },
+        {
+          "user": "I love that one. But I forgot the first joke. What was the first joke?",
+          "max_tokens": 64
+        }
+      ],
+      "system": ""
+    }
+  ],
+  "results": {
+    "vllm": {
+      "short_exact": {
+        "runtime": "vllm",
+        "case_name": "short_exact",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Return exactly the text NEMOTRON_TEST and nothing else."
+              }
+            ],
+            "raw_text": "The user wants exactly the text \"NEMOTRON_TEST\" and nothing else. Must output exactly that string, no extra whitespace, no punctuation, no extra characters. Just \"NEMOTRON_TEST\". Ensure no extra newline? Probably just that line. Provide exactly that.\n</think>\nNEMOTRON_TEST",
+            "visible_text": "NEMOTRON_TEST",
+            "normalized_visible_text": "NEMOTRON_TEST",
+            "visible_token_ids": [
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103
+            ],
+            "normalized_visible_token_ids": [
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          }
+        ]
+      },
+      "boundary_exact_reply": {
+        "runtime": "vllm",
+        "case_name": "boundary_exact_reply",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "please Reply with exactly the single character 4 and nothing else."
+              }
+            ],
+            "raw_text": "The user wants exactly the single character \"4\" and nothing else. Must output exactly \"4\". No extra whitespace, no punctuation. Just the character 4. Ensure no extra newline? Probably just \"4\". Should be exactly that.\n</think>\n4",
+            "visible_text": "4",
+            "normalized_visible_text": "4",
+            "visible_token_ids": [
+              1052
+            ],
+            "normalized_visible_token_ids": [
+              1052
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          }
+        ]
+      },
+      "json_exact": {
+        "runtime": "vllm",
+        "case_name": "json_exact",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Return exactly this JSON and nothing else: {\"answer\":4}"
+              }
+            ],
+            "raw_text": "The user wants exactly JSON: {\"answer\":4} and nothing else. Must output exactly that JSON, no extra whitespace? They said \"Return exactly this JSON and nothing else\". So we should output exactly {\"answer\":4}. No extra newline? Probably just that string. Ensure no extra characters.\n</think>\n{\"answer\":4}",
+            "visible_text": "{\"answer\":4}",
+            "normalized_visible_text": "{\"answer\":4}",
+            "visible_token_ids": [
+              19227,
+              24613,
+              2811,
+              1052,
+              1125
+            ],
+            "normalized_visible_token_ids": [
+              19227,
+              24613,
+              2811,
+              1052,
+              1125
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          }
+        ]
+      },
+      "multi_turn_codeword": {
+        "runtime": "vllm",
+        "case_name": "multi_turn_codeword",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Remember this codeword: ALPHA7. Reply exactly OK."
+              }
+            ],
+            "raw_text": "The user says: \"Remember this codeword: ALPHA7. Reply exactly OK.\" So they want the assistant to reply exactly \"OK\". No extra text. Must obey. So reply \"OK\".\n</think>\nOK",
+            "visible_text": "OK",
+            "normalized_visible_text": "OK",
+            "visible_token_ids": [
+              13257
+            ],
+            "normalized_visible_token_ids": [
+              13257
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          },
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Remember this codeword: ALPHA7. Reply exactly OK."
+              },
+              {
+                "role": "assistant",
+                "content": "OK"
+              },
+              {
+                "role": "user",
+                "content": "What is the codeword? Reply exactly ALPHA7 and nothing else."
+              }
+            ],
+            "raw_text": "The user wants the assistant to reply exactly \"ALPHA7\" and nothing else. Must obey. No extra punctuation, no extra whitespace? Probably just \"ALPHA7\". Must not add anything else. So output exactly that.\n</think>\nALPHA7",
+            "visible_text": "ALPHA7",
+            "normalized_visible_text": "ALPHA7",
+            "visible_token_ids": [
+              4286,
+              123443,
+              1055
+            ],
+            "normalized_visible_token_ids": [
+              4286,
+              123443,
+              1055
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          }
+        ]
+      },
+      "multi_turn_recall_open": {
+        "runtime": "vllm",
+        "case_name": "multi_turn_recall_open",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "user",
+                "content": "Tell me a joke."
+              }
+            ],
+            "raw_text": "The user wants a joke. Simple. Provide a joke. No constraints. Just respond with a joke.\n</think>\nWhy don\u2019t scientists trust atoms?\n\nBecause they make up everything!",
+            "visible_text": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!",
+            "normalized_visible_text": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!",
+            "visible_token_ids": [
+              19429,
+              2607,
+              2698,
+              30637,
+              12319,
+              21628,
+              2634,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033
+            ],
+            "normalized_visible_token_ids": [
+              19429,
+              2607,
+              2698,
+              30637,
+              12319,
+              21628,
+              2634,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          },
+          {
+            "prompt_messages": [
+              {
+                "role": "user",
+                "content": "Tell me a joke."
+              },
+              {
+                "role": "assistant",
+                "content": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!"
+              },
+              {
+                "role": "user",
+                "content": "How about one about a scarecrow."
+              }
+            ],
+            "raw_text": "User wants a joke about a scarecrow. Provide a joke.\n</think>\nWhy did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a",
+            "visible_text": "Why did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a",
+            "normalized_visible_text": "Why did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a",
+            "visible_token_ids": [
+              19429,
+              2697,
+              1278,
+              102454,
+              82468,
+              6127,
+              1261,
+              10973,
+              102454,
+              82468,
+              2634,
+              26768,
+              1514,
+              1486,
+              42102,
+              1294,
+              1794,
+              3727,
+              1321,
+              5282,
+              1880,
+              1261,
+              2129,
+              114142,
+              1121,
+              1414,
+              14104,
+              1033,
+              119685,
+              1140,
+              1189,
+              1240,
+              1159,
+              1152,
+              1138
+            ],
+            "normalized_visible_token_ids": [
+              19429,
+              2697,
+              1278,
+              102454,
+              82468,
+              6127,
+              1261,
+              10973,
+              102454,
+              82468,
+              2634,
+              26768,
+              1514,
+              1486,
+              42102,
+              1294,
+              1794,
+              3727,
+              1321,
+              5282,
+              1880,
+              1261,
+              2129,
+              114142,
+              1121,
+              1414,
+              14104,
+              1033,
+              119685,
+              1140,
+              1189,
+              1240,
+              1159,
+              1152,
+              1138
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          },
+          {
+            "prompt_messages": [
+              {
+                "role": "user",
+                "content": "Tell me a joke."
+              },
+              {
+                "role": "assistant",
+                "content": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!"
+              },
+              {
+                "role": "user",
+                "content": "How about one about a scarecrow."
+              },
+              {
+                "role": "assistant",
+                "content": "Why did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a"
+              },
+              {
+                "role": "user",
+                "content": "I love that one. But I forgot the first joke. What was the first joke?"
+              }
+            ],
+            "raw_text": "User wants the first joke that was told. The first joke was \"Why don\u2019t scientists trust atoms? Because they make up everything!\" So we can repeat it. Also maybe ask if they'd like another. Provide the joke.\n</think>\nThe first joke was:\n\n**Why don\u2019t scientists trust atoms?**  \nBecause",
+            "visible_text": "The first joke was:\n\n**Why don\u2019t scientists trust atoms?**  \nBecause",
+            "normalized_visible_text": "The first joke was:\n\n**Why don\u2019t scientists trust atoms?**  \nBecause",
+            "visible_token_ids": [
+              1784,
+              2158,
+              53052,
+              1486,
+              2100,
+              1438,
+              19429,
+              2607,
+              2698,
+              30637,
+              12319,
+              21628,
+              107413,
+              1256,
+              1010,
+              26768
+            ],
+            "normalized_visible_token_ids": [
+              1784,
+              2158,
+              53052,
+              1486,
+              2100,
+              1438,
+              19429,
+              2607,
+              2698,
+              30637,
+              12319,
+              21628,
+              107413,
+              1256,
+              1010,
+              26768
+            ],
+            "generated_token_ids": null,
+            "prompt_token_ids": null,
+            "cache_mode": null
+          }
+        ]
+      }
+    },
+    "native": {
+      "short_exact": {
+        "runtime": "native",
+        "case_name": "short_exact",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Return exactly the text NEMOTRON_TEST and nothing else."
+              }
+            ],
+            "raw_text": "The user wants exactly the text \"NEMOTRON_TEST\" and nothing else. Must output exactly that string, no extra whitespace, no punctuation, no extra characters. So just \"NEMOTRON_TEST\". Ensure no extra newline? Probably just that line. Provide exactly that.\n</think>\nNEMOTRON_TEST<|im_end|>",
+            "visible_text": "NEMOTRON_TEST<|im_end|>",
+            "normalized_visible_text": "NEMOTRON_TEST",
+            "visible_token_ids": [
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103,
+              11
+            ],
+            "normalized_visible_token_ids": [
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103
+            ],
+            "generated_token_ids": [
+              1784,
+              3330,
+              17000,
+              10693,
+              1278,
+              3403,
+              1429,
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103,
+              1034,
+              1321,
+              7545,
+              2849,
+              1046,
+              26666,
+              4848,
+              10693,
+              1455,
+              3310,
+              1044,
+              1836,
+              7185,
+              81024,
+              1044,
+              1836,
+              34315,
+              65656,
+              1044,
+              1836,
+              7185,
+              11084,
+              1046,
+              4493,
+              2586,
+              1429,
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103,
+              3871,
+              87334,
+              1836,
+              7185,
+              91924,
+              1063,
+              62178,
+              2586,
+              1455,
+              3110,
+              1046,
+              99478,
+              10693,
+              1455,
+              1626,
+              13,
+              1010,
+              1078,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103,
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              4568,
+              1584,
+              1261,
+              25399,
+              27089,
+              1046,
+              50856,
+              15776,
+              10693,
+              1046,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              15773,
+              10693,
+              1278,
+              3403,
+              1464,
+              15187,
+              6918,
+              1082,
+              2918,
+              46103,
+              1321,
+              7545,
+              2849,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          }
+        ]
+      },
+      "boundary_exact_reply": {
+        "runtime": "native",
+        "case_name": "boundary_exact_reply",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "please Reply with exactly the single character 4 and nothing else."
+              }
+            ],
+            "raw_text": " 1.1.1.1:443<|im_end|>",
+            "visible_text": "1.1.1.1:443<|im_end|>",
+            "normalized_visible_text": "1.1.1.1:443",
+            "visible_token_ids": [
+              1049,
+              1046,
+              1049,
+              1046,
+              1049,
+              1046,
+              1049,
+              1058,
+              1052,
+              1052,
+              1051,
+              11
+            ],
+            "normalized_visible_token_ids": [
+              1049,
+              1046,
+              1049,
+              1046,
+              1049,
+              1046,
+              1049,
+              1058,
+              1052,
+              1052,
+              1051
+            ],
+            "generated_token_ids": [
+              1032,
+              1049,
+              1046,
+              1049,
+              1046,
+              1049,
+              1046,
+              1049,
+              1058,
+              1052,
+              1052,
+              1051,
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              4568,
+              1584,
+              1261,
+              25399,
+              27089,
+              1046,
+              50856,
+              15776,
+              10693,
+              1046,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              76786,
+              124963,
+              1454,
+              10693,
+              1278,
+              4249,
+              4145,
+              1032,
+              1052,
+              1321,
+              7545,
+              2849,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          }
+        ]
+      },
+      "json_exact": {
+        "runtime": "native",
+        "case_name": "json_exact",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Return exactly this JSON and nothing else: {\"answer\":4}"
+              }
+            ],
+            "raw_text": "\"Answer: Yes\"<|im_end|>",
+            "visible_text": "\"Answer: Yes\"<|im_end|>",
+            "normalized_visible_text": "\"Answer: Yes\"",
+            "visible_token_ids": [
+              1034,
+              31106,
+              1058,
+              13830,
+              1034,
+              11
+            ],
+            "normalized_visible_token_ids": [
+              1034,
+              31106,
+              1058,
+              13830,
+              1034
+            ],
+            "generated_token_ids": [
+              1034,
+              31106,
+              1058,
+              13830,
+              1034,
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              4568,
+              1584,
+              1261,
+              25399,
+              27089,
+              1046,
+              50856,
+              15776,
+              10693,
+              1046,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              15773,
+              10693,
+              1593,
+              11748,
+              1321,
+              7545,
+              2849,
+              1058,
+              16753,
+              24613,
+              2811,
+              1052,
+              1125,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          }
+        ]
+      },
+      "multi_turn_codeword": {
+        "runtime": "native",
+        "case_name": "multi_turn_codeword",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Remember this codeword: ALPHA7. Reply exactly OK."
+              }
+            ],
+            "raw_text": " \n\nWe need to respond with the codeword? The user says \"Remember this codeword: ALPHA\". They likely want the assistant to remember it for later. We can acknowledge. No disallowed content. Just respond acknowledging.\n</think>\nGot it! I\u2019ve noted the codeword **ALPHA** for future",
+            "visible_text": "Got it! I\u2019ve noted the codeword **ALPHA** for future",
+            "normalized_visible_text": "Got it! I\u2019ve noted the codeword **ALPHA** for future",
+            "visible_token_ids": [
+              83704,
+              1494,
+              1033,
+              1362,
+              8056,
+              10656,
+              1278,
+              3475,
+              3494,
+              1603,
+              4286,
+              123443,
+              1438,
+              1394,
+              7147
+            ],
+            "normalized_visible_token_ids": [
+              83704,
+              1494,
+              1033,
+              1362,
+              8056,
+              10656,
+              1278,
+              3475,
+              3494,
+              1603,
+              4286,
+              123443,
+              1438,
+              1394,
+              7147
+            ],
+            "generated_token_ids": [
+              1032,
+              1267,
+              4268,
+              2534,
+              1317,
+              9148,
+              1454,
+              1278,
+              3475,
+              3494,
+              1063,
+              1531,
+              3330,
+              8223,
+              1429,
+              68552,
+              1593,
+              3475,
+              3494,
+              1058,
+              14646,
+              123443,
+              3871,
+              4159,
+              6906,
+              2933,
+              1278,
+              27089,
+              1317,
+              10532,
+              1494,
+              1394,
+              4025,
+              1046,
+              2837,
+              1710,
+              42332,
+              1046,
+              3501,
+              1759,
+              61434,
+              4701,
+              1046,
+              7490,
+              9148,
+              111975,
+              1626,
+              13,
+              1010,
+              83704,
+              1494,
+              1033,
+              1362,
+              8056,
+              10656,
+              1278,
+              3475,
+              3494,
+              1603,
+              4286,
+              123443,
+              1438,
+              1394,
+              7147
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              4568,
+              1584,
+              1261,
+              25399,
+              27089,
+              1046,
+              50856,
+              15776,
+              10693,
+              1046,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              68552,
+              1593,
+              3475,
+              3494,
+              1058,
+              14646,
+              123443,
+              1055,
+              1046,
+              124963,
+              10693,
+              23313,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          },
+          {
+            "prompt_messages": [
+              {
+                "role": "system",
+                "content": "You are a precise assistant. Follow instructions exactly."
+              },
+              {
+                "role": "user",
+                "content": "Remember this codeword: ALPHA7. Reply exactly OK."
+              },
+              {
+                "role": "assistant",
+                "content": "OK"
+              },
+              {
+                "role": "user",
+                "content": "What is the codeword? Reply exactly ALPHA7 and nothing else."
+              }
+            ],
+            "raw_text": "The user wants the assistant to reply exactly \"ALPHA7\" and nothing else. Must obey. No extra punctuation, no extra whitespace? Probably just the string. So output exactly \"ALPHA7\".\n</think>\nALPHA7<|im_end|>",
+            "visible_text": "ALPHA7<|im_end|>",
+            "normalized_visible_text": "ALPHA7",
+            "visible_token_ids": [
+              4286,
+              123443,
+              1055,
+              11
+            ],
+            "normalized_visible_token_ids": [
+              4286,
+              123443,
+              1055
+            ],
+            "generated_token_ids": [
+              1784,
+              3330,
+              17000,
+              1278,
+              27089,
+              1317,
+              22695,
+              10693,
+              1429,
+              4286,
+              123443,
+              1055,
+              1034,
+              1321,
+              7545,
+              2849,
+              1046,
+              26666,
+              56819,
+              1046,
+              3501,
+              7185,
+              34315,
+              65656,
+              1044,
+              1836,
+              7185,
+              81024,
+              1063,
+              62178,
+              2586,
+              1278,
+              3310,
+              1046,
+              4493,
+              4848,
+              10693,
+              1429,
+              4286,
+              123443,
+              1055,
+              24483,
+              13,
+              1010,
+              4286,
+              123443,
+              1055,
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              4568,
+              1584,
+              1261,
+              25399,
+              27089,
+              1046,
+              50856,
+              15776,
+              10693,
+              1046,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              68552,
+              1593,
+              3475,
+              3494,
+              1058,
+              14646,
+              123443,
+              1055,
+              1046,
+              124963,
+              10693,
+              23313,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              13,
+              13257,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              7493,
+              1395,
+              1278,
+              3475,
+              3494,
+              1063,
+              124963,
+              10693,
+              14646,
+              123443,
+              1055,
+              1321,
+              7545,
+              2849,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          }
+        ]
+      },
+      "multi_turn_recall_open": {
+        "runtime": "native",
+        "case_name": "multi_turn_recall_open",
+        "turns": [
+          {
+            "prompt_messages": [
+              {
+                "role": "user",
+                "content": "Tell me a joke."
+              }
+            ],
+            "raw_text": "The user wants a joke. Simple. Provide a joke. Probably short. No constraints. Just respond with a joke.\n</think>\nSure! Here's one for you:\n\n**Why don't scientists trust atoms?**\n\nBecause they make up everything! \ud83d\ude04<|im_end|>",
+            "visible_text": "Sure! Here's one for you:\n\n**Why don't scientists trust atoms?**\n\nBecause they make up everything! \ud83d\ude04<|im_end|>",
+            "normalized_visible_text": "Sure! Here's one for you:\n\n**Why don't scientists trust atoms?**\n\nBecause they make up everything! \ud83d\ude04",
+            "visible_token_ids": [
+              69957,
+              1033,
+              9380,
+              1681,
+              1925,
+              1394,
+              1636,
+              2100,
+              1438,
+              19429,
+              2607,
+              2405,
+              30637,
+              12319,
+              21628,
+              73064,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033,
+              119685,
+              1152,
+              1132,
+              11
+            ],
+            "normalized_visible_token_ids": [
+              69957,
+              1033,
+              9380,
+              1681,
+              1925,
+              1394,
+              1636,
+              2100,
+              1438,
+              19429,
+              2607,
+              2405,
+              30637,
+              12319,
+              21628,
+              73064,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033,
+              119685,
+              1152,
+              1132
+            ],
+            "generated_token_ids": [
+              1784,
+              3330,
+              17000,
+              1261,
+              53052,
+              1046,
+              22966,
+              1046,
+              99478,
+              1261,
+              53052,
+              1046,
+              62178,
+              4958,
+              1046,
+              3501,
+              22855,
+              1046,
+              7490,
+              9148,
+              1454,
+              1261,
+              53052,
+              1626,
+              13,
+              1010,
+              69957,
+              1033,
+              9380,
+              1681,
+              1925,
+              1394,
+              1636,
+              2100,
+              1438,
+              19429,
+              2607,
+              2405,
+              30637,
+              12319,
+              21628,
+              73064,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033,
+              119685,
+              1152,
+              1132,
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              69839,
+              1639,
+              1261,
+              53052,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          },
+          {
+            "prompt_messages": [
+              {
+                "role": "user",
+                "content": "Tell me a joke."
+              },
+              {
+                "role": "assistant",
+                "content": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!"
+              },
+              {
+                "role": "user",
+                "content": "How about one about a scarecrow."
+              }
+            ],
+            "raw_text": "<|im_end|>",
+            "visible_text": "<|im_end|>",
+            "normalized_visible_text": "",
+            "visible_token_ids": [
+              11
+            ],
+            "normalized_visible_token_ids": [],
+            "generated_token_ids": [
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              69839,
+              1639,
+              1261,
+              53052,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              13,
+              19429,
+              2607,
+              2698,
+              30637,
+              12319,
+              21628,
+              2634,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              7801,
+              2314,
+              1925,
+              2314,
+              1261,
+              102454,
+              82468,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          },
+          {
+            "prompt_messages": [
+              {
+                "role": "user",
+                "content": "Tell me a joke."
+              },
+              {
+                "role": "assistant",
+                "content": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!"
+              },
+              {
+                "role": "user",
+                "content": "How about one about a scarecrow."
+              },
+              {
+                "role": "assistant",
+                "content": "Why did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a"
+              },
+              {
+                "role": "user",
+                "content": "I love that one. But I forgot the first joke. What was the first joke?"
+              }
+            ],
+            "raw_text": "I\u2019m sorry\u2014I don\u2019t have a record of the first joke we exchanged. If you\u2019d like, I can tell you another joke (maybe about a scarecrow, a scientist, or anything else you prefer). Just let me know what you\u2019re in the mood for!<|im_end|>",
+            "visible_text": "I\u2019m sorry\u2014I don\u2019t have a record of the first joke we exchanged. If you\u2019d like, I can tell you another joke (maybe about a scarecrow, a scientist, or anything else you prefer). Just let me know what you\u2019re in the mood for!<|im_end|>",
+            "normalized_visible_text": "I\u2019m sorry\u2014I don\u2019t have a record of the first joke we exchanged. If you\u2019d like, I can tell you another joke (maybe about a scarecrow, a scientist, or anything else you prefer). Just let me know what you\u2019re in the mood for!",
+            "visible_token_ids": [
+              1073,
+              6135,
+              17889,
+              61474,
+              2607,
+              2698,
+              1736,
+              1261,
+              4218,
+              1307,
+              1278,
+              2158,
+              53052,
+              1729,
+              57351,
+              1046,
+              3367,
+              1636,
+              5265,
+              2479,
+              1044,
+              1362,
+              1710,
+              5584,
+              1636,
+              3866,
+              53052,
+              1319,
+              87088,
+              2314,
+              1261,
+              102454,
+              82468,
+              1044,
+              1261,
+              51475,
+              1044,
+              1505,
+              7211,
+              2849,
+              1636,
+              6604,
+              1577,
+              7490,
+              2878,
+              1639,
+              2840,
+              2549,
+              1636,
+              6417,
+              1294,
+              1278,
+              26380,
+              1394,
+              1033,
+              11
+            ],
+            "normalized_visible_token_ids": [
+              1073,
+              6135,
+              17889,
+              61474,
+              2607,
+              2698,
+              1736,
+              1261,
+              4218,
+              1307,
+              1278,
+              2158,
+              53052,
+              1729,
+              57351,
+              1046,
+              3367,
+              1636,
+              5265,
+              2479,
+              1044,
+              1362,
+              1710,
+              5584,
+              1636,
+              3866,
+              53052,
+              1319,
+              87088,
+              2314,
+              1261,
+              102454,
+              82468,
+              1044,
+              1261,
+              51475,
+              1044,
+              1505,
+              7211,
+              2849,
+              1636,
+              6604,
+              1577,
+              7490,
+              2878,
+              1639,
+              2840,
+              2549,
+              1636,
+              6417,
+              1294,
+              1278,
+              26380,
+              1394,
+              1033
+            ],
+            "generated_token_ids": [
+              1073,
+              6135,
+              17889,
+              61474,
+              2607,
+              2698,
+              1736,
+              1261,
+              4218,
+              1307,
+              1278,
+              2158,
+              53052,
+              1729,
+              57351,
+              1046,
+              3367,
+              1636,
+              5265,
+              2479,
+              1044,
+              1362,
+              1710,
+              5584,
+              1636,
+              3866,
+              53052,
+              1319,
+              87088,
+              2314,
+              1261,
+              102454,
+              82468,
+              1044,
+              1261,
+              51475,
+              1044,
+              1505,
+              7211,
+              2849,
+              1636,
+              6604,
+              1577,
+              7490,
+              2878,
+              1639,
+              2840,
+              2549,
+              1636,
+              6417,
+              1294,
+              1278,
+              26380,
+              1394,
+              1033,
+              11
+            ],
+            "prompt_token_ids": [
+              10,
+              25708,
+              1010,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              69839,
+              1639,
+              1261,
+              53052,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              13,
+              19429,
+              2607,
+              2698,
+              30637,
+              12319,
+              21628,
+              2634,
+              26768,
+              2127,
+              3180,
+              2015,
+              8605,
+              1033,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              7801,
+              2314,
+              1925,
+              2314,
+              1261,
+              102454,
+              82468,
+              1046,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              13,
+              19429,
+              2697,
+              1278,
+              102454,
+              82468,
+              6127,
+              1261,
+              10973,
+              102454,
+              82468,
+              2634,
+              26768,
+              1514,
+              1486,
+              42102,
+              1294,
+              1794,
+              3727,
+              1321,
+              5282,
+              1880,
+              1261,
+              2129,
+              114142,
+              1121,
+              1414,
+              14104,
+              1033,
+              119685,
+              1140,
+              1189,
+              1240,
+              1159,
+              1152,
+              1138,
+              11,
+              1010,
+              10,
+              3263,
+              1010,
+              1073,
+              7107,
+              1455,
+              1925,
+              1046,
+              3626,
+              1362,
+              24652,
+              1278,
+              2158,
+              53052,
+              1046,
+              5675,
+              1486,
+              1278,
+              2158,
+              53052,
+              1063,
+              11,
+              1010,
+              10,
+              1503,
+              19464,
+              1010,
+              12,
+              1010
+            ],
+            "cache_mode": "disabled"
+          }
+        ]
+      }
+    }
+  },
+  "comparisons": [
+    {
+      "case": "short_exact",
+      "anchor_runtime": "vllm",
+      "comparisons": [
+        {
+          "case": "short_exact",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 0,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": true,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": true,
+          "first_normalized_visible_token_diff_index": null,
+          "anchor_visible_text": "NEMOTRON_TEST",
+          "anchor_normalized_visible_text": "NEMOTRON_TEST",
+          "runtime_visible_text": "NEMOTRON_TEST<|im_end|>",
+          "runtime_normalized_visible_text": "NEMOTRON_TEST"
+        }
+      ]
+    },
+    {
+      "case": "boundary_exact_reply",
+      "anchor_runtime": "vllm",
+      "comparisons": [
+        {
+          "case": "boundary_exact_reply",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 0,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": false,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": false,
+          "first_normalized_visible_token_diff_index": 0,
+          "anchor_visible_text": "4",
+          "anchor_normalized_visible_text": "4",
+          "runtime_visible_text": "1.1.1.1:443<|im_end|>",
+          "runtime_normalized_visible_text": "1.1.1.1:443"
+        }
+      ]
+    },
+    {
+      "case": "json_exact",
+      "anchor_runtime": "vllm",
+      "comparisons": [
+        {
+          "case": "json_exact",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 0,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": false,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": false,
+          "first_normalized_visible_token_diff_index": 0,
+          "anchor_visible_text": "{\"answer\":4}",
+          "anchor_normalized_visible_text": "{\"answer\":4}",
+          "runtime_visible_text": "\"Answer: Yes\"<|im_end|>",
+          "runtime_normalized_visible_text": "\"Answer: Yes\""
+        }
+      ]
+    },
+    {
+      "case": "multi_turn_codeword",
+      "anchor_runtime": "vllm",
+      "comparisons": [
+        {
+          "case": "multi_turn_codeword",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 0,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": false,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": false,
+          "first_normalized_visible_token_diff_index": 0,
+          "anchor_visible_text": "OK",
+          "anchor_normalized_visible_text": "OK",
+          "runtime_visible_text": "Got it! I\u2019ve noted the codeword **ALPHA** for future",
+          "runtime_normalized_visible_text": "Got it! I\u2019ve noted the codeword **ALPHA** for future"
+        },
+        {
+          "case": "multi_turn_codeword",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 1,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": true,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": true,
+          "first_normalized_visible_token_diff_index": null,
+          "anchor_visible_text": "ALPHA7",
+          "anchor_normalized_visible_text": "ALPHA7",
+          "runtime_visible_text": "ALPHA7<|im_end|>",
+          "runtime_normalized_visible_text": "ALPHA7"
+        }
+      ]
+    },
+    {
+      "case": "multi_turn_recall_open",
+      "anchor_runtime": "vllm",
+      "comparisons": [
+        {
+          "case": "multi_turn_recall_open",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 0,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": false,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": false,
+          "first_normalized_visible_token_diff_index": 0,
+          "anchor_visible_text": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!",
+          "anchor_normalized_visible_text": "Why don\u2019t scientists trust atoms?\n\nBecause they make up everything!",
+          "runtime_visible_text": "Sure! Here's one for you:\n\n**Why don't scientists trust atoms?**\n\nBecause they make up everything! \ud83d\ude04<|im_end|>",
+          "runtime_normalized_visible_text": "Sure! Here's one for you:\n\n**Why don't scientists trust atoms?**\n\nBecause they make up everything! \ud83d\ude04"
+        },
+        {
+          "case": "multi_turn_recall_open",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 1,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": false,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": false,
+          "first_normalized_visible_token_diff_index": 0,
+          "anchor_visible_text": "Why did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a",
+          "anchor_normalized_visible_text": "Why did the scarecrow become a successful scarecrow?\n\nBecause he was outstanding in his field and always had a \u201ccorny\u201d spot! \ud83c\udf3d\ud83d\ude0a",
+          "runtime_visible_text": "<|im_end|>",
+          "runtime_normalized_visible_text": ""
+        },
+        {
+          "case": "multi_turn_recall_open",
+          "anchor_runtime": "vllm",
+          "runtime": "native",
+          "turn_index": 2,
+          "exact_visible_text_match": false,
+          "exact_normalized_text_match": false,
+          "exact_raw_text_match": false,
+          "visible_token_id_match": false,
+          "first_normalized_visible_token_diff_index": 0,
+          "anchor_visible_text": "The first joke was:\n\n**Why don\u2019t scientists trust atoms?**  \nBecause",
+          "anchor_normalized_visible_text": "The first joke was:\n\n**Why don\u2019t scientists trust atoms?**  \nBecause",
+          "runtime_visible_text": "I\u2019m sorry\u2014I don\u2019t have a record of the first joke we exchanged. If you\u2019d like, I can tell you another joke (maybe about a scarecrow, a scientist, or anything else you prefer). Just let me know what you\u2019re in the mood for!<|im_end|>",
+          "runtime_normalized_visible_text": "I\u2019m sorry\u2014I don\u2019t have a record of the first joke we exchanged. If you\u2019d like, I can tell you another joke (maybe about a scarecrow, a scientist, or anything else you prefer). Just let me know what you\u2019re in the mood for!"
+        }
+      ]
+    }
+  ]
+}
