@@ -126,7 +126,7 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
   Add a temporary `P5EpilogueMode::kFp4WarpLocal` value while bringing the code up, but the end state is to make the warp-local implementation the only production direct-FP4 P5 epilogue and delete the smem-staged path rather than keep a permanent selector.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **3. Wire the warp-local path and validate**
+- [x] **3. Wire the warp-local path and validate**
   Update `LaunchPlannedPackedInputMatVecFp4Direct` and the kernel instantiation to use the warp-local direct epilogue. Use the new low-level bitwise oracle as the primary bring-up check, then use the explicit forced-P5 runtime command to prove the live P5 code path. Once the low-level oracle and forced-P5 runtime checks pass, remove the 16KB `fp4_direct_stage_storage` allocation and delete the staged direct production path. Run validation:
   1. `ctest -j1` → 69/72
   2. low-level warp-local pack test with non-uniform per-row tensor scales → bitwise match to staged/reference outputs
@@ -144,6 +144,6 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Lock probe + invariants + test seam | done | 7cf6f27 | static_assert on part_c size==16; ValidateP5WarpLocalInvariants confirms ownership pattern; test seam passes with non-uniform per-row scales |
-| 2 | Build tables + warp-local implementation | done | — | constexpr tables + StoreUnifiedRoutedFp4WarpLocalPack + kFp4WarpLocal dispatch; compile-clean, not wired yet |
-| 3 | Wire and validate | pending | — | |
+| 2 | Build tables + warp-local implementation | done | ded3015 | constexpr tables + StoreUnifiedRoutedFp4WarpLocalPack + kFp4WarpLocal dispatch; compile-clean, not wired yet |
+| 3 | Wire and validate | done | — | Wired kFp4WarpLocal→kFp4Direct, removed staged path + 16KB smem, fixed shuffle mask (subgroup_mask), test seam passes, ctest 69/72, MoE PASS, forced-P5 compare still divergent (pre-existing) |
 | 4 | Benchmark at 384/512 | pending | — | |

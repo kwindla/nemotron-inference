@@ -179,11 +179,6 @@ static_assert(fused_decode::kNvfp4BlockWidth == 16, "FP4 block width must be 16"
 static_assert(
     kTracedP5DirectStageCols == 128 && kTracedP5DirectStageRows == 32,
     "P5 direct stage tile must be 128x32");
-constexpr int kLinearToBlockHalf[16] = {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1};
-constexpr int kLinearToTokenGroup[16] = {0, 2, 0, 2, 1, 3, 1, 3, 0, 2, 0, 2, 1, 3, 1, 3};
-constexpr int kLinearToMHalf[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
-constexpr int kBlockElemMh0[8] = {0, 4, 1, 5, 2, 6, 3, 7};
-constexpr int kBlockElemMh1[8] = {8, 12, 9, 13, 10, 14, 11, 15};
 using TracedP1MmaTileShape = cute::Shape<cute::Int<128>, cute::Int<128>, cute::Int<64>>;
 using TracedP1ClusterShape = cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>;
 using TracedP1Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -533,7 +528,6 @@ enum class UnifiedRoutedFp4Profile {
 enum class P5EpilogueMode {
   kBf16,
   kFp4Direct,
-  kFp4WarpLocal,
 };
 
 template <UnifiedRoutedFp4Profile Profile>
@@ -686,328 +680,7 @@ struct UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP15> {
   }
 };
 
-__device__ __forceinline__ void StageUnifiedRoutedFp4DirectActivated(
-    float alpha,
-    const CRegister* accum_storage,
-    int thread_idx,
-    float (*staged_activated)[kTracedP5DirectStageCols],
-    int output_row_base,
-    int valid_rows,
-    int output_rows_this_tile,
-    std::size_t row_start,
-    std::size_t output_rows_per_expert,
-    const float* per_row_tensor_scales,
-    float weight_tensor_scale,
-    std::uint8_t* fp4_packed_data,
-    std::uint8_t* fp4_block_scales,
-    std::uint8_t* fp4_matmul_block_scales,
-    float* fp4_activation_output_scale,
-    std::size_t fp4_cols,
-    std::size_t fp4_padded_blocks_per_row,
-    Nvfp4ScaleLayout fp4_scale_layout) {
-  if (staged_activated == nullptr ||
-      fp4_cols == 0 ||
-      fp4_cols != output_rows_per_expert ||
-      (fp4_cols % fused_decode::kNvfp4BlockWidth) != 0) {
-    return;
-  }
-
-  auto mma = TracedP5TiledMma{};
-  auto thr_mma = mma.get_thread_slice(thread_idx);
-  auto ref_c = cute::make_identity_tensor(
-      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
-  auto part_c = thr_mma.partition_C(ref_c);
-  static_assert(
-      decltype(cute::size(part_c))::value == 16,
-      "P5 partition_C must have exactly 16 valid elements per thread");
-  auto accum_tensor = cute::make_tensor(
-      reinterpret_cast<CRegister*>(const_cast<CRegister*>(accum_storage)),
-      TracedP5AccumProfileLayout{});
-  const std::size_t output_limit =
-      static_cast<std::size_t>(output_row_base + output_rows_this_tile);
-
-  for (int logical = 0; logical < static_cast<int>(cute::size(part_c)); ++logical) {
-    auto coord = part_c(logical);
-    const int m_coord = static_cast<int>(cute::get<0>(coord));
-    const int n_coord = static_cast<int>(cute::get<1>(coord));
-    if (m_coord < 0 ||
-        n_coord < 0 ||
-        m_coord >= kTracedP5DirectStageCols ||
-        n_coord >= kTracedP5DirectStageRows) {
-      continue;
-    }
-    const std::size_t input_row = row_start + static_cast<std::size_t>(n_coord);
-    const std::size_t output_col = static_cast<std::size_t>(output_row_base + m_coord);
-    float activated = 0.0f;
-    if (n_coord < valid_rows &&
-        output_col < output_limit &&
-        output_col < fp4_cols) {
-      const float row_alpha =
-          per_row_tensor_scales != nullptr
-              ? per_row_tensor_scales[input_row] * weight_tensor_scale
-              : alpha;
-      const float scaled = accum_tensor(logical) * row_alpha;
-      activated = fused_decode::Relu2(
-          __bfloat162float(__float2bfloat16(scaled)));
-    }
-    staged_activated[n_coord][m_coord] = activated;
-  }
-}
-
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
-__device__ __forceinline__ void ValidateP5WarpLocalInvariants(int thread_idx) {
-  constexpr int kLogicalCoords = 16;
-  auto mma = TracedP5TiledMma{};
-  auto thr_mma = mma.get_thread_slice(thread_idx);
-  auto ref_c = cute::make_identity_tensor(
-      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
-  auto part_c = thr_mma.partition_C(ref_c);
-  const int warp_id = thread_idx / 32;
-  const int lane_id = thread_idx & 31;
-  const int lane_group = lane_id & 3;
-  const int n_half = warp_id / 4;
-  const int expected_n_coords[4] = {
-      16 * n_half + 2 * lane_group,
-      16 * n_half + 2 * lane_group + 1,
-      16 * n_half + 8 + 2 * lane_group,
-      16 * n_half + 9 + 2 * lane_group};
-  const unsigned int expected_lane_mask = 0x11111111u << lane_group;
-  int block_ids[kLogicalCoords];
-  int n_coords[kLogicalCoords];
-  int token_row_counts[4] = {0, 0, 0, 0};
-  int low_block = -1;
-  int high_block = -1;
-
-#pragma unroll
-  for (int logical = 0; logical < kLogicalCoords; ++logical) {
-    auto coord = part_c(logical);
-    const int m_coord = static_cast<int>(cute::get<0>(coord));
-    const int n_coord = static_cast<int>(cute::get<1>(coord));
-    assert(m_coord >= 0);
-    assert(m_coord < kTracedP5DirectStageCols);
-    assert(n_coord >= 0);
-    assert(n_coord < kTracedP5DirectStageRows);
-    const int block_id =
-        ((m_coord & 63) / static_cast<int>(fused_decode::kNvfp4BlockWidth)) +
-        (m_coord >= 64 ? 4 : 0);
-    block_ids[logical] = block_id;
-    n_coords[logical] = n_coord;
-    if (m_coord < 64) {
-      if (low_block < 0) {
-        low_block = block_id;
-      } else {
-        assert(block_id == low_block);
-      }
-    } else {
-      if (high_block < 0) {
-        high_block = block_id;
-      } else {
-        assert(block_id == high_block);
-      }
-    }
-    int n_slot = -1;
-#pragma unroll
-    for (int token_row = 0; token_row < 4; ++token_row) {
-      if (n_coord == expected_n_coords[token_row]) {
-        n_slot = token_row;
-      }
-    }
-    assert(n_slot >= 0);
-    ++token_row_counts[n_slot];
-  }
-
-  assert(low_block >= 0);
-  assert(low_block < 4);
-  assert(high_block >= 4);
-  assert(high_block < 8);
-  assert(high_block == low_block + 4);
-
-#pragma unroll
-  for (int token_row = 0; token_row < 4; ++token_row) {
-    assert(token_row_counts[token_row] == 4);
-    bool owns_low_block = false;
-    bool owns_high_block = false;
-#pragma unroll
-    for (int logical = 0; logical < kLogicalCoords; ++logical) {
-      if (n_coords[logical] != expected_n_coords[token_row]) {
-        continue;
-      }
-      if (block_ids[logical] == low_block) {
-        owns_low_block = true;
-      }
-      if (block_ids[logical] == high_block) {
-        owns_high_block = true;
-      }
-    }
-    assert(owns_low_block);
-    assert(owns_high_block);
-    const unsigned int low_block_mask = __ballot_sync(0xffffffffu, owns_low_block);
-    const unsigned int high_block_mask = __ballot_sync(0xffffffffu, owns_high_block);
-    assert(__popc(low_block_mask) == 8);
-    assert(__popc(high_block_mask) == 8);
-    assert(low_block_mask == expected_lane_mask);
-    assert(high_block_mask == expected_lane_mask);
-  }
-}
-#endif
-
-__device__ __forceinline__ void PackUnifiedRoutedFp4DirectStaged(
-    int thread_idx,
-    float (*staged_activated)[kTracedP5DirectStageCols],
-    int output_row_base,
-    int valid_rows,
-    int output_rows_this_tile,
-    std::size_t row_start,
-    std::size_t output_rows_per_expert,
-    std::uint8_t* fp4_packed_data,
-    std::uint8_t* fp4_block_scales,
-    std::uint8_t* fp4_matmul_block_scales,
-    float* fp4_activation_output_scale,
-    std::size_t fp4_cols,
-    std::size_t fp4_padded_blocks_per_row,
-    Nvfp4ScaleLayout fp4_scale_layout) {
-  if (staged_activated == nullptr ||
-      fp4_packed_data == nullptr ||
-      fp4_block_scales == nullptr ||
-      fp4_matmul_block_scales == nullptr ||
-      fp4_activation_output_scale == nullptr ||
-      fp4_cols == 0 ||
-      fp4_cols != output_rows_per_expert ||
-      (fp4_cols % fused_decode::kNvfp4BlockWidth) != 0 ||
-      fp4_padded_blocks_per_row == 0) {
-    return;
-  }
-
-  static_assert(
-      kTracedP5DirectStageRows * kTracedP5DirectBlocksPerRow ==
-          fused_decode::kThreadsPerBlock,
-      "P5 direct pack expects one CTA thread per 16-wide output block");
-
-  const std::size_t blocks_per_row = fp4_cols / fused_decode::kNvfp4BlockWidth;
-  const std::size_t packed_row_bytes = fp4_cols / 2u;
-  const std::size_t output_limit =
-      static_cast<std::size_t>(output_row_base + output_rows_this_tile);
-  const int token_row = thread_idx / kTracedP5DirectBlocksPerRow;
-  const int block_col = thread_idx % kTracedP5DirectBlocksPerRow;
-  const std::size_t input_row = row_start + static_cast<std::size_t>(token_row);
-  const std::size_t output_col =
-      static_cast<std::size_t>(output_row_base) +
-      static_cast<std::size_t>(block_col * fused_decode::kNvfp4BlockWidth);
-  if (output_col >= fp4_cols || output_col >= output_limit) {
-    return;
-  }
-
-  const std::size_t block_index = output_col / fused_decode::kNvfp4BlockWidth;
-  const std::size_t scale_index = input_row * blocks_per_row + block_index;
-  const std::size_t matmul_scale_index = ExecutionScaleOffset(
-      input_row,
-      block_index,
-      fp4_padded_blocks_per_row,
-      fp4_scale_layout);
-  const std::size_t packed_offset = input_row * packed_row_bytes + (output_col / 2u);
-
-  if (token_row >= valid_rows) {
-    fp4_activation_output_scale[scale_index] = 0.0f;
-    fp4_block_scales[scale_index] = 0u;
-    fp4_matmul_block_scales[matmul_scale_index] = 0u;
-    for (std::size_t pair = 0; pair < (fused_decode::kNvfp4BlockWidth / 2u); ++pair) {
-      fp4_packed_data[packed_offset + pair] = 0u;
-    }
-    return;
-  }
-
-  float activated[fused_decode::kNvfp4BlockWidth];
-  float block_max_abs = 0.0f;
-#pragma unroll
-  for (int col = 0; col < fused_decode::kNvfp4BlockWidth; ++col) {
-    const float value =
-        staged_activated[token_row][block_col * fused_decode::kNvfp4BlockWidth + col];
-    activated[col] = value;
-    if (value > block_max_abs) {
-      block_max_abs = value;
-    }
-  }
-
-  float block_scale = 1.0f;
-  if (block_max_abs > 0.0f) {
-    block_scale = fused_decode::ClampNvfp4Scale(
-        block_max_abs / fused_decode::kNvfp4Fp4MaxFinite);
-  }
-  const std::uint8_t encoded_block_scale =
-      fused_decode::EncodeFp8Scale(block_scale);
-
-  fp4_activation_output_scale[scale_index] = block_scale;
-  fp4_block_scales[scale_index] = encoded_block_scale;
-  fp4_matmul_block_scales[matmul_scale_index] = encoded_block_scale;
-
-#pragma unroll
-  for (int pair = 0; pair < (fused_decode::kNvfp4BlockWidth / 2u); ++pair) {
-    const std::uint8_t lhs =
-        fused_decode::EncodeFp4(activated[pair * 2] / block_scale);
-    const std::uint8_t rhs =
-        fused_decode::EncodeFp4(activated[pair * 2 + 1] / block_scale);
-    fp4_packed_data[packed_offset + static_cast<std::size_t>(pair)] =
-        static_cast<std::uint8_t>((lhs & 0x0Fu) | ((rhs & 0x0Fu) << 4u));
-  }
-}
-
 __device__ __forceinline__ void StoreUnifiedRoutedFp4DirectPack(
-    float alpha,
-    const CRegister* accum_storage,
-    int thread_idx,
-    float (*staged_activated)[kTracedP5DirectStageCols],
-    int output_row_base,
-    int valid_rows,
-    int output_rows_this_tile,
-    std::size_t row_start,
-    std::size_t output_rows_per_expert,
-    const float* per_row_tensor_scales,
-    float weight_tensor_scale,
-    std::uint8_t* fp4_packed_data,
-    std::uint8_t* fp4_block_scales,
-    std::uint8_t* fp4_matmul_block_scales,
-    float* fp4_activation_output_scale,
-    std::size_t fp4_cols,
-    std::size_t fp4_padded_blocks_per_row,
-    Nvfp4ScaleLayout fp4_scale_layout) {
-  StageUnifiedRoutedFp4DirectActivated(
-      alpha,
-      accum_storage,
-      thread_idx,
-      staged_activated,
-      output_row_base,
-      valid_rows,
-      output_rows_this_tile,
-      row_start,
-      output_rows_per_expert,
-      per_row_tensor_scales,
-      weight_tensor_scale,
-      fp4_packed_data,
-      fp4_block_scales,
-      fp4_matmul_block_scales,
-      fp4_activation_output_scale,
-      fp4_cols,
-      fp4_padded_blocks_per_row,
-      fp4_scale_layout);
-  __syncthreads();
-  PackUnifiedRoutedFp4DirectStaged(
-      thread_idx,
-      staged_activated,
-      output_row_base,
-      valid_rows,
-      output_rows_this_tile,
-      row_start,
-      output_rows_per_expert,
-      fp4_packed_data,
-      fp4_block_scales,
-      fp4_matmul_block_scales,
-      fp4_activation_output_scale,
-      fp4_cols,
-      fp4_padded_blocks_per_row,
-      fp4_scale_layout);
-}
-
-__device__ __forceinline__ void StoreUnifiedRoutedFp4WarpLocalPack(
     float alpha,
     const CRegister* accum_storage,
     int thread_idx,
@@ -1031,9 +704,6 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4WarpLocalPack(
     return;
   }
 
-  auto mma = TracedP5TiledMma{};
-  auto thr_mma = mma.get_thread_slice(thread_idx);
-  (void)thr_mma;
   auto accum_tensor = cute::make_tensor(
       reinterpret_cast<CRegister*>(const_cast<CRegister*>(accum_storage)),
       TracedP5AccumProfileLayout{});
@@ -1044,6 +714,7 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4WarpLocalPack(
   const int g_n = warp_id / 4;
   const int q = lane_id / 4;
   const int r = lane_id & 3;
+  const unsigned int subgroup_mask = 0x11111111u << r;
 
   const int n_coords[4] = {
       16 * g_n + 2 * r,
@@ -1055,6 +726,11 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4WarpLocalPack(
   const std::size_t packed_row_bytes = fp4_cols / 2u;
   const std::size_t output_limit =
       static_cast<std::size_t>(output_row_base + output_rows_this_tile);
+  constexpr int kLinearToBlockHalf[16] = {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1};
+  constexpr int kLinearToTokenGroup[16] = {0, 2, 0, 2, 1, 3, 1, 3, 0, 2, 0, 2, 1, 3, 1, 3};
+  constexpr int kLinearToMHalf[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+  constexpr int kBlockElemMh0[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+  constexpr int kBlockElemMh1[8] = {8, 12, 9, 13, 10, 14, 11, 15};
 
   float activated[16];
 #pragma unroll
@@ -1131,11 +807,11 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4WarpLocalPack(
     }
 
     float local_max = fmaxf(val_mh0, val_mh1);
-    float partner = __shfl_xor_sync(0xffffffffu, local_max, 4);
+    float partner = __shfl_xor_sync(subgroup_mask, local_max, 4);
     local_max = fmaxf(local_max, partner);
-    partner = __shfl_xor_sync(0xffffffffu, local_max, 8);
+    partner = __shfl_xor_sync(subgroup_mask, local_max, 8);
     local_max = fmaxf(local_max, partner);
-    partner = __shfl_xor_sync(0xffffffffu, local_max, 16);
+    partner = __shfl_xor_sync(subgroup_mask, local_max, 16);
     local_max = fmaxf(local_max, partner);
 
     float block_scale = 1.0f;
@@ -1151,9 +827,9 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4WarpLocalPack(
     const std::uint8_t nibble_mh1 =
         fused_decode::EncodeFp4(val_mh1 / block_scale);
     const std::uint8_t partner_nibble_mh0 = static_cast<std::uint8_t>(
-        __shfl_down_sync(0xffffffffu, static_cast<int>(nibble_mh0), 4));
+        __shfl_down_sync(subgroup_mask, static_cast<int>(nibble_mh0), 4));
     const std::uint8_t partner_nibble_mh1 = static_cast<std::uint8_t>(
-        __shfl_down_sync(0xffffffffu, static_cast<int>(nibble_mh1), 4));
+        __shfl_down_sync(subgroup_mask, static_cast<int>(nibble_mh1), 4));
 
     if (q == 0) {
       fp4_activation_output_scale[scale_index] = block_scale;
@@ -1178,7 +854,6 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
     float alpha,
     const CRegister* accum_storage,
     int thread_idx,
-    float (*fp4_staged_activated)[kTracedP5DirectStageCols],
     int output_row_base,
     int valid_rows,
     int output_rows_this_tile,
@@ -1195,36 +870,12 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
     std::size_t fp4_padded_blocks_per_row = 0,
     Nvfp4ScaleLayout fp4_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4) {
   if constexpr (Profile == UnifiedRoutedFp4Profile::kP5) {
-    if constexpr (P5Mode == P5EpilogueMode::kFp4WarpLocal) {
-      (void)output;
-      (void)fp4_staged_activated;
-      StoreUnifiedRoutedFp4WarpLocalPack(
-          alpha,
-          accum_storage,
-          thread_idx,
-          output_row_base,
-          valid_rows,
-          output_rows_this_tile,
-          row_start,
-          output_rows_per_expert,
-          per_row_tensor_scales,
-          weight_tensor_scale,
-          fp4_packed_data,
-          fp4_block_scales,
-          fp4_matmul_block_scales,
-          fp4_activation_output_scale,
-          fp4_cols,
-          fp4_padded_blocks_per_row,
-          fp4_scale_layout);
-      return;
-    }
     if constexpr (P5Mode == P5EpilogueMode::kFp4Direct) {
       (void)output;
       StoreUnifiedRoutedFp4DirectPack(
           alpha,
           accum_storage,
           thread_idx,
-          fp4_staged_activated,
           output_row_base,
           valid_rows,
           output_rows_this_tile,
@@ -1241,7 +892,6 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
           fp4_scale_layout);
       return;
     }
-    (void)fp4_staged_activated;
     (void)fp4_packed_data;
     (void)fp4_block_scales;
     (void)fp4_matmul_block_scales;
@@ -1292,7 +942,6 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
       }
     }
   } else if constexpr (Profile == UnifiedRoutedFp4Profile::kP13) {
-    (void)fp4_staged_activated;
     (void)fp4_packed_data;
     (void)fp4_block_scales;
     (void)fp4_matmul_block_scales;
@@ -1344,7 +993,6 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
       }
     }
   } else {
-    (void)fp4_staged_activated;
     (void)fp4_packed_data;
     (void)fp4_block_scales;
     (void)fp4_matmul_block_scales;
@@ -2033,10 +1681,6 @@ template <class TiledMma>
 __device__ __noinline__ void DumpP5LinearPartitionCLayout(int thread_idx);
 #endif
 
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
-__device__ __forceinline__ void ValidateP5WarpLocalInvariants(int thread_idx);
-#endif
-
 __device__ __forceinline__ void Clear(CFragment64& fragment);
 
 __device__ __forceinline__ void Gemm(
@@ -2120,10 +1764,6 @@ __device__ int g_p5_partition_debug_dump_once = 0;
 
 #if defined(NEMOTRON_P5_LINEAR_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 __device__ int g_p5_linear_partition_debug_dump_once = 0;
-#endif
-
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
-__device__ int g_p5_warp_local_invariants_validate_once = 0;
 #endif
 
 enum class RoutedGemm1Profile {
@@ -6624,17 +6264,13 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 ? 2 : 1;
   constexpr int kP5SfbTmaStageElems =
       Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 ? Traits::kScaleSmemCosizeB : 1;
-  constexpr int kFp4DirectStageElems =
-      kUseFp4DirectOutput
-          ? nvfp4_bridge::kTracedP5DirectStageRows * nvfp4_bridge::kTracedP5DirectStageCols
-          : 1;
 
   static_assert(
       !kUseFp4DirectOutput ||
           (kFp4ConsumerWarps * 32 == fused_decode::kThreadsPerBlock &&
            Traits::kOutputTile == nvfp4_bridge::kTracedP5DirectStageCols &&
            Traits::kTokenRows == nvfp4_bridge::kTracedP5DirectStageRows),
-      "P5 direct staging assumes a full 32x128 CTA tile");
+      "P5 direct pack assumes a full 32x128 CTA tile");
 
   __shared__ alignas(1024) cute::array_aligned<
       typename Traits::SmemAllocA,
@@ -6658,7 +6294,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   __shared__ alignas(16)
       cutlass::arch::ClusterBarrier::ValueType
           p5_tma_empty_mbar_storage[kP5PipelineStages];
-  __shared__ alignas(16) float fp4_direct_stage_storage[kFp4DirectStageElems];
   __shared__ int p13_debug_capture_cta;
 
   auto* smem_swizzled_a = smem_swizzled_a_storage.data();
@@ -6670,9 +6305,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
       cute::recast_ptr<cutlass::arch::ClusterTransactionBarrier>(&p5_tma_full_mbar_storage[0]);
   auto* p5_tma_empty_mbar =
       cute::recast_ptr<cutlass::arch::ClusterBarrier>(&p5_tma_empty_mbar_storage[0]);
-  auto (*fp4_direct_stage)[nvfp4_bridge::kTracedP5DirectStageCols] =
-      reinterpret_cast<float (*)[nvfp4_bridge::kTracedP5DirectStageCols]>(
-          &fp4_direct_stage_storage[0]);
 
   const int cta_index = static_cast<int>(blockIdx.y);
   const int exact_cta_count = cta_count[0];
@@ -8092,67 +7724,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   }
 #endif
 
-  if constexpr (
-      Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 &&
-      P5Mode == nvfp4_bridge::P5EpilogueMode::kFp4Direct) {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE) && !defined(NDEBUG)
-    __shared__ int validate_p5_warp_local_invariants;
-    if (tid == 0) {
-      validate_p5_warp_local_invariants =
-          (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
-           atomicCAS(&g_p5_warp_local_invariants_validate_once, 0, 1) == 0)
-              ? 1
-              : 0;
-    }
-    __syncthreads();
-    if (validate_p5_warp_local_invariants != 0 && (warp_id == 0 || warp_id == 4)) {
-      nvfp4_bridge::ValidateP5WarpLocalInvariants(warp_id * 32 + lane_id);
-    }
-    __syncthreads();
-#endif
-    // Zero-initialize the staging tile — shared memory has undefined initial
-    // contents on CUDA, and positions not covered by partition_C (e.g., partial
-    // output tiles) must read as zero during the cooperative packing phase.
-    for (int i = tid; i < kFp4DirectStageElems; i += blockDim.x) {
-      fp4_direct_stage_storage[i] = 0.0f;
-    }
-    __syncthreads();
-    nvfp4_bridge::StageUnifiedRoutedFp4DirectActivated(
-        output_alpha,
-        &accum_storage[0],
-        warp_id * 32 + lane_id,
-        fp4_direct_stage,
-        output_row_base,
-        valid_rows,
-        output_rows_this_tile,
-        static_cast<std::size_t>(row_start),
-        output_rows_per_expert,
-        input_per_row_tensor_scales,
-        weight_tensor_scale,
-        fp4_packed_data,
-        fp4_block_scales,
-        fp4_matmul_block_scales,
-        fp4_activation_output_scale,
-        fp4_cols,
-        fp4_padded_blocks_per_row,
-        fp4_scale_layout);
-    __syncthreads();
-    nvfp4_bridge::PackUnifiedRoutedFp4DirectStaged(
-        warp_id * 32 + lane_id,
-        fp4_direct_stage,
-        output_row_base,
-        valid_rows,
-        output_rows_this_tile,
-        static_cast<std::size_t>(row_start),
-        output_rows_per_expert,
-        fp4_packed_data,
-        fp4_block_scales,
-        fp4_matmul_block_scales,
-        fp4_activation_output_scale,
-        fp4_cols,
-        fp4_padded_blocks_per_row,
-        fp4_scale_layout);
-  } else if (warp_id < kFp4ConsumerWarps) {
+  if (warp_id < kFp4ConsumerWarps) {
       if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
         if (p13_debug_capture_cta != 0 &&
             ((g_p13_debug_trace_target_thread_id < 0 && warp_id == 0 && lane_id == 0) ||
@@ -8174,7 +7746,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
         output_alpha,
         &accum_storage[0],
         warp_id * 32 + lane_id,
-        fp4_direct_stage,
         output_row_base,
         valid_rows,
         output_rows_this_tile,
