@@ -44,6 +44,12 @@ namespace {
 
 namespace wmma = nvcuda::wmma;
 
+__host__ __device__ std::size_t ExecutionScaleOffset(
+    std::size_t row,
+    std::size_t block_col,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout);
+
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 namespace cute = ::cute;
 
@@ -486,6 +492,11 @@ enum class UnifiedRoutedFp4Profile {
   kP15,
 };
 
+enum class P5EpilogueMode {
+  kBf16,
+  kFp4Direct,
+};
+
 template <UnifiedRoutedFp4Profile Profile>
 struct UnifiedRoutedFp4Traits;
 
@@ -636,7 +647,186 @@ struct UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP15> {
   }
 };
 
-template <UnifiedRoutedFp4Profile Profile, typename OutputType>
+__device__ __forceinline__ void StoreUnifiedRoutedFp4DirectPack(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int output_row_base,
+    int valid_rows,
+    int output_rows_this_tile,
+    std::size_t row_start,
+    std::size_t output_rows_per_expert,
+    const float* per_row_tensor_scales,
+    float weight_tensor_scale,
+    std::uint8_t* fp4_packed_data,
+    std::uint8_t* fp4_block_scales,
+    std::uint8_t* fp4_matmul_block_scales,
+    float* fp4_activation_output_scale,
+    std::size_t fp4_cols,
+    std::size_t fp4_padded_blocks_per_row,
+    Nvfp4ScaleLayout fp4_scale_layout) {
+  if (fp4_packed_data == nullptr ||
+      fp4_block_scales == nullptr ||
+      fp4_matmul_block_scales == nullptr ||
+      fp4_activation_output_scale == nullptr ||
+      fp4_cols == 0 ||
+      fp4_cols != output_rows_per_expert ||
+      (fp4_cols % fused_decode::kNvfp4BlockWidth) != 0 ||
+      fp4_padded_blocks_per_row == 0) {
+    return;
+  }
+
+  constexpr int kP5ValidPhysical = 16;
+  constexpr int kP5TokenGroups = 4;
+  constexpr int kP5BlockCount = 2;
+  constexpr int kP5ValuesPerLanePerBlock = 2;
+  constexpr int kPhysicalToTokenGroup[kP5ValidPhysical] = {
+      0, 2, 0, 2,
+      1, 3, 1, 3,
+      0, 2, 0, 2,
+      1, 3, 1, 3,
+  };
+  constexpr int kPhysicalPairs[kP5BlockCount][kP5TokenGroups][kP5ValuesPerLanePerBlock] = {
+      {{0, 8}, {4, 12}, {1, 9}, {5, 13}},
+      {{2, 10}, {6, 14}, {3, 11}, {7, 15}},
+  };
+
+  auto accum_tensor = cute::make_tensor(
+      reinterpret_cast<CRegister*>(const_cast<CRegister*>(accum_storage)),
+      TracedP5AccumProfileLayout{});
+
+  const int warp_id = thread_idx / 32;
+  const int lane_id = thread_idx & 31;
+  const int g_n = warp_id / 4;
+  const int g_m = warp_id % 4;
+  const int q = lane_id / 4;
+  const int r = lane_id & 3;
+  const unsigned int warp_mask = 0xffffffffu;
+  const std::size_t blocks_per_row = fp4_cols / fused_decode::kNvfp4BlockWidth;
+  const std::size_t packed_row_bytes = fp4_cols / 2u;
+  const std::size_t output_limit =
+      static_cast<std::size_t>(output_row_base + output_rows_this_tile);
+
+  const int local_token_base = 16 * g_n + 2 * r;
+  const int local_tokens[kP5TokenGroups] = {
+      local_token_base,
+      local_token_base + 1,
+      local_token_base + 8,
+      local_token_base + 9,
+  };
+
+  std::size_t input_rows[kP5TokenGroups];
+  float row_alphas[kP5TokenGroups];
+  bool row_is_active[kP5TokenGroups];
+#pragma unroll
+  for (int token_group = 0; token_group < kP5TokenGroups; ++token_group) {
+    input_rows[token_group] = row_start + static_cast<std::size_t>(local_tokens[token_group]);
+    row_is_active[token_group] = local_tokens[token_group] < valid_rows;
+    row_alphas[token_group] =
+        row_is_active[token_group]
+            ? (per_row_tensor_scales != nullptr
+                   ? per_row_tensor_scales[input_rows[token_group]] * weight_tensor_scale
+                   : alpha)
+            : alpha;
+  }
+
+  const std::size_t block_col_bases[kP5BlockCount] = {
+      static_cast<std::size_t>(output_row_base + 16 * g_m),
+      static_cast<std::size_t>(output_row_base + 64 + 16 * g_m),
+  };
+  const bool block_is_active[kP5BlockCount] = {
+      block_col_bases[0] < output_limit && block_col_bases[0] < fp4_cols,
+      block_col_bases[1] < output_limit && block_col_bases[1] < fp4_cols,
+  };
+  const std::size_t block_indices[kP5BlockCount] = {
+      block_col_bases[0] / fused_decode::kNvfp4BlockWidth,
+      block_col_bases[1] / fused_decode::kNvfp4BlockWidth,
+  };
+
+  float activated[kP5ValidPhysical];
+  // Only iterate reg=0..1: the step 2 partition_C probe confirmed that physical
+  // slots 16..31 (reg=2,3) are unpopulated on SM120, so only 0..15 are valid.
+#pragma unroll
+  for (int reg = 0; reg < 2; ++reg) {
+#pragma unroll
+    for (int m_fragment = 0; m_fragment < kTracedP5MFragments; ++m_fragment) {
+#pragma unroll
+      for (int n_fragment = 0; n_fragment < kTracedP5NFragments; ++n_fragment) {
+        const int physical = reg * 8 + m_fragment * 2 + n_fragment;
+        const int token_group = kPhysicalToTokenGroup[physical];
+        const int block = (physical & 0x2) != 0 ? 1 : 0;
+        const bool active = row_is_active[token_group] && block_is_active[block];
+        activated[physical] = active
+                                  ? fused_decode::Relu2(
+                                        accum_tensor(reg, m_fragment, n_fragment) *
+                                        row_alphas[token_group])
+                                  : 0.0f;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int block = 0; block < kP5BlockCount; ++block) {
+    const std::size_t block_col_base = block_col_bases[block];
+    const std::size_t block_index = block_indices[block];
+#pragma unroll
+    for (int token_group = 0; token_group < kP5TokenGroups; ++token_group) {
+      const int even_physical = kPhysicalPairs[block][token_group][0];
+      const int high_physical = kPhysicalPairs[block][token_group][1];
+      const std::size_t input_row = input_rows[token_group];
+      const bool output_active = row_is_active[token_group] && block_is_active[block];
+      float block_max_abs =
+          output_active ? fmaxf(activated[even_physical], activated[high_physical]) : 0.0f;
+      block_max_abs = fmaxf(block_max_abs, __shfl_xor_sync(warp_mask, block_max_abs, 4));
+      block_max_abs = fmaxf(block_max_abs, __shfl_xor_sync(warp_mask, block_max_abs, 8));
+      block_max_abs = fmaxf(block_max_abs, __shfl_xor_sync(warp_mask, block_max_abs, 16));
+
+      const float dequant_scale =
+          output_active
+              ? fused_decode::ClampNvfp4Scale(
+                    block_max_abs / fused_decode::kNvfp4Fp4MaxFinite)
+              : 0.0f;
+      const std::uint8_t encoded_scale =
+          output_active ? fused_decode::EncodeFp8Scale(dequant_scale) : 0u;
+
+      if (q == 0) {
+        const std::size_t scale_index = input_row * blocks_per_row + block_index;
+        const std::size_t matmul_scale_index = ExecutionScaleOffset(
+            input_row,
+            block_index,
+            fp4_padded_blocks_per_row,
+            fp4_scale_layout);
+        fp4_activation_output_scale[scale_index] = dequant_scale;
+        fp4_block_scales[scale_index] = encoded_scale;
+        fp4_matmul_block_scales[matmul_scale_index] = encoded_scale;
+      }
+
+      unsigned int encoded_even = 0u;
+      unsigned int encoded_high = 0u;
+      if (output_active) {
+        encoded_even = static_cast<unsigned int>(
+            fused_decode::EncodeFp4(activated[even_physical] / dequant_scale));
+        encoded_high = static_cast<unsigned int>(
+            fused_decode::EncodeFp4(activated[high_physical] / dequant_scale));
+      }
+      const unsigned int encoded_odd =
+          __shfl_down_sync(warp_mask, encoded_even, 4) & 0x0fu;
+      const unsigned int encoded_high_odd =
+          __shfl_down_sync(warp_mask, encoded_high, 4) & 0x0fu;
+
+      if ((q & 1) == 0) {
+        const std::size_t packed_offset = input_row * packed_row_bytes + (block_col_base / 2u);
+        const std::size_t pair_index = static_cast<std::size_t>(q / 2);
+        fp4_packed_data[packed_offset + pair_index] = static_cast<std::uint8_t>(
+            (encoded_even & 0x0fu) | (encoded_odd << 4u));
+        fp4_packed_data[packed_offset + 4u + pair_index] = static_cast<std::uint8_t>(
+            (encoded_high & 0x0fu) | (encoded_high_odd << 4u));
+      }
+    }
+  }
+}
+
+template <UnifiedRoutedFp4Profile Profile, P5EpilogueMode P5Mode = P5EpilogueMode::kBf16, typename OutputType>
 __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
     float alpha,
     const CRegister* accum_storage,
@@ -648,8 +838,44 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
     std::size_t output_rows_per_expert,
     OutputType* output,
     const float* per_row_tensor_scales = nullptr,
-    float weight_tensor_scale = 1.0f) {
+    float weight_tensor_scale = 1.0f,
+    std::uint8_t* fp4_packed_data = nullptr,
+    std::uint8_t* fp4_block_scales = nullptr,
+    std::uint8_t* fp4_matmul_block_scales = nullptr,
+    float* fp4_activation_output_scale = nullptr,
+    std::size_t fp4_cols = 0,
+    std::size_t fp4_padded_blocks_per_row = 0,
+    Nvfp4ScaleLayout fp4_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4) {
   if constexpr (Profile == UnifiedRoutedFp4Profile::kP5) {
+    if constexpr (P5Mode == P5EpilogueMode::kFp4Direct) {
+      (void)output;
+      StoreUnifiedRoutedFp4DirectPack(
+          alpha,
+          accum_storage,
+          thread_idx,
+          output_row_base,
+          valid_rows,
+          output_rows_this_tile,
+          row_start,
+          output_rows_per_expert,
+          per_row_tensor_scales,
+          weight_tensor_scale,
+          fp4_packed_data,
+          fp4_block_scales,
+          fp4_matmul_block_scales,
+          fp4_activation_output_scale,
+          fp4_cols,
+          fp4_padded_blocks_per_row,
+          fp4_scale_layout);
+      return;
+    }
+    (void)fp4_packed_data;
+    (void)fp4_block_scales;
+    (void)fp4_matmul_block_scales;
+    (void)fp4_activation_output_scale;
+    (void)fp4_cols;
+    (void)fp4_padded_blocks_per_row;
+    (void)fp4_scale_layout;
     int row_coords[kTracedP5CCopyCoordCapacity];
     int col_coords[kTracedP5CCopyCoordCapacity];
     auto mma = TracedP5TiledMma{};
@@ -693,6 +919,13 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
       }
     }
   } else if constexpr (Profile == UnifiedRoutedFp4Profile::kP13) {
+    (void)fp4_packed_data;
+    (void)fp4_block_scales;
+    (void)fp4_matmul_block_scales;
+    (void)fp4_activation_output_scale;
+    (void)fp4_cols;
+    (void)fp4_padded_blocks_per_row;
+    (void)fp4_scale_layout;
     int row_coords[kTracedP13CCopyCoordCapacity];
     int col_coords[kTracedP13CCopyCoordCapacity];
     auto mma = TracedP13TiledMma{};
@@ -737,6 +970,13 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
       }
     }
   } else {
+    (void)fp4_packed_data;
+    (void)fp4_block_scales;
+    (void)fp4_matmul_block_scales;
+    (void)fp4_activation_output_scale;
+    (void)fp4_cols;
+    (void)fp4_padded_blocks_per_row;
+    (void)fp4_scale_layout;
     using Traits = UnifiedRoutedFp4Traits<Profile>;
     using TiledMma = typename Traits::TiledMma;
     auto tiled_mma = TiledMma{};

@@ -153,7 +153,7 @@ Acceptance checks:
   and compares `packed_data`, `block_scales_data`, `matmul_block_scales_data`, and `activation_output_scale` before FC2.
   Key files: new `testing/backend/staged_fp4_pack_test.cu` or `testing/backend/staged_fp4_pack_test.cpp`, `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **5. Implement the fused in-epilogue FP4 packing for P5**
+- [x] **5. Implement the fused in-epilogue FP4 packing for P5**
   Replace `StoreTracedP5CFragmentsTranspose` with a routed-only fused epilogue variant for the P5 grouped FC1 kernel. Phase-1 requirements:
   1. each consumer thread computes `activated = Relu2(alpha * accum)`
   2. cooperative scale reduction follows the verified SM120 ownership pattern
@@ -198,8 +198,8 @@ Acceptance checks:
 | 1 | Lock routed contract + activation math | completed | — | `contract_notes.md` freezes activation, scales, and matrix invariants |
 | 2 | Probe partition_C layout | done | 0baaf39 | 16-elem blocks are warp-local (8 lanes × 2 cols); only 16/32 physical slots populated; not quad-local |
 | 3 | Prove shared-memory story | completed | — | Current: `81956 B`; naive +64KB stage: compile failure; aliased union: `83968 B` |
-| 4 | Prototype staged FP4 pack | done | — | GPU vs CPU byte-exact; FP32 vs BF16 legacy byte-exact; 69/72 pass |
-| 5 | Implement fused epilogue | pending | — | Core change: direct FP4 write in the P5 epilogue |
+| 4 | Prototype staged FP4 pack | done | 6f0105f | GPU vs CPU byte-exact; FP32 vs BF16 legacy byte-exact; 69/72 pass |
+| 5 | Implement fused epilogue | done | — | Warp-local path, shfl_xor max-abs + shfl_down nibble pack; fixed reg loop OOB; 69/72 |
 | 6 | Add FP4-direct launcher + wire it in | pending | — | Direct path primary for P5, BF16 fallback remains |
 | 7 | Validate, then remove BF16 workspace if safe | pending | — | No workspace removal before the direct path is proven |
 | 8 | Benchmark and compare | pending | — | TTFT + TPS + kernel timing + vLLM parity |
