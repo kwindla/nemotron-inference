@@ -71,7 +71,7 @@ For implementation structure, the closer precedent is the existing local direct-
   `shared_up_scratch` remains the FP32 FC1 output / activation workspace unless later profiling justifies further fusion. `routed_gather_scratch` remains the FP32 destination for shared-down output accumulation.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/src/backend/expert_layer.cpp`
 
-- [ ] **6. Validate correctness across multi-row shapes and decide whether routed BF16 removal is required**
+- [x] **6. Validate correctness across multi-row shapes and decide whether routed BF16 removal is required**
   Rebuild and run `fused_moe_prefill_test` and the existing runtime test suite. Add or update tests that exercise multi-row shared-prefill buckets, especially small-row cases that would otherwise default to `kSwizzled8x4`, and partial-row tile boundaries that the single-token direct-decode path does not cover. Run the per-layer diagnostic (`NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY=1`) on the short-prompt repro and compare the error curve against the pre-fix baseline. Run the prompt-length sweep with native direct MoE prefill enabled. Run constrained greedy parity against local vendored `vllm`, and use local vendored `trtllm` as an additional behavioral reference. Acceptance is: materially reduced early-layer error and elimination or clear mitigation of the observed degeneration. Claude coherence is advisory only.
   Key files: `tools/oracle/compare_chat_runtimes.py`, `tools/oracle/prompt_length_sweep.py`, `testing/backend/fused_moe_prefill_test.cpp`, `testing/backend/expert_layer_fastpath_test.cpp`
 
@@ -94,7 +94,7 @@ For implementation structure, the closer precedent is the existing local direct-
 | 2 | Extend shared weight TMA descriptor caching | done | 3e9cf1c | DeviceNvfp4Weight owns descriptors; view borrows pointers |
 | 3 | Add shared planning/cache layer | done | 3966209 | kSm120ContiguousSharedNvfp4 family + cached B/SFB descriptors + token-bucket profiles |
 | 4 | Write contiguous FP4 MMA shared GEMM kernel | done | 27b80e2 | Nvfp4ContiguousSharedFp4P5Kernel + LaunchContiguousFp4MatVec |
-| 5 | Replace shared prefill pipeline | done | — | FP4 primary, QDQ+MatVec fallback |
-| 6 | Validate correctness across multi-row shapes | pending | — | Include small-row and partial-tile coverage |
+| 5 | Replace shared prefill pipeline | done | 21301c2 | FP4 primary, QDQ+MatVec fallback |
+| 6 | Validate correctness across multi-row shapes | done | — | 23/24-token oracle PASS; sweep fails at 2,4,9; vLLM parity poor → step 8 needed |
 | 7 | Benchmark end-to-end prefill latency | pending | — | Primary gate is end-to-end prefill latency |
 | 8 | Conditional routed BF16 cleanup | pending | — | Only if Phase 1 still leaves material drift |
