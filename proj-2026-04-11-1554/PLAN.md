@@ -146,4 +146,4 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
 | 1 | Lock probe + invariants + test seam | done | 7cf6f27 | static_assert on part_c size==16; ValidateP5WarpLocalInvariants confirms ownership pattern; test seam passes with non-uniform per-row scales |
 | 2 | Build tables + warp-local implementation | done | ded3015 | constexpr tables + StoreUnifiedRoutedFp4WarpLocalPack + kFp4WarpLocal dispatch; compile-clean, not wired yet |
 | 3 | Wire and validate | done | 36d071d | Wired kFp4WarpLocal→kFp4Direct, removed staged path + 16KB smem, fixed shuffle mask (subgroup_mask), test seam passes, ctest 69/72, MoE PASS, forced-P5 compare still divergent (pre-existing) |
-| 4 | Benchmark at 384/512 | done | — | Flat: 384 hot_prefill 783.6→784.2ms (+0.08%), 512 hot_prefill 1059.6→1068.1ms (+0.80%). Integration guardrails only (legacy profile, not P5). |
+| 4 | Benchmark at 384/512 | done | e4762f7 | Flat: 384 hot_prefill 783.6→784.2ms (+0.08%), 512 hot_prefill 1059.6→1068.1ms (+0.80%). Integration guardrails only (legacy profile, not P5). |
