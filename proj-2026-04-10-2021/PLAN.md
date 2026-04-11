@@ -64,7 +64,7 @@ For implementation structure, the closer precedent is the existing local direct-
   Do not assume the routed kernel is a drop-in template. This is a contiguous shared kernel, not "routed MoE minus routing." Do not infer the final tile shape from profile enum names alone: the local routed P5 profile is named `kP5_128x128x64_SwapTrue`, while other nearby code paths use `kMacroTileK = 128`, so the shared kernel's tile shape must be derived explicitly from the chosen CUTE atom/tiling constraints and then justified by measurement on real hardware. The implementation should consume the planning/cache layer from Step 3 rather than inventing a parallel ad hoc dispatch path.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **5. Replace the shared prefill pipeline with FP4 packing + native FP4 MMA**
+- [x] **5. Replace the shared prefill pipeline with FP4 packing + native FP4 MMA**
   In `RunFusedMoePrefill`, replace the current shared path:
   - Before: `cudaMemcpy(normalized→scratch)` → `QuantizeDequantizeRows` → `LaunchContiguousMatVec(shared_up)` → `Relu2` → `QuantizeDequantizeRows` → `LaunchContiguousMatVec(shared_down)` → `AccumulateSharedOutput`
   - After: `PackIntoPerRow(normalized→shared_fc1_pack)` → `LaunchContiguousFp4MatVec(shared_fc1_pack, shared_up)` → `Relu2` → `PackIntoPerRow(relu2_output→shared_fc2_pack)` → `LaunchContiguousFp4MatVec(shared_fc2_pack, shared_down)` → `AccumulateSharedOutput`
@@ -93,8 +93,8 @@ For implementation structure, the closer precedent is the existing local direct-
 | 1 | Reuse existing shared activation packs | done | 6c3de5b | shared_fc1_pack/shared_fc2_pack aliases wired through params + validation |
 | 2 | Extend shared weight TMA descriptor caching | done | 3e9cf1c | DeviceNvfp4Weight owns descriptors; view borrows pointers |
 | 3 | Add shared planning/cache layer | done | 3966209 | kSm120ContiguousSharedNvfp4 family + cached B/SFB descriptors + token-bucket profiles |
-| 4 | Write contiguous FP4 MMA shared GEMM kernel | done | — | Nvfp4ContiguousSharedFp4P5Kernel + LaunchContiguousFp4MatVec |
-| 5 | Replace shared prefill pipeline | pending | — | |
+| 4 | Write contiguous FP4 MMA shared GEMM kernel | done | 27b80e2 | Nvfp4ContiguousSharedFp4P5Kernel + LaunchContiguousFp4MatVec |
+| 5 | Replace shared prefill pipeline | done | — | FP4 primary, QDQ+MatVec fallback |
 | 6 | Validate correctness across multi-row shapes | pending | — | Include small-row and partial-tile coverage |
 | 7 | Benchmark end-to-end prefill latency | pending | — | Primary gate is end-to-end prefill latency |
 | 8 | Conditional routed BF16 cleanup | pending | — | Only if Phase 1 still leaves material drift |

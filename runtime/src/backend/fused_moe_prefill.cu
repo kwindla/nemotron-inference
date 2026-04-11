@@ -10550,8 +10550,9 @@ bool RunLaunchPlannedNvfp4ExpertMatVecBf16(
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   const std::size_t selection_count = params.token_count * params.top_k;
-  const DeviceNvfp4Matrix* shared_fc1_pack =
-      params.shared_fc1_pack != nullptr ? params.shared_fc1_pack : params.normalized_pack;
+  DeviceNvfp4Matrix* shared_fc1_pack =
+      params.shared_fc1_pack != nullptr ? params.shared_fc1_pack
+                                        : const_cast<DeviceNvfp4Matrix*>(params.normalized_pack);
   DeviceNvfp4Matrix* shared_fc2_pack = params.shared_fc2_pack;
   const bool use_packed_fc1_source =
       params.normalized_pack != nullptr &&
@@ -10872,37 +10873,70 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
         shared_down_prepared_launch.has_value());
   }
 
-  if (!CheckCuda(cudaMemcpyAsync(
-          params.routed_gather_scratch,
-          params.normalized,
-          token_hidden_count * sizeof(float),
-          cudaMemcpyDeviceToDevice)) ||
-      !LaunchQuantizeDequantizeRows(
-          params.routed_gather_scratch,
-          nullptr,
-          params.token_count,
-          params.hidden_size) ||
-      !LaunchContiguousMatVec(
-          params.routed_gather_scratch,
-          params.token_count,
-          params.shared_up,
-          params.shared_up_scratch) ||
-      !LaunchRelu2(params.shared_up_scratch, shared_intermediate_count) ||
-      !LaunchQuantizeDequantizeRows(
-          params.shared_up_scratch,
-          nullptr,
-          params.token_count,
-          params.shared_expert_intermediate_size) ||
-      !LaunchContiguousMatVec(
-          params.shared_up_scratch,
-          params.token_count,
-          params.shared_down,
-          params.routed_gather_scratch) ||
-      !LaunchAccumulateSharedOutput(
-          params.routed_gather_scratch,
-          token_hidden_count,
-          params.output,
-          params.shared_output)) {
+  const bool use_shared_fp4_path =
+      shared_up_prepared_launch.has_value() && shared_down_prepared_launch.has_value();
+  if (use_shared_fp4_path) {
+    Nvfp4PackOptions shared_pack_options;
+    shared_pack_options.execution_scale_layout = Nvfp4ScaleLayout::kSwizzled128x4;
+    auto shared_fc1_source = DeviceTensorFp32::CreateView(
+        {params.token_count, params.hidden_size},
+        const_cast<float*>(params.normalized));
+    auto shared_fc2_source = DeviceTensorFp32::CreateView(
+        {params.token_count, params.shared_expert_intermediate_size},
+        params.shared_up_scratch);
+    if (shared_fc1_source == nullptr ||
+        shared_fc2_source == nullptr ||
+        !shared_fc1_pack->PackIntoPerRow(*shared_fc1_source, shared_pack_options) ||
+        !LaunchContiguousFp4MatVec(
+            *shared_fc1_pack,
+            *shared_up_prepared_launch,
+            params.shared_up,
+            params.shared_up_scratch) ||
+        !LaunchRelu2(params.shared_up_scratch, shared_intermediate_count) ||
+        !shared_fc2_pack->PackIntoPerRow(*shared_fc2_source, shared_pack_options) ||
+        !LaunchContiguousFp4MatVec(
+            *shared_fc2_pack,
+            *shared_down_prepared_launch,
+            params.shared_down,
+            params.routed_gather_scratch) ||
+        !LaunchAccumulateSharedOutput(
+            params.routed_gather_scratch,
+            token_hidden_count,
+            params.output,
+            params.shared_output)) {
+      return false;
+    }
+  } else if (!CheckCuda(cudaMemcpyAsync(
+                 params.routed_gather_scratch,
+                 params.normalized,
+                 token_hidden_count * sizeof(float),
+                 cudaMemcpyDeviceToDevice)) ||
+             !LaunchQuantizeDequantizeRows(
+                 params.routed_gather_scratch,
+                 nullptr,
+                 params.token_count,
+                 params.hidden_size) ||
+             !LaunchContiguousMatVec(
+                 params.routed_gather_scratch,
+                 params.token_count,
+                 params.shared_up,
+                 params.shared_up_scratch) ||
+             !LaunchRelu2(params.shared_up_scratch, shared_intermediate_count) ||
+             !LaunchQuantizeDequantizeRows(
+                 params.shared_up_scratch,
+                 nullptr,
+                 params.token_count,
+                 params.shared_expert_intermediate_size) ||
+             !LaunchContiguousMatVec(
+                 params.shared_up_scratch,
+                 params.token_count,
+                 params.shared_down,
+                 params.routed_gather_scratch) ||
+             !LaunchAccumulateSharedOutput(
+                 params.routed_gather_scratch,
+                 token_hidden_count,
+                 params.output,
+                 params.shared_output)) {
     return false;
   }
 

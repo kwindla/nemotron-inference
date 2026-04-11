@@ -29,7 +29,7 @@ struct FusedMoePrefillParams {
   const float* input = nullptr;  // Reserved for future fused epilog variants.
   const float* normalized = nullptr;
   const DeviceNvfp4Matrix* normalized_pack = nullptr;  // Default shared FC1 pack and optional packed routed FC1 source pack.
-  const DeviceNvfp4Matrix* shared_fc1_pack = nullptr;  // Alias for the shared FC1 input pack. Defaults to normalized_pack.
+  DeviceNvfp4Matrix* shared_fc1_pack = nullptr;  // Alias for the shared FC1 input pack. Defaults to normalized_pack.
   DeviceExpertRouting* routing = nullptr;
   DeviceMoeLaunchPlan* launch_plan = nullptr;
   GemmHeuristicCache* heuristic_cache = nullptr;
