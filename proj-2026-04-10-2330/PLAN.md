@@ -45,7 +45,7 @@ The fused MoE prefill path packs all tokens' activations with a single global te
   Update all sites in `RunFusedMoePrefill` that call these launch functions accordingly.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **4. Wire PackIntoPerRow in the expert layer**
+- [x] **4. Wire PackIntoPerRow in the expert layer**
   In `RunFusedMoePrefillPath` (expert_layer.cpp line 1520), change `normalized_pack->PackInto(...)` to `normalized_pack->PackIntoPerRow(...)`. The rest of the FC1 prefill pipeline then picks up per-row scales because `fc1_grouped_pack` receives them via `GatherDeviceNvfp4Rows` and the FC1 launch functions read them via `input_pack.per_row_tensor_scales()`.
   Do not change the generic decode path, cublasLt direct-decode path, or FC2 repack sites in this step. Those remain on the old contract until explicitly upgraded.
   Key files: `runtime/src/backend/expert_layer.cpp`
@@ -71,7 +71,7 @@ The fused MoE prefill path packs all tokens' activations with a single global te
 |---|------|--------|--------|-------|
 | 1 | Per-row packing infrastructure | done | 93f3a03 | |
 | 2 | Add parameter to all FC1 kernels | done | 053d64d | |
-| 3 | Wire through launch functions | done | — | build + fused_moe_prefill_test |
-| 4 | Wire PackIntoPerRow in expert layer | pending | — | |
+| 3 | Wire through launch functions | done | 15b8041 | build + fused_moe_prefill_test |
+| 4 | Wire PackIntoPerRow in expert layer | done | — | fused_moe_prefill_test PASS |
 | 5 | Add exact low-level tests | pending | — | |
 | 6 | Validate and test | pending | — | |

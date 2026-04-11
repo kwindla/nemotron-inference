@@ -1517,7 +1517,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
     return false;
   }
 
-  if (!normalized_pack->PackInto(normalized, RuntimeMoeNvfp4PackOptions())) {
+  if (!normalized_pack->PackIntoPerRow(normalized, RuntimeMoeNvfp4PackOptions())) {
     return false;
   }
 
