@@ -786,9 +786,10 @@ SingleTokenForwardConfig KnownNemotron3Nano30BA3BConfig() {
   config.experts_per_token = 6;
   config.expert_n_group = 1;
   config.expert_topk_group = 1;
-  // Keep routed MoE prefill on the known-stable window until the roofline
-  // kernel rewrite replaces the legacy row-count launch matrix.
-  config.moe_prefill_window_tokens = 23;
+  // Use the request-scoped MoE prefill workspace capacity as the runtime window.
+  // This lets natural long-prefill runs reach the routed profile matrix instead of
+  // forcing a small legacy-only clamp.
+  config.moe_prefill_window_tokens = 0;
 
   config.layer_norm_epsilon = 1.0e-5f;
   config.mamba_time_step_min = 1.0e-3f;

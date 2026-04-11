@@ -1,0 +1,1951 @@
+{
+  "benchmark": "nano_shared_prefill_benchmark",
+  "timestamp_utc": "2026-04-11T19:55:24Z",
+  "device": {
+    "device_name": "NVIDIA GeForce RTX 5090",
+    "runtime_version": 13000,
+    "driver_version": 13000,
+    "compute_capability": "12.0",
+    "total_global_mem_bytes": 33633665024
+  },
+  "options": {
+    "build_dir": "build-sm120-relwithdebinfo",
+    "manifest_path": "/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json",
+    "lengths": [
+      4,
+      8,
+      16,
+      24,
+      32,
+      64,
+      128,
+      256,
+      384,
+      512
+    ],
+    "warmup_iterations": 1,
+    "hot_iterations": 3,
+    "decode_token_count": 1,
+    "profile_warmup_iterations": 1,
+    "capture_shared_kernel_time": false,
+    "shared_profile_debug": true,
+    "native_env": {
+      "NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL": "1",
+      "NEMOTRON_SHARED_PROFILE_DEBUG": "1"
+    },
+    "raw_dir": "/home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw"
+  },
+  "warnings": [],
+  "results": [
+    {
+      "prompt_token_count": 4,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 132.983553,
+      "hot_prefill_mean_ms": 20.173666,
+      "cold_setup_overhead_ms_estimate": 112.809887,
+      "hot_first_token_mean_ms": 20.718673,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 300,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 300,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 4,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 1520878493183173536,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 4,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 1520878493183173536,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 4,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12570412114559513835,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 4,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12570412114559513835,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 4,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 1520878493183173536,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 4,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 1520878493183173536,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 4,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12570412114559513835,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 4,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12570412114559513835,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "profile": "sm120_shared_p5_bucket_1_8"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "profile": "sm120_shared_p5_bucket_1_8"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0004_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0004_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0004_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 8,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 146.834259,
+      "hot_prefill_mean_ms": 35.516285,
+      "cold_setup_overhead_ms_estimate": 111.317974,
+      "hot_first_token_mean_ms": 36.268755,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 300,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 300,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 8,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 1520878493183173536,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 8,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 1520878493183173536,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 8,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12570412114559513835,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 8,
+            "profile": "sm120_shared_p5_bucket_1_8",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12570412114559513835,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 8,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 1520878493183173536,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 8,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 1520878493183173536,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 8,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12570412114559513835,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 8,
+              "profile": "sm120_shared_p5_bucket_1_8",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 1,
+              "bucket_upper": 8,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12570412114559513835,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "profile": "sm120_shared_p5_bucket_1_8"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 1,
+            "bucket_upper": 8,
+            "profile": "sm120_shared_p5_bucket_1_8"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0008_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0008_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0008_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 16,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 150.872216,
+      "hot_prefill_mean_ms": 39.243706,
+      "cold_setup_overhead_ms_estimate": 111.62851,
+      "hot_first_token_mean_ms": 40.436762,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 300,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 300,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 16,
+            "profile": "sm120_shared_p5_bucket_9_16",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 9,
+            "bucket_upper": 16,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 13395470581001441480,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 16,
+            "profile": "sm120_shared_p5_bucket_9_16",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 9,
+            "bucket_upper": 16,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 13395470581001441480,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 16,
+            "profile": "sm120_shared_p5_bucket_9_16",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 9,
+            "bucket_upper": 16,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 13095402604453956259,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 16,
+            "profile": "sm120_shared_p5_bucket_9_16",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 9,
+            "bucket_upper": 16,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 13095402604453956259,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 16,
+              "profile": "sm120_shared_p5_bucket_9_16",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 9,
+              "bucket_upper": 16,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 13395470581001441480,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 16,
+              "profile": "sm120_shared_p5_bucket_9_16",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 9,
+              "bucket_upper": 16,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 13395470581001441480,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 16,
+              "profile": "sm120_shared_p5_bucket_9_16",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 9,
+              "bucket_upper": 16,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 13095402604453956259,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 16,
+              "profile": "sm120_shared_p5_bucket_9_16",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 9,
+              "bucket_upper": 16,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 13095402604453956259,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 9,
+            "bucket_upper": 16,
+            "profile": "sm120_shared_p5_bucket_9_16"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 9,
+            "bucket_upper": 16,
+            "profile": "sm120_shared_p5_bucket_9_16"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0016_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0016_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0016_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 24,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 171.279455,
+      "hot_prefill_mean_ms": 62.861137,
+      "cold_setup_overhead_ms_estimate": 108.418318,
+      "hot_first_token_mean_ms": 64.475321,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 300,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 300,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 24,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 16021349517240622680,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 24,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 16021349517240622680,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 24,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 6901093643583820771,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 24,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 6901093643583820771,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 24,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 16021349517240622680,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 24,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 16021349517240622680,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 24,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 6901093643583820771,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 24,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 6901093643583820771,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "profile": "sm120_shared_p5_bucket_17_32"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "profile": "sm120_shared_p5_bucket_17_32"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0024_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0024_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0024_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 32,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 182.60365,
+      "hot_prefill_mean_ms": 74.938733,
+      "cold_setup_overhead_ms_estimate": 107.664917,
+      "hot_first_token_mean_ms": 76.931292,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 300,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 300,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 32,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 16021349517240622680,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 32,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 16021349517240622680,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 32,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 6901093643583820771,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 32,
+            "profile": "sm120_shared_p5_bucket_17_32",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 6901093643583820771,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 32,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 16021349517240622680,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 32,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 16021349517240622680,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 32,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 6901093643583820771,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 32,
+              "profile": "sm120_shared_p5_bucket_17_32",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 17,
+              "bucket_upper": 32,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 6901093643583820771,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "profile": "sm120_shared_p5_bucket_17_32"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 17,
+            "bucket_upper": 32,
+            "profile": "sm120_shared_p5_bucket_17_32"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0032_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0032_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0032_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 64,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 210.658772,
+      "hot_prefill_mean_ms": 102.088045,
+      "cold_setup_overhead_ms_estimate": 108.570727,
+      "hot_first_token_mean_ms": 108.948862,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 420,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 420,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 64,
+            "profile": "sm120_shared_p5_bucket_33_64",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 33,
+            "bucket_upper": 64,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12326770806895249678,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 64,
+            "profile": "sm120_shared_p5_bucket_33_64",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 33,
+            "bucket_upper": 64,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12326770806895249678,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 64,
+            "profile": "sm120_shared_p5_bucket_33_64",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 33,
+            "bucket_upper": 64,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 3780163829775846653,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 64,
+            "profile": "sm120_shared_p5_bucket_33_64",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 33,
+            "bucket_upper": 64,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 3780163829775846653,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 64,
+              "profile": "sm120_shared_p5_bucket_33_64",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 33,
+              "bucket_upper": 64,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12326770806895249678,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 64,
+              "profile": "sm120_shared_p5_bucket_33_64",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 33,
+              "bucket_upper": 64,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12326770806895249678,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 64,
+              "profile": "sm120_shared_p5_bucket_33_64",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 33,
+              "bucket_upper": 64,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 3780163829775846653,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 64,
+              "profile": "sm120_shared_p5_bucket_33_64",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 33,
+              "bucket_upper": 64,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 3780163829775846653,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 33,
+            "bucket_upper": 64,
+            "profile": "sm120_shared_p5_bucket_33_64"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 33,
+            "bucket_upper": 64,
+            "profile": "sm120_shared_p5_bucket_33_64"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0064_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0064_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0064_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 128,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 219.153952,
+      "hot_prefill_mean_ms": 112.463807,
+      "cold_setup_overhead_ms_estimate": 106.690145,
+      "hot_first_token_mean_ms": 126.249477,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 660,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 660,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 128,
+            "profile": "sm120_shared_p5_bucket_65_128",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 65,
+            "bucket_upper": 128,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 7890290467572540972,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 128,
+            "profile": "sm120_shared_p5_bucket_65_128",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 65,
+            "bucket_upper": 128,
+            "cta_m": 1,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 7890290467572540972,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 128,
+            "profile": "sm120_shared_p5_bucket_65_128",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 65,
+            "bucket_upper": 128,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 11832893375318510603,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 128,
+            "profile": "sm120_shared_p5_bucket_65_128",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 65,
+            "bucket_upper": 128,
+            "cta_m": 1,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 11832893375318510603,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 128,
+              "profile": "sm120_shared_p5_bucket_65_128",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 65,
+              "bucket_upper": 128,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 7890290467572540972,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 128,
+              "profile": "sm120_shared_p5_bucket_65_128",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 65,
+              "bucket_upper": 128,
+              "cta_m": 1,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 7890290467572540972,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 128,
+              "profile": "sm120_shared_p5_bucket_65_128",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 65,
+              "bucket_upper": 128,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 11832893375318510603,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 128,
+              "profile": "sm120_shared_p5_bucket_65_128",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 65,
+              "bucket_upper": 128,
+              "cta_m": 1,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 11832893375318510603,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 65,
+            "bucket_upper": 128,
+            "profile": "sm120_shared_p5_bucket_65_128"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 65,
+            "bucket_upper": 128,
+            "profile": "sm120_shared_p5_bucket_65_128"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0128_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0128_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0128_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 256,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 252.330026,
+      "hot_prefill_mean_ms": 144.437284,
+      "cold_setup_overhead_ms_estimate": 107.892742,
+      "hot_first_token_mean_ms": 171.130788,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 1140,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 1140,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 256,
+            "profile": "sm120_shared_p5_bucket_129_256",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 129,
+            "bucket_upper": 256,
+            "cta_m": 2,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 10656777381841372624,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 256,
+            "profile": "sm120_shared_p5_bucket_129_256",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 129,
+            "bucket_upper": 256,
+            "cta_m": 2,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 10656777381841372624,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 256,
+            "profile": "sm120_shared_p5_bucket_129_256",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 129,
+            "bucket_upper": 256,
+            "cta_m": 2,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12354828243834569255,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 256,
+            "profile": "sm120_shared_p5_bucket_129_256",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 129,
+            "bucket_upper": 256,
+            "cta_m": 2,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 12354828243834569255,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 256,
+              "profile": "sm120_shared_p5_bucket_129_256",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 129,
+              "bucket_upper": 256,
+              "cta_m": 2,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 10656777381841372624,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 256,
+              "profile": "sm120_shared_p5_bucket_129_256",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 129,
+              "bucket_upper": 256,
+              "cta_m": 2,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 10656777381841372624,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 256,
+              "profile": "sm120_shared_p5_bucket_129_256",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 129,
+              "bucket_upper": 256,
+              "cta_m": 2,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12354828243834569255,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 256,
+              "profile": "sm120_shared_p5_bucket_129_256",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 129,
+              "bucket_upper": 256,
+              "cta_m": 2,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 12354828243834569255,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 129,
+            "bucket_upper": 256,
+            "profile": "sm120_shared_p5_bucket_129_256"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 129,
+            "bucket_upper": 256,
+            "profile": "sm120_shared_p5_bucket_129_256"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0256_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0256_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0256_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 384,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 290.122074,
+      "hot_prefill_mean_ms": 188.40385,
+      "cold_setup_overhead_ms_estimate": 101.718224,
+      "hot_first_token_mean_ms": 229.611812,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 1620,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 1620,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 384,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 3,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 7904894445976036802,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 384,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 3,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 7904894445976036802,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 384,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 3,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 10782503591889849261,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 384,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 3,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 10782503591889849261,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 384,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 3,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 7904894445976036802,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 384,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 3,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 7904894445976036802,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 384,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 3,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 10782503591889849261,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 384,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 3,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 10782503591889849261,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "profile": "sm120_shared_p5_bucket_257_512"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "profile": "sm120_shared_p5_bucket_257_512"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0384_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0384_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0384_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    },
+    {
+      "prompt_token_count": 512,
+      "decode_token_count": 1,
+      "cold_prefill_ms": 332.196102,
+      "hot_prefill_mean_ms": 227.061275,
+      "cold_setup_overhead_ms_estimate": 105.134827,
+      "hot_first_token_mean_ms": 282.020398,
+      "linear_op_counters": {
+        "dense_fastpath_plan_success": 2100,
+        "dense_fastpath_plan_fail": 0,
+        "dense_fastpath_execute": 2100,
+        "dense_fastpath_execute_fail": 0,
+        "nvfp4_fastpath_plan_success": 170,
+        "nvfp4_fastpath_plan_fail": 0,
+        "nvfp4_fastpath_execute": 170,
+        "nvfp4_fastpath_execute_fail": 0,
+        "scaled_fp8_fastpath_execute": 0
+      },
+      "expert_staging_counters": {
+        "total_bytes_uploaded": 0,
+        "total_experts_staged": 0,
+        "total_staging_calls": 0,
+        "staging_elapsed_us": 0
+      },
+      "shared_profile_debug": {
+        "event_count": 230,
+        "summaries": [
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 512,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 4,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 7904894445976036802,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_down_prefill",
+            "rows": 512,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 4,
+            "cta_n": 21,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 7904894445976036802,
+            "cached": true,
+            "count": 114
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 512,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 4,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 10782503591889849261,
+            "cached": false,
+            "count": 1
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "rows": 512,
+            "profile": "sm120_shared_p5_bucket_257_512",
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "cta_m": 4,
+            "cta_n": 29,
+            "backend": "sm120_contiguous_shared_nvfp4",
+            "algorithm": 10782503591889849261,
+            "cached": true,
+            "count": 114
+          }
+        ],
+        "by_tensor": {
+          "shared_down_prefill": [
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 512,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 4,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 7904894445976036802,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_down_prefill",
+              "rows": 512,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 4,
+              "cta_n": 21,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 7904894445976036802,
+              "cached": true,
+              "count": 114
+            }
+          ],
+          "shared_up_prefill": [
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 512,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 4,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 10782503591889849261,
+              "cached": false,
+              "count": 1
+            },
+            {
+              "tensor": "shared_up_prefill",
+              "rows": 512,
+              "profile": "sm120_shared_p5_bucket_257_512",
+              "tile_m": 128,
+              "tile_n": 128,
+              "tile_k": 64,
+              "bucket_lower": 257,
+              "bucket_upper": 512,
+              "cta_m": 4,
+              "cta_n": 29,
+              "backend": "sm120_contiguous_shared_nvfp4",
+              "algorithm": 10782503591889849261,
+              "cached": true,
+              "count": 114
+            }
+          ]
+        },
+        "token_buckets": [
+          {
+            "tensor": "shared_down_prefill",
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "profile": "sm120_shared_p5_bucket_257_512"
+          },
+          {
+            "tensor": "shared_up_prefill",
+            "bucket_lower": 257,
+            "bucket_upper": 512,
+            "profile": "sm120_shared_p5_bucket_257_512"
+          }
+        ]
+      },
+      "raw_artifacts": {
+        "phased_json": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0512_phased.json",
+        "phased_stdout": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0512_phased.stdout.txt",
+        "phased_stderr": "proj-2026-04-11-1554/post_default_direct_benchmarks/shared_prefill/raw/prompt_0512_phased.stderr.txt"
+      },
+      "nsys": {
+        "available": false,
+        "reason": "capture disabled"
+      },
+      "hot_shared_kernel_ms": null,
+      "hot_shared_kernel_instances": 0,
+      "profile_ready_prefill_ms": null,
+      "hot_shared_kernel_fraction_of_prefill": null
+    }
+  ]
+}

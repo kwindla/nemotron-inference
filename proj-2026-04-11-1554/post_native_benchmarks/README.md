@@ -2,6 +2,10 @@
 
 Captured on `2026-04-11` after committing the native P5 direct-FP4 activation/pack path.
 
+Historical note:
+- This README reflects the state before removing Nano's hard-coded `23`-token routed-MoE prefill clamp.
+- The current default-runtime measurements live under `../post_default_direct_benchmarks/README.md`.
+
 ### Sequential test sweep
 
 - Command: `ctest --test-dir build-sm120-relwithdebinfo --output-on-failure -j1`
@@ -15,6 +19,7 @@ Captured on `2026-04-11` after committing the native P5 direct-FP4 activation/pa
 
 - Artifact: `shared_prefill/nano_shared_prefill_native_direct.json`
 - Command shape: `benchmarks/nano_shared_prefill/run_default_bench.sh --native-env NEMOTRON_ENABLE_FP4_DIRECT_FC1=1`
+  - Historical only: the direct-FC1 path was still opt-in at this point.
 - `384`: `hot_prefill_mean_ms = 785.876749`, `hot_first_token_mean_ms = 828.139879`
 - `512`: `hot_prefill_mean_ms = 1062.848968`, `hot_first_token_mean_ms = 1119.214678`
 - Versus the saved pre-native guardrail, both are slightly slower:

@@ -24,6 +24,7 @@ Captured on `2026-04-11` before implementing the warp-local P5 direct-FP4 epilog
 - These were captured by running `nano_fused_decode_bench --mode=phased` directly with:
   - `NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL=1`
   - `NEMOTRON_ENABLE_FP4_DIRECT_FC1=1`
+  - Historical note: `NEMOTRON_ENABLE_FP4_DIRECT_FC1` was required at capture time but is no longer used by the current runtime.
 
 ### Prompt 384
 

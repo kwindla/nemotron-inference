@@ -11782,7 +11782,6 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   const bool use_fp4_direct_fc1 =
       use_grouped_gemm1_output &&
       use_packed_fc1_source &&
-      RoutedEnvEnabled("NEMOTRON_ENABLE_FP4_DIRECT_FC1") &&
       grouped_gemm1_profile == RoutedGemm1Profile::kP5_128x128x64_SwapTrue;
 
   if ((!use_packed_fc1_source &&

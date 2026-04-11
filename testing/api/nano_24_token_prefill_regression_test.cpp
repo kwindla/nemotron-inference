@@ -15,7 +15,6 @@
 namespace {
 
 constexpr const char* kNanoModelId = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4";
-constexpr std::size_t kStableMoeWindowTokens = 23;
 constexpr std::size_t kMaxNewTokens = 16;
 constexpr std::size_t kRequestMaxTokens = 64;
 
@@ -180,8 +179,8 @@ bool run_regression_test() {
   nemotron::SingleTokenForwardConfig config = nemotron::KnownNemotron3Nano30BA3BConfig();
   config.max_tokens = std::max(config.max_tokens, kRequestMaxTokens);
   if (!expect(
-          config.moe_prefill_window_tokens == kStableMoeWindowTokens,
-          "Nano config should clamp routed MoE prefill to the stable 23-token window")) {
+          config.moe_prefill_window_tokens == 0,
+          "Nano config should use the workspace-backed routed MoE prefill window")) {
     return false;
   }
 

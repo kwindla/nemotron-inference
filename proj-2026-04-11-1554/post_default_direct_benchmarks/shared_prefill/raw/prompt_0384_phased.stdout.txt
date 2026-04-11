@@ -1,0 +1,23 @@
+nano_fused_decode_bench: starting cold run prompt_tokens=384 max_new_tokens=1
+nano_fused_decode_bench: cold prefill start prompt_tokens=384
+nano_fused_decode_bench: cold prefill complete elapsed_ms=290.122 first_token_ms=333.208 token=1319
+nano_fused_decode_bench: completed cold run total_ms=333.244 prefill_ms=290.122 first_token_ms=333.208 steady_state_mean_ms=0
+nano_fused_decode_bench: warmup 1/1 start
+nano_fused_decode_bench: warmup 1/1 prefill start prompt_tokens=384
+nano_fused_decode_bench: warmup 1/1 prefill complete elapsed_ms=188.482 first_token_ms=230.931 token=1319
+nano_fused_decode_bench: warmup 1/1 total_ms=230.946 steady_state_mean_ms=0
+nano_fused_decode_bench: hot 1/3 start
+nano_fused_decode_bench: hot 1/3 prefill start prompt_tokens=384
+nano_fused_decode_bench: hot 1/3 prefill complete elapsed_ms=188.278 first_token_ms=228.805 token=4286
+nano_fused_decode_bench: hot 1/3 total_ms=228.818 prefill_ms=188.278 first_token_ms=228.805 steady_state_mean_ms=0
+nano_fused_decode_bench: hot 2/3 start
+nano_fused_decode_bench: hot 2/3 prefill start prompt_tokens=384
+nano_fused_decode_bench: hot 2/3 prefill complete elapsed_ms=188.597 first_token_ms=228.811 token=4286
+nano_fused_decode_bench: hot 2/3 total_ms=228.821 prefill_ms=188.597 first_token_ms=228.811 steady_state_mean_ms=0
+nano_fused_decode_bench: hot 3/3 start
+nano_fused_decode_bench: hot 3/3 prefill start prompt_tokens=384
+nano_fused_decode_bench: hot 3/3 prefill complete elapsed_ms=188.337 first_token_ms=231.219 token=1044
+nano_fused_decode_bench: hot 3/3 total_ms=231.234 prefill_ms=188.337 first_token_ms=231.219 steady_state_mean_ms=0
+nano_fused_decode_bench: mode=phased prompt_tokens=384 generated_tokens=1 cold_prefill_ms=290.122 cold_first_token_ms=333.208 cold_steady_state_mean_ms=0.000 hot_prefill_mean_ms=188.404 hot_first_token_mean_ms=229.612 hot_steady_state_mean_ms=0.000 steady_state_generated_tokens_per_second=0.000
+linear_op_counters dense_fastpath_plan_success=1620 dense_fastpath_plan_fail=0 dense_fastpath_execute=1620 dense_fastpath_execute_fail=0 nvfp4_fastpath_plan_success=170 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=170 nvfp4_fastpath_execute_fail=0 scaled_fp8_fastpath_execute=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=0 monolithic_layers=0 staging_elapsed_us=0

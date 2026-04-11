@@ -32,9 +32,31 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 ## Post-native validation
 
 - Sequential validation artifacts are recorded under `proj-2026-04-11-1554/post_native_benchmarks/README.md`.
-- The default shared-prefill and TTFT benchmarks are still constrained by Nano's current `moe_prefill_window_tokens = 23` runtime default, so they remain end-to-end guardrails rather than direct measurements of the new P5 direct FC1 path.
-- A direct diagnostic run at `384` tokens confirms that natural long-prompt throughput still uses `routed_gemm1 dispatch_rows=23 ... profile=legacy`.
+- This section is now historical only. It captured the state before removing Nano's `23`-token routed-MoE prefill clamp and before making the supported P5 direct FC1 path unconditional.
 - For TTFT, forcing `--moe-prefill-window-tokens 4096` materially reduces prefill-driven latency while leaving first-token decode roughly unchanged, which is the current best evidence that the native direct path is helping once the runtime is allowed to use it.
+
+## Post-default-direct validation
+
+- Sequential validation artifacts are recorded under `proj-2026-04-11-1554/post_default_direct_benchmarks/README.md`.
+- Nano no longer hard-codes `moe_prefill_window_tokens = 23`; the default runtime now resolves routed-MoE prefill windowing from workspace capacity (`4096` tokens on this RTX 5090 setup).
+- The supported packed-input/grouped-output P5 FC1 path no longer depends on `NEMOTRON_ENABLE_FP4_DIRECT_FC1`; the native direct implementation is now unconditional for that regime.
+- Saved routed-profile proof: `proj-2026-04-11-1554/post_default_direct_benchmarks/diagnostics/prompt_0384_routed_profile.stderr.txt`
+  - Natural long-prompt throughput now uses `routed_gemm1 dispatch_rows=384 active_selection_count=2304 profile=p5_128x128x64_swap_true mode=fp4_direct`
+- Shared-prefill throughput is now a direct measurement of the path we care about:
+  - `384`: `hot_prefill_mean_ms 783.608886 -> 188.403850` (`-75.96%`), `hot_first_token_mean_ms 825.789506 -> 229.611812` (`-72.19%`)
+  - `512`: `hot_prefill_mean_ms 1059.598123 -> 227.061275` (`-78.57%`), `hot_first_token_mean_ms 1115.096786 -> 282.020398` (`-74.71%`)
+- Default TTFT now matches the old forced-`4096` run within measurement noise, which is the expected outcome after removing the `23`-token clamp:
+  - `cold_prefill_prefix256`: `166.604 -> 167.024 ms` (`+0.25%`)
+  - `cold_prefill_prefix1024`: `494.662 -> 494.160 ms` (`-0.10%`)
+  - `cold_prefill_prefix4096`: `2186.216 -> 2186.433 ms` (`+0.01%`)
+  - `cached_committed_head_prefix4096_tail32 hot-prefix TTFT`: `138.974 -> 139.445 ms` (`+0.34%`)
+- Default TTFT versus the old default-window regime shows the real end-to-end win from using the wide routed-MoE prefill window in production:
+  - `cold_prefill_prefix256`: `666.521 -> 167.024 ms` (`-74.94%`)
+  - `cold_prefill_prefix1024`: `2684.803 -> 494.160 ms` (`-81.59%`)
+  - `cold_prefill_prefix4096`: `12179.834 -> 2186.433 ms` (`-82.05%`)
+  - `cached_committed_head_prefix256_tail32 hot-prefix TTFT`: `122.426 -> 97.807 ms` (`-20.11%`)
+  - `cached_committed_head_prefix1024_tail32 hot-prefix TTFT`: `136.342 -> 106.269 ms` (`-22.06%`)
+  - `cached_committed_head_prefix4096_tail32 hot-prefix TTFT`: `183.702 -> 139.445 ms` (`-24.09%`)
 
 ## Reference implementations
 
@@ -61,7 +83,7 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 - Kernel-level smem: `fp4_direct_stage_storage[32*128]` at line 6319 (16KB)
 - Kernel epilogue site: lines 7724-7768 (zero-fill → stage → sync → pack)
 - FC1 boundary compare harness: `NEMOTRON_DEBUG_COMPARE_FP4_DIRECT` at line 2164
-- P5 direct gating: `use_fp4_direct_fc1` at line 11647
+- P5 direct selection: native direct is unconditional for the supported packed-input/grouped-output `P5` regime
 - Constants: `kTracedP5DirectStageRows=32`, `kTracedP5DirectStageCols=128`, `kTracedP5DirectBlocksPerRow=8` at lines 167-170
 - `kTracedP5CCopyCoordCapacity=32` (but only 16 valid per step 2) at line 405
 - `fused_decode::kNvfp4BlockWidth=16`, `kNvfp4Fp4MaxFinite=6.0f` in `fused_decode_common.cuh`
@@ -86,16 +108,16 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 
 ### Safety and sequencing
 - Keep the smem-staged path only as a development oracle while bringing up the warp-local path. Do not leave a permanent production fallback once the warp-local path is validated.
-- Keep the BF16 grouped FC1 path as the default (unchanged).
+- Keep native direct as the only production FC1 implementation for the supported packed-input/grouped-output `P5` regime. Non-`P5`/legacy routed paths remain until the broader row-count launch-matrix rewrite lands.
 - Keep the `NEMOTRON_DEBUG_COMPARE_FP4_DIRECT` compare harness for verification.
 - Do not modify the BF16 epilogue, the FC2 consumer, or any non-P5 code path.
 
 ### Validation categories
 - **FC1 boundary compare**: `NEMOTRON_DEBUG_COMPARE_FP4_DIRECT=1` under forced P5 dispatch. Use the explicit forced-P5 command below. Target: profile log confirms `P5`, and the compare output is treated as a numerics-drift diagnostic against the old BF16-boundary path, not as a zero-mismatch gate.
-- **Token oracle**: `nano_24_token_prefill_regression_test` with `NEMOTRON_ENABLE_FP4_DIRECT_FC1=1` (natural profile selection). Must PASS.
+- **Token oracle**: `nano_24_token_prefill_regression_test` under natural profile selection. Must PASS.
 - **Per-layer diagnostic**: `NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY=1` envelope must not regress.
 - **Low-level bitwise oracle**: `testing/backend/staged_fp4_pack_test.cpp` must drive the live P5 direct packer through the real `TracedP5AccumProfileLayout`, with deliberately non-uniform per-row tensor scales, and bitwise-compare `packed_data`, `block_scales_data`, `matmul_block_scales_data`, `activation_output_scale`, `tensor_scale`, and `per_row_tensor_scales` against the staged/reference native oracle.
-- **Benchmark**: compare `warp-local` against recorded `smem-staged direct` numbers first, and against the BF16 baseline second. Hot prefill is the primary metric; cold setup and TTFT are secondary but must not regress materially. For the existing `384/512` long-prompt benchmark, treat results as end-to-end guardrails only because the routed MoE window still dispatches `23` rows and selects `legacy` rather than `P5`.
+- **Benchmark**: compare `warp-local` against recorded `smem-staged direct` numbers first, and against the BF16 baseline second. Hot prefill is the primary metric; cold setup and TTFT are secondary but must not regress materially. After removing Nano's `23`-token clamp, `384/512` long-prompt runs are now direct measurements of the native `P5` routed-MoE path rather than legacy-only guardrails.
 - **Test baseline**: `ctest -j1` must remain 69/72.
 
 ### Test protocol
@@ -114,7 +136,6 @@ NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL=1 build/testing/nano_24_token_p
 Forced-P5 code-path validation command:
 ```
 NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL=1 \
-NEMOTRON_ENABLE_FP4_DIRECT_FC1=1 \
 NEMOTRON_DEBUG_USE_SELECTED_TOKEN_TILE_FOR_DISPATCH=1 \
 NEMOTRON_ROUTED_PROFILE_DEBUG=1 \
 NEMOTRON_DEBUG_COMPARE_FP4_DIRECT=1 \
@@ -148,14 +169,14 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
   Update `LaunchPlannedPackedInputMatVecFp4Direct` and the kernel instantiation to use the warp-local direct epilogue. Use the new low-level bitwise oracle as the primary bring-up check, then use the explicit forced-P5 runtime command to prove the live P5 code path. Once the low-level oracle and forced-P5 runtime checks pass, remove the 16KB `fp4_direct_stage_storage` allocation and delete the staged direct production path. Run validation:
   1. `ctest -j1` → 69/72
   2. low-level warp-local pack test with non-uniform per-row tensor scales → bitwise match to staged/reference outputs
-  3. `nano_24_token_prefill_regression_test` with `NEMOTRON_ENABLE_FP4_DIRECT_FC1=1` → PASS
+  3. `nano_24_token_prefill_regression_test` → PASS
   4. forced-P5 code-path validation command → log shows `profile=P5`; treat FC1 boundary compare as a diagnostic against the old BF16 path, not a zero-mismatch gate
   5. Per-layer diagnostic → within envelope
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `testing/backend/staged_fp4_pack_test.cpp`
 
 - [x] **4. Benchmark at 384/512 tokens and compare**
   The current baseline is already captured at `proj-2026-04-11-1554/baseline_reference/manual_bench/`. After wiring the warp-local path, rerun the long-prompt benchmark at `384/512` and compare first against those recorded numbers and second against the BF16 baseline. Report hot prefill as the primary metric, with cold setup and TTFT as guardrails.
-  Important: these long-prompt runs are integration guardrails, not direct P5-epilogue measurements, because the routed MoE window still dispatches `23` rows and selects `legacy`. Do not treat a flat `384/512` result as proof that the warp-local P5 epilogue failed to help.
+  After removing Nano's `23`-token clamp, these long-prompt runs become direct `P5` routed-MoE measurements and should be used as the main throughput evidence for the new path.
   Key files: `benchmarks/nano_shared_prefill/run_default_bench.sh`, `tools/benchmark_analysis/compare_shared_prefill_benchmarks.py`
 
 ## Progress

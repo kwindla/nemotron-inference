@@ -1,0 +1,15 @@
+nano_fused_decode_bench: starting cold run prompt_tokens=384 max_new_tokens=1
+nano_fused_decode_bench: cold prefill start prompt_tokens=384
+nano_fused_decode_bench: cold prefill complete elapsed_ms=288.779 first_token_ms=331.435 token=4286
+nano_fused_decode_bench: completed cold run total_ms=331.473 prefill_ms=288.779 first_token_ms=331.435 steady_state_mean_ms=0
+nano_fused_decode_bench: warmup 1/1 start
+nano_fused_decode_bench: warmup 1/1 prefill start prompt_tokens=384
+nano_fused_decode_bench: warmup 1/1 prefill complete elapsed_ms=187.9 first_token_ms=229.156 token=4286
+nano_fused_decode_bench: warmup 1/1 total_ms=229.177 steady_state_mean_ms=0
+nano_fused_decode_bench: hot 1/1 start
+nano_fused_decode_bench: hot 1/1 prefill start prompt_tokens=384
+nano_fused_decode_bench: hot 1/1 prefill complete elapsed_ms=188.129 first_token_ms=230.786 token=1319
+nano_fused_decode_bench: hot 1/1 total_ms=230.809 prefill_ms=188.129 first_token_ms=230.786 steady_state_mean_ms=0
+nano_fused_decode_bench: mode=phased prompt_tokens=384 generated_tokens=1 cold_prefill_ms=288.779 cold_first_token_ms=331.435 cold_steady_state_mean_ms=0.000 hot_prefill_mean_ms=188.129 hot_first_token_mean_ms=230.786 hot_steady_state_mean_ms=0.000 steady_state_generated_tokens_per_second=0.000
+linear_op_counters dense_fastpath_plan_success=972 dense_fastpath_plan_fail=0 dense_fastpath_execute=972 dense_fastpath_execute_fail=0 nvfp4_fastpath_plan_success=102 nvfp4_fastpath_plan_fail=0 nvfp4_fastpath_execute=102 nvfp4_fastpath_execute_fail=0 scaled_fp8_fastpath_execute=0
+expert_staging_counters total_bytes_uploaded=0 total_experts_staged=0 total_staging_calls=0 monolithic_layers=0 staging_elapsed_us=0
