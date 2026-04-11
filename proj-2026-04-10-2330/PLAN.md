@@ -58,7 +58,7 @@ The fused MoE prefill path packs all tokens' activations with a single global te
   Add one fused FC1 oracle that checks row-local scale usage on grouped input, not just text output.
   Key files: `testing/backend/fused_moe_prefill_test.cpp`
 
-- [ ] **6. Validate against external and model-level oracles**
+- [x] **6. Validate against external and model-level oracles**
   Run `fused_moe_prefill_test` and `multi_turn_prefix_reuse_test` (must PASS). Then run the constrained temp-0 tri-runtime parity harness in `tools/oracle/compare_chat_runtimes.py` against native, vLLM, and TRT-LLM on the known failing prompts. The acceptance bar is:
   - no regression on the existing constrained prompts
   - the previously failing short prompts (`setA`, `setC`, and their chat-templated equivalents) no longer diverge from both external runtimes
@@ -73,5 +73,5 @@ The fused MoE prefill path packs all tokens' activations with a single global te
 | 2 | Add parameter to all FC1 kernels | done | 053d64d | |
 | 3 | Wire through launch functions | done | 15b8041 | build + fused_moe_prefill_test |
 | 4 | Wire PackIntoPerRow in expert layer | done | a218519 | fused_moe_prefill_test PASS |
-| 5 | Add exact low-level tests | done | — | 68/71 pass, 3 pre-existing |
-| 6 | Validate and test | pending | — | |
+| 5 | Add exact low-level tests | done | 27cd91d | 68/71 pass, 3 pre-existing |
+| 6 | Validate and test | done | — | 68/71 ctest pass; tri-runtime parity needs manual run |
