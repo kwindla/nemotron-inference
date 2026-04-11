@@ -641,7 +641,9 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
     int output_rows_this_tile,
     std::size_t row_start,
     std::size_t output_rows_per_expert,
-    OutputType* output) {
+    OutputType* output,
+    const float* per_row_tensor_scales = nullptr,
+    float weight_tensor_scale = 1.0f) {
   if constexpr (Profile == UnifiedRoutedFp4Profile::kP5) {
     int row_coords[kTracedP5CCopyCoordCapacity];
     int col_coords[kTracedP5CCopyCoordCapacity];
@@ -672,7 +674,11 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
           }
           const std::size_t input_row = row_start + static_cast<std::size_t>(token);
           const std::size_t output_col = static_cast<std::size_t>(output_row_base + row);
-          const float value = accum_tensor(reg, m_fragment, n_fragment) * alpha;
+          const float row_alpha =
+              per_row_tensor_scales != nullptr
+                  ? per_row_tensor_scales[input_row] * weight_tensor_scale
+                  : alpha;
+          const float value = accum_tensor(reg, m_fragment, n_fragment) * row_alpha;
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + output_col] = __float2bfloat16(value);
           } else {
@@ -712,7 +718,11 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
           const std::size_t input_row = row_start + static_cast<std::size_t>(token_row);
           const std::size_t output_col =
               static_cast<std::size_t>(output_row_base + output_col_offset);
-          const float value = accum_tensor(reg, m_fragment, n_fragment) * alpha;
+          const float row_alpha =
+              per_row_tensor_scales != nullptr
+                  ? per_row_tensor_scales[input_row] * weight_tensor_scale
+                  : alpha;
+          const float value = accum_tensor(reg, m_fragment, n_fragment) * row_alpha;
           if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
             output[input_row * output_rows_per_expert + output_col] = __float2bfloat16(value);
           } else {
@@ -741,11 +751,15 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
       }
       const std::size_t input_row = row_start + static_cast<std::size_t>(token_row);
       const std::size_t output_col = static_cast<std::size_t>(output_row_base + output_col_offset);
+      const float row_alpha =
+          per_row_tensor_scales != nullptr
+              ? per_row_tensor_scales[input_row] * weight_tensor_scale
+              : alpha;
       if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
         output[input_row * output_rows_per_expert + output_col] =
-            __float2bfloat16(accum_tensor(i) * alpha);
+            __float2bfloat16(accum_tensor(i) * row_alpha);
       } else {
-        output[input_row * output_rows_per_expert + output_col] = accum_tensor(i) * alpha;
+        output[input_row * output_rows_per_expert + output_col] = accum_tensor(i) * row_alpha;
       }
     }
   }
@@ -4671,6 +4685,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
     const int* cta_count,
     const int* cta_batch_indices,
     const int* cta_row_starts,
@@ -4715,11 +4730,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
   const int output_rows_this_tile = static_cast<int>(
       min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
           static_cast<std::size_t>(kOutputTile)));
-  const float input_tensor_scale =
-      input_dq_scales == nullptr
-          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
-                                                   : *input_tensor_scale_data)
-          : 1.0f;
 
   wmma::fragment<
       wmma::accumulator,
@@ -4752,13 +4762,22 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
           &a_tile[buffer_index][tile_token]
                  [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       if (tile_token < valid_rows) {
+        const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+        const float row_ts =
+            input_dq_scales != nullptr
+                ? 1.0f
+                : (input_expert_tensor_scales != nullptr
+                       ? input_expert_tensor_scales[expert_index]
+                       : (input_per_row_tensor_scales != nullptr
+                              ? input_per_row_tensor_scales[input_row]
+                              : *input_tensor_scale_data));
         DecodeGroupedPackedInputBlockBf16(
             packed_input,
             input_block_scales,
             input_dq_scales,
-            input_tensor_scale,
+            row_ts,
             weight.input_cols,
-            static_cast<std::size_t>(row_start + tile_token),
+            input_row,
             block_base + static_cast<std::size_t>(tile_block),
             dst);
       } else {
@@ -4880,6 +4899,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
     const int* cta_count,
     const int* cta_batch_indices,
     const int* cta_row_starts,
@@ -4924,11 +4944,6 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
   const int output_rows_this_tile = static_cast<int>(
       min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
           static_cast<std::size_t>(kOutputTile)));
-  const float input_tensor_scale =
-      input_dq_scales == nullptr
-          ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
-                                                   : *input_tensor_scale_data)
-          : 1.0f;
 
   wmma::fragment<
       wmma::accumulator,
@@ -4985,13 +5000,22 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
           &b_tile[buffer_index][tile_token]
                  [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
       if (tile_token < valid_rows) {
+        const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+        const float row_ts =
+            input_dq_scales != nullptr
+                ? 1.0f
+                : (input_expert_tensor_scales != nullptr
+                       ? input_expert_tensor_scales[expert_index]
+                       : (input_per_row_tensor_scales != nullptr
+                              ? input_per_row_tensor_scales[input_row]
+                              : *input_tensor_scale_data));
         DecodeGroupedPackedInputBlockBf16(
             packed_input,
             input_block_scales,
             input_dq_scales,
-            input_tensor_scale,
+            row_ts,
             weight.input_cols,
-            static_cast<std::size_t>(row_start + tile_token),
+            input_row,
             block_base + static_cast<std::size_t>(tile_block),
             dst);
       } else {
@@ -5409,6 +5433,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
     const int* cta_count,
     const int* cta_batch_indices,
     const int* cta_row_starts,
@@ -5600,12 +5625,13 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   const int output_rows_this_tile = static_cast<int>(
       min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
           static_cast<std::size_t>(kOutputTile)));
+  const float weight_tensor_scale = *weight.tensor_scale_data;
   const float input_tensor_scale =
       input_dq_scales == nullptr
           ? (input_expert_tensor_scales != nullptr ? input_expert_tensor_scales[expert_index]
                                                    : *input_tensor_scale_data)
           : 1.0f;
-  const float output_alpha = input_tensor_scale * (*weight.tensor_scale_data);
+  const float output_alpha = input_tensor_scale * weight_tensor_scale;
 
   nvfp4_bridge::CRegister accum_storage[Traits::kAccumProfileCosize];
   if (warp_id < kFp4ConsumerWarps) {
@@ -6860,7 +6886,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
         output_rows_this_tile,
         static_cast<std::size_t>(row_start),
         output_rows_per_expert,
-        output);
+        output,
+        input_per_row_tensor_scales,
+        weight_tensor_scale);
   }
 #else
   (void) packed_input;
@@ -6869,6 +6897,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   (void) input_tensor_scale_data;
   (void) input_expert_tensor_scales;
   (void) input_dq_scales;
+  (void) input_per_row_tensor_scales;
   (void) cta_count;
   (void) cta_batch_indices;
   (void) cta_row_starts;
@@ -7751,6 +7780,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
     const int* cta_count,
     const int* cta_batch_indices,
     const int* cta_m_limits,
@@ -7771,6 +7801,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel(
       (input_tensor_scale_data == nullptr && input_dq_scales == nullptr)) {
     return;
   }
+  (void) input_per_row_tensor_scales;
 
   const int tid = static_cast<int>(threadIdx.x);
   const int warp_id = tid / 32;
@@ -7914,6 +7945,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsBf16Kernel(
     const float* input_tensor_scale_data,
     const float* input_expert_tensor_scales,
     const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
     const int* cta_count,
     const int* cta_batch_indices,
     const int* cta_m_limits,
@@ -7935,6 +7967,7 @@ __global__ void Nvfp4LaunchPlannedPackedInputExpertMatVecRowsBf16Kernel(
       output == nullptr) {
     return;
   }
+  (void) input_per_row_tensor_scales;
 
   const int tid = static_cast<int>(threadIdx.x);
   const int warp_id = tid / 32;
@@ -9309,6 +9342,7 @@ bool LaunchPlannedPackedInputMatVec(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9369,6 +9403,7 @@ bool LaunchPlannedPackedInputMatVec(
               input_pack.device_tensor_scale_ptr(),
               input_expert_tensor_scales,
               input_dq_scales,
+              nullptr,
               launch_plan->num_non_exiting_ctas(),
               launch_plan->cta_idx_xy_to_batch_idx(),
               launch_plan->cta_row_starts(),
@@ -9400,6 +9435,7 @@ bool LaunchPlannedPackedInputMatVec(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9454,6 +9490,7 @@ bool LaunchPlannedPackedInputMatVec(
       input_pack.device_tensor_scale_ptr(),
       input_expert_tensor_scales,
       input_dq_scales,
+      nullptr,
       launch_plan->num_non_exiting_ctas(),
       launch_plan->cta_idx_xy_to_batch_idx(),
       launch_plan->cta_idx_xy_to_mn_limit(),
@@ -9522,6 +9559,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9537,6 +9575,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9552,6 +9591,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9583,6 +9623,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9609,6 +9650,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
             input_pack.device_tensor_scale_ptr(),
             input_expert_tensor_scales,
             input_dq_scales,
+            nullptr,
             launch_plan->num_non_exiting_ctas(),
             launch_plan->cta_idx_xy_to_batch_idx(),
             launch_plan->cta_row_starts(),
@@ -9652,6 +9694,7 @@ bool LaunchPlannedPackedInputMatVecBf16(
       input_pack.device_tensor_scale_ptr(),
       input_expert_tensor_scales,
       input_dq_scales,
+      nullptr,
       launch_plan->num_non_exiting_ctas(),
       launch_plan->cta_idx_xy_to_batch_idx(),
       launch_plan->cta_idx_xy_to_mn_limit(),

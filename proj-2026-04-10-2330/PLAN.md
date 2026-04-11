@@ -21,7 +21,7 @@ The fused MoE prefill path packs all tokens' activations with a single global te
   Add `per_row_tensor_scales` (float*) storage to `DeviceNvfp4Matrix::Impl`. Allocate in `Create()`, free in destructor. Add three CUDA kernels: `ComputePerRowMaxAbsKernel` (one atomicMax per row), `WritePerRowTensorScalesKernel` (per-row max-abs to tensor scale), `PackAndSwizzleRowMajorFp32ToNvfp4PerRowScaleKernel` (same as existing pack kernel but reads `per_row_tensor_scales[row]` instead of `*tensor_scale_data`). Add `PackIntoPerRow()` method that orchestrates these. Keep writing the existing global tensor scale for bookkeeping/debug visibility, but do not treat it as a complete decode contract for per-row-packed matrices. Add `per_row_tensor_scales()` accessor. Add per-row scale gathering in `GatherDeviceNvfp4Rows`: when both source and output have `per_row_tensor_scales != nullptr`, launch `GatherPerRowTensorScalesKernel` to gather `source.per_row_tensor_scales[source_row_indices[i]]` into `output.per_row_tensor_scales[i]`.
   Key files: `runtime/include/nemotron/device_nvfp4_matrix.h`, `runtime/src/backend/device_nvfp4_matrix.cu`
 
-- [ ] **2. Add `input_per_row_tensor_scales` parameter to all FC1 kernels**
+- [x] **2. Add `input_per_row_tensor_scales` parameter to all FC1 kernels**
   Add `const float* input_per_row_tensor_scales` parameter to the following kernel signatures (after `input_dq_scales`): `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse` (line 4668), `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue` (line 4877), `Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel` (line 5405). Also add to `Nvfp4LaunchPlannedPackedInputExpertMatVecRowsKernel` (line 7748) and `Nvfp4LaunchPlannedPackedInputExpertMatVecRowsBf16Kernel` (line 7911) for completeness, though these legacy kernels will pass nullptr. For the unified kernel's `#else` (non-CUTE) block, add `(void) input_per_row_tensor_scales;`.
   In each NON-unified kernel (SwapFalse, SwapTrue): preserve the current precedence exactly:
   1. `input_dq_scales`
@@ -69,8 +69,8 @@ The fused MoE prefill path packs all tokens' activations with a single global te
 ## Progress
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Per-row packing infrastructure | done | — | |
-| 2 | Add parameter to all FC1 kernels | pending | — | |
+| 1 | Per-row packing infrastructure | done | 93f3a03 | |
+| 2 | Add parameter to all FC1 kernels | done | — | |
 | 3 | Wire through launch functions | pending | — | |
 | 4 | Wire PackIntoPerRow in expert layer | pending | — | |
 | 5 | Add exact low-level tests | pending | — | |
