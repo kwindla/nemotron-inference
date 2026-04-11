@@ -37,6 +37,8 @@ const char* SummaryKernelFamilyName(GemmKernelFamily family) {
       return "dense";
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       return "nvfp4";
+    case GemmKernelFamily::kSm120ContiguousSharedNvfp4:
+      return "shared_nvfp4";
   }
   return "unknown";
 }

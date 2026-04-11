@@ -12,6 +12,7 @@
 namespace nemotron {
 
 class DeviceMoeLaunchPlan;
+struct GemmLaunchPlan;
 
 class DeviceNvfp4Matrix {
  public:
@@ -44,6 +45,8 @@ class DeviceNvfp4Matrix {
   const std::uint8_t* tensor_scale_data() const;
   const void* p5_tma_load_b_descriptors(const DeviceMoeLaunchPlan& launch_plan) const;
   const void* p5_tma_load_sfb_descriptors(const DeviceMoeLaunchPlan& launch_plan) const;
+  const void* shared_p5_tma_load_b_descriptors(const GemmLaunchPlan& launch_plan) const;
+  const void* shared_p5_tma_load_sfb_descriptors(const GemmLaunchPlan& launch_plan) const;
   Nvfp4ScaleLayout scale_layout() const;
   bool PackInto(
       const DeviceTensorFp32& source,

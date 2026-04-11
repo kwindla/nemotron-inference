@@ -46,7 +46,7 @@ For implementation structure, the closer precedent is the existing local direct-
   Use the routed ownership pattern as the precedent: routed A/SFA descriptors are owned by `MonolithicNvfp4ExpertWeights`, and views only borrow pointers. For the shared path, extend `DeviceNvfp4Weight` so the long-lived shared weight objects own cached P5-style A/SFA descriptors, then expose borrowed pointers through `FusedNvfp4WeightView`. Immutable weight descriptors should be built once during weight preparation, not reconstructed every launch.
   Key files: `runtime/include/nemotron/nvfp4_weight.h`, `runtime/src/backend/nvfp4_weight.cpp`, `runtime/include/nemotron/fused_moe_decode.h`, `runtime/src/backend/expert_layer.cpp`, `runtime/src/backend/monolithic_expert_weights.cu`
 
-- [ ] **3. Add a reusable contiguous shared-NVFP4 planning and descriptor-cache layer**
+- [x] **3. Add a reusable contiguous shared-NVFP4 planning and descriptor-cache layer**
   Introduce a shared-kernel planning surface that fits the existing runtime architecture instead of bypassing it. At minimum this means:
   - a distinct kernel family/backend kind for native contiguous SM120 NVFP4 shared GEMMs
   - a contiguous CTA/profile selection model keyed by token-count bucket, tile shape, and relevant weight dimensions
@@ -91,8 +91,8 @@ For implementation structure, the closer precedent is the existing local direct-
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Reuse existing shared activation packs | done | 6c3de5b | shared_fc1_pack/shared_fc2_pack aliases wired through params + validation |
-| 2 | Extend shared weight TMA descriptor caching | done | — | DeviceNvfp4Weight owns descriptors; view borrows pointers |
-| 3 | Add shared planning/cache layer | pending | — | Include contiguous activation descriptor ownership and profiling hooks |
+| 2 | Extend shared weight TMA descriptor caching | done | 3e9cf1c | DeviceNvfp4Weight owns descriptors; view borrows pointers |
+| 3 | Add shared planning/cache layer | done | — | kSm120ContiguousSharedNvfp4 family + cached B/SFB descriptors + token-bucket profiles |
 | 4 | Write contiguous FP4 MMA shared GEMM kernel | pending | — | Consume Step 3 dispatch/cache plumbing |
 | 5 | Replace shared prefill pipeline | pending | — | |
 | 6 | Validate correctness across multi-row shapes | pending | — | Include small-row and partial-tile coverage |

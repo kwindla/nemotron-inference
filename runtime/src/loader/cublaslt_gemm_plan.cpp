@@ -167,6 +167,9 @@ std::optional<CublasLtGemmPlan> BuildCublasLtGemmPlan(
       plan.tensor_scale_alignment_ok =
           IsAligned(execution.launch_plan.tensor_scale_bytes.data, plan.required_alignment_bytes);
       break;
+    case GemmBackendKind::kSm120ContiguousSharedNvfp4:
+      LogPlanReject(execution, "unsupported_cublaslt_backend", reject_info);
+      return std::nullopt;
   }
 
   if (!plan.packed_alignment_ok) {

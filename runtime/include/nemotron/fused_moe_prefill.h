@@ -11,6 +11,7 @@
 namespace nemotron {
 
 class DeviceNvfp4Matrix;
+class GemmHeuristicCache;
 
 struct FusedMoePrefillParams {
   std::size_t token_count = 0;
@@ -31,6 +32,7 @@ struct FusedMoePrefillParams {
   const DeviceNvfp4Matrix* shared_fc1_pack = nullptr;  // Alias for the shared FC1 input pack. Defaults to normalized_pack.
   DeviceExpertRouting* routing = nullptr;
   DeviceMoeLaunchPlan* launch_plan = nullptr;
+  GemmHeuristicCache* heuristic_cache = nullptr;
   float* routed_gather_scratch = nullptr;  // padded_row_capacity x hidden_size
   float* fc1_expert_activation_scales = nullptr;  // Optional legacy FC1 input tensor scales.
   DeviceNvfp4Matrix* fc1_grouped_pack = nullptr;  // Optional legacy packed FC1 input contract.

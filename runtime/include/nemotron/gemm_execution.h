@@ -11,6 +11,7 @@ namespace nemotron {
 enum class GemmBackendKind {
   kCublasLtDense,
   kCublasLtNvfp4BlockScaled,
+  kSm120ContiguousSharedNvfp4,
 };
 
 const char* ToString(GemmBackendKind backend_kind);

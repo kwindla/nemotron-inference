@@ -9,8 +9,13 @@
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <type_traits>
 
+#include "nemotron/gemm_execution.h"
+#include "nemotron/linear_op_trace.h"
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 #include <cutlass/arch/barrier.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
@@ -1490,6 +1495,13 @@ enum class RoutedGemm2Profile {
   kP15_256x128x64_SwapTrue,
 };
 
+struct SharedContiguousPreparedLaunch {
+  GemmLaunchPlan launch_plan;
+  PreparedGemmExecution execution;
+  const void* p5_tma_load_b_descriptors = nullptr;
+  const void* p5_tma_load_sfb_descriptors = nullptr;
+};
+
 struct P15ScaleTrace {
   int valid = 0;
   int row_start = -1;
@@ -1659,6 +1671,114 @@ bool RoutedEnvEnabled(const char* env_var) {
 
 bool RoutedProfileDebugEnabled() {
   return std::getenv("NEMOTRON_ROUTED_PROFILE_DEBUG") != nullptr;
+}
+
+bool SharedProfileDebugEnabled() {
+  return std::getenv("NEMOTRON_SHARED_PROFILE_DEBUG") != nullptr;
+}
+
+bool ValidFusedNvfp4WeightView(const FusedNvfp4WeightView& weight);
+
+void AppendSharedContiguousTraceEntry(
+    const std::string& tensor_name,
+    bool plan_build_ok,
+    bool execute_ok) {
+  if (!IsLinearOpTraceEnabled()) {
+    return;
+  }
+  auto& trace = GetLinearOpTrace();
+  std::lock_guard<std::mutex> lock(trace.mutex);
+  trace.entries.push_back(LinearOpTraceEntry{
+      tensor_name,
+      GemmKernelFamily::kSm120ContiguousSharedNvfp4,
+      LinearOpPath::kFastpath,
+      plan_build_ok,
+      execute_ok,
+  });
+}
+
+std::optional<SharedContiguousPreparedLaunch> PrepareSharedContiguousLaunch(
+    const std::string& tensor_name,
+    const DeviceNvfp4Matrix& input_pack,
+    std::size_t activation_rows,
+    const FusedNvfp4WeightView& weight,
+    GemmHeuristicCache* heuristic_cache) {
+  if (!input_pack.valid() ||
+      !ValidFusedNvfp4WeightView(weight) ||
+      activation_rows == 0 ||
+      activation_rows > input_pack.rows() ||
+      input_pack.cols() != weight.input_cols ||
+      input_pack.scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4) {
+    return std::nullopt;
+  }
+
+  const auto launch_plan = BuildSharedNvfp4ContiguousLaunchPlan(
+      SharedNvfp4ContiguousPlanRequest{
+          tensor_name,
+          activation_rows,
+          weight.output_rows,
+          weight.input_cols,
+          ByteRangeView{weight.packed_data, (weight.output_rows * weight.input_cols) / 2u},
+          ByteRangeView{
+              weight.matmul_block_scales_data != nullptr
+                  ? weight.matmul_block_scales_data
+                  : weight.block_scales_data,
+              1u,
+          },
+          ByteRangeView{reinterpret_cast<const std::uint8_t*>(weight.tensor_scale_data), sizeof(float)},
+      });
+  if (!launch_plan.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto execution = PrepareGemmExecution(*launch_plan, heuristic_cache);
+  if (!execution.has_value()) {
+    return std::nullopt;
+  }
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  const void* p5_tma_load_b_descriptors =
+      input_pack.shared_p5_tma_load_b_descriptors(*launch_plan);
+  const void* p5_tma_load_sfb_descriptors =
+      input_pack.shared_p5_tma_load_sfb_descriptors(*launch_plan);
+  if (p5_tma_load_b_descriptors == nullptr || p5_tma_load_sfb_descriptors == nullptr) {
+    return std::nullopt;
+  }
+#else
+  const void* p5_tma_load_b_descriptors = nullptr;
+  const void* p5_tma_load_sfb_descriptors = nullptr;
+  return std::nullopt;
+#endif
+
+  if (SharedProfileDebugEnabled()) {
+    const std::string bucket_upper =
+        launch_plan->token_bucket_upper == std::numeric_limits<std::size_t>::max()
+            ? "inf"
+            : std::to_string(launch_plan->token_bucket_upper);
+    std::fprintf(
+        stderr,
+        "shared_contiguous profile tensor=%s rows=%zu profile=%s tile=%zux%zux%zu bucket=%zu-%s cta=%zux%zu backend=%s algorithm=%llu cached=%d\n",
+        tensor_name.c_str(),
+        activation_rows,
+        launch_plan->profile_name.c_str(),
+        launch_plan->tile_m,
+        launch_plan->tile_n,
+        launch_plan->tile_k,
+        launch_plan->token_bucket_lower,
+        bucket_upper.c_str(),
+        launch_plan->cta_m_count,
+        launch_plan->cta_n_count,
+        ToString(execution->backend_kind),
+        static_cast<unsigned long long>(execution->algorithm_id),
+        execution->algorithm_from_cache ? 1 : 0);
+  }
+
+  SharedContiguousPreparedLaunch prepared;
+  prepared.launch_plan = *launch_plan;
+  prepared.execution = *execution;
+  prepared.p5_tma_load_b_descriptors = p5_tma_load_b_descriptors;
+  prepared.p5_tma_load_sfb_descriptors = p5_tma_load_sfb_descriptors;
+  return prepared;
 }
 
 const char* RoutedGemm1ProfileName(RoutedGemm1Profile profile) {
@@ -10272,6 +10392,41 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
           params.output,
           params.routed_output)) {
     return false;
+  }
+
+  const bool should_prepare_shared_up_plan =
+      shared_fc1_pack != nullptr && shared_fc1_pack->valid();
+  const bool should_prepare_shared_down_plan =
+      shared_fc2_pack != nullptr && shared_fc2_pack->valid();
+  const auto shared_up_prepared_launch =
+      should_prepare_shared_up_plan
+          ? PrepareSharedContiguousLaunch(
+                "shared_up_prefill",
+                *shared_fc1_pack,
+                params.token_count,
+                params.shared_up,
+                params.heuristic_cache)
+          : std::nullopt;
+  const auto shared_down_prepared_launch =
+      should_prepare_shared_down_plan
+          ? PrepareSharedContiguousLaunch(
+                "shared_down_prefill",
+                *shared_fc2_pack,
+                params.token_count,
+                params.shared_down,
+                params.heuristic_cache)
+          : std::nullopt;
+  if (should_prepare_shared_up_plan) {
+    AppendSharedContiguousTraceEntry(
+        "shared_up_prefill",
+        shared_up_prepared_launch.has_value(),
+        shared_up_prepared_launch.has_value());
+  }
+  if (should_prepare_shared_down_plan) {
+    AppendSharedContiguousTraceEntry(
+        "shared_down_prefill",
+        shared_down_prepared_launch.has_value(),
+        shared_down_prepared_launch.has_value());
   }
 
   if (!CheckCuda(cudaMemcpyAsync(

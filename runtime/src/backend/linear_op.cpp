@@ -396,6 +396,12 @@ std::unique_ptr<UploadedLinearOp> UploadedLinearOp::Create(
         return nullptr;
       }
       break;
+    case GemmKernelFamily::kSm120ContiguousSharedNvfp4:
+      if (debug) {
+        std::cerr << "linear_op_create: shared contiguous NVFP4 family is not a standalone linear op for "
+                  << descriptor.tensor_name << "\n";
+      }
+      return nullptr;
   }
   return std::unique_ptr<UploadedLinearOp>(new UploadedLinearOp(std::move(impl)));
 }
@@ -422,6 +428,8 @@ bool UploadedLinearOp::valid() const {
                impl_->fixed_activation_tensor_scale_device->valid())) &&
              impl_->activation_pack &&
              impl_->activation_pack->valid();
+    case GemmKernelFamily::kSm120ContiguousSharedNvfp4:
+      return false;
   }
   return false;
 }
@@ -743,6 +751,8 @@ bool UploadedLinearOp::Run(
         }
         break;
       }
+    case GemmKernelFamily::kSm120ContiguousSharedNvfp4:
+      break;
   }
 
   if (trace_enabled) {

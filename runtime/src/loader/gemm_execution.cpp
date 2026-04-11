@@ -24,6 +24,8 @@ const char* ToString(GemmBackendKind backend_kind) {
       return "cublaslt_dense";
     case GemmBackendKind::kCublasLtNvfp4BlockScaled:
       return "cublaslt_nvfp4_block_scaled";
+    case GemmBackendKind::kSm120ContiguousSharedNvfp4:
+      return "sm120_contiguous_shared_nvfp4";
   }
   return "unknown";
 }
@@ -49,6 +51,22 @@ std::optional<PreparedGemmExecution> PrepareGemmExecution(
         return std::nullopt;
       }
       execution.backend_kind = GemmBackendKind::kCublasLtNvfp4BlockScaled;
+      execution.workspace_bytes = 0;
+      execution.requires_block_scales = true;
+      execution.requires_tensor_scale = true;
+      break;
+    case GemmKernelFamily::kSm120ContiguousSharedNvfp4:
+      if (!launch_plan.block_scales_bytes.valid() ||
+          !launch_plan.tensor_scale_bytes.valid() ||
+          launch_plan.tile_m == 0 ||
+          launch_plan.tile_n == 0 ||
+          launch_plan.tile_k == 0 ||
+          launch_plan.cta_m_count == 0 ||
+          launch_plan.cta_n_count == 0 ||
+          launch_plan.profile_name.empty()) {
+        return std::nullopt;
+      }
+      execution.backend_kind = GemmBackendKind::kSm120ContiguousSharedNvfp4;
       execution.workspace_bytes = 0;
       execution.requires_block_scales = true;
       execution.requires_tensor_scale = true;

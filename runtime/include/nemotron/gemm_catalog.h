@@ -13,6 +13,7 @@ namespace nemotron {
 enum class GemmKernelFamily {
   kDenseRowMajor,
   kCublasLtNvfp4BlockScaled,
+  kSm120ContiguousSharedNvfp4,
 };
 
 const char* ToString(GemmKernelFamily family);

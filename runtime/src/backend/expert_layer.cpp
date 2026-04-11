@@ -1586,6 +1586,7 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.shared_fc1_pack = shared_fc1_pack;
   params.routing = routing;
   params.launch_plan = launch_plan;
+  params.heuristic_cache = heuristic_cache;
   params.routed_gather_scratch = gather_scratch->data();
   params.fc1_grouped_pack = gather_pack;
   params.routed_up_scratch = expert_up_scratch->data();

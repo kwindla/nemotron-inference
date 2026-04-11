@@ -36,6 +36,8 @@ const char* ToString(GemmKernelFamily family) {
       return "dense_row_major";
     case GemmKernelFamily::kCublasLtNvfp4BlockScaled:
       return "cublaslt_nvfp4_block_scaled";
+    case GemmKernelFamily::kSm120ContiguousSharedNvfp4:
+      return "sm120_contiguous_shared_nvfp4";
   }
   return "unknown";
 }
