@@ -1408,6 +1408,11 @@ __device__ __forceinline__ void StoreTracedP5CFragmentsTranspose(
     std::size_t output_rows_per_expert,
     OutputType* output);
 
+#if defined(NEMOTRON_P5_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+template <class TiledMma>
+__device__ __noinline__ void DumpP5PartitionCLayout(int thread_idx);
+#endif
+
 __device__ __forceinline__ void Clear(CFragment64& fragment);
 
 __device__ __forceinline__ void Gemm(
@@ -1484,6 +1489,10 @@ constexpr int kSharedContiguousP5ThreadsPerBlock =
 #endif
 
 static_assert(kGroupedTokenTile == static_cast<int>(kMoeLaunchPlanTokenTile));
+
+#if defined(NEMOTRON_P5_PARTITION_DEBUG)
+__device__ int g_p5_partition_debug_dump_once = 0;
+#endif
 
 enum class RoutedGemm1Profile {
   kLegacy,
@@ -3893,6 +3902,45 @@ __device__ __forceinline__ void nvfp4_bridge::StoreTracedP5CFragmentsTranspose(
   }
 #endif
 }
+
+#if defined(NEMOTRON_P5_PARTITION_DEBUG) && defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+template <class TiledMma>
+__device__ __noinline__ void nvfp4_bridge::DumpP5PartitionCLayout(int thread_idx) {
+  static_assert(cute::size(TiledMma{}) == 256);
+  int m_coords[kTracedP5CCopyCoordCapacity];
+  int n_coords[kTracedP5CCopyCoordCapacity];
+#pragma unroll
+  for (int physical = 0; physical < kTracedP5CCopyCoordCapacity; ++physical) {
+    m_coords[physical] = -1;
+    n_coords[physical] = -1;
+  }
+  auto mma = TiledMma{};
+  auto thr_mma = mma.get_thread_slice(thread_idx);
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
+  auto part_c = thr_mma.partition_C(ref_c);
+  FillPhysicalCoordMapCopyViewLimited(
+      part_c,
+      kTracedP5CCopyCoordCapacity,
+      m_coords,
+      n_coords);
+
+  printf(
+      "p5_partition_c thread_id=%d warp_id=%d lane_id=%d",
+      thread_idx,
+      thread_idx / 32,
+      thread_idx & 31);
+#pragma unroll
+  for (int physical = 0; physical < kTracedP5CCopyCoordCapacity; ++physical) {
+    printf(
+        " physical_idx=%02d m_coord=%d n_coord=%d",
+        physical,
+        m_coords[physical],
+        n_coords[physical]);
+  }
+  printf("\n");
+}
+#endif
 
 template <int kRowsPerTile>
 __device__ __forceinline__ nvfp4_bridge::BFragment64
@@ -6983,6 +7031,30 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
     __syncthreads();
   }
   }
+
+#if defined(NEMOTRON_P5_PARTITION_DEBUG)
+  if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5) {
+    __shared__ int dump_p5_partition_layout;
+    if (tid == 0) {
+      dump_p5_partition_layout =
+          (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+           atomicCAS(&g_p5_partition_debug_dump_once, 0, 1) == 0)
+              ? 1
+              : 0;
+    }
+    __syncthreads();
+    if (dump_p5_partition_layout != 0) {
+      constexpr int kP5ConsumerThreads = kFp4ConsumerWarps * 32;
+      for (int debug_thread = 0; debug_thread < kP5ConsumerThreads; ++debug_thread) {
+        if (tid == debug_thread) {
+          nvfp4_bridge::DumpP5PartitionCLayout<TiledMma>(tid);
+        }
+        __syncthreads();
+      }
+    }
+    __syncthreads();
+  }
+#endif
 
   if (warp_id < kFp4ConsumerWarps) {
       if constexpr (Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP13) {
