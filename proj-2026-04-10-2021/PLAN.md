@@ -97,4 +97,4 @@ For implementation structure, the closer precedent is the existing local direct-
 | 5 | Replace shared prefill pipeline | done | 21301c2 | FP4 primary, QDQ+MatVec fallback |
 | 6 | Validate correctness across multi-row shapes | done | e7d851a | 23/24-token oracle PASS; sweep fails at 2,4,9; vLLM parity poor → step 8 needed |
 | 7 | Benchmark end-to-end prefill latency | done | 7264008 | Hot: 20-530ms (4-256 tok); cold overhead ~100ms; kernel 4-11% of total |
-| 8 | Conditional routed BF16 cleanup | done | — | Removed BF16 staging; FP32→ReLU2→pack→FC2 is now primary routed path |
+| 8 | Conditional routed BF16 cleanup | done | a87bb7c | Removed BF16 staging; FP32→ReLU2→pack→FC2 is now primary routed path |
