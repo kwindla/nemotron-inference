@@ -726,11 +726,11 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4DirectPack(
   const std::size_t packed_row_bytes = fp4_cols / 2u;
   const std::size_t output_limit =
       static_cast<std::size_t>(output_row_base + output_rows_this_tile);
-  constexpr int kLinearToBlockHalf[16] = {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1};
-  constexpr int kLinearToTokenGroup[16] = {0, 2, 0, 2, 1, 3, 1, 3, 0, 2, 0, 2, 1, 3, 1, 3};
-  constexpr int kLinearToMHalf[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
-  constexpr int kBlockElemMh0[8] = {0, 4, 1, 5, 2, 6, 3, 7};
-  constexpr int kBlockElemMh1[8] = {8, 12, 9, 13, 10, 14, 11, 15};
+  constexpr int kLinearToBlockHalf[16] = {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1};
+  constexpr int kLinearToTokenGroup[16] = {0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3};
+  constexpr int kLinearToMHalf[16] = {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1};
+  constexpr int kBlockElemMh0[8] = {0, 1, 8, 9, 4, 5, 12, 13};
+  constexpr int kBlockElemMh1[8] = {2, 3, 10, 11, 6, 7, 14, 15};
 
   float activated[16];
 #pragma unroll
@@ -754,8 +754,9 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4DirectPack(
               ? per_row_tensor_scales[input_row] * weight_tensor_scale
               : alpha;
       const float scaled = accum_tensor(i) * row_alpha;
-      activated[i] = fused_decode::Relu2(
-          __bfloat162float(__float2bfloat16(scaled)));
+      // Native direct path: keep accumulation in FP32 through activation and
+      // NVFP4 repack instead of recreating the legacy BF16 boundary.
+      activated[i] = fused_decode::Relu2(scaled);
     }
   }
 
@@ -11485,6 +11486,183 @@ bool RunLaunchPlannedNvfp4ExpertMatVecBf16(
       weights,
       output_rows_per_expert,
       output);
+}
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+__global__ void P5NativeDirectPackOracleKernel(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+  constexpr int kTileRows = 128;
+  constexpr int kTileCols = 128;
+  constexpr int kPassRows = nvfp4_bridge::kTracedP5DirectStageRows;
+
+  static_assert(cute::size(nvfp4_bridge::TracedP5TiledMma{}) == 256);
+  auto mma = nvfp4_bridge::TracedP5TiledMma{};
+  auto thr_mma = mma.get_thread_slice(threadIdx.x);
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
+  auto part_c = thr_mma.partition_C(ref_c);
+  static_assert(
+      decltype(cute::size(part_c))::value == 16,
+      "P5 warp-local direct pack expects 16 logical accum coords per thread");
+  constexpr int kLinearToBlockHalf[16] = {
+      0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1};
+  constexpr int kLinearToTokenGroup[16] = {
+      0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3};
+  constexpr int kLinearToMHalf[16] = {
+      0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1};
+
+  for (std::size_t row = threadIdx.x; row < static_cast<std::size_t>(kTileRows);
+       row += blockDim.x) {
+    per_row_tensor_scales[row] =
+        per_row_tensor_scales_input != nullptr ? per_row_tensor_scales_input[row]
+                                               : 1.0f;
+  }
+  if (threadIdx.x == 0) {
+    *tensor_scale_data = 1.0f;
+  }
+  __syncthreads();
+
+  for (int pass = 0; pass < (kTileRows / kPassRows); ++pass) {
+    const int row_base = pass * kPassRows;
+    const int pass_valid_rows =
+        max(0, min(valid_rows - row_base, kPassRows));
+    nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kTracedP5AccumProfileCosize];
+#pragma unroll
+    for (int i = 0; i < nvfp4_bridge::kTracedP5AccumProfileCosize; ++i) {
+      accum_storage[i] = 0.0f;
+    }
+
+    auto accum_tensor = cute::make_tensor(
+        reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
+        nvfp4_bridge::TracedP5AccumProfileLayout{});
+
+#pragma unroll
+    for (int linear = 0; linear < static_cast<int>(cute::size(part_c)); ++linear) {
+      auto coord = part_c(linear);
+      const int m_coord = static_cast<int>(cute::get<0>(coord));
+      const int n_coord = static_cast<int>(cute::get<1>(coord));
+      const int block_half = kLinearToBlockHalf[linear];
+      const int token_group = kLinearToTokenGroup[linear];
+      const int m_half = kLinearToMHalf[linear];
+      const int warp_id = threadIdx.x / 32;
+      const int lane_id = threadIdx.x & 31;
+      const int g_m = warp_id & 3;
+      const int g_n = warp_id / 4;
+      const int q = lane_id / 4;
+      const int r = lane_id & 3;
+      const int expected_n_coords[4] = {
+          16 * g_n + 2 * r,
+          16 * g_n + 2 * r + 1,
+          16 * g_n + 8 + 2 * r,
+          16 * g_n + 9 + 2 * r};
+      const int expected_m_coord =
+          (block_half == 0 ? 0 : 64) + 16 * g_m + (m_half == 0 ? q : 8 + q);
+      const int expected_n_coord = expected_n_coords[token_group];
+      if (m_coord != expected_m_coord || n_coord != expected_n_coord) {
+        printf(
+            "p5_native_direct_pack_oracle mapping mismatch thread=%d linear=%d actual=(%d,%d) expected=(%d,%d)\n",
+            static_cast<int>(threadIdx.x),
+            linear,
+            m_coord,
+            n_coord,
+            expected_m_coord,
+            expected_n_coord);
+        asm("trap;");
+      }
+      if (n_coord < pass_valid_rows && m_coord < kTileCols) {
+        const int abs_row = row_base + n_coord;
+        if (abs_row < kTileRows) {
+          accum_tensor(linear) =
+              input[static_cast<std::size_t>(abs_row) * kTileCols + m_coord];
+        }
+      }
+    }
+
+    nvfp4_bridge::StoreUnifiedRoutedFp4DirectPack(
+        1.0f,
+        &accum_storage[0],
+        threadIdx.x,
+        0,
+        pass_valid_rows,
+        kTileCols,
+        static_cast<std::size_t>(row_base),
+        static_cast<std::size_t>(kTileCols),
+        per_row_tensor_scales_input,
+        1.0f,
+        packed_data,
+        block_scales_data,
+        matmul_block_scales_data,
+        activation_output_scale,
+        static_cast<std::size_t>(kTileCols),
+        padded_blocks_per_row,
+        scale_layout);
+    __syncthreads();
+  }
+}
+#endif
+
+bool RunP5NativeDirectPackOracleForTesting(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (input == nullptr ||
+      activation_output_scale == nullptr ||
+      packed_data == nullptr ||
+      block_scales_data == nullptr ||
+      matmul_block_scales_data == nullptr ||
+      tensor_scale_data == nullptr ||
+      per_row_tensor_scales == nullptr ||
+      valid_rows < 0 ||
+      valid_rows > 128) {
+    return false;
+  }
+
+  P5NativeDirectPackOracleKernel<<<1, 256>>>(
+      input,
+      per_row_tensor_scales_input,
+      valid_rows,
+      padded_blocks_per_row,
+      scale_layout,
+      activation_output_scale,
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data,
+      per_row_tensor_scales);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+#else
+  (void) input;
+  (void) per_row_tensor_scales_input;
+  (void) valid_rows;
+  (void) padded_blocks_per_row;
+  (void) scale_layout;
+  (void) activation_output_scale;
+  (void) packed_data;
+  (void) block_scales_data;
+  (void) matmul_block_scales_data;
+  (void) tensor_scale_data;
+  (void) per_row_tensor_scales;
+  return false;
+#endif
 }
 
 bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {

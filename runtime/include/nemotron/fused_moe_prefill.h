@@ -7,6 +7,7 @@
 #include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_decode.h"
 #include "nemotron/moe_launch_plan_device.h"
+#include "nemotron/nvfp4_scale_layout.h"
 
 namespace nemotron {
 
@@ -101,5 +102,21 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params);
 
 bool CopyP13DebugTrace(P13DebugTrace* out);
 void ResetP13DebugTrace();
+
+// Testing hook: runs the live P5 native direct-pack epilogue against a
+// synthetic 128x128 accumulator tile laid out with the real CUTE
+// `TracedP5AccumProfileLayout`.
+bool RunP5NativeDirectPackOracleForTesting(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales);
 
 }  // namespace nemotron

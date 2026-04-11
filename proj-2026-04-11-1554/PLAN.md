@@ -18,10 +18,21 @@ Project directory: `./proj-2026-04-11-1554`
 ## Context
 The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but shows no performance gain over the BF16 boundary path. The warp-local approach eliminates the staged shared-memory tile, the zero-fill, and the CTA barriers by using only register-to-register warp shuffles, but the original implementation (step 5) failed because it used 3D `accum_tensor(reg, m_frag, n_frag)` indexing while the lookup tables were derived from the linear `part_c(i)` iteration order. This plan derives the correct linear mapping via a runtime probe, builds constexpr lookup tables, implements a register-only warp-shuffle epilogue, validates it against a low-level oracle, and then deletes the smem-staged production path instead of leaving a permanent fallback.
 
+## Native correction
+
+- The target contract is now the true native direct path: `Relu2(row_alpha * accum)` with no BF16 truncation before activation.
+- `NEMOTRON_DEBUG_COMPARE_FP4_DIRECT` remains useful only as a diagnostic against the old BF16-boundary path. It is no longer the primary correctness oracle and zero mismatches are not expected.
+- The low-level oracle now exercises the live P5 packer through `RunP5NativeDirectPackOracleForTesting`, which materializes the real `TracedP5AccumProfileLayout` and calls the production `StoreUnifiedRoutedFp4DirectPack` helper.
+- That live-layout oracle proved the previous lookup table was wrong. The actual linear `part_c(i)` order is recorded in `proj-2026-04-11-1554/linear_partition_c_mapping.md`, and the production tables were retabled to match it.
+- Current verification after the native-path correction:
+  - `staged_fp4_pack_test` PASS
+  - `nano_24_token_prefill_regression_test` PASS under natural dispatch with native direct FC1 enabled
+  - `ctest --test-dir build --output-on-failure -j1` remains `69/72`, with the same three failures: `nvfp4_weight_test`, `expert_layer_oracle_test`, and `expert_layer8_oracle_test`
+
 ## Reference implementations
 
 **Working smem-staged path** (`fused_moe_prefill.cu:678-841`):
-- `StageUnifiedRoutedFp4DirectActivated` (line 678): scatters `Relu2(bf16(row_alpha*accum))` to smem using `part_c(logical)` linear iteration, where `row_alpha = per_row_tensor_scales[input_row] * weight_tensor_scale` when per-row scales are present — proven correct
+- Historical correctness reference: a staged oracle that scatters `Relu2(row_alpha * accum)` using `part_c(logical)` linear iteration, where `row_alpha = per_row_tensor_scales[input_row] * weight_tensor_scale` when per-row scales are present
 - `PackUnifiedRoutedFp4DirectStaged` (line 743): cooperatively packs 16-wide blocks from smem — proven correct
 - Key insight: `accum_tensor(logical)` and `part_c(logical)` with the same 1D index are guaranteed consistent
 
@@ -51,10 +62,10 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 ## Rules
 
 ### Kernel correctness
-- The warp-local path must produce output identical to the smem-staged path (which matches the BF16 reference modulo GEMM non-determinism at near-zero blocks).
+- The warp-local path must produce output identical to the staged/reference native oracle.
 - Iterate accumulator and partition_C with the same 1D linear index: `accum_tensor(i)` and `part_c(i)`.
-- The zero-block scale convention must match the BF16 reference: `block_scale = 1.0f` when all activated values are zero.
-- BF16 truncation before Relu2: `Relu2(__bfloat162float(__float2bfloat16(scaled)))` to match the BF16 path.
+- The zero-block scale convention remains the current direct-pack contract: `block_scale = 1.0f` when all activated values are zero.
+- No BF16 truncation before Relu2: `Relu2(row_alpha * accum)`.
 
 ### Mapping invariants
 - Treat the current P5 ownership pattern as a contract that must be checked explicitly before relying on warp-local shuffle tables.
@@ -73,10 +84,10 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 - Do not modify the BF16 epilogue, the FC2 consumer, or any non-P5 code path.
 
 ### Validation categories
-- **FC1 boundary compare**: `NEMOTRON_DEBUG_COMPARE_FP4_DIRECT=1` under forced P5 dispatch. Use the explicit forced-P5 command below. Target: profile log confirms `P5`, and compare summary reports zero mismatches (or only near-zero noise from BF16 truncation / GEMM non-determinism).
+- **FC1 boundary compare**: `NEMOTRON_DEBUG_COMPARE_FP4_DIRECT=1` under forced P5 dispatch. Use the explicit forced-P5 command below. Target: profile log confirms `P5`, and the compare output is treated as a numerics-drift diagnostic against the old BF16-boundary path, not as a zero-mismatch gate.
 - **Token oracle**: `nano_24_token_prefill_regression_test` with `NEMOTRON_ENABLE_FP4_DIRECT_FC1=1` (natural profile selection). Must PASS.
 - **Per-layer diagnostic**: `NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY=1` envelope must not regress.
-- **Low-level bitwise oracle**: extend `testing/backend/staged_fp4_pack_test.cpp` with a tiny kernel seam that feeds the warp-local packer deterministic accumulator data plus deliberately non-uniform per-row tensor scales, then bitwise-compares `packed_data`, `block_scales_data`, `matmul_block_scales_data`, `activation_output_scale`, `tensor_scale`, and `per_row_tensor_scales` against the staged/reference packer.
+- **Low-level bitwise oracle**: `testing/backend/staged_fp4_pack_test.cpp` must drive the live P5 direct packer through the real `TracedP5AccumProfileLayout`, with deliberately non-uniform per-row tensor scales, and bitwise-compare `packed_data`, `block_scales_data`, `matmul_block_scales_data`, `activation_output_scale`, `tensor_scale`, and `per_row_tensor_scales` against the staged/reference native oracle.
 - **Benchmark**: compare `warp-local` against recorded `smem-staged direct` numbers first, and against the BF16 baseline second. Hot prefill is the primary metric; cold setup and TTFT are secondary but must not regress materially. For the existing `384/512` long-prompt benchmark, treat results as end-to-end guardrails only because the routed MoE window still dispatches `23` rows and selects `legacy` rather than `P5`.
 - **Test baseline**: `ctest -j1` must remain 69/72.
 
@@ -119,7 +130,7 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
   - `kLinearToMHalf[16]`: 0 (low m within block, position q) or 1 (high m, position 8+q)
   Replace `StageUnifiedRoutedFp4DirectActivated` + `PackUnifiedRoutedFp4DirectStaged` with a new `StoreUnifiedRoutedFp4WarpLocalPack` that:
   1. Iterates `i=0..cute::size(part_c)-1`, reads `accum_tensor(i)`, classifies via lookup tables
-  2. Preserves the current direct-path math exactly: for each logical element compute `row_alpha = per_row_tensor_scales[input_row] * weight_tensor_scale` when per-row scales are present, otherwise use scalar `alpha`, then compute `Relu2(bf16(row_alpha * accum))`
+  2. Uses the native direct-path math: for each logical element compute `row_alpha = per_row_tensor_scales[input_row] * weight_tensor_scale` when per-row scales are present, otherwise use scalar `alpha`, then compute `Relu2(row_alpha * accum)`
   3. For each of 8 FP4 blocks (2 m-blocks × 4 token groups): max-abs reduction via `__shfl_xor_sync(4/8/16)`
   4. FP4 encode per element, nibble pair assembly via `__shfl_down_sync(4)`
   5. Scale + packed byte writes by designated lanes (q=0 for scales, even-q for packed bytes)
@@ -131,7 +142,7 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
   1. `ctest -j1` → 69/72
   2. low-level warp-local pack test with non-uniform per-row tensor scales → bitwise match to staged/reference outputs
   3. `nano_24_token_prefill_regression_test` with `NEMOTRON_ENABLE_FP4_DIRECT_FC1=1` → PASS
-  4. forced-P5 code-path validation command → log shows `profile=P5` and FC1 boundary compare reports zero or near-zero mismatches
+  4. forced-P5 code-path validation command → log shows `profile=P5`; treat FC1 boundary compare as a diagnostic against the old BF16 path, not a zero-mismatch gate
   5. Per-layer diagnostic → within envelope
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `testing/backend/staged_fp4_pack_test.cpp`
 
@@ -147,3 +158,4 @@ Use this command to prove the warp-local P5 path is actually running. This is a 
 | 2 | Build tables + warp-local implementation | done | ded3015 | constexpr tables + StoreUnifiedRoutedFp4WarpLocalPack + kFp4WarpLocal dispatch; compile-clean, not wired yet |
 | 3 | Wire and validate | done | 36d071d | Wired kFp4WarpLocal→kFp4Direct, removed staged path + 16KB smem, fixed shuffle mask (subgroup_mask), test seam passes, ctest 69/72, MoE PASS, forced-P5 compare still divergent (pre-existing) |
 | 4 | Benchmark at 384/512 | done | e4762f7 | Flat: 384 hot_prefill 783.6→784.2ms (+0.08%), 512 hot_prefill 1059.6→1068.1ms (+0.80%). Integration guardrails only (legacy profile, not P5). |
+| 5 | Native-path correction + live-layout oracle | done | worktree | Removed BF16 truncation from live P5 direct pack, added `RunP5NativeDirectPackOracleForTesting`, corrected the lookup tables to the actual `part_c(i)` order, `staged_fp4_pack_test` PASS, `nano_24_token_prefill_regression_test` PASS, `ctest -j1` still 69/72 |

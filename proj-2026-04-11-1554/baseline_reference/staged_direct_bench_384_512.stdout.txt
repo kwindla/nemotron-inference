@@ -1,0 +1,17 @@
+benchmark prompt_tokens=384 phased...
+run_shared_prefill_benchmark.py: command failed (1): /home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/benchmarks/nano_fused_decode/nano_fused_decode_bench --manifest /home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json --mode=phased --prompt-tokens 384 --decode-tokens 1 --warmup 1 --iterations 3 --json-output /home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/baseline_reference/staged_direct_bench_384_512_raw/prompt_0384_phased.json
+stdout: /home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/baseline_reference/staged_direct_bench_384_512_raw/prompt_0384_phased.stdout.txt
+stderr: /home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/baseline_reference/staged_direct_bench_384_512_raw/prompt_0384_phased.stderr.txt
+Traceback (most recent call last):
+  File "/home/khkramer/src/nemotron-inference/tools/benchmark_analysis/run_shared_prefill_benchmark.py", line 596, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/khkramer/src/nemotron-inference/tools/benchmark_analysis/run_shared_prefill_benchmark.py", line 492, in main
+    phased_completed = run_command(phased_cmd, base_env, phased_stdout, phased_stderr)
+  File "/home/khkramer/src/nemotron-inference/tools/benchmark_analysis/run_shared_prefill_benchmark.py", line 171, in run_command
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: command failed (1): /home/khkramer/src/nemotron-inference/build-sm120-relwithdebinfo/benchmarks/nano_fused_decode/nano_fused_decode_bench --manifest /home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json --mode=phased --prompt-tokens 384 --decode-tokens 1 --warmup 1 --iterations 3 --json-output /home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/baseline_reference/staged_direct_bench_384_512_raw/prompt_0384_phased.json
+stdout: /home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/baseline_reference/staged_direct_bench_384_512_raw/prompt_0384_phased.stdout.txt
+stderr: /home/khkramer/src/nemotron-inference/proj-2026-04-11-1554/baseline_reference/staged_direct_bench_384_512_raw/prompt_0384_phased.stderr.txt

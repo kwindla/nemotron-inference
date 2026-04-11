@@ -1,5 +1,6 @@
 #include "nemotron/device_nvfp4_matrix.h"
 #include "nemotron/device_tensor.h"
+#include "nemotron/fused_moe_prefill.h"
 #include "nemotron/nvfp4_scale_layout.h"
 
 #include <cuda_bf16.h>
@@ -26,6 +27,7 @@ using nemotron::DeviceTensorBf16;
 using nemotron::DeviceTensorFp32;
 using nemotron::Nvfp4ExecutionScaleLayout;
 using nemotron::Nvfp4ScaleLayout;
+using nemotron::RunP5NativeDirectPackOracleForTesting;
 using nemotron::SwizzleRowMajorNvfp4ScalesForExecution;
 
 constexpr int kTileRows = 128;
@@ -996,7 +998,7 @@ HostPackOutputs run_staged_kernel_with_per_row_scales(
   return output;
 }
 
-HostPackOutputs run_warp_local_kernel(
+HostPackOutputs run_live_p5_native_kernel(
     const std::vector<float>& input,
     const std::vector<float>& per_row_tensor_scales_input,
     int valid_rows,
@@ -1023,19 +1025,18 @@ HostPackOutputs run_warp_local_kernel(
     return output;
   }
 
-  TestWarpLocalFp4PackKernel<<<1, kThreadsPerBlock>>>(
+  if (!RunP5NativeDirectPackOracleForTesting(
       device_input->data(),
       device_per_row_tensor_scales->data(),
       valid_rows,
       scale_layout.padded_blocks_per_row,
+      kScaleLayout,
       device_activation_scales->data(),
       const_cast<std::uint8_t*>(device_pack->packed_data()),
       const_cast<std::uint8_t*>(device_pack->block_scales_data()),
       const_cast<std::uint8_t*>(device_pack->matmul_block_scales_data()),
       const_cast<float*>(device_pack->device_tensor_scale_ptr()),
-      const_cast<float*>(device_pack->per_row_tensor_scales()));
-  if (!check_cuda(cudaGetLastError(), "TestWarpLocalFp4PackKernel launch") ||
-      !check_cuda(cudaDeviceSynchronize(), "TestWarpLocalFp4PackKernel sync")) {
+      const_cast<float*>(device_pack->per_row_tensor_scales()))) {
     return output;
   }
 
@@ -1205,29 +1206,30 @@ bool test_direct_output_compare(
              label + " activation_output_scale");
 }
 
-bool test_warp_local_matches_staged(const Nvfp4ExecutionScaleLayout& scale_layout) {
+bool test_live_p5_native_matches_staged(const Nvfp4ExecutionScaleLayout& scale_layout) {
   const std::vector<float> input = make_mixed_input(false);
   const std::vector<float> per_row_tensor_scales = make_non_uniform_per_row_scales();
   const std::vector<int> valid_rows_cases = {kTileRows, 1, 7, 64, 127};
 
   for (int valid_rows : valid_rows_cases) {
-    const std::string label = "warp_local_matches_staged_valid_rows_" + std::to_string(valid_rows);
+    const std::string label =
+        "live_p5_native_matches_staged_valid_rows_" + std::to_string(valid_rows);
     bool staged_ok = false;
-    bool warp_local_ok = false;
+    bool live_ok = false;
     const HostPackOutputs staged = run_staged_kernel_with_per_row_scales(
         input,
         per_row_tensor_scales,
         valid_rows,
         scale_layout,
         &staged_ok);
-    const HostPackOutputs warp_local = run_warp_local_kernel(
+    const HostPackOutputs live = run_live_p5_native_kernel(
         input,
         per_row_tensor_scales,
         valid_rows,
         scale_layout,
-        &warp_local_ok);
+        &live_ok);
     if (!expect(staged_ok, label + " staged kernel execution should succeed") ||
-        !expect(warp_local_ok, label + " warp-local kernel execution should succeed")) {
+        !expect(live_ok, label + " live P5 kernel execution should succeed")) {
       return false;
     }
 
@@ -1237,8 +1239,8 @@ bool test_warp_local_matches_staged(const Nvfp4ExecutionScaleLayout& scale_layou
         valid_rows,
         false);
     if (!compare_all_outputs_bitwise(staged, reference, label + " staged_reference") ||
-        !compare_all_outputs_bitwise(warp_local, reference, label + " warp_local_reference") ||
-        !compare_all_outputs_bitwise(warp_local, staged, label + " warp_local_staged")) {
+        !compare_all_outputs_bitwise(live, reference, label + " live_reference") ||
+        !compare_all_outputs_bitwise(live, staged, label + " live_staged")) {
       return false;
     }
   }
@@ -1315,7 +1317,7 @@ int main() {
           *scale_layout)) {
     return 1;
   }
-  if (!test_warp_local_matches_staged(*scale_layout)) {
+  if (!test_live_p5_native_matches_staged(*scale_layout)) {
     return 1;
   }
 

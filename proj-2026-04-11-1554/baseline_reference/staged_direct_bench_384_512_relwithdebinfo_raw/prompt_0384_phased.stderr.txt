@@ -1,0 +1,1 @@
+nano_fused_decode_bench: forward model build failed
