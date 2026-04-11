@@ -28,7 +28,7 @@ DEFAULT_MANIFEST = (
 DEFAULT_JSON_OUTPUT = (
     REPO_ROOT / "artifacts" / "benchmarks" / "nano_shared_prefill_latest.json"
 )
-DEFAULT_LENGTHS = [4, 8, 16, 24, 32, 64, 128, 256]
+DEFAULT_LENGTHS = [4, 8, 16, 24, 32, 64, 128, 256, 384, 512]
 SHARED_KERNEL_NAME_SUBSTRING = "Nvfp4ContiguousSharedFp4P5Kernel"
 SHARED_PROFILE_PATTERN = re.compile(
     r"shared_contiguous profile "
