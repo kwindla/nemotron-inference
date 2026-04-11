@@ -1049,6 +1049,8 @@ struct ExpertLayerSlice::Impl {
   std::unique_ptr<DeviceMoeLaunchPlan> fused_prefill_launch_plan;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
+  std::unique_ptr<DeviceTensorBf16> fused_prefill_gemm1_output_bf16;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_gemm1_output_scales;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
   std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_normalized_pack;
@@ -1466,12 +1468,18 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   DeviceNvfp4Matrix* shared_fc1_pack = normalized_pack;
   DeviceNvfp4Matrix* gather_pack = ResolveFusedPrefillGatherPack();
   DeviceNvfp4Matrix* shared_fc2_pack = ResolveFusedPrefillSharedUpPack();
-  DeviceTensorFp32* fc2_activation_scales =
+  DeviceTensorBf16* gemm1_output_bf16 =
       direct_moe_execution_state.workspace != nullptr &&
-              direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales != nullptr &&
-              direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales->valid()
-          ? direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales.get()
-          : nullptr;
+              direct_moe_execution_state.workspace->fused_prefill_gemm1_output_bf16 != nullptr &&
+              direct_moe_execution_state.workspace->fused_prefill_gemm1_output_bf16->valid()
+          ? direct_moe_execution_state.workspace->fused_prefill_gemm1_output_bf16.get()
+          : fused_prefill_gemm1_output_bf16.get();
+  DeviceTensorFp32* gemm1_output_scales =
+      direct_moe_execution_state.workspace != nullptr &&
+              direct_moe_execution_state.workspace->fused_prefill_gemm1_output_scales != nullptr &&
+              direct_moe_execution_state.workspace->fused_prefill_gemm1_output_scales->valid()
+          ? direct_moe_execution_state.workspace->fused_prefill_gemm1_output_scales.get()
+          : fused_prefill_gemm1_output_scales.get();
   DeviceTensorFp32* expert_up_scratch = ResolveFusedPrefillExpertUpScratch();
   DeviceTensorFp32* shared_up_scratch = ResolveFusedPrefillSharedUpScratch();
   const std::size_t selection_count = token_count * config.top_k;
@@ -1483,8 +1491,8 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       gather_scratch != nullptr ? gather_scratch->shape() : std::vector<std::size_t>{};
   const auto expert_up_shape =
       expert_up_scratch != nullptr ? expert_up_scratch->shape() : std::vector<std::size_t>{};
-  const auto fc2_activation_scale_shape =
-      fc2_activation_scales != nullptr ? fc2_activation_scales->shape() : std::vector<std::size_t>{};
+  const auto gemm1_output_scale_shape =
+      gemm1_output_scales != nullptr ? gemm1_output_scales->shape() : std::vector<std::size_t>{};
   const auto shared_up_shape =
       shared_up_scratch != nullptr ? shared_up_scratch->shape() : std::vector<std::size_t>{};
   if (routing == nullptr ||
@@ -1512,11 +1520,13 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
       gather_shape.size() != 2 ||
       gather_shape[0] < *padded_selection_count ||
       gather_shape[1] != config.hidden_size ||
-      fc2_activation_scales == nullptr ||
-      !fc2_activation_scales->valid() ||
-      fc2_activation_scale_shape.size() != 2 ||
-      fc2_activation_scale_shape[0] != config.n_routed_experts ||
-      fc2_activation_scale_shape[1] != 1 ||
+      gemm1_output_bf16 == nullptr ||
+      !gemm1_output_bf16->valid() ||
+      gemm1_output_scales == nullptr ||
+      !gemm1_output_scales->valid() ||
+      gemm1_output_scale_shape.size() != 2 ||
+      gemm1_output_scale_shape[0] < *padded_selection_count ||
+      gemm1_output_scale_shape[1] != (routed_expert_intermediate_size / 16) ||
       expert_up_scratch == nullptr ||
       !expert_up_scratch->valid() ||
       expert_up_shape.size() != 2 ||
@@ -1580,14 +1590,21 @@ bool ExpertLayerSlice::Impl::RunFusedMoePrefillPath(
   params.routed_gather_scratch = gather_scratch->data();
   params.fc1_grouped_pack = gather_pack;
   params.routed_up_scratch = expert_up_scratch->data();
+  params.gemm1_output_bf16 = gemm1_output_bf16->data();
   auto* expert_up_pack = ResolveFusedPrefillExpertUpPack();
   if (expert_up_pack != nullptr && expert_up_pack->valid()) {
     params.fc2_grouped_pack = expert_up_pack;
     params.gemm1_output = expert_up_pack;
   }
   params.shared_fc2_pack = shared_fc2_pack;
-  params.fc2_expert_activation_scales = fc2_activation_scales->data();
-  params.activation_output_scale = fc2_activation_scales->data();
+  if (direct_moe_execution_state.workspace != nullptr &&
+      direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales != nullptr &&
+      direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales->valid()) {
+    params.fc2_expert_activation_scales =
+        direct_moe_execution_state.workspace->fused_prefill_fc2_activation_scales->data();
+  }
+  params.gemm1_output_scale = gemm1_output_scales->data();
+  params.activation_output_scale = gemm1_output_scales->data();
   params.shared_up_scratch = shared_up_scratch->data();
   params.output = output->data();
   params.routed_output = routed_output_scratch->data();
@@ -2381,6 +2398,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   std::unique_ptr<DeviceMoeLaunchPlan> fused_prefill_launch_plan;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_routed_output_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
+  std::unique_ptr<DeviceTensorBf16> fused_prefill_gemm1_output_bf16;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_gemm1_output_scales;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
   std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_normalized_pack;
@@ -2399,6 +2418,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   (void)fused_prefill_launch_plan;
   (void)fused_prefill_routed_output_scratch;
   (void)fused_prefill_gather_scratch;
+  (void)fused_prefill_gemm1_output_bf16;
+  (void)fused_prefill_gemm1_output_scales;
   (void)fused_prefill_expert_up_scratch;
   (void)fused_prefill_shared_up_scratch;
   (void)fused_prefill_normalized_pack;
@@ -2437,6 +2458,8 @@ std::unique_ptr<ExpertLayerSlice> ExpertLayerSlice::Create(
   impl->fused_prefill_launch_plan = std::move(fused_prefill_launch_plan);
   impl->fused_prefill_routed_output_scratch = std::move(fused_prefill_routed_output_scratch);
   impl->fused_prefill_gather_scratch = std::move(fused_prefill_gather_scratch);
+  impl->fused_prefill_gemm1_output_bf16 = std::move(fused_prefill_gemm1_output_bf16);
+  impl->fused_prefill_gemm1_output_scales = std::move(fused_prefill_gemm1_output_scales);
   impl->fused_prefill_expert_up_scratch = std::move(fused_prefill_expert_up_scratch);
   impl->fused_prefill_shared_up_scratch = std::move(fused_prefill_shared_up_scratch);
   impl->fused_prefill_normalized_pack = std::move(fused_prefill_normalized_pack);

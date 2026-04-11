@@ -83,7 +83,7 @@ For implementation structure, the closer precedent is the existing local direct-
   The benchmark plan should make it possible to compare future tile/profile changes without rewriting measurement code.
   Key files: `tools/benchmark_analysis/compare_gemm_benchmarks.py`, benchmark artifacts/scripts for the shared path
 
-- [x] **8. Conditional Phase 2: remove the routed BF16 FC1→activation boundary if needed**
+- [ ] **8. Conditional Phase 2: remove the routed BF16 FC1→activation boundary if needed**
   If Phase 1 still leaves material residual drift, expand the work to remove `gemm1_output_bf16` / `LaunchRoutedBf16Relu2Pack` from the routed path and keep the FC1→activation→FC2 boundary in a more upstream-like packed/fused representation. Do not start this step until Phase 1 has been measured, because otherwise we lose attribution.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, routed MoE packing/epilogue helpers
 
@@ -97,4 +97,4 @@ For implementation structure, the closer precedent is the existing local direct-
 | 5 | Replace shared prefill pipeline | done | 21301c2 | FP4 primary, QDQ+MatVec fallback |
 | 6 | Validate correctness across multi-row shapes | done | e7d851a | 23/24-token oracle PASS; sweep fails at 2,4,9; vLLM parity poor → step 8 needed |
 | 7 | Benchmark end-to-end prefill latency | done | 7264008 | Hot: 20-530ms (4-256 tok); cold overhead ~100ms; kernel 4-11% of total |
-| 8 | Conditional routed BF16 cleanup | done | a87bb7c | Removed BF16 staging; FP32→ReLU2→pack→FC2 is now primary routed path |
+| 8 | Conditional routed BF16 cleanup | reverted | — | a87bb7c broke grouped FC1 routing → reverted. Needs grouped FP32 GEMM kernel, not just removing BF16 buffer. |

@@ -60,6 +60,8 @@ struct MoePrefillWorkspace {
   std::unique_ptr<DeviceTensorFp32> fused_prefill_gather_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_fc1_activation_scales;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_fc2_activation_scales;
+  std::unique_ptr<DeviceTensorBf16> fused_prefill_gemm1_output_bf16;
+  std::unique_ptr<DeviceTensorFp32> fused_prefill_gemm1_output_scales;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_expert_up_scratch;
   std::unique_ptr<DeviceTensorFp32> fused_prefill_shared_up_scratch;
   std::unique_ptr<DeviceNvfp4Matrix> fused_prefill_normalized_pack;  // Owns the default shared FC1 pack and packed routed FC1 source.

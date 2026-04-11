@@ -10569,18 +10569,14 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
   float* activation_output_scale =
       params.activation_output_scale != nullptr ? params.activation_output_scale
                                                 : gemm1_output_scale;
-  float* packed_fc2_input_expert_scales =
-      params.fc2_expert_activation_scales != nullptr ? params.fc2_expert_activation_scales
-                                                     : activation_output_scale;
   const bool use_legacy_packed_fc1 =
       params.fc1_grouped_pack != nullptr && fc1_input_expert_scales != nullptr;
   const bool use_grouped_gemm1_output =
-      params.gemm1_output_bf16 != nullptr &&
       gemm1_output != nullptr &&
       gemm1_output_scale != nullptr &&
       activation_output_scale != nullptr;
   const bool use_packed_fc2 =
-      gemm1_output != nullptr && packed_fc2_input_expert_scales != nullptr;
+      gemm1_output != nullptr && activation_output_scale != nullptr;
 
   if (params.token_count == 0 ||
       params.hidden_size == 0 ||
@@ -10604,6 +10600,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
       params.launch_plan == nullptr ||
       params.routed_gather_scratch == nullptr ||
       (!use_grouped_gemm1_output && params.routed_up_scratch == nullptr) ||
+      (use_grouped_gemm1_output && params.gemm1_output_bf16 == nullptr) ||
       params.shared_up_scratch == nullptr ||
       params.output == nullptr) {
     return false;
@@ -10780,13 +10777,13 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
             params.launch_plan->total_num_padded_tokens(),
             params.launch_plan->padded_row_capacity(),
             params.routed_expert_intermediate_size) ||
-        (packed_fc2_input_expert_scales != nullptr &&
+        (activation_output_scale != nullptr &&
          !LaunchComputeExpertActivationScales(
              params.routed_up_scratch,
              params.launch_plan->expert_first_token_offsets(),
              params.n_routed_experts,
              params.routed_expert_intermediate_size,
-             packed_fc2_input_expert_scales)) ||
+             activation_output_scale)) ||
         (gemm1_output != nullptr &&
          !PackDeviceRowMajorFp32ToNvfp4PerExpert(
              params.routed_up_scratch,
@@ -10794,7 +10791,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
              params.routed_expert_intermediate_size,
              params.launch_plan->expert_first_token_offsets(),
              params.n_routed_experts,
-             packed_fc2_input_expert_scales,
+             activation_output_scale,
              gemm1_output)) ||
         (gemm1_output == nullptr &&
          !LaunchQuantizeDequantizeRows(
@@ -10808,7 +10805,7 @@ bool RunFusedMoePrefill(const FusedMoePrefillParams& params) {
     if (!(use_packed_fc2
               ? LaunchPlannedPackedInputMatVec(
                     *gemm1_output,
-                    packed_fc2_input_expert_scales,
+                    params.fc2_expert_activation_scales,
                     nullptr,
                     nullptr,
                     params.launch_plan,
