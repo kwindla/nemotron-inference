@@ -34,7 +34,7 @@ The fused MoE prefill path packs all tokens' activations with a single global te
   In the unified kernel: modify `StoreUnifiedRoutedFp4Output` to accept optional `const float* per_row_tensor_scales` and `float weight_tensor_scale` default params. In all three store paths (P5, P13, generic), compute `row_alpha = (per_row_tensor_scales != nullptr) ? per_row_tensor_scales[input_row] * weight_tensor_scale : alpha` and use it instead of `alpha`. This replaces only the current `input_tensor_scale * weight_tensor_scale` path; it must not interfere with FC2 repacked activations that already use per-expert or dq scales. Update the single call site (line ~6866) to pass `input_per_row_tensor_scales` and `*weight.tensor_scale_data`.
   Key files: `runtime/src/backend/fused_moe_prefill.cu`
 
-- [ ] **3. Wire per-row scales through launch functions and call sites**
+- [x] **3. Wire per-row scales through launch functions and call sites**
   Update `LaunchPlannedPackedInputMatVecBf16` (line 9468) to accept and forward `const float* input_per_row_tensor_scales`. Pass it through to each FC1 kernel call in the switch statement. For the P5 unified kernel launch via `LaunchProgrammaticKernel`, pass `input_pack.per_row_tensor_scales()`. For all other FC1 kernel launches (P0, P1, P4, P7, legacy), pass the same pointer.
   Update `LaunchPlannedPackedInputMatVec` (line 9252) to accept the same pointer too, because it is used in two different ways:
   - FC1 legacy packed route at `RunFusedMoePrefill(... use_legacy_packed_fc1 ...)`
@@ -70,8 +70,8 @@ The fused MoE prefill path packs all tokens' activations with a single global te
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Per-row packing infrastructure | done | 93f3a03 | |
-| 2 | Add parameter to all FC1 kernels | done | — | |
-| 3 | Wire through launch functions | pending | — | |
+| 2 | Add parameter to all FC1 kernels | done | 053d64d | |
+| 3 | Wire through launch functions | done | — | build + fused_moe_prefill_test |
 | 4 | Wire PackIntoPerRow in expert layer | pending | — | |
 | 5 | Add exact low-level tests | pending | — | |
 | 6 | Validate and test | pending | — | |
