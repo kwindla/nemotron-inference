@@ -29,6 +29,13 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
   - `nano_24_token_prefill_regression_test` PASS under natural dispatch with native direct FC1 enabled
   - `ctest --test-dir build --output-on-failure -j1` remains `69/72`, with the same three failures: `nvfp4_weight_test`, `expert_layer_oracle_test`, and `expert_layer8_oracle_test`
 
+## Post-native validation
+
+- Sequential validation artifacts are recorded under `proj-2026-04-11-1554/post_native_benchmarks/README.md`.
+- The default shared-prefill and TTFT benchmarks are still constrained by Nano's current `moe_prefill_window_tokens = 23` runtime default, so they remain end-to-end guardrails rather than direct measurements of the new P5 direct FC1 path.
+- A direct diagnostic run at `384` tokens confirms that natural long-prompt throughput still uses `routed_gemm1 dispatch_rows=23 ... profile=legacy`.
+- For TTFT, forcing `--moe-prefill-window-tokens 4096` materially reduces prefill-driven latency while leaving first-token decode roughly unchanged, which is the current best evidence that the native direct path is helping once the runtime is allowed to use it.
+
 ## Reference implementations
 
 **Working smem-staged path** (`fused_moe_prefill.cu:678-841`):

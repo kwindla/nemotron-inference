@@ -1,0 +1,271 @@
+nano_prefix_cache_ttft_bench: manifest="/home/khkramer/src/nemotron-inference/artifacts/manifests/forward_runtime_manifest_nano_rtx5090_unverified.json" model_id=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 warmup_iterations=1 measured_iterations=5 tail_token_count=32 target_active_requests=1 moe_prefill_window_tokens_cli=4096 resolved_runtime_moe_prefill_capacity_tokens=4096 resolved_runtime_moe_prefill_window_tokens=4096
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix256
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix256 (total_prompt_tokens=256)
+  cold TTFT                   : median=166.604 ms p95=166.970 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+  attention native multi-token runs: median=6 runs p95=6 runs
+  attention native multi-token tokens: median=1536 tokens p95=1536 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=23 runs p95=23 runs
+  expert native multi-token tokens: median=5888 tokens p95=5888 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=23 runs p95=23 runs
+  mamba native multi-token tokens: median=5888 tokens p95=5888 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix1024
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix1024 (total_prompt_tokens=1024)
+  cold TTFT                   : median=494.662 ms p95=495.196 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+  attention native multi-token runs: median=6 runs p95=6 runs
+  attention native multi-token tokens: median=6144 tokens p95=6144 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=23 runs p95=23 runs
+  expert native multi-token tokens: median=23552 tokens p95=23552 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=23 runs p95=23 runs
+  mamba native multi-token tokens: median=23552 tokens p95=23552 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cold_prefill_prefix4096
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cold_prefill_prefix4096 (total_prompt_tokens=4096)
+  cold TTFT                   : median=2186.216 ms p95=2188.131 ms
+  restore latency             : n/a
+  tail prefill latency        : n/a
+  first-token decode latency  : n/a
+  commit/snapshot latency     : n/a
+  hot-prefix TTFT             : n/a
+  speedup factor              : n/a
+  prefix snapshot size        : n/a
+  matched prefix token count  : n/a
+  attention native multi-token runs: median=24 runs p95=24 runs
+  attention native multi-token tokens: median=24576 tokens p95=24576 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=23 runs p95=23 runs
+  expert native multi-token tokens: median=94208 tokens p95=94208 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=23 runs p95=23 runs
+  mamba native multi-token tokens: median=94208 tokens p95=94208 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix256_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix256_tail32 (total_prompt_tokens=288)
+  cold TTFT                   : median=170.834 ms p95=171.013 ms
+  restore latency             : median=0.351 ms p95=0.353 ms
+  tail prefill latency        : median=82.558 ms p95=82.968 ms
+  first-token decode latency  : median=14.689 ms p95=14.748 ms
+  commit/snapshot latency     : median=0.380 ms p95=0.410 ms
+  hot-prefix TTFT             : median=97.598 ms p95=97.907 ms
+  speedup factor              : median=1.750x p95=1.771x
+  prefix snapshot size        : median=108523121 bytes p95=108523121 bytes
+  matched prefix token count  : median=256 tokens p95=256 tokens
+  attention native multi-token runs: median=18 runs p95=18 runs
+  attention native multi-token tokens: median=3456 tokens p95=3456 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=69 runs p95=69 runs
+  expert native multi-token tokens: median=13248 tokens p95=13248 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=13248 tokens p95=13248 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix1024_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix1024_tail32 (total_prompt_tokens=1056)
+  cold TTFT                   : median=514.701 ms p95=515.075 ms
+  restore latency             : median=0.403 ms p95=0.408 ms
+  tail prefill latency        : median=86.725 ms p95=86.935 ms
+  first-token decode latency  : median=18.655 ms p95=18.690 ms
+  commit/snapshot latency     : median=0.532 ms p95=0.541 ms
+  hot-prefix TTFT             : median=105.788 ms p95=105.960 ms
+  speedup factor              : median=4.869x p95=4.869x
+  prefix snapshot size        : median=149420657 bytes p95=149420657 bytes
+  matched prefix token count  : median=1024 tokens p95=1024 tokens
+  attention native multi-token runs: median=24 runs p95=24 runs
+  attention native multi-token tokens: median=12672 tokens p95=12672 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=69 runs p95=69 runs
+  expert native multi-token tokens: median=48576 tokens p95=48576 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=48576 tokens p95=48576 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_committed_head_prefix4096_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_committed_head_prefix4096_tail32 (total_prompt_tokens=4128)
+  cold TTFT                   : median=2296.184 ms p95=2296.827 ms
+  restore latency             : median=0.627 ms p95=0.631 ms
+  tail prefill latency        : median=103.747 ms p95=103.821 ms
+  first-token decode latency  : median=34.633 ms p95=34.657 ms
+  commit/snapshot latency     : median=1.191 ms p95=1.224 ms
+  hot-prefix TTFT             : median=138.974 ms p95=139.074 ms
+  speedup factor              : median=16.528x p95=16.546x
+  prefix snapshot size        : median=313010801 bytes p95=313010801 bytes
+  matched prefix token count  : median=4096 tokens p95=4096 tokens
+  attention native multi-token runs: median=60 runs p95=60 runs
+  attention native multi-token tokens: median=49536 tokens p95=49536 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=92 runs p95=92 runs
+  expert native multi-token tokens: median=189888 tokens p95=189888 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=92 runs p95=92 runs
+  mamba native multi-token tokens: median=189888 tokens p95=189888 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_global_root_prefix256_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_global_root_prefix256_tail32 (total_prompt_tokens=288)
+  cold TTFT                   : median=171.400 ms p95=171.484 ms
+  restore latency             : median=0.348 ms p95=0.348 ms
+  tail prefill latency        : median=82.506 ms p95=82.585 ms
+  first-token decode latency  : median=14.618 ms p95=14.669 ms
+  commit/snapshot latency     : median=0.275 ms p95=0.319 ms
+  hot-prefix TTFT             : median=97.467 ms p95=97.544 ms
+  speedup factor              : median=1.759x p95=1.772x
+  prefix snapshot size        : median=108523121 bytes p95=108523121 bytes
+  matched prefix token count  : median=256 tokens p95=256 tokens
+  attention native multi-token runs: median=18 runs p95=18 runs
+  attention native multi-token tokens: median=3456 tokens p95=3456 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=69 runs p95=69 runs
+  expert native multi-token tokens: median=13248 tokens p95=13248 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=13248 tokens p95=13248 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_global_root_prefix1024_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_global_root_prefix1024_tail32 (total_prompt_tokens=1056)
+  cold TTFT                   : median=514.824 ms p95=515.065 ms
+  restore latency             : median=0.403 ms p95=0.405 ms
+  tail prefill latency        : median=86.891 ms p95=87.031 ms
+  first-token decode latency  : median=18.693 ms p95=18.700 ms
+  commit/snapshot latency     : median=0.352 ms p95=0.361 ms
+  hot-prefix TTFT             : median=105.952 ms p95=106.127 ms
+  speedup factor              : median=4.862x p95=4.862x
+  prefix snapshot size        : median=149420657 bytes p95=149420657 bytes
+  matched prefix token count  : median=1024 tokens p95=1024 tokens
+  attention native multi-token runs: median=24 runs p95=24 runs
+  attention native multi-token tokens: median=12672 tokens p95=12672 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=69 runs p95=69 runs
+  expert native multi-token tokens: median=48576 tokens p95=48576 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=69 runs p95=69 runs
+  mamba native multi-token tokens: median=48576 tokens p95=48576 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
+nano_prefix_cache_ttft_bench: running cached_global_root_prefix4096_tail32
+  iteration 1/6 warmup
+  iteration 2/6 measure
+  iteration 3/6 measure
+  iteration 4/6 measure
+  iteration 5/6 measure
+  iteration 6/6 measure
+
+Case: cached_global_root_prefix4096_tail32 (total_prompt_tokens=4128)
+  cold TTFT                   : median=2297.497 ms p95=2298.497 ms
+  restore latency             : median=0.624 ms p95=0.629 ms
+  tail prefill latency        : median=103.811 ms p95=103.957 ms
+  first-token decode latency  : median=34.606 ms p95=34.643 ms
+  commit/snapshot latency     : median=0.664 ms p95=0.687 ms
+  hot-prefix TTFT             : median=139.063 ms p95=139.174 ms
+  speedup factor              : median=16.526x p95=16.537x
+  prefix snapshot size        : median=313010801 bytes p95=313010801 bytes
+  matched prefix token count  : median=4096 tokens p95=4096 tokens
+  attention native multi-token runs: median=60 runs p95=60 runs
+  attention native multi-token tokens: median=49536 tokens p95=49536 tokens
+  attention row replay runs   : median=0 runs p95=0 runs
+  attention row replay tokens : median=0 tokens p95=0 tokens
+  expert native multi-token runs: median=92 runs p95=92 runs
+  expert native multi-token tokens: median=189888 tokens p95=189888 tokens
+  expert row replay runs      : median=0 runs p95=0 runs
+  expert row replay tokens    : median=0 tokens p95=0 tokens
+  mamba native multi-token runs: median=92 runs p95=92 runs
+  mamba native multi-token tokens: median=189888 tokens p95=189888 tokens
+  mamba row replay runs       : median=0 runs p95=0 runs
+  mamba row replay tokens     : median=0 tokens p95=0 tokens
