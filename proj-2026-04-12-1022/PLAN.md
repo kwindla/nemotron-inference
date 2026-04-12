@@ -283,29 +283,41 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/` (read-only), `proj-2026-04-12-1022/trtllm_architecture.md` (new).
 
-- [ ] **2. Stand up an instrumented TRT-LLM reference harness that captures the highest-fidelity source-level reference surface**
-  Build a standalone test harness that runs TRT-LLM's NVFP4 MoE GEMM on a synthetic problem and captures the highest-fidelity surface it can expose cleanly on an SM120 source-level path. That surface becomes the external oracle for steps 4-6.
+- [ ] **2. Stand up an instrumented TRT-LLM reference harness capturing two reference surfaces**
+  Build a standalone test harness that runs TRT-LLM's SM120 NVFP4 MoE GEMM on a synthetic problem and captures **two** concrete reference surfaces identified by the step 1 architecture read. These become the external oracles for steps 4-6.
 
-  **Build-path investigation first** — check how accessible TRT-LLM's build is. Do **not** use the `.venv-trtllm` FlashInfer wheel as the authoritative path in this plan; locally it routes through `get_trtllm_moe_sm100_module()` and is unsuitable for source-level SM120 instrumentation. Options from cheapest to most expensive:
+  **Surfaces to capture** (both required):
 
-  - **(a)** Extract just the NVFP4 MoE GEMM kernel source files from the vendored TRT-LLM at `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/` and compile them directly into a small C++/CUDA test binary in our repo. Link against the same CUTLASS headers we already use.
-  - **(b)** Build all of vendored TRT-LLM from source via its own CMake. Most work, most complete.
-  - **(c)** If both source-level routes fail, write an alternative oracle: a Python script using `torch` that does the same GEMM + activation + per-block FP4 quantize math in full precision, paired with a local direct-pack contract check patterned on `RunP5NativeDirectPackOracleForTesting`.
+  1. **BF16 intermediate output of `MoeGemmRunner::moeGemm(...)`**, captured immediately after the kernel returns and **before** `doActivationKernel` at `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu:2063`. This is the bitwise primary kernel-level oracle for step 4b's mainloop. TRT-LLM's MoE GEMM kernel's own epilogue is `LinearCombination<ElementD, float, void, float>` (per-expert `alpha` only — no activation, no quantization, see step 1 architecture doc §6), so the BF16 intermediate is the highest-fidelity surface TRT-LLM exposes for the `A*B` core.
+  2. **TRT-LLM's `maybePrintSm120P1CompileProbe` dump** at `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl:309`, triggered via the `TLLM_FUSED_MOE_PRINT_COMPILE_PROBE_P1=1` env var. This dumps TRT-LLM's own `SmemLayoutAtomSFA`, `SmemLayoutSFA`, `SmemCopyAtomSFA`, `LayoutSFA_TV`, and `tCrC_profile` values for the SM120 P1 CollectiveMainloop instantiation (SwapAB=false, `CTA_M=128, CTA_N=128, CTA_K=64 FP4 elements`, cluster `1×1×1`). This is a no-kernel-run Traits-level oracle for step 4a: we compare the step 4a `ShowInt<N>` probe output against this captured text bit-for-bit.
 
-  Pick the cheapest viable **source-level** option. Do not combine options unless step 2's notes explain exactly why two paths are needed.
+  We do **not** try to capture a packed-FP4 reference surface from TRT-LLM. TRT-LLM does not have one at the GEMM-kernel boundary — its FP4 pack is in a separate post-GEMM `doActivationKernel`. Validation of our fused direct-pack epilogue (step 4c) anchors against a **local** direct-pack contract reference patterned on `RunP5NativeDirectPackOracleForTesting` at `runtime/src/backend/fused_moe_prefill.cu:13515` and `testing/backend/staged_fp4_pack_test.cpp:1001-1050`, not against TRT-LLM.
 
-  **Harness scope for this step**:
-  - Minimal synthetic problem: 1 expert, small token count (16), small hidden dim (128), small intermediate dim (128), FP32 input, TRT-LLM-native quantization to NVFP4, run the kernel, and dump the highest-fidelity observable reference surface to disk
-  - **Verification**: first identify the exact surface TRT-LLM can expose. Preferred order: pre-epilogue accumulator or activation tiles, then post-activation dense output, then dequantized final output. If TRT-LLM cannot expose packed bytes / block scales / activation-output-scale tensors matching our `DeviceNvfp4Matrix` contract, document that explicitly and do **not** pretend it does. The final 4-channel packed-buffer validation in steps 4c-5 then uses a local direct-pack contract reference patterned on `RunP5NativeDirectPackOracleForTesting`.
-  - The host-side reference computation of the same problem must agree with the captured TRT-LLM surface either bitwise or within the exact tolerance envelope TRT-LLM itself validates. If only tolerance-based agreement is achievable, document the tolerance and why.
+  **Build-path investigation first** — surface 2 (compile probe) is cheap; surface 1 (BF16 reference data) is where the build-path choice matters. Do **not** use the `.venv-trtllm` FlashInfer wheel: its `trtllm_fp4_block_scale_moe` routes through `get_trtllm_moe_sm100_module()` and is Hopper-only. Options for surface 1 from cheapest to most expensive:
+
+  - **(a)** Include the TRT-LLM headers directly in a small C++/CUDA test binary built under our existing `testing/` CMake. `#include "third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"` and explicitly instantiate `MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>`. Compile the specific instantiations we need with nvcc against our existing CUTLASS headers; let our CMake handle the build. No TRT-LLM-side build infrastructure. Cheapest if TRT-LLM's headers compile cleanly as-is against our CUTLASS version.
+  - **(b)** Build the vendored `third_party/TensorRT-LLM/` via its own CMake and link against the produced library from our test binary. More robust but requires understanding TRT-LLM's build system.
+  - **(c)** Write a Python script using `torch` that does FP32 GEMM + per-block FP4 quantize, use it as the BF16 reference via a BF16-rounding step, and drop surface 1 as a TRT-LLM-captured artifact. Only if both (a) and (b) fail. Documents what we could NOT verify.
+
+  Pick the cheapest viable option for surface 1. Surface 2 (compile probe) is independent and can be captured via whichever build path exposes `moe_gemm_tma_ws_launcher.inl` instantiation — normally option (a).
+
+  **Surface 2 capture detail.** The compile probe runs at kernel-launcher instantiation time, not at kernel runtime. Any build that instantiates `tma_warp_specialized_generic_moe_gemm_kernelLauncher<cutlass::arch::Sm120, __nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, ..., CTA_Shape=(128,128,64_bytes), Cluster=(1,1,1), ..., SwapAB=false>` with the env var set will emit the P1 layout text to stderr or the diagnostic stream. The env var controls which profile prints (`P1`, `P5`, `P15`). Capture the P1 output verbatim to `proj-2026-04-12-1022/trtllm_reference/golden/sm120_p1_compile_probe.txt`.
+
+  **Surface 1 harness scope**:
+  - Minimal synthetic problem: 1 expert, token count 16, small hidden dim 128, small intermediate dim 128, FP32 → NVFP4 quantize via TRT-LLM's own quantizer (so the FP4 input bits and per-block FP8 scales match what `MoeGemmRunner::moeGemm` expects)
+  - Run `moeGemm(...)` with `OutputType=__nv_bfloat16`, bias=null, per-expert alpha=1.0
+  - Copy the BF16 output to host, save to `proj-2026-04-12-1022/trtllm_reference/golden/sm120_p1_bf16_reference.bin` as raw little-endian BF16 bytes plus a JSON sidecar describing dtype/shape/(expert, token, intermediate) axis order
+  - Also save the exact input tensors we fed in: `input_fp32.bin`, `input_fp4_packed.bin`, `input_fp4_block_scales.bin`, `weight_fp32.bin`, `weight_fp4_packed.bin`, `weight_fp4_block_scales.bin`, `per_row_alpha.bin`, plus a `problem.json` describing dims and seeds
+  - **Host-side cross-check**: compute the same GEMM in fp32 from the original fp32 tensors (before quantization); the fp32 result should agree with the TRT-LLM BF16 output within the documented BF16 rounding envelope. Record the observed max_abs_diff and ulp-diff distribution in `NOTES.md`.
   - Scale up to a realistic Nano bucket in step 5, not here.
 
   **Output of this step**:
-  - `proj-2026-04-12-1022/trtllm_reference/` directory with the harness source + README for running it
-  - `proj-2026-04-12-1022/trtllm_reference/golden/` with reference artifacts for the minimal synthetic problem, for exactly the surface step 2 can capture
-  - A brief `trtllm_reference/NOTES.md` explaining which surface was captured, which surfaces were not observable, any tolerance / residual observed vs the host fp32 reference, and which build-path option was used
+  - `proj-2026-04-12-1022/trtllm_reference/` directory with the harness source + build hookup + README for running it
+  - `proj-2026-04-12-1022/trtllm_reference/golden/sm120_p1_bf16_reference.bin` (surface 1, kernel-runtime capture) + the input tensor binaries + `problem.json`
+  - `proj-2026-04-12-1022/trtllm_reference/golden/sm120_p1_compile_probe.txt` (surface 2, compile-time capture)
+  - `proj-2026-04-12-1022/trtllm_reference/NOTES.md` documenting: which build-path option was used for surface 1; any TRT-LLM include-path adjustments required; the observed BF16 vs fp32 tolerance envelope; exact instructions for reproducing both captures; anything unexpected
 
-  Gate: the harness runs on the target GPU, produces reference artifacts, and the exact oracle contract for later steps is written down unambiguously.
+  Gate: both surface 1 (`sm120_p1_bf16_reference.bin` + input binaries) and surface 2 (`sm120_p1_compile_probe.txt`) exist, the BF16 output agrees with the fp32 host reference within a documented tolerance, and the reproducible capture instructions in `NOTES.md` work on a fresh checkout.
 
   Key files: `proj-2026-04-12-1022/trtllm_reference/` (new), plus whatever build/CMake plumbing is needed.
 
@@ -448,7 +460,7 @@ Expected: `ALL CHECKS PASSED`.
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | pending | — | Read-only; no code changes |
-| 2 | Stand up instrumented TRT-LLM reference harness | pending | — | Produces source-level reference artifacts; exact surface documented |
+| 2 | Stand up instrumented TRT-LLM reference harness | pending | — | Captures BF16 intermediate (kernel runtime) + P1 compile probe (compile time) |
 | 3 | Delete all kP1-specific broken code (5 sub-commits 3a-3e) | pending | — | BF16-WMMA fallback stays live |
 | 4 | Implement new kP1 kernel from scratch (3 sub-commits 4a-4c) | pending | — | New `NanoP1*` names |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
