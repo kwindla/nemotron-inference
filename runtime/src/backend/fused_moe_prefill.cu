@@ -1530,6 +1530,89 @@ CUTE_HOST_DEVICE constexpr auto MakeTracedP1TiledCopySFB(TiledMma const& mma) {
   return LocalTiledCopy<CopyAtom, LayoutTV, TilerMN>{};
 }
 
+CUTE_HOST_DEVICE void FillTracedP1FragmentDebugCoordMaps(
+    int thread_idx,
+    int a_rows[kTiledCopyCoordCapacityA],
+    int a_cols[kTiledCopyCoordCapacityA],
+    int b_rows[kTiledCopyCoordCapacityB],
+    int b_cols[kTiledCopyCoordCapacityB],
+    int sfa_rows[kTracedP1ScaleFragmentCosizeA],
+    int sfa_cols[kTracedP1ScaleFragmentCosizeA],
+    int sfb_rows[kTracedP1ScaleFragmentCosizeB],
+    int sfb_cols[kTracedP1ScaleFragmentCosizeB]) {
+  auto mma = TracedP1TiledMma{};
+  auto thr_mma = mma.get_thread_slice(thread_idx);
+  auto ref_a = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(typename TracedP1TiledMma::AtomShape_MNK{}),
+          cute::size<2>(typename TracedP1TiledMma::AtomShape_MNK{})));
+  auto ref_b = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<1>(typename TracedP1TiledMma::AtomShape_MNK{}),
+          cute::size<2>(typename TracedP1TiledMma::AtomShape_MNK{})));
+  auto ref_sfa = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(typename TracedP1TiledMma::AtomShape_MNK{}),
+          cute::Int<4>{}));
+  auto ref_sfb = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<1>(typename TracedP1TiledMma::AtomShape_MNK{}),
+          cute::Int<4>{}));
+  auto part_a = thr_mma.partition_A(ref_a);
+  auto part_b = thr_mma.partition_B(ref_b);
+  auto part_sfa = PartitionScaleA(ref_sfa, thr_mma);
+  auto part_sfb = PartitionScaleB(ref_sfb, thr_mma);
+
+  auto smem_tiled_copy_a = MakeLocalTiledCopyA<cute::SM75_U32x4_LDSM_N>(mma);
+  auto smem_tiled_copy_b = MakeLocalTiledCopyB<cute::SM75_U32x4_LDSM_N>(mma);
+  auto smem_tiled_copy_sfa = MakeTracedP1TiledCopySFA(mma);
+  auto smem_tiled_copy_sfb = MakeTracedP1TiledCopySFB(mma);
+  auto smem_thr_copy_a = smem_tiled_copy_a.get_thread_slice(thread_idx);
+  auto smem_thr_copy_b = smem_tiled_copy_b.get_thread_slice(thread_idx);
+  auto smem_thr_copy_sfa = smem_tiled_copy_sfa.get_thread_slice(thread_idx);
+  auto smem_thr_copy_sfb = smem_tiled_copy_sfb.get_thread_slice(thread_idx);
+
+  FillPhysicalCoordMapCopyViewLimited(
+      smem_thr_copy_a.retile_D(part_a),
+      kTiledCopyCoordCapacityA,
+      a_rows,
+      a_cols);
+  FillPhysicalCoordMapCopyViewLimited(
+      smem_thr_copy_b.retile_D(part_b),
+      kTiledCopyCoordCapacityB,
+      b_rows,
+      b_cols);
+  FillPhysicalCoordMapCopyViewLimited(
+      smem_thr_copy_sfa.retile_D(part_sfa),
+      kTracedP1ScaleFragmentCosizeA,
+      sfa_rows,
+      sfa_cols);
+  FillPhysicalCoordMapCopyViewLimited(
+      smem_thr_copy_sfb.retile_D(part_sfb),
+      kTracedP1ScaleFragmentCosizeB,
+      sfb_rows,
+      sfb_cols);
+}
+
+CUTE_HOST_DEVICE void FillSingleAtomCLayoutCoords(
+    int thread_idx,
+    int token_rows[4],
+    int output_rows[4]) {
+  auto mma = SingleAtomTiledMma{};
+  auto thr_mma = mma.get_thread_slice(thread_idx);
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<16>{}, cute::Int<8>{}));
+  auto part_c = thr_mma.partition_C(ref_c);
+  static_assert(
+      decltype(cute::size(part_c))::value == 4,
+      "Single-atom P1 debug expects four C outputs per lane");
+  for (int reg = 0; reg < 4; ++reg) {
+    auto coord = part_c(reg);
+    token_rows[reg] = static_cast<int>(cute::get<0>(coord));
+    output_rows[reg] = static_cast<int>(cute::get<1>(coord));
+  }
+}
+
 template <class TiledMma>
 CUTE_HOST_DEVICE constexpr auto MakeTracedP13TiledCopySFA(TiledMma const& mma) {
   using CopyAtom = LocalCopyAtom<cute::UniversalCopy<nvfp4_cute::ElementSFCompute>, nvfp4_cute::ElementSFCompute>;
@@ -2081,6 +2164,7 @@ __device__ __managed__ P1DirectTrace g_p1_direct_trace;
 __device__ __managed__ P13DebugTrace g_p13_debug_trace;
 __device__ __managed__ P1NativeFp4MmaTrace g_p1_native_fp4_mma_trace;
 __device__ __managed__ P1NaturalFp4MmaTrace g_p1_natural_fp4_mma_trace;
+__device__ __managed__ P1FragmentDebugTrace g_p1_fragment_debug_trace;
 __device__ __managed__ int g_enable_p15_scale_trace = 0;
 __device__ __managed__ int g_enable_p5_scale_trace = 0;
 __device__ __managed__ int g_enable_p13_scale_trace = 0;
@@ -4066,6 +4150,27 @@ __device__ __forceinline__ std::uint8_t ScaleByteValue(T const& value) {
     return static_cast<std::uint8_t>(value);
   } else {
     return static_cast<std::uint8_t>(value.raw());
+  }
+}
+
+template <int kWordCount, class CopyViewTensor>
+__device__ __forceinline__ void PackLinearFp4CopyViewWords(
+    CopyViewTensor const& copy_view,
+    std::uint32_t (&words)[kWordCount]) {
+  constexpr int kPhysicalCount = decltype(cute::size(copy_view))::value;
+  static_assert(
+      kPhysicalCount == kWordCount * 8,
+      "Packed FP4 copy view size must match the requested word count");
+#pragma unroll
+  for (int word = 0; word < kWordCount; ++word) {
+    std::uint32_t packed = 0u;
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      const int physical = word * 8 + elem;
+      packed |= static_cast<std::uint32_t>(ScaleByteValue(copy_view(physical)) & 0x0Fu)
+                << (elem * 4);
+    }
+    words[word] = packed;
   }
 }
 
@@ -13147,6 +13252,21 @@ void ResetP1NaturalFp4MmaTrace() {
   g_p1_natural_fp4_mma_trace = {};
 }
 
+bool CopyP1FragmentDebugTrace(P1FragmentDebugTrace* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    return false;
+  }
+  *out = g_p1_fragment_debug_trace;
+  return true;
+}
+
+void ResetP1FragmentDebugTrace() {
+  g_p1_fragment_debug_trace = {};
+}
+
 const char* SelectRoutedGemm1ProfileNameForTesting(std::size_t num_rows) {
   return RoutedGemm1ProfileName(SelectRoutedGemm1Profile(num_rows));
 }
@@ -13956,6 +14076,172 @@ __global__ void P1NaturalFp4MmaOracleKernel(
   }
 }
 
+__global__ void P1FragmentDebugOracleKernel(
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales) {
+  constexpr int kRows = kPlannedWmmaTileM;
+  constexpr int kOutputTile = 128;
+  constexpr int kK = 64;
+  constexpr int kBlocksPerRow = kK / fused_decode::kNvfp4BlockWidth;
+  constexpr int kPackedBytesPerRow = kK / 2;
+  constexpr int kDebugLanes = kP1FragmentDebugLaneCount;
+  constexpr int kNBase = 0;
+
+  __shared__ std::uint8_t a_packed[kRows][kPackedBytesPerRow];
+  __shared__ std::uint8_t a_scale_smem[nvfp4_bridge::kTracedP1ScaleSmemCosizeA];
+  __shared__ std::uint8_t b_packed[kOutputTile][kPackedBytesPerRow];
+  __shared__ std::uint8_t b_scale_smem[nvfp4_bridge::kTracedP1ScaleSmemCosizeB];
+
+  const auto a_tile_view =
+      nvfp4_bridge::MakePackedTile64<kRows>(&a_packed[0][0], nullptr);
+  const auto b_tile_view =
+      nvfp4_bridge::MakePackedTile64<kOutputTile>(&b_packed[0][0], nullptr);
+  auto a_scale_tensor = cute::make_tensor(
+      cute::make_smem_ptr(&a_scale_smem[0]),
+      nvfp4_bridge::TracedP1SmemLayoutSFA{});
+  auto b_scale_tensor = cute::make_tensor(
+      cute::make_smem_ptr(&b_scale_smem[0]),
+      nvfp4_bridge::TracedP1SmemLayoutSFB{});
+  const int tid = static_cast<int>(threadIdx.x);
+  if (tid >= kDebugLanes) {
+    return;
+  }
+
+  if (tid == 0) {
+    g_p1_fragment_debug_trace.valid = 1;
+    g_p1_fragment_debug_trace.sfa_logical_cols =
+        cute::size<1>(nvfp4_bridge::TracedP1SmemLayoutSFA{});
+    g_p1_fragment_debug_trace.sfb_logical_cols =
+        cute::size<1>(nvfp4_bridge::TracedP1SmemLayoutSFB{});
+  }
+
+  for (int row = tid; row < kRows; row += blockDim.x) {
+    std::uint8_t* dst = a_tile_view.packed_rows + row * kPackedBytesPerRow;
+#pragma unroll
+    for (int byte_index = 0; byte_index < kPackedBytesPerRow; ++byte_index) {
+      dst[byte_index] = input_packed[row * kPackedBytesPerRow + byte_index];
+    }
+    const std::uint8_t scale_bytes[4] = {
+        input_block_scales[row * kBlocksPerRow + 0],
+        input_block_scales[row * kBlocksPerRow + 1],
+        input_block_scales[row * kBlocksPerRow + 2],
+        input_block_scales[row * kBlocksPerRow + 3],
+    };
+    nvfp4_bridge::StoreTracedScaleBytes(a_scale_tensor, scale_bytes, row);
+  }
+
+  for (int row = tid; row < kOutputTile; row += blockDim.x) {
+    std::uint8_t* dst = b_tile_view.packed_rows + row * kPackedBytesPerRow;
+#pragma unroll
+    for (int byte_index = 0; byte_index < kPackedBytesPerRow; ++byte_index) {
+      dst[byte_index] = weight_packed[row * kPackedBytesPerRow + byte_index];
+    }
+    const std::uint8_t scale_bytes[4] = {
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            0u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            1u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            2u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            3u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+    };
+    nvfp4_bridge::StoreTracedScaleBytes(b_scale_tensor, scale_bytes, row);
+  }
+  __syncthreads();
+
+  int a_rows[kP1FragmentDebugACoordCount];
+  int a_cols[kP1FragmentDebugACoordCount];
+  int b_rows[kP1FragmentDebugBCoordCount];
+  int b_cols[kP1FragmentDebugBCoordCount];
+  int sfa_rows[nvfp4_bridge::kTracedP1ScaleFragmentCosizeA];
+  int sfa_cols[nvfp4_bridge::kTracedP1ScaleFragmentCosizeA];
+  int sfb_rows[nvfp4_bridge::kTracedP1ScaleFragmentCosizeB];
+  int sfb_cols[nvfp4_bridge::kTracedP1ScaleFragmentCosizeB];
+  nvfp4_bridge::FillTracedP1FragmentDebugCoordMaps(
+      tid,
+      a_rows,
+      a_cols,
+      b_rows,
+      b_cols,
+      sfa_rows,
+      sfa_cols,
+      sfb_rows,
+      sfb_cols);
+
+  for (int i = 0; i < kP1FragmentDebugACoordCount; ++i) {
+    g_p1_fragment_debug_trace.a_row_coord[tid][i] = a_rows[i];
+    g_p1_fragment_debug_trace.a_col_coord[tid][i] = a_cols[i];
+  }
+  for (int i = 0; i < kP1FragmentDebugBCoordCount; ++i) {
+    g_p1_fragment_debug_trace.b_row_coord[tid][i] = b_rows[i];
+    g_p1_fragment_debug_trace.b_col_coord[tid][i] = b_cols[i];
+  }
+  for (int i = 0; i < kP1FragmentDebugScaleCoordCount; ++i) {
+    g_p1_fragment_debug_trace.sfa_row_coord[tid][i] = sfa_rows[i];
+    g_p1_fragment_debug_trace.sfa_col_coord[tid][i] = sfa_cols[i];
+    g_p1_fragment_debug_trace.sfb_row_coord[tid][i] = sfb_rows[i];
+    g_p1_fragment_debug_trace.sfb_col_coord[tid][i] = sfb_cols[i];
+  }
+
+  const auto a_fragment =
+      nvfp4_bridge::LoadFragmentA_RowMajor16x64TracedScaleTiledP1<
+          nvfp4_bridge::TracedP1TiledMma,
+          kRows>(&a_packed[0][0], a_scale_smem, 0, tid);
+  const auto b_fragment =
+      nvfp4_bridge::LoadFragmentB_ColMajor64x8TracedScaleTiledP1<
+          nvfp4_bridge::TracedP1TiledMma,
+          kOutputTile>(&b_packed[0][0], b_scale_smem, tid, kNBase);
+
+  for (int reg = 0; reg < 4; ++reg) {
+    g_p1_fragment_debug_trace.tCrA_pre_shift[tid][reg] = a_fragment.regs[reg] >> 2u;
+  }
+  for (int reg = 0; reg < 2; ++reg) {
+    g_p1_fragment_debug_trace.tCrB_pre_shift[tid][reg] = b_fragment.regs[reg] >> 2u;
+  }
+  g_p1_fragment_debug_trace.tCrSFA[tid] =
+      static_cast<std::uint32_t>(a_fragment.scale[0]);
+  g_p1_fragment_debug_trace.tCrSFB[tid] =
+      static_cast<std::uint32_t>(b_fragment.scale[0]);
+  for (int reg = 0; reg < 4; ++reg) {
+    g_p1_fragment_debug_trace.tCrA_post_shift[tid][reg] = a_fragment.regs[reg];
+  }
+  for (int reg = 0; reg < 2; ++reg) {
+    g_p1_fragment_debug_trace.tCrB_post_shift[tid][reg] = b_fragment.regs[reg];
+  }
+
+  nvfp4_bridge::CFragment64 accum{};
+  nvfp4_bridge::Clear(accum);
+  nvfp4_bridge::Gemm(accum, a_fragment, b_fragment);
+
+  int token_rows[4];
+  int output_rows[4];
+  nvfp4_bridge::FillSingleAtomCLayoutCoords(tid, token_rows, output_rows);
+  for (int reg = 0; reg < kP1FragmentDebugCAtomCount; ++reg) {
+    g_p1_fragment_debug_trace.c_token_row[tid][reg] = token_rows[reg];
+    g_p1_fragment_debug_trace.c_output_row[tid][reg] = kNBase + output_rows[reg];
+    g_p1_fragment_debug_trace.c_atom_post_mma[tid][reg] = accum.regs[reg];
+  }
+}
+
 __global__ void P13GenericDirectStageOracleKernel(
     const float* input,
     const float* per_row_tensor_scales_input,
@@ -14160,6 +14446,35 @@ bool RunP1NaturalFp4MmaOracleForTesting(
   (void) input_packed;
   (void) input_block_scales;
   (void) token_major_output;
+  return false;
+#endif
+}
+
+bool RunP1FragmentDebugOracleForTesting(
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (weight_packed == nullptr ||
+      weight_matmul_block_scales == nullptr ||
+      input_packed == nullptr ||
+      input_block_scales == nullptr) {
+    return false;
+  }
+
+  ResetP1FragmentDebugTrace();
+  P1FragmentDebugOracleKernel<<<1, kP1FragmentDebugLaneCount>>>(
+      weight_packed,
+      weight_matmul_block_scales,
+      input_packed,
+      input_block_scales);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+#else
+  (void) weight_packed;
+  (void) weight_matmul_block_scales;
+  (void) input_packed;
+  (void) input_block_scales;
   return false;
 #endif
 }

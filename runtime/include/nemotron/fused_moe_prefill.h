@@ -77,6 +77,11 @@ constexpr int kP1NativeFp4MmaTraceGroupCount = 8 * 2 * 32;
 constexpr int kP1NativeFp4MmaTraceEntryCount =
     kP1NativeFp4MmaTraceGroupCount * 4;
 constexpr int kP1NaturalFp4MmaTraceEntryCount = 128 * 32;
+constexpr int kP1FragmentDebugLaneCount = 32;
+constexpr int kP1FragmentDebugACoordCount = 32;
+constexpr int kP1FragmentDebugBCoordCount = 16;
+constexpr int kP1FragmentDebugScaleCoordCount = 4;
+constexpr int kP1FragmentDebugCAtomCount = 4;
 
 struct P1NativeFp4MmaTrace {
   int valid = 0;
@@ -106,6 +111,29 @@ struct P1NaturalFp4MmaTrace {
   int m_fragment_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
   int n_fragment_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
   float values[kP1NaturalFp4MmaTraceEntryCount] = {};
+};
+
+struct P1FragmentDebugTrace {
+  int valid = 0;
+  int sfa_logical_cols = 0;
+  int sfb_logical_cols = 0;
+  std::uint32_t tCrA_pre_shift[kP1FragmentDebugLaneCount][4] = {};
+  std::uint32_t tCrA_post_shift[kP1FragmentDebugLaneCount][4] = {};
+  std::uint32_t tCrB_pre_shift[kP1FragmentDebugLaneCount][2] = {};
+  std::uint32_t tCrB_post_shift[kP1FragmentDebugLaneCount][2] = {};
+  std::uint32_t tCrSFA[kP1FragmentDebugLaneCount] = {};
+  std::uint32_t tCrSFB[kP1FragmentDebugLaneCount] = {};
+  int a_row_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugACoordCount] = {};
+  int a_col_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugACoordCount] = {};
+  int b_row_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugBCoordCount] = {};
+  int b_col_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugBCoordCount] = {};
+  int sfa_row_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugScaleCoordCount] = {};
+  int sfa_col_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugScaleCoordCount] = {};
+  int sfb_row_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugScaleCoordCount] = {};
+  int sfb_col_coord[kP1FragmentDebugLaneCount][kP1FragmentDebugScaleCoordCount] = {};
+  int c_output_row[kP1FragmentDebugLaneCount][kP1FragmentDebugCAtomCount] = {};
+  int c_token_row[kP1FragmentDebugLaneCount][kP1FragmentDebugCAtomCount] = {};
+  float c_atom_post_mma[kP1FragmentDebugLaneCount][kP1FragmentDebugCAtomCount] = {};
 };
 
 bool RunGroupedNvfp4ExpertMatVec(
@@ -185,6 +213,8 @@ bool CopyP1NativeFp4MmaTrace(P1NativeFp4MmaTrace* out);
 void ResetP1NativeFp4MmaTrace();
 bool CopyP1NaturalFp4MmaTrace(P1NaturalFp4MmaTrace* out);
 void ResetP1NaturalFp4MmaTrace();
+bool CopyP1FragmentDebugTrace(P1FragmentDebugTrace* out);
+void ResetP1FragmentDebugTrace();
 
 // Testing hook: runs the current traced P1 native FP4 MMA load+mma chain in
 // isolation on a synthetic 16x64 activation tile and 128x64 weight tile,
@@ -205,5 +235,14 @@ bool RunP1NaturalFp4MmaOracleForTesting(
     const std::uint8_t* input_packed,
     const std::uint8_t* input_block_scales,
     float* token_major_output);
+
+// Testing hook: runs a single natural traced P1 `m=0,n=0,k=0` fragment path
+// for warp 0 and dumps the live A/B payloads, traced scale words, and the
+// first `mma_atom.call` output for all 32 lanes.
+bool RunP1FragmentDebugOracleForTesting(
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales);
 
 }  // namespace nemotron
