@@ -1,6 +1,7 @@
 #include <algorithm>
 #include "nemotron/expert_layer.h"
 #include "nemotron/expert_staging_counters.h"
+#include "nemotron/fused_moe_prefill.h"
 #include "nemotron/nvfp4_packing.h"
 
 #include <cuda_runtime.h>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -244,6 +246,322 @@ bool all_finite(const std::vector<float>& values) {
     if (!std::isfinite(value)) {
       return false;
     }
+  }
+  return true;
+}
+
+struct DirectMoePrefillCompareCaseConfig {
+  std::size_t token_count = 0;
+  std::size_t top_k = 1;
+  std::size_t layer_index = 4;
+  std::size_t hidden_size = 64;
+  std::size_t intermediate_size = 64;
+  std::size_t routed_experts = 8;
+  bool deterministic_single_expert = false;
+};
+
+struct DirectMoePrefillCompareCaseResult {
+  std::size_t dispatch_rows = 0;
+  std::string fc1_profile;
+  std::string fc1_class;
+  std::string fc2_profile;
+  std::string fc2_class;
+  ExpertLayerExecutionCounters safe_counters;
+  ExpertLayerExecutionCounters unsafe_counters;
+  std::vector<float> safe_host;
+  std::vector<float> unsafe_host;
+  float max_abs_diff = 0.0f;
+};
+
+std::vector<std::size_t> ParseRowCountsEnv(
+    const char* env_name,
+    const std::vector<std::size_t>& default_rows) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || *value == '\0') {
+    return default_rows;
+  }
+
+  std::vector<std::size_t> rows;
+  std::stringstream stream(value);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoull(token.c_str(), &end, 10);
+    if (end == token.c_str() || *end != '\0') {
+      return {};
+    }
+    rows.push_back(static_cast<std::size_t>(parsed));
+  }
+  return rows.empty() ? default_rows : rows;
+}
+
+std::optional<float> ParseOptionalFloatEnv(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || *value == '\0') {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  const float parsed = std::strtof(value, &end);
+  if (end == value || *end != '\0') {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
+std::optional<std::size_t> ParseOptionalSizeEnv(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || *value == '\0') {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0') {
+    return std::nullopt;
+  }
+  return static_cast<std::size_t>(parsed);
+}
+
+bool ApplyDimensionEnvOverrides(
+    DirectMoePrefillCompareCaseConfig* case_config,
+    const char* hidden_env,
+    const char* intermediate_env,
+    const char* routed_experts_env,
+    const char* top_k_env) {
+  const auto hidden = ParseOptionalSizeEnv(hidden_env);
+  if (std::getenv(hidden_env) != nullptr && !hidden.has_value()) {
+    return expect(false, "hidden_size env must parse as size_t");
+  }
+  if (hidden.has_value()) {
+    case_config->hidden_size = *hidden;
+  }
+  const auto intermediate = ParseOptionalSizeEnv(intermediate_env);
+  if (std::getenv(intermediate_env) != nullptr && !intermediate.has_value()) {
+    return expect(false, "intermediate_size env must parse as size_t");
+  }
+  if (intermediate.has_value()) {
+    case_config->intermediate_size = *intermediate;
+  }
+  const auto experts = ParseOptionalSizeEnv(routed_experts_env);
+  if (std::getenv(routed_experts_env) != nullptr && !experts.has_value()) {
+    return expect(false, "routed_experts env must parse as size_t");
+  }
+  if (experts.has_value()) {
+    case_config->routed_experts = *experts;
+  }
+  const auto top_k = ParseOptionalSizeEnv(top_k_env);
+  if (std::getenv(top_k_env) != nullptr && !top_k.has_value()) {
+    return expect(false, "top_k env must parse as size_t");
+  }
+  if (top_k.has_value()) {
+    case_config->top_k = *top_k;
+  }
+  return true;
+}
+
+bool RunDirectMoePrefillCompareCase(
+    CublasLtHandle& cublas,
+    const DirectMoePrefillCompareCaseConfig& case_config,
+    DirectMoePrefillCompareCaseResult* result) {
+  const std::size_t hidden_size = case_config.hidden_size;
+  const std::size_t intermediate_size = case_config.intermediate_size;
+  const std::size_t routed_experts = case_config.routed_experts;
+
+  if (case_config.token_count < 2) {
+    return expect(false, "direct_moe_prefill compare case requires token_count >= 2");
+  }
+  if (hidden_size == 0 || intermediate_size == 0 || routed_experts == 0) {
+    return expect(false, "direct_moe_prefill compare case requires nonzero dims");
+  }
+  if (case_config.top_k == 0 || case_config.top_k > routed_experts) {
+    return expect(false, "direct_moe_prefill compare case requires 1 <= top_k <= routed experts");
+  }
+
+  const std::string layer_prefix =
+      "backbone.layers." + std::to_string(case_config.layer_index);
+  const std::string mixer_prefix = layer_prefix + ".mixer";
+
+  std::vector<float> input_norm_weight(hidden_size, 1.0f);
+  std::vector<float> gate_bias(routed_experts, 0.0f);
+  std::vector<float> gate_weight(routed_experts * hidden_size, 0.0f);
+  if (case_config.deterministic_single_expert) {
+    gate_bias[0] = 12.0f;
+    for (std::size_t e = 1; e < routed_experts; ++e) {
+      gate_bias[e] = -static_cast<float>(e);
+    }
+  } else {
+    constexpr float kPatternedBias[8] = {0.02f, -0.04f, 0.03f, 0.00f, -0.01f, 0.05f, -0.02f, 0.01f};
+    for (std::size_t e = 0; e < routed_experts; ++e) {
+      gate_bias[e] = kPatternedBias[e % 8];
+    }
+    gate_weight = make_patterned_values(routed_experts, hidden_size, 11, 0.0125f);
+  }
+  std::vector<float> shared_up_values =
+      make_patterned_values(intermediate_size, hidden_size, 43, 0.02f);
+  std::vector<float> shared_down_values =
+      make_patterned_values(hidden_size, intermediate_size, 59, 0.02f);
+
+  const auto input_norm_descriptor =
+      make_fp32_descriptor(layer_prefix + ".norm.weight", input_norm_weight, {hidden_size});
+  const auto gate_bias_descriptor =
+      make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {routed_experts});
+  const auto gate_weight_descriptor =
+      make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, routed_experts, hidden_size);
+  auto shared_up_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.up_proj.weight",
+          shared_up_values,
+          intermediate_size,
+          hidden_size);
+  auto shared_down_descriptor =
+      make_owned_nvfp4_descriptor(
+          mixer_prefix + ".shared_experts.down_proj.weight",
+          shared_down_values,
+          hidden_size,
+          intermediate_size);
+  if (!expect(shared_up_descriptor.has_value(), "shared up NVFP4 descriptor should build") ||
+      !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
+    return false;
+  }
+  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
+  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
+
+  std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(routed_experts);
+  std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(routed_experts);
+  ExpertLayerBindings bindings;
+  bindings.input_norm_weight = &input_norm_descriptor;
+  bindings.gate_weight = &gate_weight_descriptor;
+  bindings.gate_score_correction_bias = &gate_bias_descriptor;
+  bindings.shared_up_gemm_weight = &shared_up_descriptor->descriptor;
+  bindings.shared_down_gemm_weight = &shared_down_descriptor->descriptor;
+  bindings.routed_experts.resize(routed_experts);
+  for (std::size_t expert_index = 0; expert_index < routed_experts; ++expert_index) {
+    const std::string expert_prefix =
+        mixer_prefix + ".experts." + std::to_string(expert_index);
+    const auto up_values = make_patterned_values(
+        intermediate_size,
+        hidden_size,
+        67 + static_cast<int>(expert_index * 2),
+        0.0175f);
+    const auto down_values = make_patterned_values(
+        hidden_size,
+        intermediate_size,
+        101 + static_cast<int>(expert_index * 3),
+        0.0175f);
+    const auto up_descriptor =
+        make_owned_nvfp4_descriptor(
+            expert_prefix + ".up_proj.weight",
+            up_values,
+            intermediate_size,
+            hidden_size);
+    const auto down_descriptor =
+        make_owned_nvfp4_descriptor(
+            expert_prefix + ".down_proj.weight",
+            down_values,
+            hidden_size,
+            intermediate_size);
+    if (!expect(up_descriptor.has_value(), "routed up NVFP4 descriptor should build") ||
+        !expect(down_descriptor.has_value(), "routed down NVFP4 descriptor should build")) {
+      return false;
+    }
+    routed_up_descriptors[expert_index] = std::move(*up_descriptor);
+    routed_down_descriptors[expert_index] = std::move(*down_descriptor);
+    RebindOwnedNvfp4Descriptor(&routed_up_descriptors[expert_index]);
+    RebindOwnedNvfp4Descriptor(&routed_down_descriptors[expert_index]);
+    bindings.routed_experts[expert_index].up_proj =
+        &routed_up_descriptors[expert_index].descriptor;
+    bindings.routed_experts[expert_index].down_proj =
+        &routed_down_descriptors[expert_index].descriptor;
+  }
+
+  ExpertLayerConfig config;
+  config.layer_index = case_config.layer_index;
+  config.hidden_size = hidden_size;
+  config.moe_latent_size = 0;
+  config.routed_expert_intermediate_size = intermediate_size;
+  config.shared_expert_intermediate_size = intermediate_size;
+  config.n_routed_experts = routed_experts;
+  config.top_k = case_config.top_k;
+  config.max_token_count = case_config.token_count;
+  config.n_group = 1;
+  config.topk_group = 1;
+  config.rms_epsilon = 1.0e-5f;
+  config.routed_scaling_factor = 5.0f;
+  config.norm_topk_prob = true;
+
+  auto slice = ExpertLayerSlice::Create(config, bindings);
+  if (!expect(slice != nullptr && slice->valid(), "resident expert layer slice should create")) {
+    return false;
+  }
+
+  std::vector<float> input_values(case_config.token_count * hidden_size, 0.0f);
+  for (std::size_t token = 0; token < case_config.token_count; ++token) {
+    for (std::size_t dim = 0; dim < hidden_size; ++dim) {
+      input_values[token * hidden_size + dim] =
+          (static_cast<float>(((token + 1) * 19 + (dim * 5)) % 41) - 20.0f) * 0.03125f;
+    }
+  }
+
+  auto batch_input = DeviceTensorFp32::Create({case_config.token_count, hidden_size});
+  auto safe_output = DeviceTensorFp32::Create({case_config.token_count, hidden_size});
+  auto unsafe_output = DeviceTensorFp32::Create({case_config.token_count, hidden_size});
+  if (!expect(batch_input != nullptr && safe_output != nullptr && unsafe_output != nullptr,
+              "batched tensors should allocate") ||
+      !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
+              "batched input should upload")) {
+    return false;
+  }
+
+  GemmHeuristicCache heuristic_cache;
+  ResetExpertLayerExecutionCounters();
+  unsetenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+  if (!expect(
+          slice->Run(cublas, &heuristic_cache, *batch_input, safe_output.get(), nullptr),
+          "safe row-replay run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "safe row-replay run should synchronize")) {
+    return false;
+  }
+  const ExpertLayerExecutionCounters safe_counters = GetExpertLayerExecutionCounters();
+
+  ResetExpertLayerExecutionCounters();
+  setenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL", "1", 1);
+  if (!expect(
+          slice->Run(cublas, &heuristic_cache, *batch_input, unsafe_output.get(), nullptr),
+          "unsafe native prefill run should succeed") ||
+      !expect(cudaDeviceSynchronize() == cudaSuccess, "unsafe native prefill run should synchronize")) {
+    return false;
+  }
+  const ExpertLayerExecutionCounters unsafe_counters = GetExpertLayerExecutionCounters();
+
+  std::vector<float> safe_host(safe_output->numel(), 0.0f);
+  std::vector<float> unsafe_host(unsafe_output->numel(), 0.0f);
+  if (!expect(safe_output->CopyToHost(safe_host.data(), safe_host.size()),
+              "safe output should copy to host") ||
+      !expect(unsafe_output->CopyToHost(unsafe_host.data(), unsafe_host.size()),
+              "unsafe output should copy to host") ||
+      !expect(all_finite(safe_host), "safe output should stay finite") ||
+      !expect(all_finite(unsafe_host), "unsafe output should stay finite")) {
+    return false;
+  }
+
+  if (result != nullptr) {
+    result->dispatch_rows = case_config.deterministic_single_expert &&
+                                    case_config.top_k == 1
+                                ? case_config.token_count
+                                : 0;
+    if (result->dispatch_rows != 0) {
+      result->fc1_profile = nemotron::SelectRoutedGemm1ProfileNameForTesting(result->dispatch_rows);
+      result->fc1_class = nemotron::ClassifyRoutedGemm1ProfileForTesting(result->dispatch_rows);
+      result->fc2_profile = nemotron::SelectRoutedGemm2ProfileNameForTesting(result->dispatch_rows);
+      result->fc2_class = nemotron::ClassifyRoutedGemm2ProfileForTesting(result->dispatch_rows);
+    }
+    result->safe_counters = safe_counters;
+    result->unsafe_counters = unsafe_counters;
+    result->safe_host = std::move(safe_host);
+    result->unsafe_host = std::move(unsafe_host);
+    result->max_abs_diff = max_abs_diff(result->safe_host, result->unsafe_host);
   }
   return true;
 }
@@ -610,7 +928,6 @@ bool test_direct_moe_prefill_compare_if_requested() {
   ScopedEnvVar scoped_unsafe_prefill("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
   setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "1", 1);
   setenv("NEMOTRON_EXPERT_MONOLITHIC", "1", 1);
-  unsetenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
 
   const auto cublas = CublasLtHandle::Create();
   if (!cublas || !cublas->valid()) {
@@ -618,176 +935,159 @@ bool test_direct_moe_prefill_compare_if_requested() {
     return true;
   }
 
-  constexpr std::size_t kHiddenSize = 64;
-  constexpr std::size_t kIntermediateSize = 64;
-  constexpr std::size_t kRoutedExperts = 8;
-  constexpr std::size_t kTopK = 2;
-  constexpr std::size_t kTokenCount = 2;
-
-  const std::string layer_prefix = "backbone.layers.4";
-  const std::string mixer_prefix = layer_prefix + ".mixer";
-
-  std::vector<float> input_norm_weight(kHiddenSize, 1.0f);
-  std::vector<float> gate_bias = {0.02f, -0.04f, 0.03f, 0.00f, -0.01f, 0.05f, -0.02f, 0.01f};
-  std::vector<float> gate_weight = make_patterned_values(kRoutedExperts, kHiddenSize, 11, 0.0125f);
-  std::vector<float> shared_up_values = make_patterned_values(kIntermediateSize, kHiddenSize, 43, 0.02f);
-  std::vector<float> shared_down_values = make_patterned_values(kHiddenSize, kIntermediateSize, 59, 0.02f);
-
-  const auto input_norm_descriptor =
-      make_fp32_descriptor(layer_prefix + ".norm.weight", input_norm_weight, {kHiddenSize});
-  const auto gate_bias_descriptor =
-      make_fp32_descriptor(mixer_prefix + ".gate.e_score_correction_bias", gate_bias, {kRoutedExperts});
-  const auto gate_weight_descriptor =
-      make_dense_descriptor(mixer_prefix + ".gate.weight", gate_weight, kRoutedExperts, kHiddenSize);
-  auto shared_up_descriptor =
-      make_owned_nvfp4_descriptor(
-          mixer_prefix + ".shared_experts.up_proj.weight",
-          shared_up_values,
-          kIntermediateSize,
-          kHiddenSize);
-  auto shared_down_descriptor =
-      make_owned_nvfp4_descriptor(
-          mixer_prefix + ".shared_experts.down_proj.weight",
-          shared_down_values,
-          kHiddenSize,
-          kIntermediateSize);
-  if (!expect(shared_up_descriptor.has_value(), "shared up NVFP4 descriptor should build") ||
-      !expect(shared_down_descriptor.has_value(), "shared down NVFP4 descriptor should build")) {
+  DirectMoePrefillCompareCaseConfig case_config;
+  case_config.token_count = 2;
+  case_config.top_k = 2;
+  case_config.layer_index = 4;
+  case_config.deterministic_single_expert = false;
+  if (!ApplyDimensionEnvOverrides(
+          &case_config,
+          "NEMOTRON_DIRECT_MOE_PREFILL_COMPARE_HIDDEN_SIZE",
+          "NEMOTRON_DIRECT_MOE_PREFILL_COMPARE_INTERMEDIATE_SIZE",
+          "NEMOTRON_DIRECT_MOE_PREFILL_COMPARE_ROUTED_EXPERTS",
+          "NEMOTRON_DIRECT_MOE_PREFILL_COMPARE_TOP_K")) {
     return false;
   }
-  RebindOwnedNvfp4Descriptor(&*shared_up_descriptor);
-  RebindOwnedNvfp4Descriptor(&*shared_down_descriptor);
-
-  std::vector<OwnedNvfp4Descriptor> routed_up_descriptors(kRoutedExperts);
-  std::vector<OwnedNvfp4Descriptor> routed_down_descriptors(kRoutedExperts);
-  ExpertLayerBindings bindings;
-  bindings.input_norm_weight = &input_norm_descriptor;
-  bindings.gate_weight = &gate_weight_descriptor;
-  bindings.gate_score_correction_bias = &gate_bias_descriptor;
-  bindings.shared_up_gemm_weight = &shared_up_descriptor->descriptor;
-  bindings.shared_down_gemm_weight = &shared_down_descriptor->descriptor;
-  bindings.routed_experts.resize(kRoutedExperts);
-  for (std::size_t expert_index = 0; expert_index < kRoutedExperts; ++expert_index) {
-    const std::string expert_prefix =
-        mixer_prefix + ".experts." + std::to_string(expert_index);
-    const auto up_values = make_patterned_values(
-        kIntermediateSize,
-        kHiddenSize,
-        67 + static_cast<int>(expert_index * 2),
-        0.0175f);
-    const auto down_values = make_patterned_values(
-        kHiddenSize,
-        kIntermediateSize,
-        101 + static_cast<int>(expert_index * 3),
-        0.0175f);
-    const auto up_descriptor =
-        make_owned_nvfp4_descriptor(
-            expert_prefix + ".up_proj.weight",
-            up_values,
-            kIntermediateSize,
-            kHiddenSize);
-    const auto down_descriptor =
-        make_owned_nvfp4_descriptor(
-            expert_prefix + ".down_proj.weight",
-            down_values,
-            kHiddenSize,
-            kIntermediateSize);
-    if (!expect(up_descriptor.has_value(), "routed up NVFP4 descriptor should build") ||
-        !expect(down_descriptor.has_value(), "routed down NVFP4 descriptor should build")) {
-      return false;
-    }
-    routed_up_descriptors[expert_index] = std::move(*up_descriptor);
-    routed_down_descriptors[expert_index] = std::move(*down_descriptor);
-    RebindOwnedNvfp4Descriptor(&routed_up_descriptors[expert_index]);
-    RebindOwnedNvfp4Descriptor(&routed_down_descriptors[expert_index]);
-    bindings.routed_experts[expert_index].up_proj =
-        &routed_up_descriptors[expert_index].descriptor;
-    bindings.routed_experts[expert_index].down_proj =
-        &routed_down_descriptors[expert_index].descriptor;
+  const auto max_allowed_diff =
+      ParseOptionalFloatEnv("NEMOTRON_DIRECT_MOE_PREFILL_COMPARE_MAX_ABS_DIFF");
+  if (std::getenv("NEMOTRON_DIRECT_MOE_PREFILL_COMPARE_MAX_ABS_DIFF") != nullptr &&
+      !max_allowed_diff.has_value()) {
+    return expect(false, "direct compare max_abs_diff env must parse as float");
   }
-
-  ExpertLayerConfig config;
-  config.layer_index = 4;
-  config.hidden_size = kHiddenSize;
-  config.moe_latent_size = 0;
-  config.routed_expert_intermediate_size = kIntermediateSize;
-  config.shared_expert_intermediate_size = kIntermediateSize;
-  config.n_routed_experts = kRoutedExperts;
-  config.top_k = kTopK;
-  config.max_token_count = kTokenCount;
-  config.n_group = 1;
-  config.topk_group = 1;
-  config.rms_epsilon = 1.0e-5f;
-  config.routed_scaling_factor = 5.0f;
-  config.norm_topk_prob = true;
-
-  auto slice = ExpertLayerSlice::Create(config, bindings);
-  if (!expect(slice != nullptr && slice->valid(), "resident expert layer slice should create")) {
+  DirectMoePrefillCompareCaseResult result;
+  if (!RunDirectMoePrefillCompareCase(*cublas, case_config, &result)) {
     return false;
   }
 
-  std::vector<float> input_values(kTokenCount * kHiddenSize, 0.0f);
-  for (std::size_t token = 0; token < kTokenCount; ++token) {
-    for (std::size_t dim = 0; dim < kHiddenSize; ++dim) {
-      input_values[token * kHiddenSize + dim] =
-          (static_cast<float>(((token + 1) * 19 + (dim * 5)) % 41) - 20.0f) * 0.03125f;
-    }
-  }
-
-  auto batch_input = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  auto safe_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  auto unsafe_output = DeviceTensorFp32::Create({kTokenCount, kHiddenSize});
-  if (!expect(batch_input != nullptr && safe_output != nullptr && unsafe_output != nullptr,
-              "batched tensors should allocate") ||
-      !expect(batch_input->CopyFromHost(input_values.data(), input_values.size()),
-              "batched input should upload")) {
-    return false;
-  }
-
-  GemmHeuristicCache heuristic_cache;
-  ResetExpertLayerExecutionCounters();
-  unsetenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
-  if (!expect(
-          slice->Run(*cublas, &heuristic_cache, *batch_input, safe_output.get(), nullptr),
-          "safe row-replay run should succeed") ||
-      !expect(cudaDeviceSynchronize() == cudaSuccess, "safe row-replay run should synchronize")) {
-    return false;
-  }
-  const ExpertLayerExecutionCounters safe_counters = GetExpertLayerExecutionCounters();
-
-  ResetExpertLayerExecutionCounters();
-  setenv("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL", "1", 1);
-  if (!expect(
-          slice->Run(*cublas, &heuristic_cache, *batch_input, unsafe_output.get(), nullptr),
-          "unsafe native prefill run should succeed") ||
-      !expect(cudaDeviceSynchronize() == cudaSuccess, "unsafe native prefill run should synchronize")) {
-    return false;
-  }
-  const ExpertLayerExecutionCounters unsafe_counters = GetExpertLayerExecutionCounters();
-
-  std::vector<float> safe_host(safe_output->numel(), 0.0f);
-  std::vector<float> unsafe_host(unsafe_output->numel(), 0.0f);
-  if (!expect(safe_output->CopyToHost(safe_host.data(), safe_host.size()),
-              "safe output should copy to host") ||
-      !expect(unsafe_output->CopyToHost(unsafe_host.data(), unsafe_host.size()),
-              "unsafe output should copy to host")) {
-    return false;
-  }
-
-  const float diff = max_abs_diff(safe_host, unsafe_host);
   std::cout << "expert_layer_fastpath_test: direct_moe_prefill_compare"
-            << " token_count=" << kTokenCount
-            << " safe_native_runs=" << safe_counters.native_multi_token_runs
-            << " safe_row_replay_runs=" << safe_counters.row_replay_runs
-            << " unsafe_native_runs=" << unsafe_counters.native_multi_token_runs
-            << " unsafe_row_replay_runs=" << unsafe_counters.row_replay_runs
-            << " max_abs_diff=" << diff
+            << " token_count=" << case_config.token_count
+            << " hidden_size=" << case_config.hidden_size
+            << " intermediate_size=" << case_config.intermediate_size
+            << " routed_experts=" << case_config.routed_experts
+            << " top_k=" << case_config.top_k
+            << " safe_native_runs=" << result.safe_counters.native_multi_token_runs
+            << " safe_row_replay_runs=" << result.safe_counters.row_replay_runs
+            << " unsafe_native_runs=" << result.unsafe_counters.native_multi_token_runs
+            << " unsafe_row_replay_runs=" << result.unsafe_counters.row_replay_runs
+            << " max_abs_diff=" << result.max_abs_diff
             << "\n";
 
-  if (diff > 0.0f) {
-    print_top_diffs(safe_host, unsafe_host, kTokenCount, kHiddenSize, 12);
-    std::cerr << "expert_layer_fastpath_test: direct_moe_prefill_compare mismatch\n";
+  if (max_allowed_diff.has_value() && result.max_abs_diff > *max_allowed_diff) {
+    print_top_diffs(
+        result.safe_host,
+        result.unsafe_host,
+        case_config.token_count,
+        case_config.hidden_size,
+        12);
+    std::cerr << "expert_layer_fastpath_test: direct_moe_prefill_compare exceeded threshold"
+              << " max_abs_diff=" << result.max_abs_diff
+              << " threshold=" << *max_allowed_diff
+              << "\n";
     return false;
+  }
+  return true;
+}
+
+bool test_direct_moe_prefill_bucket_sweep_if_requested() {
+  if (std::getenv("NEMOTRON_RUN_DIRECT_MOE_PREFILL_BUCKET_SWEEP") == nullptr) {
+    return true;
+  }
+  if (!has_cuda_device()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device)\n";
+    return true;
+  }
+
+  ScopedEnvVar scoped_full_residency("NEMOTRON_EXPERT_FULL_RESIDENCY");
+  ScopedEnvVar scoped_monolithic("NEMOTRON_EXPERT_MONOLITHIC");
+  ScopedEnvVar scoped_unsafe_prefill("NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL");
+  setenv("NEMOTRON_EXPERT_FULL_RESIDENCY", "1", 1);
+  setenv("NEMOTRON_EXPERT_MONOLITHIC", "1", 1);
+
+  const auto cublas = CublasLtHandle::Create();
+  if (!cublas || !cublas->valid()) {
+    std::cout << "expert_layer_fastpath_test: SKIP (no CUDA device or cublasLt unavailable)\n";
+    return true;
+  }
+
+  const auto rows =
+      ParseRowCountsEnv("NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_ROWS", {16, 64, 120});
+  if (!expect(!rows.empty(), "bucket sweep requires at least one row count")) {
+    return false;
+  }
+  const auto max_allowed_diff =
+      ParseOptionalFloatEnv("NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_MAX_ABS_DIFF");
+  if (std::getenv("NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_MAX_ABS_DIFF") != nullptr &&
+      !max_allowed_diff.has_value()) {
+    return expect(false, "bucket sweep max_abs_diff env must parse as float");
+  }
+
+  for (std::size_t row_count : rows) {
+    DirectMoePrefillCompareCaseConfig case_config;
+    case_config.token_count = row_count;
+    case_config.top_k = 1;
+    case_config.layer_index = 5;
+    case_config.deterministic_single_expert = true;
+    if (!ApplyDimensionEnvOverrides(
+            &case_config,
+            "NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_HIDDEN_SIZE",
+            "NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_INTERMEDIATE_SIZE",
+            "NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_ROUTED_EXPERTS",
+            "NEMOTRON_DIRECT_MOE_PREFILL_BUCKET_TOP_K")) {
+      return false;
+    }
+    const bool deterministic_dispatch =
+        case_config.deterministic_single_expert && case_config.top_k == 1;
+    DirectMoePrefillCompareCaseResult result;
+    if (!RunDirectMoePrefillCompareCase(*cublas, case_config, &result)) {
+      return false;
+    }
+    if (deterministic_dispatch) {
+      if (!expect(
+              result.safe_counters.native_multi_token_runs == 0 &&
+                  result.safe_counters.row_replay_runs == 1,
+              "safe bucket sweep run should stay on row replay") ||
+          !expect(
+              result.unsafe_counters.native_multi_token_runs == 1 &&
+                  result.unsafe_counters.row_replay_runs == 0,
+              "unsafe bucket sweep run should take native fused prefill")) {
+        return false;
+      }
+    }
+    if (max_allowed_diff.has_value() && result.max_abs_diff > *max_allowed_diff) {
+      print_top_diffs(
+          result.safe_host,
+          result.unsafe_host,
+          row_count,
+          case_config.hidden_size,
+          12);
+      std::cerr << "expert_layer_fastpath_test: bucket sweep diff exceeded threshold"
+                << " row_count=" << row_count
+                << " max_abs_diff=" << result.max_abs_diff
+                << " threshold=" << *max_allowed_diff
+                << "\n";
+      return false;
+    }
+
+    std::cout << "expert_layer_fastpath_test: direct_moe_prefill_bucket"
+              << " row_count=" << row_count
+              << " hidden_size=" << case_config.hidden_size
+              << " intermediate_size=" << case_config.intermediate_size
+              << " routed_experts=" << case_config.routed_experts
+              << " top_k=" << case_config.top_k
+              << " fc1_profile=" << result.fc1_profile
+              << " fc1_class=" << result.fc1_class
+              << " fc2_profile=" << result.fc2_profile
+              << " fc2_class=" << result.fc2_class
+              << " safe_native_runs=" << result.safe_counters.native_multi_token_runs
+              << " safe_native_tokens=" << result.safe_counters.native_multi_token_tokens
+              << " safe_row_replay_runs=" << result.safe_counters.row_replay_runs
+              << " safe_row_replay_tokens=" << result.safe_counters.row_replay_tokens
+              << " unsafe_native_runs=" << result.unsafe_counters.native_multi_token_runs
+              << " unsafe_native_tokens=" << result.unsafe_counters.native_multi_token_tokens
+              << " unsafe_row_replay_runs=" << result.unsafe_counters.row_replay_runs
+              << " unsafe_row_replay_tokens=" << result.unsafe_counters.row_replay_tokens
+              << " max_abs_diff=" << result.max_abs_diff
+              << "\n";
   }
   return true;
 }
@@ -1110,6 +1410,7 @@ int main() {
   return test_unified_fused_prefill_is_default_and_avoids_host_routing_adapter() &&
                  test_resident_fastpath_decode_is_deterministic_and_avoids_runtime_staging() &&
                  test_direct_moe_prefill_compare_if_requested() &&
+                 test_direct_moe_prefill_bucket_sweep_if_requested() &&
                  test_nano_p13_compare_if_requested() &&
                  test_direct_moe_rejects_non_nvfp4_configuration()
              ? 0

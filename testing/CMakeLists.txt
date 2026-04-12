@@ -254,6 +254,30 @@ target_compile_features(expert_layer_fastpath_test PRIVATE cxx_std_17)
 nemotron_add_test(expert_layer_fastpath_test)
 
 add_executable(
+  routed_profile_matrix_probe
+  backend/routed_profile_matrix_probe.cpp
+)
+
+target_link_libraries(routed_profile_matrix_probe PRIVATE nemotron_runtime_backend)
+target_compile_features(routed_profile_matrix_probe PRIVATE cxx_std_17)
+
+add_executable(
+  swap_false_fp4_oracle_test
+  backend/swap_false_fp4_oracle_test.cpp
+)
+
+target_link_libraries(
+  swap_false_fp4_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_compile_features(swap_false_fp4_oracle_test PRIVATE cxx_std_17)
+
+nemotron_add_test(swap_false_fp4_oracle_test)
+
+add_executable(
   fused_moe_prefill_test
   backend/fused_moe_prefill_test.cpp
 )
