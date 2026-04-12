@@ -1111,6 +1111,10 @@ __device__ __forceinline__ void StoreUnifiedRoutedFp4Output(
   }
 }
 
+// Oracle-only generic FP4-direct helpers. They preserve a dense row-major
+// accumulator/store view for narrow bring-up and contract validation on
+// non-kP5 unified profiles, but they are not the intended optimized production
+// epilogue on this platform.
 template <UnifiedRoutedFp4Profile Profile>
 __device__ __forceinline__ void StageUnifiedRoutedFp4DirectPrepack(
     float alpha,
@@ -7766,6 +7770,9 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel(
   constexpr bool kUseSpecializedP5Fp4DirectOutput =
       Profile == nvfp4_bridge::UnifiedRoutedFp4Profile::kP5 &&
       P5Mode == nvfp4_bridge::P5EpilogueMode::kFp4Direct;
+  // Keep the generic stage/pack path available for targeted contract probes.
+  // Product FP4-direct dispatch uses explicit profile-specific epilogues
+  // instead: the unified P5 direct packer or the dedicated swap-false P1 path.
   constexpr bool kUseGenericDirectStage =
       UseFp4DirectOutput && !kUseSpecializedP5Fp4DirectOutput;
   using Traits = nvfp4_bridge::UnifiedRoutedFp4Traits<Profile>;
@@ -12698,6 +12705,48 @@ bool LaunchPlannedPackedInputMatVecBf16(
   return CheckCuda(cudaGetLastError());
 }
 
+struct DirectFp4OutputBufferState {
+  std::size_t output_row_tile_count = 0;
+  std::size_t blocks_per_row = 0;
+  std::size_t padded_blocks_per_row = 0;
+  std::size_t scale_count = 0;
+};
+
+bool PrepareDirectFp4OutputBuffers(
+    const DeviceMoeLaunchPlan& launch_plan,
+    std::size_t output_rows_per_expert,
+    DeviceNvfp4Matrix* output_pack,
+    float* activation_output_scale,
+    __nv_bfloat16* debug_prepack_output,
+    DirectFp4OutputBufferState* state) {
+  if (output_pack == nullptr ||
+      activation_output_scale == nullptr ||
+      state == nullptr) {
+    return false;
+  }
+
+  state->output_row_tile_count =
+      (output_rows_per_expert + static_cast<std::size_t>(kPlannedOutputTile) - 1u) /
+      static_cast<std::size_t>(kPlannedOutputTile);
+  state->blocks_per_row = output_pack->cols() / fused_decode::kNvfp4BlockWidth;
+  state->padded_blocks_per_row =
+      RoundUp(state->blocks_per_row, kNvfp4ScaleBlockTile);
+  state->scale_count = launch_plan.padded_row_capacity() * state->blocks_per_row;
+
+  if (state->output_row_tile_count == 0 ||
+      state->blocks_per_row == 0 ||
+      !ClearDeviceNvfp4Matrix(output_pack, 1.0f, 1.0f) ||
+      (debug_prepack_output != nullptr &&
+       !LaunchZeroBf16Buffer(
+           debug_prepack_output,
+           launch_plan.padded_row_capacity() * output_rows_per_expert)) ||
+      !LaunchZeroBuffer(activation_output_scale, state->scale_count)) {
+    return false;
+  }
+
+  return true;
+}
+
 bool LaunchPlannedPackedInputMatVecFp4Direct(
     const DeviceNvfp4Matrix& input_pack,
     const float* input_expert_tensor_scales,
@@ -12762,26 +12811,20 @@ bool LaunchPlannedPackedInputMatVecFp4Direct(
             RoutedGemm1ProfileName(profile));
       }
 
-      const int output_tile = RoutedOutputTile(profile);
-      const std::size_t output_row_tile_count =
-          (output_rows_per_expert + static_cast<std::size_t>(output_tile) - 1u) /
-          static_cast<std::size_t>(output_tile);
-      const std::size_t blocks_per_row =
-          output_pack->cols() / fused_decode::kNvfp4BlockWidth;
-      const std::size_t padded_blocks_per_row =
-          RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
-      const std::size_t scale_count =
-          launch_plan->padded_row_capacity() * blocks_per_row;
-      if (output_row_tile_count == 0 ||
-          blocks_per_row == 0 ||
-          !ClearDeviceNvfp4Matrix(output_pack, 1.0f, 1.0f) ||
-          !LaunchZeroBuffer(activation_output_scale, scale_count)) {
+      DirectFp4OutputBufferState output_state;
+      if (!PrepareDirectFp4OutputBuffers(
+              *launch_plan,
+              output_rows_per_expert,
+              output_pack,
+              activation_output_scale,
+              nullptr,
+              &output_state)) {
         return false;
       }
 
       const dim3 block(kRoutedThreadsPerBlock);
       const dim3 grid(
-          static_cast<unsigned int>(output_row_tile_count),
+          static_cast<unsigned int>(output_state.output_row_tile_count),
           static_cast<unsigned int>(*current_cta_capacity));
 
       g_enable_p5_scale_trace = std::getenv("NEMOTRON_P5_SCALE_DEBUG") != nullptr ? 1 : 0;
@@ -12825,7 +12868,7 @@ bool LaunchPlannedPackedInputMatVecFp4Direct(
               activation_output_scale,
               static_cast<__nv_bfloat16*>(nullptr),
               output_pack->cols(),
-              padded_blocks_per_row,
+              output_state.padded_blocks_per_row,
               output_pack->scale_layout())) {
         return false;
       }
@@ -12945,35 +12988,26 @@ bool LaunchPlannedPackedInputMatVecFp4Direct(
         active_selection_count,
         RoutedGemm1ProfileName(RoutedGemm1Profile::kP1_128x128x64_SwapFalse));
   }
-  const std::size_t output_row_tile_count =
-      (output_rows_per_expert + static_cast<std::size_t>(kPlannedOutputTile) - 1u) /
-      static_cast<std::size_t>(kPlannedOutputTile);
-  const std::size_t blocks_per_row =
-      output_pack->cols() / fused_decode::kNvfp4BlockWidth;
-  const std::size_t padded_blocks_per_row =
-      RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
-  const std::size_t scale_count =
-      launch_plan->padded_row_capacity() * blocks_per_row;
-  if (output_row_tile_count == 0 ||
-      blocks_per_row == 0 ||
-      !ClearDeviceNvfp4Matrix(output_pack, 1.0f, 1.0f) ||
-      (debug_prepack_output != nullptr &&
-       !LaunchZeroBf16Buffer(
-           debug_prepack_output,
-           launch_plan->padded_row_capacity() * output_rows_per_expert)) ||
-      !LaunchZeroBuffer(output_activation_scales, scale_count)) {
+  DirectFp4OutputBufferState output_state;
+  if (!PrepareDirectFp4OutputBuffers(
+          *launch_plan,
+          output_rows_per_expert,
+          output_pack,
+          output_activation_scales,
+          debug_prepack_output,
+          &output_state)) {
     return false;
   }
   const dim3 block(kRoutedThreadsPerBlock);
   const dim3 grid(
-      static_cast<unsigned int>(output_row_tile_count),
+      static_cast<unsigned int>(output_state.output_row_tile_count),
       static_cast<unsigned int>(*current_cta_capacity));
   g_enable_p1_direct_trace = std::getenv("NEMOTRON_P1_DIRECT_TRACE") != nullptr ? 1 : 0;
   if (g_enable_p1_direct_trace != 0) {
     g_p1_direct_trace = {};
   }
-  // Dispatch kP1+kFp4Direct through the new kernel that shares the
-  // well-tested BF16 WMMA pipeline of
+  // Production swap-false direct path: keep the explicit P1 kernel that shares
+  // the well-tested BF16 WMMA pipeline of
   // `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse<bf16,128,64>` but
   // replaces the final BF16 store with an in-place FP4 pack epilogue. The
   // BF16 boundary is at the operands (dequant in producer), not before
@@ -12999,7 +13033,7 @@ bool LaunchPlannedPackedInputMatVecFp4Direct(
       const_cast<std::uint8_t*>(output_pack->matmul_block_scales_data()),
       output_activation_scales,
       debug_prepack_output,
-      padded_blocks_per_row,
+      output_state.padded_blocks_per_row,
       output_pack->scale_layout());
   if (!launched) {
     return false;
@@ -13358,6 +13392,231 @@ bool RunP5NativeDirectPackOracleForTesting(
   (void) valid_rows;
   (void) padded_blocks_per_row;
   (void) scale_layout;
+  (void) activation_output_scale;
+  (void) packed_data;
+  (void) block_scales_data;
+  (void) matmul_block_scales_data;
+  (void) tensor_scale_data;
+  (void) per_row_tensor_scales;
+  return false;
+#endif
+}
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+__global__ void P13GenericDirectStageOracleKernel(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    __nv_bfloat16* generic_dense_output,
+    __nv_bfloat16* store_dense_output,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+  constexpr auto kProfile = nvfp4_bridge::UnifiedRoutedFp4Profile::kP13;
+  using Traits = nvfp4_bridge::UnifiedRoutedFp4Traits<kProfile>;
+  using TiledMma = typename Traits::TiledMma;
+  constexpr int kOutputTile = Traits::kOutputTile;
+  constexpr int kTokenRows = Traits::kTokenRows;
+  constexpr int kConsumerThreads = cute::size(TiledMma{});
+
+  static_assert(kConsumerThreads == 256, "P13 oracle expects a 256-thread CTA");
+  static_assert(kOutputTile == 128, "P13 oracle assumes a 128-column output tile");
+  static_assert(kTokenRows == 32, "P13 oracle assumes a 32-row token tile");
+
+  __shared__ float direct_prepack_stage[kTokenRows * kOutputTile];
+
+  if (threadIdx.x < static_cast<unsigned int>(kTokenRows)) {
+    per_row_tensor_scales[threadIdx.x] =
+        per_row_tensor_scales_input != nullptr ? per_row_tensor_scales_input[threadIdx.x]
+                                               : 1.0f;
+  }
+  if (threadIdx.x == 0) {
+    *tensor_scale_data = 1.0f;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < static_cast<unsigned int>(kConsumerThreads)) {
+    nvfp4_bridge::CRegister accum_storage[Traits::kAccumProfileCosize];
+    auto accum_tensor = cute::make_tensor(
+        reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
+        typename Traits::AccumLayout{});
+    cute::clear(accum_tensor);
+
+    auto tiled_mma = TiledMma{};
+    auto thread_mma = tiled_mma.get_thread_slice(threadIdx.x);
+    auto dense_c = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kTokenRows>{}));
+    auto part_c = thread_mma.partition_C(dense_c);
+    int row_coords[nvfp4_bridge::kTracedP13CCopyCoordCapacity];
+    int col_coords[nvfp4_bridge::kTracedP13CCopyCoordCapacity];
+    nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
+        part_c,
+        nvfp4_bridge::kTracedP13CCopyCoordCapacity,
+        row_coords,
+        col_coords);
+
+#pragma unroll
+    for (int reg = 0; reg < 4; ++reg) {
+#pragma unroll
+      for (int m_fragment = 0; m_fragment < nvfp4_bridge::kTracedP13MFragments; ++m_fragment) {
+#pragma unroll
+        for (int n_fragment = 0; n_fragment < nvfp4_bridge::kTracedP13NFragments; ++n_fragment) {
+          const int physical = n_fragment * 8 + m_fragment * 4 + reg;
+          const int output_col_offset = row_coords[physical];
+          const int token_row = col_coords[physical];
+          if (token_row >= valid_rows || output_col_offset >= kOutputTile) {
+            continue;
+          }
+          accum_tensor(reg, m_fragment, n_fragment) =
+              input[static_cast<std::size_t>(token_row) * kOutputTile + output_col_offset];
+        }
+      }
+    }
+
+    nvfp4_bridge::StageUnifiedRoutedFp4DirectPrepack<kProfile>(
+        1.0f,
+        &accum_storage[0],
+        threadIdx.x,
+        valid_rows,
+        kOutputTile,
+        0u,
+        per_row_tensor_scales_input,
+        1.0f,
+        &direct_prepack_stage[0]);
+
+    nvfp4_bridge::StoreUnifiedRoutedFp4Output<kProfile>(
+        1.0f,
+        &accum_storage[0],
+        threadIdx.x,
+        0,
+        valid_rows,
+        kOutputTile,
+        0u,
+        static_cast<std::size_t>(kOutputTile),
+        store_dense_output,
+        per_row_tensor_scales_input,
+        1.0f);
+  }
+
+  __syncthreads();
+
+  nvfp4_bridge::PackUnifiedRoutedFp4DirectStage<kProfile>(
+      &direct_prepack_stage[0],
+      threadIdx.x,
+      0,
+      valid_rows,
+      0,
+      kOutputTile,
+      static_cast<std::size_t>(kOutputTile),
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      activation_output_scale,
+      generic_dense_output,
+      padded_blocks_per_row,
+      scale_layout);
+}
+#endif
+
+bool RunP13GenericDirectStageOracleForTesting(
+    const float* input,
+    const float* per_row_tensor_scales_input,
+    int valid_rows,
+    std::size_t padded_blocks_per_row,
+    Nvfp4ScaleLayout scale_layout,
+    __nv_bfloat16* generic_dense_output,
+    __nv_bfloat16* store_dense_output,
+    float* activation_output_scale,
+    std::uint8_t* packed_data,
+    std::uint8_t* block_scales_data,
+    std::uint8_t* matmul_block_scales_data,
+    float* tensor_scale_data,
+    float* per_row_tensor_scales) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr std::size_t kTokenRows =
+      nvfp4_bridge::UnifiedRoutedFp4Traits<nvfp4_bridge::UnifiedRoutedFp4Profile::kP13>::kTokenRows;
+  constexpr std::size_t kOutputTile =
+      nvfp4_bridge::UnifiedRoutedFp4Traits<nvfp4_bridge::UnifiedRoutedFp4Profile::kP13>::kOutputTile;
+  constexpr std::size_t kBlocksPerRow = kOutputTile / fused_decode::kNvfp4BlockWidth;
+  const auto scale_layout_info =
+      BuildNvfp4ExecutionScaleLayout(kTokenRows, kOutputTile, scale_layout);
+
+  if (input == nullptr ||
+      generic_dense_output == nullptr ||
+      store_dense_output == nullptr ||
+      activation_output_scale == nullptr ||
+      packed_data == nullptr ||
+      block_scales_data == nullptr ||
+      matmul_block_scales_data == nullptr ||
+      tensor_scale_data == nullptr ||
+      per_row_tensor_scales == nullptr ||
+      !scale_layout_info.has_value() ||
+      padded_blocks_per_row != scale_layout_info->padded_blocks_per_row ||
+      valid_rows < 0 ||
+      valid_rows > static_cast<int>(kTokenRows)) {
+    return false;
+  }
+
+  if (!CheckCuda(cudaMemset(
+          generic_dense_output,
+          0,
+          kTokenRows * kOutputTile * sizeof(__nv_bfloat16))) ||
+      !CheckCuda(cudaMemset(
+          store_dense_output,
+          0,
+          kTokenRows * kOutputTile * sizeof(__nv_bfloat16))) ||
+      !CheckCuda(cudaMemset(
+          activation_output_scale,
+          0,
+          kTokenRows * kBlocksPerRow * sizeof(float))) ||
+      !CheckCuda(cudaMemset(
+          packed_data,
+          0,
+          kTokenRows * kOutputTile / 2u)) ||
+      !CheckCuda(cudaMemset(
+          block_scales_data,
+          0,
+          kTokenRows * kBlocksPerRow)) ||
+      !CheckCuda(cudaMemset(
+          matmul_block_scales_data,
+          0,
+          scale_layout_info->nbytes())) ||
+      !CheckCuda(cudaMemset(tensor_scale_data, 0, sizeof(float))) ||
+      !CheckCuda(cudaMemset(
+          per_row_tensor_scales,
+          0,
+          kTokenRows * sizeof(float)))) {
+    return false;
+  }
+
+  P13GenericDirectStageOracleKernel<<<1, 256>>>(
+      input,
+      per_row_tensor_scales_input,
+      valid_rows,
+      padded_blocks_per_row,
+      scale_layout,
+      generic_dense_output,
+      store_dense_output,
+      activation_output_scale,
+      packed_data,
+      block_scales_data,
+      matmul_block_scales_data,
+      tensor_scale_data,
+      per_row_tensor_scales);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+#else
+  (void) input;
+  (void) per_row_tensor_scales_input;
+  (void) valid_rows;
+  (void) padded_blocks_per_row;
+  (void) scale_layout;
+  (void) generic_dense_output;
+  (void) store_dense_output;
   (void) activation_output_scale;
   (void) packed_data;
   (void) block_scales_data;

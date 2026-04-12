@@ -563,6 +563,16 @@ target_compile_features(staged_fp4_pack_test PRIVATE cxx_std_17)
 nemotron_add_test(staged_fp4_pack_test)
 
 add_executable(
+  p13_generic_direct_stage_oracle_test
+  backend/p13_generic_direct_stage_oracle_test.cpp
+)
+
+target_link_libraries(p13_generic_direct_stage_oracle_test PRIVATE nemotron_runtime_backend)
+target_compile_features(p13_generic_direct_stage_oracle_test PRIVATE cxx_std_17)
+
+nemotron_add_test(p13_generic_direct_stage_oracle_test)
+
+add_executable(
   nvfp4_pack_compare_test
   backend/nvfp4_pack_compare_test.cpp
 )
