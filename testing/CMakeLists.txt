@@ -583,6 +583,16 @@ target_compile_features(p1_native_fp4_mma_oracle_test PRIVATE cxx_std_17)
 nemotron_add_test(p1_native_fp4_mma_oracle_test)
 
 add_executable(
+  p1_natural_fp4_mma_oracle_test
+  backend/p1_natural_fp4_mma_oracle_test.cpp
+)
+
+target_link_libraries(p1_natural_fp4_mma_oracle_test PRIVATE nemotron_runtime_backend)
+target_compile_features(p1_natural_fp4_mma_oracle_test PRIVATE cxx_std_17)
+
+nemotron_add_test(p1_natural_fp4_mma_oracle_test)
+
+add_executable(
   nvfp4_pack_compare_test
   backend/nvfp4_pack_compare_test.cpp
 )

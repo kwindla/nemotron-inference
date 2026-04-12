@@ -2080,6 +2080,7 @@ __device__ __managed__ P13ScaleTrace g_p13_scale_trace;
 __device__ __managed__ P1DirectTrace g_p1_direct_trace;
 __device__ __managed__ P13DebugTrace g_p13_debug_trace;
 __device__ __managed__ P1NativeFp4MmaTrace g_p1_native_fp4_mma_trace;
+__device__ __managed__ P1NaturalFp4MmaTrace g_p1_natural_fp4_mma_trace;
 __device__ __managed__ int g_enable_p15_scale_trace = 0;
 __device__ __managed__ int g_enable_p5_scale_trace = 0;
 __device__ __managed__ int g_enable_p13_scale_trace = 0;
@@ -13131,6 +13132,21 @@ void ResetP1NativeFp4MmaTrace() {
   g_p1_native_fp4_mma_trace = {};
 }
 
+bool CopyP1NaturalFp4MmaTrace(P1NaturalFp4MmaTrace* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    return false;
+  }
+  *out = g_p1_natural_fp4_mma_trace;
+  return true;
+}
+
+void ResetP1NaturalFp4MmaTrace() {
+  g_p1_natural_fp4_mma_trace = {};
+}
+
 const char* SelectRoutedGemm1ProfileNameForTesting(std::size_t num_rows) {
   return RoutedGemm1ProfileName(SelectRoutedGemm1Profile(num_rows));
 }
@@ -13475,6 +13491,51 @@ void PrintP1NativeFp4MmaLayoutDump() {
       LayoutString(accum_profile.layout()).c_str());
 }
 
+void PrintP1NaturalFp4MmaLayoutDump() {
+  static bool printed = false;
+  if (printed) {
+    return;
+  }
+  printed = true;
+
+  using Traits = nvfp4_bridge::UnifiedRoutedFp4Traits<
+      nvfp4_bridge::UnifiedRoutedFp4Profile::kP1>;
+  using TiledMma = typename Traits::TiledMma;
+  auto tiled_mma = TiledMma{};
+  auto thread_mma = tiled_mma.get_thread_slice(0);
+  auto ref_a = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(typename TiledMma::AtomShape_MNK{}),
+          cute::size<2>(typename TiledMma::AtomShape_MNK{})));
+  auto ref_b = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<1>(typename TiledMma::AtomShape_MNK{}),
+          cute::size<2>(typename TiledMma::AtomShape_MNK{})));
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<Traits::kOutputTile>{}, cute::Int<Traits::kTokenRows>{}));
+
+  const auto part_a = thread_mma.partition_A(ref_a);
+  const auto part_b = thread_mma.partition_B(ref_b);
+  const auto part_c = thread_mma.partition_C(ref_c);
+
+  std::fprintf(
+      stderr,
+      "p1_natural_fp4_mma_oracle: partA.layout: %s\n",
+      LayoutString(part_a.layout()).c_str());
+  std::fprintf(
+      stderr,
+      "p1_natural_fp4_mma_oracle: partB.layout: %s\n",
+      LayoutString(part_b.layout()).c_str());
+  std::fprintf(
+      stderr,
+      "p1_natural_fp4_mma_oracle: partC.layout: %s\n",
+      LayoutString(part_c.layout()).c_str());
+  std::fprintf(
+      stderr,
+      "p1_natural_fp4_mma_oracle: accum_profile.layout: %s\n",
+      LayoutString(typename Traits::AccumLayout{}).c_str());
+}
+
 __global__ void P1NativeFp4MmaOracleKernel(
     const std::uint8_t* input_packed,
     const std::uint8_t* input_block_scales,
@@ -13666,6 +13727,235 @@ __global__ void P1NativeFp4MmaOracleKernel(
   }
 }
 
+__global__ void P1NaturalFp4MmaOracleKernel(
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales,
+    float* token_major_output) {
+  constexpr auto kProfile = nvfp4_bridge::UnifiedRoutedFp4Profile::kP1;
+  using Traits = nvfp4_bridge::UnifiedRoutedFp4Traits<kProfile>;
+  using TiledMma = typename Traits::TiledMma;
+  using CollectiveMainloop = typename Traits::CollectiveMainloop;
+  using SmemLayoutA = typename Traits::SmemLayoutA;
+  using SmemLayoutB = typename Traits::SmemLayoutB;
+  using SmemLayoutSFA = typename Traits::SmemLayoutSFA;
+  using SmemLayoutSFB = typename Traits::SmemLayoutSFB;
+  using SmemCopyAtomA = typename Traits::SmemCopyAtomA;
+  using SmemCopyAtomB = typename Traits::SmemCopyAtomB;
+  using SmemCopyAtomSFA = typename Traits::SmemCopyAtomSFA;
+  using SmemCopyAtomSFB = typename Traits::SmemCopyAtomSFB;
+
+  constexpr int kOutputTile = Traits::kOutputTile;
+  constexpr int kTokenRows = Traits::kTokenRows;
+  constexpr int kMacroTileK = Traits::kMacroTileK;
+  constexpr int kBlocksPerRow = kMacroTileK / fused_decode::kNvfp4BlockWidth;
+  constexpr int kPackedBytesPerRow = kMacroTileK / 2;
+  constexpr int kConsumerThreads = cute::size(TiledMma{});
+  constexpr int kCoordCapacity = Traits::kAccumProfileCosize;
+
+  __shared__ alignas(1024) cute::array_aligned<typename Traits::SmemAllocA, Traits::kSwizzledAElems>
+      smem_swizzled_a_storage;
+  __shared__ alignas(1024) cute::array_aligned<typename Traits::SmemAllocB, Traits::kSwizzledBElems>
+      smem_swizzled_b_storage;
+  __shared__ alignas(1024) cute::array_aligned<nvfp4_cute::ElementSFCompute, Traits::kScaleSmemCosizeA>
+      a_scale_smem_storage;
+  __shared__ alignas(1024) cute::array_aligned<nvfp4_cute::ElementSFCompute, Traits::kScaleSmemCosizeB>
+      b_scale_smem_storage;
+
+  auto* smem_swizzled_a = smem_swizzled_a_storage.data();
+  auto* smem_swizzled_b = smem_swizzled_b_storage.data();
+  auto* a_scale_smem = a_scale_smem_storage.data();
+  auto* b_scale_smem = b_scale_smem_storage.data();
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int lane_id = tid & 31;
+
+  if (tid == 0) {
+    g_p1_natural_fp4_mma_trace.valid = 1;
+  }
+
+  auto a_scale_tensor = cute::make_tensor(cute::make_smem_ptr(a_scale_smem), SmemLayoutSFA{});
+  auto b_scale_tensor = cute::make_tensor(cute::make_smem_ptr(b_scale_smem), SmemLayoutSFB{});
+  auto stage0_A = SmemLayoutA{}(cute::_, cute::_, cute::Int<0>{});
+  auto stage0_B = SmemLayoutB{}(cute::_, cute::_, cute::Int<0>{});
+  auto* sw_a = reinterpret_cast<std::uint8_t*>(smem_swizzled_a);
+  auto* sw_b = reinterpret_cast<std::uint8_t*>(smem_swizzled_b);
+
+  for (int row = tid; row < kOutputTile; row += blockDim.x) {
+    const std::size_t packed_offset = static_cast<std::size_t>(row) * kPackedBytesPerRow;
+#pragma unroll
+    for (int byte_index = 0; byte_index < kPackedBytesPerRow; ++byte_index) {
+      auto elem_offset = stage0_A(row, byte_index * 2);
+      sw_a[static_cast<int>(elem_offset) / 2] =
+          weight_packed[packed_offset + static_cast<std::size_t>(byte_index)];
+    }
+    const std::uint8_t scale_bytes[4] = {
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            0u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            1u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            2u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            3u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+    };
+    nvfp4_bridge::StoreTracedScaleBytes(a_scale_tensor, scale_bytes, row);
+  }
+
+  for (int row = tid; row < kTokenRows; row += blockDim.x) {
+    const std::size_t packed_offset = static_cast<std::size_t>(row) * kPackedBytesPerRow;
+#pragma unroll
+    for (int byte_index = 0; byte_index < kPackedBytesPerRow; ++byte_index) {
+      auto elem_offset = stage0_B(row, byte_index * 2);
+      sw_b[static_cast<int>(elem_offset) / 2] =
+          input_packed[packed_offset + static_cast<std::size_t>(byte_index)];
+    }
+    const std::uint8_t scale_bytes[4] = {
+        input_block_scales[static_cast<std::size_t>(row) * kBlocksPerRow + 0u],
+        input_block_scales[static_cast<std::size_t>(row) * kBlocksPerRow + 1u],
+        input_block_scales[static_cast<std::size_t>(row) * kBlocksPerRow + 2u],
+        input_block_scales[static_cast<std::size_t>(row) * kBlocksPerRow + 3u],
+    };
+    nvfp4_bridge::StoreTracedScaleBytes(b_scale_tensor, scale_bytes, row);
+  }
+  __syncthreads();
+
+  if (tid < kConsumerThreads) {
+    nvfp4_bridge::CRegister accum_storage[Traits::kAccumProfileCosize];
+    auto accum_tensor = cute::make_tensor(
+        reinterpret_cast<nvfp4_bridge::CRegister*>(&accum_storage[0]),
+        typename Traits::AccumLayout{});
+    cute::clear(accum_tensor);
+
+    auto tiled_mma = TiledMma{};
+    auto thread_mma = tiled_mma.get_thread_slice(tid);
+
+    auto sA_ = cute::make_tensor(cute::make_smem_ptr(smem_swizzled_a), SmemLayoutA{});
+    auto sB_ = cute::make_tensor(cute::make_smem_ptr(smem_swizzled_b), SmemLayoutB{});
+    auto sSFA = cute::make_tensor(cute::make_smem_ptr(a_scale_smem), SmemLayoutSFA{});
+    auto sSFB = cute::make_tensor(cute::make_smem_ptr(b_scale_smem), SmemLayoutSFB{});
+    auto sA = cute::as_position_independent_swizzle_tensor(sA_);
+    auto sB = cute::as_position_independent_swizzle_tensor(sB_);
+    auto sScaleA = cute::as_position_independent_swizzle_tensor(sSFA);
+    auto sScaleB = cute::as_position_independent_swizzle_tensor(sSFB);
+
+    auto tCrA = thread_mma.partition_fragment_A(sA(cute::_, cute::_, cute::Int<0>{}));
+    auto tCrB = thread_mma.partition_fragment_B(sB(cute::_, cute::_, cute::Int<0>{}));
+    auto tCrSFA = CollectiveMainloop{}.partition_fragment_SFA(
+        sSFA(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+    auto tCrSFB = CollectiveMainloop{}.partition_fragment_SFB(
+        sSFB(cute::_, cute::_, cute::Int<0>{}), thread_mma);
+
+    auto s2r_copy_A = cute::make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto s2r_thr_A = s2r_copy_A.get_thread_slice(tid);
+    auto tCsA = s2r_thr_A.partition_S(sA);
+    auto tCrA_cv = s2r_thr_A.retile_D(tCrA);
+
+    auto s2r_copy_B = cute::make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+    auto s2r_thr_B = s2r_copy_B.get_thread_slice(tid);
+    auto tCsB = s2r_thr_B.partition_S(sB);
+    auto tCrB_cv = s2r_thr_B.retile_D(tCrB);
+
+    auto tile_shape_mnk = cute::tile_shape(tiled_mma);
+    auto s2r_copy_SFA = cute::make_tiled_copy_impl(
+        SmemCopyAtomSFA{},
+        Traits::GetLayoutSFATV(tiled_mma),
+        cute::make_shape(cute::size<0>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+    auto s2r_thr_SFA = s2r_copy_SFA.get_thread_slice(tid);
+    auto tCsSFA = s2r_thr_SFA.partition_S(sScaleA);
+    auto tCrSFA_cv = s2r_thr_SFA.retile_D(tCrSFA);
+
+    auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+        SmemCopyAtomSFB{},
+        Traits::GetLayoutSFBTV(tiled_mma),
+        cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+    auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+    auto tCsSFB = s2r_thr_SFB.partition_S(sScaleB);
+    auto tCrSFB_cv = s2r_thr_SFB.retile_D(tCrSFB);
+
+    cute::copy(s2r_copy_A, tCsA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrA_cv);
+    cute::copy(s2r_copy_B, tCsB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrB_cv);
+    cute::copy(tCsSFA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFA_cv);
+    cute::copy(tCsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_cv);
+
+    using MMAOp = typename TiledMma::MMA_Op;
+    for (int k = 0; k < cute::size<2>(tCrA_cv); ++k) {
+      cute::fp4_shift_A(MMAOp{}, tCrA_cv(cute::_, cute::_, k));
+      cute::fp4_shift_B(MMAOp{}, tCrB_cv(cute::_, cute::_, k));
+    }
+
+    constexpr int kMFragments = cute::size<1>(decltype(tCrA){});
+    constexpr int kNFragments = cute::size<1>(decltype(tCrB){});
+    constexpr int kKBlocks = cute::size<2>(decltype(tCrA){});
+    constexpr int kRegsPerFragment = Traits::kAccumProfileCosize / (kMFragments * kNFragments);
+    static_assert(
+        Traits::kAccumProfileCosize % (kMFragments * kNFragments) == 0,
+        "Natural P1 oracle expects an integer register fragment decomposition");
+    static_assert(
+        Traits::kAccumProfileCosize == kRegsPerFragment * kMFragments * kNFragments,
+        "Natural P1 oracle expects a dense register fragment decomposition");
+
+    typename TiledMma::Atom mma_atom;
+    for (int k = 0; k < kKBlocks; ++k) {
+      for (int n = 0; n < kNFragments; ++n) {
+        for (int m = 0; m < kMFragments; ++m) {
+          auto a_atom = tCrA(cute::_, m, k);
+          auto b_atom = tCrB(cute::_, n, k);
+          auto c_atom = accum_tensor(cute::_, m, n);
+          auto sfa_atom = tCrSFA(cute::_, m, k);
+          auto sfb_atom = tCrSFB(cute::_, n, k);
+          auto a_zipped = cute::make_zip_tensor(a_atom, sfa_atom);
+          auto b_zipped = cute::make_zip_tensor(b_atom, sfb_atom);
+          mma_atom.call(c_atom, a_zipped, b_zipped, c_atom);
+        }
+      }
+    }
+
+    auto dense_c = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<kTokenRows>{}));
+    auto part_c = thread_mma.partition_C(dense_c);
+    for (int i = 0; i < static_cast<int>(cute::size(part_c)); ++i) {
+      auto coord = part_c(i);
+      const int output_row = static_cast<int>(cute::get<0>(coord));
+      const int token_row = static_cast<int>(cute::get<1>(coord));
+      const int slot = tid * kCoordCapacity + i;
+      const float value = accum_tensor(i);
+      g_p1_natural_fp4_mma_trace.output_rows[slot] = output_row;
+      g_p1_natural_fp4_mma_trace.token_rows[slot] = token_row;
+      g_p1_natural_fp4_mma_trace.warp_ids[slot] = warp_id;
+      g_p1_natural_fp4_mma_trace.lane_ids[slot] = lane_id;
+      g_p1_natural_fp4_mma_trace.physical_indices[slot] = i;
+      g_p1_natural_fp4_mma_trace.reg_ids[slot] = i;
+      g_p1_natural_fp4_mma_trace.m_fragment_ids[slot] = -1;
+      g_p1_natural_fp4_mma_trace.n_fragment_ids[slot] = -1;
+      g_p1_natural_fp4_mma_trace.values[slot] = value;
+      if (output_row >= 0 && output_row < kOutputTile &&
+          token_row >= 0 && token_row < kTokenRows) {
+        token_major_output[static_cast<std::size_t>(token_row) * kOutputTile + output_row] =
+            value;
+      }
+    }
+  }
+}
+
 __global__ void P13GenericDirectStageOracleKernel(
     const float* input,
     const float* per_row_tensor_scales_input,
@@ -13822,6 +14112,54 @@ bool RunP1NativeFp4MmaOracleForTesting(
   (void) weight_packed;
   (void) weight_matmul_block_scales;
   (void) dense_output;
+  return false;
+#endif
+}
+
+bool RunP1NaturalFp4MmaOracleForTesting(
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales,
+    float* token_major_output) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr std::size_t kOutputTile =
+      nvfp4_bridge::UnifiedRoutedFp4Traits<nvfp4_bridge::UnifiedRoutedFp4Profile::kP1>::kOutputTile;
+  constexpr std::size_t kTokenRows =
+      nvfp4_bridge::UnifiedRoutedFp4Traits<nvfp4_bridge::UnifiedRoutedFp4Profile::kP1>::kTokenRows;
+  constexpr std::size_t kConsumerThreads =
+      cute::size(nvfp4_bridge::TracedP1TiledMma{});
+
+  if (weight_packed == nullptr ||
+      weight_matmul_block_scales == nullptr ||
+      input_packed == nullptr ||
+      input_block_scales == nullptr ||
+      token_major_output == nullptr) {
+    return false;
+  }
+
+  PrintP1NaturalFp4MmaLayoutDump();
+  ResetP1NaturalFp4MmaTrace();
+  if (!CheckCuda(cudaMemset(
+          token_major_output,
+          0,
+          kTokenRows * kOutputTile * sizeof(float)))) {
+    return false;
+  }
+
+  P1NaturalFp4MmaOracleKernel<<<1, kConsumerThreads>>>(
+      weight_packed,
+      weight_matmul_block_scales,
+      input_packed,
+      input_block_scales,
+      token_major_output);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+#else
+  (void) weight_packed;
+  (void) weight_matmul_block_scales;
+  (void) input_packed;
+  (void) input_block_scales;
+  (void) token_major_output;
   return false;
 #endif
 }

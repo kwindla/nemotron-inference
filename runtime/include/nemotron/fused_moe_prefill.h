@@ -76,6 +76,7 @@ struct P13DebugTrace {
 constexpr int kP1NativeFp4MmaTraceGroupCount = 8 * 2 * 32;
 constexpr int kP1NativeFp4MmaTraceEntryCount =
     kP1NativeFp4MmaTraceGroupCount * 4;
+constexpr int kP1NaturalFp4MmaTraceEntryCount = 128 * 32;
 
 struct P1NativeFp4MmaTrace {
   int valid = 0;
@@ -92,6 +93,19 @@ struct P1NativeFp4MmaTrace {
   int lane_ids[kP1NativeFp4MmaTraceEntryCount] = {};
   int reg_ids[kP1NativeFp4MmaTraceEntryCount] = {};
   float values[kP1NativeFp4MmaTraceEntryCount] = {};
+};
+
+struct P1NaturalFp4MmaTrace {
+  int valid = 0;
+  int output_rows[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int token_rows[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int warp_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int lane_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int physical_indices[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int reg_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int m_fragment_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
+  int n_fragment_ids[kP1NaturalFp4MmaTraceEntryCount] = {};
+  float values[kP1NaturalFp4MmaTraceEntryCount] = {};
 };
 
 bool RunGroupedNvfp4ExpertMatVec(
@@ -169,6 +183,8 @@ bool RunP13GenericDirectStageOracleForTesting(
 
 bool CopyP1NativeFp4MmaTrace(P1NativeFp4MmaTrace* out);
 void ResetP1NativeFp4MmaTrace();
+bool CopyP1NaturalFp4MmaTrace(P1NaturalFp4MmaTrace* out);
+void ResetP1NaturalFp4MmaTrace();
 
 // Testing hook: runs the current traced P1 native FP4 MMA load+mma chain in
 // isolation on a synthetic 16x64 activation tile and 128x64 weight tile,
@@ -179,5 +195,15 @@ bool RunP1NativeFp4MmaOracleForTesting(
     const std::uint8_t* weight_packed,
     const std::uint8_t* weight_matmul_block_scales,
     float* dense_output);
+
+// Testing hook: runs the natural traced P1 MMA contract end-to-end on a single
+// 128x32x64 tile with A=weight(128x64), B=input(32x64), and writes the result
+// out token-major as a 32x128 FP32 rectangle.
+bool RunP1NaturalFp4MmaOracleForTesting(
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales,
+    float* token_major_output);
 
 }  // namespace nemotron
