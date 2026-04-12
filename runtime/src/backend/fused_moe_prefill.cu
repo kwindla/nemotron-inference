@@ -6577,6 +6577,282 @@ __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse(
   }
 }
 
+// FP4-direct-output variant of Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse.
+// Identical MMA structure (producer/consumer BF16 WMMA pipeline) but replaces
+// the final BF16 output write with an in-place FP4 pack epilogue. The BF16
+// dequant in the producer already bakes both input and weight tensor scales
+// into c_tile, so the epilogue does NOT re-apply row_alpha — it only runs
+// Relu2 and per-block FP4 quantization.
+template <int kOutputTile, int kMacroTileK>
+__global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct(
+    const std::uint8_t* packed_input,
+    const std::uint8_t* input_block_scales,
+    const float* input_tensor_scale_data,
+    const float* input_expert_tensor_scales,
+    const float* input_dq_scales,
+    const float* input_per_row_tensor_scales,
+    const int* cta_count,
+    const int* cta_batch_indices,
+    const int* cta_row_starts,
+    const int* cta_valid_rows,
+    const FusedNvfp4WeightView* weights,
+    std::size_t output_rows_per_expert,
+    std::uint8_t* output_packed,
+    std::uint8_t* output_block_scales,
+    std::uint8_t* output_matmul_scales,
+    float* output_activation_scales,
+    __nv_bfloat16* debug_prepack_output,
+    std::size_t output_padded_blocks_per_row,
+    Nvfp4ScaleLayout output_scale_layout) {
+  constexpr int kWarpSubTiles =
+      kOutputTile / (kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileN);
+  static_assert(kWarpSubTiles >= 1);
+  __shared__ __nv_bfloat16 a_tile[2][kPlannedWmmaTileM][kMacroTileK];
+  __shared__ __nv_bfloat16 b_tile[2][kOutputTile][kMacroTileK];
+  __shared__ float c_tile_storage[kPlannedWmmaTileM * kOutputTile];
+  auto* c_tile = reinterpret_cast<float (*)[kOutputTile]>(c_tile_storage);
+
+  const int cta_index = static_cast<int>(blockIdx.y);
+  const int exact_cta_count = cta_count[0];
+  if (cta_index >= exact_cta_count ||
+      packed_input == nullptr ||
+      input_block_scales == nullptr ||
+      (input_tensor_scale_data == nullptr && input_dq_scales == nullptr) ||
+      output_packed == nullptr ||
+      output_block_scales == nullptr ||
+      output_matmul_scales == nullptr ||
+      output_activation_scales == nullptr ||
+      weights == nullptr ||
+      output_rows_per_expert == 0) {
+    return;
+  }
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const bool mma_warp = warp_id < kGroupedConsumerWarpsPerBlock;
+  const bool producer_warp = warp_id >= kGroupedConsumerWarpsPerBlock;
+  const int producer_tid = tid - (kGroupedConsumerWarpsPerBlock * 32);
+  const int expert_index = cta_batch_indices[cta_index];
+  const int row_start = cta_row_starts[cta_index];
+  const int valid_rows = cta_valid_rows[cta_index];
+  const int output_row_base = static_cast<int>(blockIdx.x) * kOutputTile;
+  if (expert_index < 0 ||
+      valid_rows <= 0 ||
+      static_cast<std::size_t>(output_row_base) >= output_rows_per_expert) {
+    return;
+  }
+
+  const FusedNvfp4WeightView weight = weights[expert_index];
+  const int output_rows_this_tile = static_cast<int>(
+      min(output_rows_per_expert - static_cast<std::size_t>(output_row_base),
+          static_cast<std::size_t>(kOutputTile)));
+
+  wmma::fragment<
+      wmma::accumulator,
+      kPlannedWmmaTileM,
+      kPlannedWmmaTileN,
+      kPlannedWmmaTileK,
+      float>
+      c_frags[kWarpSubTiles];
+  if (mma_warp) {
+    for (int i = 0; i < kWarpSubTiles; ++i) {
+      wmma::fill_fragment(c_frags[i], 0.0f);
+    }
+  }
+
+  auto stage_macro_tile = [&](int buffer_index, std::size_t k_base) {
+    if (!producer_warp) {
+      return;
+    }
+    const int producer_threads = kGroupedProducerWarpsPerBlock * 32;
+    const int macro_k = static_cast<int>(
+        min(static_cast<std::size_t>(kMacroTileK), weight.input_cols - k_base));
+    const int macro_blocks = macro_k / static_cast<int>(fused_decode::kNvfp4BlockWidth);
+    const std::size_t block_base = k_base / fused_decode::kNvfp4BlockWidth;
+    for (int linear_block = producer_tid;
+         linear_block < (kPlannedWmmaTileM * macro_blocks);
+         linear_block += producer_threads) {
+      const int tile_token = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &a_tile[buffer_index][tile_token]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      if (tile_token < valid_rows) {
+        const std::size_t input_row = static_cast<std::size_t>(row_start + tile_token);
+        const float row_ts =
+            input_dq_scales != nullptr
+                ? 1.0f
+                : (input_expert_tensor_scales != nullptr
+                       ? input_expert_tensor_scales[expert_index]
+                       : (input_per_row_tensor_scales != nullptr
+                              ? input_per_row_tensor_scales[input_row]
+                              : *input_tensor_scale_data));
+        DecodeGroupedPackedInputBlockBf16(
+            packed_input,
+            input_block_scales,
+            input_dq_scales,
+            row_ts,
+            weight.input_cols,
+            input_row,
+            block_base + static_cast<std::size_t>(tile_block),
+            dst);
+      } else {
+        ZeroBf16Block16(dst);
+      }
+    }
+    for (int linear_block = producer_tid;
+         linear_block < (output_rows_this_tile * macro_blocks);
+         linear_block += producer_threads) {
+      const int tile_output_row = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &b_tile[buffer_index][tile_output_row]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      DecodeNvfp4WeightBlockBf16(
+          weight,
+          static_cast<std::size_t>(output_row_base + tile_output_row),
+          block_base + static_cast<std::size_t>(tile_block),
+          dst);
+    }
+    for (int linear_block = producer_tid + output_rows_this_tile * macro_blocks;
+         linear_block < (kOutputTile * macro_blocks);
+         linear_block += producer_threads) {
+      const int tile_output_row = linear_block / macro_blocks;
+      const int tile_block = linear_block % macro_blocks;
+      __nv_bfloat16* dst =
+          &b_tile[buffer_index][tile_output_row]
+                 [tile_block * static_cast<int>(fused_decode::kNvfp4BlockWidth)];
+      ZeroBf16Block16(dst);
+    }
+  };
+
+  const std::size_t k_step = static_cast<std::size_t>(kMacroTileK);
+  int buffer_index = 0;
+  stage_macro_tile(buffer_index, 0);
+  __syncthreads();
+  for (std::size_t k_base = 0; k_base < weight.input_cols; k_base += k_step) {
+    const int macro_k = static_cast<int>(
+        min(k_step, weight.input_cols - k_base));
+    const int next_buffer = buffer_index ^ 1;
+    const std::size_t next_k_base = k_base + k_step;
+    if (next_k_base < weight.input_cols) {
+      stage_macro_tile(next_buffer, next_k_base);
+    }
+    if (mma_warp) {
+      wmma::fragment<
+          wmma::matrix_a,
+          kPlannedWmmaTileM,
+          kPlannedWmmaTileN,
+          kPlannedWmmaTileK,
+          __nv_bfloat16,
+          wmma::row_major>
+          a_frag;
+      for (int tile_k_base = 0; tile_k_base < macro_k; tile_k_base += kPlannedWmmaTileK) {
+        wmma::load_matrix_sync(a_frag, &a_tile[buffer_index][0][tile_k_base], kMacroTileK);
+        for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+          const int warp_col = warp_id * kPlannedWmmaTileN +
+              subtile * kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileN;
+          if (warp_col < output_rows_this_tile) {
+            wmma::fragment<
+                wmma::matrix_b,
+                kPlannedWmmaTileM,
+                kPlannedWmmaTileN,
+                kPlannedWmmaTileK,
+                __nv_bfloat16,
+                wmma::col_major>
+                b_frag;
+            wmma::load_matrix_sync(
+                b_frag, &b_tile[buffer_index][warp_col][tile_k_base], kMacroTileK);
+            wmma::mma_sync(c_frags[subtile], a_frag, b_frag, c_frags[subtile]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    buffer_index ^= 1;
+  }
+
+  if (mma_warp) {
+    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+      const int warp_col = warp_id * kPlannedWmmaTileN +
+          subtile * kGroupedConsumerWarpsPerBlock * kPlannedWmmaTileN;
+      if (warp_col < output_rows_this_tile) {
+        wmma::store_matrix_sync(
+            &c_tile[0][warp_col], c_frags[subtile], kOutputTile, wmma::mem_row_major);
+      }
+    }
+  }
+  __syncthreads();
+
+  const std::size_t output_blocks_per_row =
+      output_rows_per_expert / fused_decode::kNvfp4BlockWidth;
+  const std::size_t output_blocks_this_tile =
+      static_cast<std::size_t>(output_rows_this_tile) / fused_decode::kNvfp4BlockWidth;
+  const std::size_t output_packed_row_bytes = output_rows_per_expert / 2u;
+  for (std::size_t linear_index = static_cast<std::size_t>(tid);
+       linear_index < static_cast<std::size_t>(valid_rows) * output_blocks_this_tile;
+       linear_index += static_cast<std::size_t>(blockDim.x)) {
+    const std::size_t tile_token = linear_index / output_blocks_this_tile;
+    const std::size_t tile_block = linear_index % output_blocks_this_tile;
+    const std::size_t input_row = static_cast<std::size_t>(row_start) + tile_token;
+    const std::size_t output_col_start =
+        static_cast<std::size_t>(output_row_base) +
+        tile_block * fused_decode::kNvfp4BlockWidth;
+
+    float activated[fused_decode::kNvfp4BlockWidth];
+    float block_max_abs = 0.0f;
+#pragma unroll
+    for (int col = 0; col < static_cast<int>(fused_decode::kNvfp4BlockWidth); ++col) {
+      const float scaled =
+          c_tile[tile_token][tile_block * fused_decode::kNvfp4BlockWidth + col];
+      if (debug_prepack_output != nullptr) {
+        const std::size_t output_col =
+            output_col_start + static_cast<std::size_t>(col);
+        debug_prepack_output[input_row * output_rows_per_expert + output_col] =
+            __float2bfloat16(scaled);
+      }
+      const float activated_value = fused_decode::Relu2(scaled);
+      activated[col] = activated_value;
+      if (activated_value > block_max_abs) {
+        block_max_abs = activated_value;
+      }
+    }
+
+    float block_scale = 1.0f;
+    if (block_max_abs > 0.0f) {
+      block_scale = fused_decode::ClampNvfp4Scale(
+          block_max_abs / fused_decode::kNvfp4Fp4MaxFinite);
+    }
+    const std::uint8_t encoded_block_scale =
+        fused_decode::EncodeFp8Scale(block_scale);
+    const std::size_t block_index =
+        output_col_start / fused_decode::kNvfp4BlockWidth;
+    const std::size_t scale_index =
+        input_row * output_blocks_per_row + block_index;
+    const std::size_t matmul_scale_index = ExecutionScaleOffset(
+        input_row,
+        block_index,
+        output_padded_blocks_per_row,
+        output_scale_layout);
+    const std::size_t packed_offset =
+        input_row * output_packed_row_bytes +
+        block_index * (fused_decode::kNvfp4BlockWidth / 2u);
+
+    output_activation_scales[scale_index] = block_scale;
+    output_block_scales[scale_index] = encoded_block_scale;
+    output_matmul_scales[matmul_scale_index] = encoded_block_scale;
+#pragma unroll
+    for (std::size_t pair = 0; pair < (fused_decode::kNvfp4BlockWidth / 2u); ++pair) {
+      const std::uint8_t lhs =
+          fused_decode::EncodeFp4(activated[pair * 2u] / block_scale);
+      const std::uint8_t rhs =
+          fused_decode::EncodeFp4(activated[pair * 2u + 1u] / block_scale);
+      output_packed[packed_offset + pair] =
+          static_cast<std::uint8_t>((lhs & 0x0Fu) | ((rhs & 0x0Fu) << 4u));
+    }
+  }
+}
+
 template <typename OutputType, int kOutputTile, int kMacroTileK>
 __global__ void Nvfp4LaunchPlannedPackedInputGroupedKernelSwapTrue(
     const std::uint8_t* packed_input,
@@ -12696,13 +12972,18 @@ bool LaunchPlannedPackedInputMatVecFp4Direct(
   if (g_enable_p1_direct_trace != 0) {
     g_p1_direct_trace = {};
   }
+  // Dispatch kP1+kFp4Direct through the new kernel that shares the
+  // well-tested BF16 WMMA pipeline of
+  // `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalse<bf16,128,64>` but
+  // replaces the final BF16 store with an in-place FP4 pack epilogue. The
+  // BF16 boundary is at the operands (dequant in producer), not before
+  // Relu2 — the Relu2/FP4-quant path stays on the FP32 accumulator.
   const bool launched = LaunchProgrammaticKernel(
       grid,
       block,
-      Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSmemP1Direct,
+      Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct<128, 64>,
       input_pack.packed_data(),
       input_pack.block_scales_data(),
-      input_pack.scale_layout(),
       input_pack.device_tensor_scale_ptr(),
       input_expert_tensor_scales,
       input_dq_scales,
