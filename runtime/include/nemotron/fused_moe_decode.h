@@ -14,8 +14,15 @@ struct FusedNvfp4WeightView {
   const float* tensor_scale_data = nullptr;
   std::size_t output_rows = 0;
   std::size_t input_cols = 0;
+  // Per-expert TMA descriptors for loading the weight as the A operand
+  // (M-dim = output_rows). Used by the swap=true unified kernel.
   const void* p5_tma_load_a = nullptr;
   const void* p5_tma_load_sfa = nullptr;
+  // Per-expert TMA descriptors for loading the weight as the B operand
+  // (N-dim = output_rows). Used by the swap=false unified kernel where
+  // the input is A and the weight is B.
+  const void* p5_tma_load_b = nullptr;
+  const void* p5_tma_load_sfb = nullptr;
 };
 
 struct FusedMoeDirectLayerParams {

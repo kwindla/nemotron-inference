@@ -125,6 +125,120 @@ void* CreateDeviceP5TmaLoadSFAArray(
   return device_descriptors;
 }
 
+void* CreateDeviceP5TmaLoadBArray(
+    const std::uint8_t* packed_data,
+    std::size_t expert_count,
+    std::size_t expert_packed_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols) {
+  if (packed_data == nullptr ||
+      expert_count == 0 ||
+      expert_packed_stride_bytes == 0 ||
+      output_rows == 0 ||
+      input_cols == 0 ||
+      (output_rows % 128u) != 0 ||
+      (input_cols % 128u) != 0 ||
+      (expert_packed_stride_bytes % sizeof(std::uint8_t)) != 0) {
+    return nullptr;
+  }
+
+  int device_count = 0;
+  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+    return nullptr;
+  }
+
+  std::vector<P5TmaLoadB> host_descriptors;
+  host_descriptors.reserve(expert_count);
+  for (std::size_t expert_index = 0; expert_index < expert_count; ++expert_index) {
+    const std::uint8_t* expert_packed =
+        packed_data + (expert_index * expert_packed_stride_bytes);
+    auto tensor_b = cute::make_tensor(
+        cute::make_gmem_ptr(cute::recast_ptr<ElementAB>(expert_packed)),
+        cute::make_layout(
+            cute::make_shape(
+                static_cast<int32_t>(output_rows),
+                static_cast<int32_t>(input_cols),
+                int32_t{1}),
+            cute::make_stride(
+                static_cast<int64_t>(input_cols),
+                cute::Int<1>{},
+                static_cast<int64_t>(output_rows * input_cols))));
+    host_descriptors.push_back(MakeP5TmaLoadB(tensor_b));
+  }
+
+  P5TmaLoadB* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes = sizeof(P5TmaLoadB) * host_descriptors.size();
+  if (!CheckCuda(cudaMalloc(
+          reinterpret_cast<void**>(&device_descriptors),
+          descriptor_bytes))) {
+    return nullptr;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    cudaFree(device_descriptors);
+    return nullptr;
+  }
+
+  return device_descriptors;
+}
+
+void* CreateDeviceP5TmaLoadSFBArray(
+    const std::uint8_t* scale_data,
+    std::size_t expert_count,
+    std::size_t expert_scale_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols) {
+  if (scale_data == nullptr ||
+      expert_count == 0 ||
+      expert_scale_stride_bytes == 0 ||
+      output_rows == 0 ||
+      input_cols == 0 ||
+      (output_rows % 128u) != 0 ||
+      (input_cols % 128u) != 0) {
+    return nullptr;
+  }
+
+  int device_count = 0;
+  if (!CheckCuda(cudaGetDeviceCount(&device_count)) || device_count <= 0) {
+    return nullptr;
+  }
+
+  std::vector<P5TmaLoadSFB> host_descriptors;
+  host_descriptors.reserve(expert_count);
+  for (std::size_t expert_index = 0; expert_index < expert_count; ++expert_index) {
+    const std::uint8_t* expert_scales =
+        scale_data + (expert_index * expert_scale_stride_bytes);
+    auto tensor_sfb = cute::make_tensor(
+        cute::make_gmem_ptr(
+            reinterpret_cast<ElementSF const*>(expert_scales)),
+        MakeP5ScaleLayoutSFB(
+            static_cast<int32_t>(output_rows),
+            static_cast<int32_t>(input_cols)));
+    host_descriptors.push_back(MakeP5TmaLoadSFB(tensor_sfb));
+  }
+
+  P5TmaLoadSFB* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes = sizeof(P5TmaLoadSFB) * host_descriptors.size();
+  if (!CheckCuda(cudaMalloc(
+          reinterpret_cast<void**>(&device_descriptors),
+          descriptor_bytes))) {
+    return nullptr;
+  }
+  if (!CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    cudaFree(device_descriptors);
+    return nullptr;
+  }
+
+  return device_descriptors;
+}
+
 void DestroyDeviceP5TmaLoadAArray(void** descriptor_array) {
   if (descriptor_array == nullptr || *descriptor_array == nullptr) {
     return;
@@ -137,12 +251,28 @@ void DestroyDeviceP5TmaLoadSFAArray(void** descriptor_array) {
   DestroyDeviceP5TmaLoadAArray(descriptor_array);
 }
 
+void DestroyDeviceP5TmaLoadBArray(void** descriptor_array) {
+  DestroyDeviceP5TmaLoadAArray(descriptor_array);
+}
+
+void DestroyDeviceP5TmaLoadSFBArray(void** descriptor_array) {
+  DestroyDeviceP5TmaLoadAArray(descriptor_array);
+}
+
 std::size_t P5TmaLoadABytes() {
   return sizeof(P5TmaLoadA);
 }
 
 std::size_t P5TmaLoadSFABytes() {
   return sizeof(P5TmaLoadSFA);
+}
+
+std::size_t P5TmaLoadBBytes() {
+  return sizeof(P5TmaLoadB);
+}
+
+std::size_t P5TmaLoadSFBBytes() {
+  return sizeof(P5TmaLoadSFB);
 }
 
 }  // namespace nemotron::routed_p5_tma

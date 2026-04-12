@@ -159,7 +159,33 @@ void* CreateDeviceP5TmaLoadSFAArray(
     std::size_t output_rows,
     std::size_t input_cols);
 
+// Builds per-expert TMA descriptors that load the weight as the B operand
+// (N-dim = output_rows). Used by the swap=false unified kernel where the
+// input is the A operand and the weight is B. Same gmem layout as the
+// existing weight-as-A path; only the destination smem layout differs.
+void* CreateDeviceP5TmaLoadBArray(
+    const std::uint8_t* packed_data,
+    std::size_t expert_count,
+    std::size_t expert_packed_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols);
+
+// Per-expert TMA descriptors that load the weight scales as SFB.
+void* CreateDeviceP5TmaLoadSFBArray(
+    const std::uint8_t* scale_data,
+    std::size_t expert_count,
+    std::size_t expert_scale_stride_bytes,
+    std::size_t output_rows,
+    std::size_t input_cols);
+
 void DestroyDeviceP5TmaLoadAArray(void** descriptor_array);
 void DestroyDeviceP5TmaLoadSFAArray(void** descriptor_array);
+void DestroyDeviceP5TmaLoadBArray(void** descriptor_array);
+void DestroyDeviceP5TmaLoadSFBArray(void** descriptor_array);
+
+std::size_t P5TmaLoadABytes();
+std::size_t P5TmaLoadSFABytes();
+std::size_t P5TmaLoadBBytes();
+std::size_t P5TmaLoadSFBBytes();
 
 }  // namespace nemotron::routed_p5_tma

@@ -101,12 +101,16 @@ struct MonolithicNvfp4ExpertWeights::Impl {
   std::size_t total_tensor_scales_nbytes = 0;
   std::size_t total_p5_tma_load_a_descriptor_nbytes = 0;
   std::size_t total_p5_tma_load_sfa_descriptor_nbytes = 0;
+  std::size_t total_p5_tma_load_b_descriptor_nbytes = 0;
+  std::size_t total_p5_tma_load_sfb_descriptor_nbytes = 0;
   std::uint8_t* packed_data = nullptr;
   std::uint8_t* block_scales_data = nullptr;
   std::uint8_t* matmul_block_scales_data = nullptr;
   std::uint8_t* tensor_scales_data = nullptr;
   void* p5_tma_load_a_descriptors = nullptr;
   void* p5_tma_load_sfa_descriptors = nullptr;
+  void* p5_tma_load_b_descriptors = nullptr;
+  void* p5_tma_load_sfb_descriptors = nullptr;
   std::vector<float> host_tensor_scales;
   bool store_row_major_block_scales = true;
 };
@@ -182,6 +186,26 @@ std::unique_ptr<MonolithicNvfp4ExpertWeights> MonolithicNvfp4ExpertWeights::Crea
     impl->total_p5_tma_load_sfa_descriptor_nbytes =
         num_experts * sizeof(routed_p5_tma::P5TmaLoadSFA);
   }
+  impl->p5_tma_load_b_descriptors = routed_p5_tma::CreateDeviceP5TmaLoadBArray(
+      impl->packed_data,
+      impl->num_experts,
+      impl->expert_packed_nbytes,
+      impl->output_rows,
+      impl->input_cols);
+  if (impl->p5_tma_load_b_descriptors != nullptr) {
+    impl->total_p5_tma_load_b_descriptor_nbytes =
+        num_experts * sizeof(routed_p5_tma::P5TmaLoadB);
+  }
+  impl->p5_tma_load_sfb_descriptors = routed_p5_tma::CreateDeviceP5TmaLoadSFBArray(
+      impl->matmul_block_scales_data,
+      impl->num_experts,
+      impl->expert_matmul_block_scales_nbytes,
+      impl->output_rows,
+      impl->input_cols);
+  if (impl->p5_tma_load_sfb_descriptors != nullptr) {
+    impl->total_p5_tma_load_sfb_descriptor_nbytes =
+        num_experts * sizeof(routed_p5_tma::P5TmaLoadSFB);
+  }
 
   return std::unique_ptr<MonolithicNvfp4ExpertWeights>(
       new MonolithicNvfp4ExpertWeights(std::move(impl)));
@@ -202,6 +226,8 @@ MonolithicNvfp4ExpertWeights::~MonolithicNvfp4ExpertWeights() {
   }
   routed_p5_tma::DestroyDeviceP5TmaLoadAArray(&impl_->p5_tma_load_a_descriptors);
   routed_p5_tma::DestroyDeviceP5TmaLoadSFAArray(&impl_->p5_tma_load_sfa_descriptors);
+  routed_p5_tma::DestroyDeviceP5TmaLoadBArray(&impl_->p5_tma_load_b_descriptors);
+  routed_p5_tma::DestroyDeviceP5TmaLoadSFBArray(&impl_->p5_tma_load_sfb_descriptors);
   ReleaseBuffer(&impl_->tensor_scales_data);
   ReleaseBuffer(&impl_->matmul_block_scales_data);
   ReleaseBuffer(&impl_->block_scales_data);
@@ -342,6 +368,16 @@ FusedNvfp4WeightView MonolithicNvfp4ExpertWeights::GetView(std::size_t expert_in
         static_cast<const routed_p5_tma::P5TmaLoadSFA*>(impl_->p5_tma_load_sfa_descriptors);
     view.p5_tma_load_sfa = p5_tma_load_sfa + expert_index;
   }
+  if (impl_->p5_tma_load_b_descriptors != nullptr) {
+    const auto* p5_tma_load_b =
+        static_cast<const routed_p5_tma::P5TmaLoadB*>(impl_->p5_tma_load_b_descriptors);
+    view.p5_tma_load_b = p5_tma_load_b + expert_index;
+  }
+  if (impl_->p5_tma_load_sfb_descriptors != nullptr) {
+    const auto* p5_tma_load_sfb =
+        static_cast<const routed_p5_tma::P5TmaLoadSFB*>(impl_->p5_tma_load_sfb_descriptors);
+    view.p5_tma_load_sfb = p5_tma_load_sfb + expert_index;
+  }
   return view;
 }
 
@@ -363,7 +399,9 @@ std::size_t MonolithicNvfp4ExpertWeights::total_bytes() const {
                   impl_->total_matmul_block_scales_nbytes +
                   impl_->total_tensor_scales_nbytes +
                   impl_->total_p5_tma_load_a_descriptor_nbytes +
-                  impl_->total_p5_tma_load_sfa_descriptor_nbytes)
+                  impl_->total_p5_tma_load_sfa_descriptor_nbytes +
+                  impl_->total_p5_tma_load_b_descriptor_nbytes +
+                  impl_->total_p5_tma_load_sfb_descriptor_nbytes)
                : 0;
 }
 
