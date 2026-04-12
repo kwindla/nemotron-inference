@@ -73,6 +73,27 @@ struct P13DebugTrace {
   std::uint8_t b_copy_raw[16] = {};
 };
 
+constexpr int kP1NativeFp4MmaTraceGroupCount = 8 * 2 * 32;
+constexpr int kP1NativeFp4MmaTraceEntryCount =
+    kP1NativeFp4MmaTraceGroupCount * 4;
+
+struct P1NativeFp4MmaTrace {
+  int valid = 0;
+  int group_output_cols[kP1NativeFp4MmaTraceGroupCount] = {};
+  int group_match_counts[kP1NativeFp4MmaTraceGroupCount] = {};
+  int group_warp_ids[kP1NativeFp4MmaTraceGroupCount] = {};
+  int group_subtile_ids[kP1NativeFp4MmaTraceGroupCount] = {};
+  int group_lane_ids[kP1NativeFp4MmaTraceGroupCount] = {};
+  int output_cols[kP1NativeFp4MmaTraceEntryCount] = {};
+  int token_rows[kP1NativeFp4MmaTraceEntryCount] = {};
+  int physical_indices[kP1NativeFp4MmaTraceEntryCount] = {};
+  int warp_ids[kP1NativeFp4MmaTraceEntryCount] = {};
+  int subtile_ids[kP1NativeFp4MmaTraceEntryCount] = {};
+  int lane_ids[kP1NativeFp4MmaTraceEntryCount] = {};
+  int reg_ids[kP1NativeFp4MmaTraceEntryCount] = {};
+  float values[kP1NativeFp4MmaTraceEntryCount] = {};
+};
+
 bool RunGroupedNvfp4ExpertMatVec(
     const float* input,
     const int* expert_offsets,
@@ -145,5 +166,18 @@ bool RunP13GenericDirectStageOracleForTesting(
     std::uint8_t* matmul_block_scales_data,
     float* tensor_scale_data,
     float* per_row_tensor_scales);
+
+bool CopyP1NativeFp4MmaTrace(P1NativeFp4MmaTrace* out);
+void ResetP1NativeFp4MmaTrace();
+
+// Testing hook: runs the current traced P1 native FP4 MMA load+mma chain in
+// isolation on a synthetic 16x64 activation tile and 128x64 weight tile,
+// storing into a dense 16x128 output through a CUTE-derived coord map.
+bool RunP1NativeFp4MmaOracleForTesting(
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales,
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    float* dense_output);
 
 }  // namespace nemotron

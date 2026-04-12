@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -56,6 +57,15 @@ bool RunLaunchPlannedNvfp4ExpertMatVecBf16(
 namespace {
 
 namespace wmma = nvcuda::wmma;
+
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+template <class Layout>
+std::string LayoutString(Layout const& layout) {
+  std::ostringstream oss;
+  oss << layout;
+  return oss.str();
+}
+#endif
 
 __host__ __device__ std::size_t ExecutionScaleOffset(
     std::size_t row,
@@ -2069,6 +2079,7 @@ __device__ __managed__ P5ScaleTrace g_p5_scale_trace;
 __device__ __managed__ P13ScaleTrace g_p13_scale_trace;
 __device__ __managed__ P1DirectTrace g_p1_direct_trace;
 __device__ __managed__ P13DebugTrace g_p13_debug_trace;
+__device__ __managed__ P1NativeFp4MmaTrace g_p1_native_fp4_mma_trace;
 __device__ __managed__ int g_enable_p15_scale_trace = 0;
 __device__ __managed__ int g_enable_p5_scale_trace = 0;
 __device__ __managed__ int g_enable_p13_scale_trace = 0;
@@ -13105,6 +13116,21 @@ void ResetP13DebugTrace() {
   g_p13_debug_trace = {};
 }
 
+bool CopyP1NativeFp4MmaTrace(P1NativeFp4MmaTrace* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    return false;
+  }
+  *out = g_p1_native_fp4_mma_trace;
+  return true;
+}
+
+void ResetP1NativeFp4MmaTrace() {
+  g_p1_native_fp4_mma_trace = {};
+}
+
 const char* SelectRoutedGemm1ProfileNameForTesting(std::size_t num_rows) {
   return RoutedGemm1ProfileName(SelectRoutedGemm1Profile(num_rows));
 }
@@ -13403,6 +13429,243 @@ bool RunP5NativeDirectPackOracleForTesting(
 }
 
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+void PrintP1NativeFp4MmaLayoutDump() {
+  static bool printed = false;
+  if (printed) {
+    return;
+  }
+  printed = true;
+
+  using TiledMma = nvfp4_bridge::TracedP1TiledMma;
+  auto tiled_mma = TiledMma{};
+  auto thread_mma = tiled_mma.get_thread_slice(0);
+  auto ref_a = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(typename TiledMma::AtomShape_MNK{}),
+          cute::size<2>(typename TiledMma::AtomShape_MNK{})));
+  auto ref_b = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<1>(typename TiledMma::AtomShape_MNK{}),
+          cute::size<2>(typename TiledMma::AtomShape_MNK{})));
+  auto ref_c = cute::make_identity_tensor(
+      cute::make_shape(cute::tile_size<0>(tiled_mma), cute::tile_size<1>(tiled_mma)));
+  auto accum_ref = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<128>{}, cute::Int<128>{}));
+
+  const auto part_a = thread_mma.partition_A(ref_a);
+  const auto part_b = thread_mma.partition_B(ref_b);
+  const auto part_c = thread_mma.partition_C(ref_c);
+  const auto accum_profile = thread_mma.partition_C(accum_ref);
+
+  std::fprintf(
+      stderr,
+      "p1_native_fp4_mma_oracle: partA.layout: %s\n",
+      LayoutString(part_a.layout()).c_str());
+  std::fprintf(
+      stderr,
+      "p1_native_fp4_mma_oracle: partB.layout: %s\n",
+      LayoutString(part_b.layout()).c_str());
+  std::fprintf(
+      stderr,
+      "p1_native_fp4_mma_oracle: partC.layout: %s\n",
+      LayoutString(part_c.layout()).c_str());
+  std::fprintf(
+      stderr,
+      "p1_native_fp4_mma_oracle: accum_profile.layout: %s\n",
+      LayoutString(accum_profile.layout()).c_str());
+}
+
+__global__ void P1NativeFp4MmaOracleKernel(
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales,
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    float* dense_output) {
+  constexpr int kRows = 16;
+  constexpr int kK = 64;
+  constexpr int kOutputTile = 128;
+  constexpr int kBlocksPerRow = kK / fused_decode::kNvfp4BlockWidth;
+  constexpr int kPackedBytesPerRow = kK / 2;
+  constexpr int kFp4ConsumerWarps = kGroupedConsumerWarpsPerBlock;
+  constexpr int kWarpSubTiles = kOutputTile / (kFp4ConsumerWarps * kFp4MmaTileN);
+  constexpr int kPartCCoordCapacity = 16;
+
+  static_assert(kBlocksPerRow == 4, "P1 oracle expects a single K=64 tile");
+  static_assert(kWarpSubTiles == 2, "P1 oracle expects two subtiles per consumer warp");
+
+  __shared__ std::uint8_t a_packed[kRows][kPackedBytesPerRow];
+  __shared__ std::uint8_t a_scale_smem[nvfp4_bridge::kTracedP1ScaleSmemCosizeA];
+  __shared__ std::uint8_t b_packed[kOutputTile][kPackedBytesPerRow];
+  __shared__ std::uint8_t b_scale_smem[nvfp4_bridge::kTracedP1ScaleSmemCosizeB];
+  __shared__ float c_tile[kRows][kOutputTile];
+
+  const auto a_tile_view =
+      nvfp4_bridge::MakePackedTile64<kRows>(&a_packed[0][0], nullptr);
+  const auto b_tile_view =
+      nvfp4_bridge::MakePackedTile64<kOutputTile>(&b_packed[0][0], nullptr);
+  auto a_scale_tensor = cute::make_tensor(
+      cute::make_smem_ptr(&a_scale_smem[0]),
+      nvfp4_bridge::TracedP1SmemLayoutSFA{});
+  auto b_scale_tensor = cute::make_tensor(
+      cute::make_smem_ptr(&b_scale_smem[0]),
+      nvfp4_bridge::TracedP1SmemLayoutSFB{});
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid / 32;
+  const int lane_id = tid & 31;
+
+  if (tid == 0) {
+    g_p1_native_fp4_mma_trace.valid = 1;
+  }
+
+  nvfp4_bridge::CFragment64 accum[kWarpSubTiles];
+  if (warp_id < kFp4ConsumerWarps) {
+#pragma unroll
+    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+      nvfp4_bridge::Clear(accum[subtile]);
+    }
+  }
+
+  for (int row = tid; row < kRows; row += blockDim.x) {
+    std::uint8_t* dst = a_tile_view.packed_rows + row * kPackedBytesPerRow;
+#pragma unroll
+    for (int byte_index = 0; byte_index < kPackedBytesPerRow; ++byte_index) {
+      dst[byte_index] = input_packed[row * kPackedBytesPerRow + byte_index];
+    }
+    const std::uint8_t scale_bytes[4] = {
+        input_block_scales[row * kBlocksPerRow + 0],
+        input_block_scales[row * kBlocksPerRow + 1],
+        input_block_scales[row * kBlocksPerRow + 2],
+        input_block_scales[row * kBlocksPerRow + 3],
+    };
+    nvfp4_bridge::StoreTracedScaleBytes(a_scale_tensor, scale_bytes, row);
+  }
+
+  for (int row = tid; row < kOutputTile; row += blockDim.x) {
+    std::uint8_t* dst = b_tile_view.packed_rows + row * kPackedBytesPerRow;
+#pragma unroll
+    for (int byte_index = 0; byte_index < kPackedBytesPerRow; ++byte_index) {
+      dst[byte_index] = weight_packed[row * kPackedBytesPerRow + byte_index];
+    }
+    const std::uint8_t scale_bytes[4] = {
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            0u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            1u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            2u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+        LoadExecutionScaleByte(
+            weight_matmul_block_scales,
+            static_cast<std::size_t>(row),
+            3u,
+            kBlocksPerRow,
+            Nvfp4ScaleLayout::kSwizzled128x4),
+    };
+    nvfp4_bridge::StoreTracedScaleBytes(b_scale_tensor, scale_bytes, row);
+  }
+  __syncthreads();
+
+  if (warp_id < kFp4ConsumerWarps) {
+    const auto a_fragment =
+        nvfp4_bridge::LoadFragmentA_RowMajor16x64TracedScaleTiledP1<
+            nvfp4_bridge::TracedP1TiledMma,
+            kRows>(&a_packed[0][0], a_scale_smem, 0, tid);
+#pragma unroll
+    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+      const int n_base = warp_id * kFp4MmaTileN + subtile * kFp4ConsumerWarps * kFp4MmaTileN;
+      const auto b_fragment =
+          nvfp4_bridge::LoadFragmentB_ColMajor64x8TracedScaleTiledP1<
+              nvfp4_bridge::TracedP1TiledMma,
+              kOutputTile>(&b_packed[0][0], b_scale_smem, tid, n_base);
+      nvfp4_bridge::Gemm(accum[subtile], a_fragment, b_fragment);
+    }
+  }
+  __syncthreads();
+
+  for (int linear_index = tid; linear_index < kRows * kOutputTile; linear_index += blockDim.x) {
+    c_tile[linear_index / kOutputTile][linear_index % kOutputTile] = 0.0f;
+  }
+  __syncthreads();
+
+  if (warp_id < kFp4ConsumerWarps) {
+    auto tiled_mma = nvfp4_bridge::TracedP1TiledMma{};
+    auto thread_mma = tiled_mma.get_thread_slice(tid);
+    auto dense_c = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kOutputTile>{}, cute::Int<32>{}));
+    auto part_c = thread_mma.partition_C(dense_c);
+    int row_coords[kPartCCoordCapacity];
+    int col_coords[kPartCCoordCapacity];
+    nvfp4_bridge::FillPhysicalCoordMapCopyViewLimited(
+        part_c,
+        kPartCCoordCapacity,
+        row_coords,
+        col_coords);
+
+    const int col_in_subtile = lane_id & 7;
+#pragma unroll
+    for (int subtile = 0; subtile < kWarpSubTiles; ++subtile) {
+      const int n_base = warp_id * kFp4MmaTileN + subtile * kFp4ConsumerWarps * kFp4MmaTileN;
+      const int expected_output_col = n_base + col_in_subtile;
+      const int group_slot = ((warp_id * kWarpSubTiles) + subtile) * 32 + lane_id;
+      int matching_physicals[4] = {-1, -1, -1, -1};
+      int match_count = 0;
+      for (int physical = 0; physical < kPartCCoordCapacity; ++physical) {
+        if (row_coords[physical] == expected_output_col && match_count < 4) {
+          matching_physicals[match_count++] = physical;
+        }
+      }
+      g_p1_native_fp4_mma_trace.group_output_cols[group_slot] = expected_output_col;
+      g_p1_native_fp4_mma_trace.group_match_counts[group_slot] = match_count;
+      g_p1_native_fp4_mma_trace.group_warp_ids[group_slot] = warp_id;
+      g_p1_native_fp4_mma_trace.group_subtile_ids[group_slot] = subtile;
+      g_p1_native_fp4_mma_trace.group_lane_ids[group_slot] = lane_id;
+
+#pragma unroll
+      for (int reg = 0; reg < 4; ++reg) {
+        const int slot = (((warp_id * kWarpSubTiles) + subtile) * 32 + lane_id) * 4 + reg;
+        g_p1_native_fp4_mma_trace.output_cols[slot] = -1;
+        g_p1_native_fp4_mma_trace.token_rows[slot] = -1;
+        g_p1_native_fp4_mma_trace.physical_indices[slot] = -1;
+        g_p1_native_fp4_mma_trace.warp_ids[slot] = warp_id;
+        g_p1_native_fp4_mma_trace.subtile_ids[slot] = subtile;
+        g_p1_native_fp4_mma_trace.lane_ids[slot] = lane_id;
+        g_p1_native_fp4_mma_trace.reg_ids[slot] = reg;
+        g_p1_native_fp4_mma_trace.values[slot] = accum[subtile].regs[reg];
+        if (reg >= match_count) {
+          continue;
+        }
+        const int physical = matching_physicals[reg];
+        const int output_col = row_coords[physical];
+        const int token_row = col_coords[physical];
+        g_p1_native_fp4_mma_trace.output_cols[slot] = output_col;
+        g_p1_native_fp4_mma_trace.token_rows[slot] = token_row;
+        g_p1_native_fp4_mma_trace.physical_indices[slot] = physical;
+        if (token_row >= 0 && token_row < kRows &&
+            output_col >= 0 && output_col < kOutputTile) {
+          c_tile[token_row][output_col] = accum[subtile].regs[reg];
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int linear_index = tid; linear_index < kRows * kOutputTile; linear_index += blockDim.x) {
+    dense_output[linear_index] = c_tile[linear_index / kOutputTile][linear_index % kOutputTile];
+  }
+}
+
 __global__ void P13GenericDirectStageOracleKernel(
     const float* input,
     const float* per_row_tensor_scales_input,
@@ -13522,6 +13785,46 @@ __global__ void P13GenericDirectStageOracleKernel(
       scale_layout);
 }
 #endif
+
+bool RunP1NativeFp4MmaOracleForTesting(
+    const std::uint8_t* input_packed,
+    const std::uint8_t* input_block_scales,
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* weight_matmul_block_scales,
+    float* dense_output) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  constexpr std::size_t kRows = 16;
+  constexpr std::size_t kOutputTile = 128;
+  if (input_packed == nullptr ||
+      input_block_scales == nullptr ||
+      weight_packed == nullptr ||
+      weight_matmul_block_scales == nullptr ||
+      dense_output == nullptr) {
+    return false;
+  }
+
+  PrintP1NativeFp4MmaLayoutDump();
+  ResetP1NativeFp4MmaTrace();
+  if (!CheckCuda(cudaMemset(dense_output, 0, kRows * kOutputTile * sizeof(float)))) {
+    return false;
+  }
+
+  P1NativeFp4MmaOracleKernel<<<1, kGroupedThreadsPerBlock>>>(
+      input_packed,
+      input_block_scales,
+      weight_packed,
+      weight_matmul_block_scales,
+      dense_output);
+  return CheckCuda(cudaGetLastError()) && CheckCuda(cudaDeviceSynchronize());
+#else
+  (void) input_packed;
+  (void) input_block_scales;
+  (void) weight_packed;
+  (void) weight_matmul_block_scales;
+  (void) dense_output;
+  return false;
+#endif
+}
 
 bool RunP13GenericDirectStageOracleForTesting(
     const float* input,
