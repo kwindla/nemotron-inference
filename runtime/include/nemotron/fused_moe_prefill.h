@@ -82,6 +82,7 @@ constexpr int kP1FragmentDebugACoordCount = 32;
 constexpr int kP1FragmentDebugBCoordCount = 16;
 constexpr int kP1FragmentDebugScaleCoordCount = 4;
 constexpr int kP1FragmentDebugCAtomCount = 4;
+constexpr int kP1FragmentDebugScaleSmemDumpByteCount = 4608;
 
 struct P1NativeFp4MmaTrace {
   int valid = 0;
@@ -117,6 +118,11 @@ struct P1FragmentDebugTrace {
   int valid = 0;
   int sfa_logical_cols = 0;
   int sfb_logical_cols = 0;
+  int observed_sfa_fragment_cosize = 0;
+  int observed_sfb_fragment_cosize = 0;
+  std::uint8_t sfa_smem_dump[kP1FragmentDebugScaleSmemDumpByteCount] = {};
+  std::int16_t sfa_smem_row_coord[kP1FragmentDebugScaleSmemDumpByteCount] = {};
+  std::int16_t sfa_smem_col_coord[kP1FragmentDebugScaleSmemDumpByteCount] = {};
   std::uint32_t tCrA_pre_shift[kP1FragmentDebugLaneCount][4] = {};
   std::uint32_t tCrA_post_shift[kP1FragmentDebugLaneCount][4] = {};
   std::uint32_t tCrB_pre_shift[kP1FragmentDebugLaneCount][2] = {};

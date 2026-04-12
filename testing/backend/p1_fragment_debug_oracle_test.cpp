@@ -32,6 +32,8 @@ constexpr std::size_t kK = 64;
 constexpr std::size_t kBlocksPerRow = kK / 16u;
 constexpr int kTargetTokenRow = 0;
 constexpr int kTargetOutputRow = 2;
+constexpr int kExpectedSfaFragmentCosize = 8;
+constexpr int kExpectedSfbFragmentCosize = 32;
 
 bool expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -243,6 +245,51 @@ std::uint32_t build_expected_scale_word(
     packed_word |= static_cast<std::uint32_t>(raw) << (elem * 8);
   }
   return packed_word;
+}
+
+std::uint8_t load_expected_scale_byte(
+    const std::vector<std::uint8_t>& block_scales,
+    int logical_cols,
+    int row,
+    int col) {
+  if (row < 0 || col < 0) {
+    return 0u;
+  }
+  const std::size_t row_u = static_cast<std::size_t>(row);
+  if (row_u >= block_scales.size() / kBlocksPerRow) {
+    return 0u;
+  }
+  const int segment_len = logical_cols > 0 ? std::max(1, logical_cols / 4) : 1;
+  const int byte_index = std::min(col / segment_len, 3);
+  return block_scales[row_u * kBlocksPerRow +
+                      static_cast<std::size_t>(byte_index)];
+}
+
+bool compare_sfa_smem_dump(
+    const P1FragmentDebugTrace& trace,
+    const std::vector<std::uint8_t>& block_scales,
+    bool print) {
+  for (int physical = 0;
+       physical < nemotron::kP1FragmentDebugScaleSmemDumpByteCount;
+       ++physical) {
+    const int row = trace.sfa_smem_row_coord[physical];
+    const int col = trace.sfa_smem_col_coord[physical];
+    const std::uint8_t expected =
+        load_expected_scale_byte(block_scales, trace.sfa_logical_cols, row, col);
+    const std::uint8_t actual = trace.sfa_smem_dump[physical];
+    if (expected == actual) {
+      continue;
+    }
+    if (print) {
+      std::cerr << "FAIL: sfa_smem_dump mismatch physical=" << physical
+                << " logical=(" << row << "," << col << ") actual=0x"
+                << std::hex << static_cast<unsigned int>(actual)
+                << " expected=0x" << static_cast<unsigned int>(expected)
+                << std::dec << "\n";
+    }
+    return false;
+  }
+  return true;
 }
 
 bool compare_scale_bucket(
@@ -475,9 +522,13 @@ int main() {
       kK);
   const auto reference = compute_host_reference_token_major(weight_dq, input_dq);
 
+  const bool sfa_smem_equal = compare_sfa_smem_dump(
+      trace,
+      input_pack->block_scales,
+      false);
   const bool sfa_equal = compare_scale_bucket(
       "tCrSFA",
-      weight_pack->block_scales,
+      input_pack->block_scales,
       trace.sfa_logical_cols,
       &trace.tCrSFA[0],
       trace.sfa_row_coord,
@@ -485,7 +536,7 @@ int main() {
       false);
   const bool sfb_equal = compare_scale_bucket(
       "tCrSFB",
-      input_pack->block_scales,
+      weight_pack->block_scales,
       trace.sfb_logical_cols,
       &trace.tCrSFB[0],
       trace.sfb_row_coord,
@@ -493,7 +544,7 @@ int main() {
       false);
   const bool a_pre_equal = compare_fragment_bucket(
       "tCrA_pre_shift",
-      weight_pack->packed,
+      input_pack->packed,
       kK,
       &trace.tCrA_pre_shift[0][0],
       &trace.a_row_coord[0][0],
@@ -504,7 +555,7 @@ int main() {
       false);
   const bool a_post_equal = compare_fragment_bucket(
       "tCrA_post_shift",
-      weight_pack->packed,
+      input_pack->packed,
       kK,
       &trace.tCrA_post_shift[0][0],
       &trace.a_row_coord[0][0],
@@ -515,7 +566,7 @@ int main() {
       false);
   const bool b_pre_equal = compare_fragment_bucket(
       "tCrB_pre_shift",
-      input_pack->packed,
+      weight_pack->packed,
       kK,
       &trace.tCrB_pre_shift[0][0],
       &trace.b_row_coord[0][0],
@@ -526,7 +577,7 @@ int main() {
       false);
   const bool b_post_equal = compare_fragment_bucket(
       "tCrB_post_shift",
-      input_pack->packed,
+      weight_pack->packed,
       kK,
       &trace.tCrB_post_shift[0][0],
       &trace.b_row_coord[0][0],
@@ -538,11 +589,14 @@ int main() {
   const bool c_equal = compare_c_atom_bucket(trace, reference, false);
 
   std::string first_bucket;
-  if (!sfa_equal) {
+  if (!sfa_smem_equal) {
+    first_bucket = "sfa_smem_dump";
+    compare_sfa_smem_dump(trace, input_pack->block_scales, true);
+  } else if (!sfa_equal) {
     first_bucket = "tCrSFA";
     compare_scale_bucket(
         "tCrSFA",
-        weight_pack->block_scales,
+        input_pack->block_scales,
         trace.sfa_logical_cols,
         &trace.tCrSFA[0],
         trace.sfa_row_coord,
@@ -552,7 +606,7 @@ int main() {
     first_bucket = "tCrSFB";
     compare_scale_bucket(
         "tCrSFB",
-        input_pack->block_scales,
+        weight_pack->block_scales,
         trace.sfb_logical_cols,
         &trace.tCrSFB[0],
         trace.sfb_row_coord,
@@ -562,7 +616,7 @@ int main() {
     first_bucket = "tCrA_pre_shift";
     compare_fragment_bucket(
         "tCrA_pre_shift",
-        weight_pack->packed,
+        input_pack->packed,
         kK,
         &trace.tCrA_pre_shift[0][0],
         &trace.a_row_coord[0][0],
@@ -575,7 +629,7 @@ int main() {
     first_bucket = "tCrA_post_shift";
     compare_fragment_bucket(
         "tCrA_post_shift",
-        weight_pack->packed,
+        input_pack->packed,
         kK,
         &trace.tCrA_post_shift[0][0],
         &trace.a_row_coord[0][0],
@@ -588,7 +642,7 @@ int main() {
     first_bucket = "tCrB_pre_shift";
     compare_fragment_bucket(
         "tCrB_pre_shift",
-        input_pack->packed,
+        weight_pack->packed,
         kK,
         &trace.tCrB_pre_shift[0][0],
         &trace.b_row_coord[0][0],
@@ -601,7 +655,7 @@ int main() {
     first_bucket = "tCrB_post_shift";
     compare_fragment_bucket(
         "tCrB_post_shift",
-        input_pack->packed,
+        weight_pack->packed,
         kK,
         &trace.tCrB_post_shift[0][0],
         &trace.b_row_coord[0][0],
@@ -615,14 +669,32 @@ int main() {
     compare_c_atom_bucket(trace, reference, true);
   }
 
+  const bool sfa_fragment_cosize_match =
+      trace.observed_sfa_fragment_cosize == kExpectedSfaFragmentCosize;
+  const bool sfb_fragment_cosize_match =
+      trace.observed_sfb_fragment_cosize == kExpectedSfbFragmentCosize;
+  std::cout << "p1_fragment_debug_oracle_test: sfa_fragment_cosize="
+            << trace.observed_sfa_fragment_cosize << "/"
+            << kExpectedSfaFragmentCosize
+            << " sfb_fragment_cosize=" << trace.observed_sfb_fragment_cosize
+            << "/" << kExpectedSfbFragmentCosize
+            << " scale_fragment_cosize_match="
+            << ((sfa_fragment_cosize_match && sfb_fragment_cosize_match) ? "true"
+                                                                         : "false")
+            << "\n";
+  std::cout << "p1_fragment_debug_oracle_test: sfa_smem_match="
+            << (sfa_smem_equal ? "true" : "false")
+            << " sfa_scale_match=" << (sfa_equal ? "true" : "false")
+            << " sfb_scale_match=" << (sfb_equal ? "true" : "false")
+            << "\n";
   print_target_coord_owner(trace, reference);
 
   const bool fully_equal =
-      sfa_equal && sfb_equal && a_pre_equal && a_post_equal && b_pre_equal &&
-      b_post_equal && c_equal;
+      sfa_smem_equal && sfa_equal && sfb_equal && a_pre_equal && a_post_equal &&
+      b_pre_equal && b_post_equal && c_equal;
 
   // This is intentionally a negative sentinel today: it localizes the first
-  // fragment-level mismatch in the natural traced P1 path. If the traced P1
+  // fragment-level mismatch in the bespoke traced P1 fragment path. If the traced P1
   // contract is repaired later, flip this to require exact equality instead.
   if (!expect_divergence(
           fully_equal,

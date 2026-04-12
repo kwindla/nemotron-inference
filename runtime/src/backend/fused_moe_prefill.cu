@@ -1571,6 +1571,8 @@ CUTE_HOST_DEVICE void FillTracedP1FragmentDebugCoordMaps(
   auto smem_thr_copy_b = smem_tiled_copy_b.get_thread_slice(thread_idx);
   auto smem_thr_copy_sfa = smem_tiled_copy_sfa.get_thread_slice(thread_idx);
   auto smem_thr_copy_sfb = smem_tiled_copy_sfb.get_thread_slice(thread_idx);
+  auto copy_view_sfa = smem_thr_copy_sfa.retile_D(part_sfa);
+  auto copy_view_sfb = smem_thr_copy_sfb.retile_D(part_sfb);
 
   FillPhysicalCoordMapCopyViewLimited(
       smem_thr_copy_a.retile_D(part_a),
@@ -1583,12 +1585,12 @@ CUTE_HOST_DEVICE void FillTracedP1FragmentDebugCoordMaps(
       b_rows,
       b_cols);
   FillPhysicalCoordMapCopyViewLimited(
-      smem_thr_copy_sfa.retile_D(part_sfa),
+      copy_view_sfa,
       kTracedP1ScaleFragmentCosizeA,
       sfa_rows,
       sfa_cols);
   FillPhysicalCoordMapCopyViewLimited(
-      smem_thr_copy_sfb.retile_D(part_sfb),
+      copy_view_sfb,
       kTracedP1ScaleFragmentCosizeB,
       sfb_rows,
       sfb_cols);
@@ -14088,6 +14090,9 @@ __global__ void P1FragmentDebugOracleKernel(
   constexpr int kPackedBytesPerRow = kK / 2;
   constexpr int kDebugLanes = kP1FragmentDebugLaneCount;
   constexpr int kNBase = 0;
+  static_assert(
+      nvfp4_bridge::kTracedP1ScaleSmemCosizeA == kP1FragmentDebugScaleSmemDumpByteCount,
+      "P1 fragment debug trace must dump the full traced P1 SFA backing store");
 
   __shared__ std::uint8_t a_packed[kRows][kPackedBytesPerRow];
   __shared__ std::uint8_t a_scale_smem[nvfp4_bridge::kTracedP1ScaleSmemCosizeA];
@@ -14115,6 +14120,29 @@ __global__ void P1FragmentDebugOracleKernel(
         cute::size<1>(nvfp4_bridge::TracedP1SmemLayoutSFA{});
     g_p1_fragment_debug_trace.sfb_logical_cols =
         cute::size<1>(nvfp4_bridge::TracedP1SmemLayoutSFB{});
+
+    auto mma = nvfp4_bridge::TracedP1TiledMma{};
+    auto thr_mma = mma.get_thread_slice(tid);
+    auto ref_sfa = cute::make_identity_tensor(
+        cute::make_shape(
+            cute::size<0>(typename nvfp4_bridge::TracedP1TiledMma::AtomShape_MNK{}),
+            cute::Int<4>{}));
+    auto ref_sfb = cute::make_identity_tensor(
+        cute::make_shape(
+            cute::size<1>(typename nvfp4_bridge::TracedP1TiledMma::AtomShape_MNK{}),
+            cute::Int<4>{}));
+    auto part_sfa = nvfp4_bridge::PartitionScaleA(ref_sfa, thr_mma);
+    auto part_sfb = nvfp4_bridge::PartitionScaleB(ref_sfb, thr_mma);
+    auto smem_tiled_copy_sfa = nvfp4_bridge::MakeTracedP1TiledCopySFA(mma);
+    auto smem_tiled_copy_sfb = nvfp4_bridge::MakeTracedP1TiledCopySFB(mma);
+    auto smem_thr_copy_sfa = smem_tiled_copy_sfa.get_thread_slice(tid);
+    auto smem_thr_copy_sfb = smem_tiled_copy_sfb.get_thread_slice(tid);
+    auto copy_view_sfa = smem_thr_copy_sfa.retile_D(part_sfa);
+    auto copy_view_sfb = smem_thr_copy_sfb.retile_D(part_sfb);
+    g_p1_fragment_debug_trace.observed_sfa_fragment_cosize =
+        cute::cosize_v<decltype(copy_view_sfa.layout())>;
+    g_p1_fragment_debug_trace.observed_sfb_fragment_cosize =
+        cute::cosize_v<decltype(copy_view_sfb.layout())>;
   }
 
   for (int row = tid; row < kRows; row += blockDim.x) {
@@ -14167,6 +14195,34 @@ __global__ void P1FragmentDebugOracleKernel(
     nvfp4_bridge::StoreTracedScaleBytes(b_scale_tensor, scale_bytes, row);
   }
   __syncthreads();
+
+  if (tid == 0) {
+    const auto sfa_layout = nvfp4_bridge::TracedP1SmemLayoutSFA{};
+    const int sfa_logical_rows =
+        static_cast<int>(cute::size<0>(sfa_layout));
+    const int sfa_logical_cols =
+        static_cast<int>(cute::size<1>(sfa_layout));
+    for (int physical = 0; physical < kP1FragmentDebugScaleSmemDumpByteCount;
+         ++physical) {
+      g_p1_fragment_debug_trace.sfa_smem_dump[physical] = a_scale_smem[physical];
+      g_p1_fragment_debug_trace.sfa_smem_row_coord[physical] = -1;
+      g_p1_fragment_debug_trace.sfa_smem_col_coord[physical] = -1;
+    }
+    for (int row = 0; row < sfa_logical_rows; ++row) {
+      for (int col = 0; col < sfa_logical_cols; ++col) {
+        const int physical =
+            static_cast<int>(sfa_layout(row, col, cute::Int<0>{}));
+        if (physical < 0 ||
+            physical >= kP1FragmentDebugScaleSmemDumpByteCount) {
+          continue;
+        }
+        g_p1_fragment_debug_trace.sfa_smem_row_coord[physical] =
+            static_cast<std::int16_t>(row);
+        g_p1_fragment_debug_trace.sfa_smem_col_coord[physical] =
+            static_cast<std::int16_t>(col);
+      }
+    }
+  }
 
   int a_rows[kP1FragmentDebugACoordCount];
   int a_cols[kP1FragmentDebugACoordCount];
