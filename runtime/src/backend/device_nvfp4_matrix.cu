@@ -670,6 +670,12 @@ struct DeviceNvfp4Matrix::Impl {
   const DeviceMoeLaunchPlan* cached_p5_tma_sfb_launch_plan = nullptr;
   std::size_t cached_p5_tma_sfb_build_epoch = 0;
   void* cached_p5_tma_sfb_descriptors = nullptr;
+  const DeviceMoeLaunchPlan* cached_p5_tma_a_launch_plan = nullptr;
+  std::size_t cached_p5_tma_a_build_epoch = 0;
+  void* cached_p5_tma_a_descriptors = nullptr;
+  const DeviceMoeLaunchPlan* cached_p5_tma_sfa_launch_plan = nullptr;
+  std::size_t cached_p5_tma_sfa_build_epoch = 0;
+  void* cached_p5_tma_sfa_descriptors = nullptr;
   std::unordered_map<std::string, SharedDescriptorCacheEntry> shared_p5_tma_b_descriptors;
   std::unordered_map<std::string, SharedDescriptorCacheEntry> shared_p5_tma_sfb_descriptors;
 };
@@ -738,6 +744,12 @@ DeviceNvfp4Matrix::~DeviceNvfp4Matrix() {
   }
   if (impl_->cached_p5_tma_sfb_descriptors != nullptr) {
     cudaFree(impl_->cached_p5_tma_sfb_descriptors);
+  }
+  if (impl_->cached_p5_tma_a_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_a_descriptors);
+  }
+  if (impl_->cached_p5_tma_sfa_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_sfa_descriptors);
   }
   for (auto& entry : impl_->shared_p5_tma_b_descriptors) {
     if (entry.second.device_descriptors != nullptr) {
@@ -989,6 +1001,166 @@ const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
   impl_->cached_p5_tma_sfb_build_epoch = launch_plan.build_epoch();
   impl_->cached_p5_tma_sfb_descriptors = device_descriptors;
   return impl_->cached_p5_tma_sfb_descriptors;
+#else
+  (void) launch_plan;
+  return nullptr;
+#endif
+}
+
+const void* DeviceNvfp4Matrix::p5_tma_load_a_descriptors(
+    const DeviceMoeLaunchPlan& launch_plan) const {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (!valid() ||
+      cols() == 0 ||
+      (cols() % 128u) != 0 ||
+      launch_plan.exact_cta_count_host() <= 0 ||
+      launch_plan.cta_row_starts_host() == nullptr ||
+      launch_plan.cta_valid_rows_host() == nullptr) {
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_a_launch_plan == &launch_plan &&
+      impl_->cached_p5_tma_a_build_epoch == launch_plan.build_epoch() &&
+      impl_->cached_p5_tma_a_descriptors != nullptr) {
+    return impl_->cached_p5_tma_a_descriptors;
+  }
+
+  std::vector<routed_p5_tma::P5TmaLoadA> host_descriptors;
+  host_descriptors.reserve(static_cast<std::size_t>(launch_plan.exact_cta_count_host()));
+  const std::size_t packed_row_bytes = cols() / 2u;
+  const int32_t input_cols = static_cast<int32_t>(cols());
+  const int64_t input_cols_stride = static_cast<int64_t>(cols());
+  for (int cta_index = 0; cta_index < launch_plan.exact_cta_count_host(); ++cta_index) {
+    const int row_start = launch_plan.cta_row_starts_host()[cta_index];
+    const int valid_rows = launch_plan.cta_valid_rows_host()[cta_index];
+    if (row_start < 0 ||
+        valid_rows <= 0 ||
+        static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > rows()) {
+      return nullptr;
+    }
+
+    const auto* cta_packed =
+        packed_data() + static_cast<std::size_t>(row_start) * packed_row_bytes;
+    auto tensor_a = cute::make_tensor(
+        cute::make_gmem_ptr(cute::recast_ptr<routed_p5_tma::ElementAB>(cta_packed)),
+        cute::make_layout(
+            cute::make_shape(static_cast<int32_t>(valid_rows), input_cols, int32_t{1}),
+            cute::make_stride(
+                input_cols_stride,
+                cute::Int<1>{},
+                static_cast<int64_t>(valid_rows) * input_cols_stride)));
+    host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadA(tensor_a));
+  }
+
+  void* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes =
+      sizeof(routed_p5_tma::P5TmaLoadA) * host_descriptors.size();
+  if (descriptor_bytes == 0 ||
+      !CheckCuda(cudaMalloc(&device_descriptors, descriptor_bytes)) ||
+      !CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    if (device_descriptors != nullptr) {
+      cudaFree(device_descriptors);
+    }
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_a_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_a_descriptors);
+  }
+  impl_->cached_p5_tma_a_launch_plan = &launch_plan;
+  impl_->cached_p5_tma_a_build_epoch = launch_plan.build_epoch();
+  impl_->cached_p5_tma_a_descriptors = device_descriptors;
+  return impl_->cached_p5_tma_a_descriptors;
+#else
+  (void) launch_plan;
+  return nullptr;
+#endif
+}
+
+const void* DeviceNvfp4Matrix::p5_tma_load_sfa_descriptors(
+    const DeviceMoeLaunchPlan& launch_plan) const {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (!valid() ||
+      scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4 ||
+      cols() == 0 ||
+      (cols() % 128u) != 0 ||
+      launch_plan.exact_cta_count_host() <= 0 ||
+      launch_plan.cta_row_starts_host() == nullptr ||
+      launch_plan.cta_valid_rows_host() == nullptr) {
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_sfa_launch_plan == &launch_plan &&
+      impl_->cached_p5_tma_sfa_build_epoch == launch_plan.build_epoch() &&
+      impl_->cached_p5_tma_sfa_descriptors != nullptr) {
+    return impl_->cached_p5_tma_sfa_descriptors;
+  }
+
+  const std::size_t blocks_per_row = cols() / kBlockWidth;
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kScaleBlockTile);
+  const std::size_t padded_scale_rows = RoundUp(rows(), static_cast<std::size_t>(kP5ScaleTmaRowTile));
+  std::vector<routed_p5_tma::P5TmaLoadSFA> host_descriptors;
+  host_descriptors.reserve(static_cast<std::size_t>(launch_plan.exact_cta_count_host()));
+  for (int cta_index = 0; cta_index < launch_plan.exact_cta_count_host(); ++cta_index) {
+    const int row_start = launch_plan.cta_row_starts_host()[cta_index];
+    const int valid_rows = launch_plan.cta_valid_rows_host()[cta_index];
+    const int aligned_row_base =
+        row_start >= 0 ? (row_start / static_cast<int>(kP5ScaleTmaRowTile)) * static_cast<int>(kP5ScaleTmaRowTile)
+                       : row_start;
+    const int row_offset_in_tile = row_start - aligned_row_base;
+    if (row_start < 0 ||
+        valid_rows <= 0 ||
+        row_offset_in_tile < 0 ||
+        row_offset_in_tile + valid_rows > static_cast<int>(kP5ScaleTmaRowTile) ||
+        static_cast<std::size_t>(aligned_row_base) + static_cast<std::size_t>(kP5ScaleTmaRowTile) >
+            padded_scale_rows ||
+        static_cast<std::size_t>(row_start) + static_cast<std::size_t>(valid_rows) > rows()) {
+      return nullptr;
+    }
+
+    const std::size_t scale_offset =
+        ExecutionScaleOffset(
+            static_cast<std::size_t>(aligned_row_base),
+            0u,
+            padded_blocks_per_row,
+            scale_layout());
+    const auto* cta_scales = reinterpret_cast<const routed_p5_tma::ElementSF*>(
+        matmul_block_scales_data() + scale_offset);
+    auto tensor_sfa = cute::make_tensor(
+        cute::make_gmem_ptr(cta_scales),
+        routed_p5_tma::MakeP5ScaleLayoutSFA(
+            static_cast<int32_t>(kP5ScaleTmaRowTile),
+            static_cast<int32_t>(cols())));
+    host_descriptors.push_back(routed_p5_tma::MakeP5TmaLoadSFA(tensor_sfa));
+  }
+
+  void* device_descriptors = nullptr;
+  const std::size_t descriptor_bytes =
+      sizeof(routed_p5_tma::P5TmaLoadSFA) * host_descriptors.size();
+  if (descriptor_bytes == 0 ||
+      !CheckCuda(cudaMalloc(&device_descriptors, descriptor_bytes)) ||
+      !CheckCuda(cudaMemcpy(
+          device_descriptors,
+          host_descriptors.data(),
+          descriptor_bytes,
+          cudaMemcpyHostToDevice))) {
+    if (device_descriptors != nullptr) {
+      cudaFree(device_descriptors);
+    }
+    return nullptr;
+  }
+
+  if (impl_->cached_p5_tma_sfa_descriptors != nullptr) {
+    cudaFree(impl_->cached_p5_tma_sfa_descriptors);
+  }
+  impl_->cached_p5_tma_sfa_launch_plan = &launch_plan;
+  impl_->cached_p5_tma_sfa_build_epoch = launch_plan.build_epoch();
+  impl_->cached_p5_tma_sfa_descriptors = device_descriptors;
+  return impl_->cached_p5_tma_sfa_descriptors;
 #else
   (void) launch_plan;
   return nullptr;

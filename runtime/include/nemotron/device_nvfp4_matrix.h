@@ -45,6 +45,11 @@ class DeviceNvfp4Matrix {
   const std::uint8_t* tensor_scale_data() const;
   const void* p5_tma_load_b_descriptors(const DeviceMoeLaunchPlan& launch_plan) const;
   const void* p5_tma_load_sfb_descriptors(const DeviceMoeLaunchPlan& launch_plan) const;
+  // Per-CTA TMA descriptors that load this matrix as the A operand of an
+  // FP4 GEMM (M-dim = valid_rows). Used by the swap=false unified kernel
+  // where the input matrix is A and the weight is B.
+  const void* p5_tma_load_a_descriptors(const DeviceMoeLaunchPlan& launch_plan) const;
+  const void* p5_tma_load_sfa_descriptors(const DeviceMoeLaunchPlan& launch_plan) const;
   const void* shared_p5_tma_load_b_descriptors(const GemmLaunchPlan& launch_plan) const;
   const void* shared_p5_tma_load_sfb_descriptors(const GemmLaunchPlan& launch_plan) const;
   Nvfp4ScaleLayout scale_layout() const;
