@@ -226,6 +226,183 @@ std::uint32_t pack_expected_fragment_word(
   return packed_word;
 }
 
+std::uint32_t pack_scale_word_from_row(
+    const std::vector<std::uint8_t>& block_scales,
+    int row) {
+  if (row < 0) {
+    return 0u;
+  }
+  const std::size_t row_u = static_cast<std::size_t>(row);
+  if (row_u >= block_scales.size() / kBlocksPerRow) {
+    return 0u;
+  }
+  const std::size_t base = row_u * kBlocksPerRow;
+  return static_cast<std::uint32_t>(block_scales[base + 0]) |
+         (static_cast<std::uint32_t>(block_scales[base + 1]) << 8u) |
+         (static_cast<std::uint32_t>(block_scales[base + 2]) << 16u) |
+         (static_cast<std::uint32_t>(block_scales[base + 3]) << 24u);
+}
+
+std::uint32_t build_manual_a_word(
+    const std::vector<std::uint8_t>& packed,
+    int lane,
+    int reg) {
+  const int col_base = lane >> 2;
+  const int row_pair_base = (lane & 3) * 2;
+  const int row0 = row_pair_base;
+  const int row1 = row_pair_base + 1;
+  const int row8 = row_pair_base + 8;
+  const int row9 = row_pair_base + 9;
+  switch (reg) {
+    case 0:
+      return pack_expected_fragment_word(
+          packed,
+          kK,
+          std::array<int, 8>{row0, row0, row0, row0, row1, row1, row1, row1}.data(),
+          std::array<int, 8>{
+              col_base + 0,
+              col_base + 16,
+              col_base + 32,
+              col_base + 48,
+              col_base + 0,
+              col_base + 16,
+              col_base + 32,
+              col_base + 48}
+              .data(),
+          0);
+    case 1:
+      return pack_expected_fragment_word(
+          packed,
+          kK,
+          std::array<int, 8>{row0, row0, row0, row0, row1, row1, row1, row1}.data(),
+          std::array<int, 8>{
+              col_base + 8,
+              col_base + 24,
+              col_base + 40,
+              col_base + 56,
+              col_base + 8,
+              col_base + 24,
+              col_base + 40,
+              col_base + 56}
+              .data(),
+          0);
+    case 2:
+      return pack_expected_fragment_word(
+          packed,
+          kK,
+          std::array<int, 8>{row8, row8, row8, row8, row9, row9, row9, row9}.data(),
+          std::array<int, 8>{
+              col_base + 0,
+              col_base + 16,
+              col_base + 32,
+              col_base + 48,
+              col_base + 0,
+              col_base + 16,
+              col_base + 32,
+              col_base + 48}
+              .data(),
+          0);
+    default:
+      return pack_expected_fragment_word(
+          packed,
+          kK,
+          std::array<int, 8>{row8, row8, row8, row8, row9, row9, row9, row9}.data(),
+          std::array<int, 8>{
+              col_base + 8,
+              col_base + 24,
+              col_base + 40,
+              col_base + 56,
+              col_base + 8,
+              col_base + 24,
+              col_base + 40,
+              col_base + 56}
+              .data(),
+          0);
+  }
+}
+
+std::uint32_t build_manual_b_word(
+    const std::vector<std::uint8_t>& packed,
+    int lane,
+    int reg) {
+  const int row_group = lane & 3;
+  const int k_base = lane >> 2;
+  const int row0 = row_group;
+  const int row4 = row_group + 4;
+  const int row = reg == 0 ? row0 : row4;
+  return pack_expected_fragment_word(
+      packed,
+      kK,
+      std::array<int, 8>{row, row, row, row, row, row, row, row}.data(),
+      std::array<int, 8>{
+          k_base + 0,
+          k_base + 8,
+          k_base + 16,
+          k_base + 24,
+          k_base + 32,
+          k_base + 40,
+          k_base + 48,
+          k_base + 56}
+          .data(),
+      0);
+}
+
+bool compare_manual_atom_contract(
+    const P1FragmentDebugTrace& trace,
+    const std::vector<std::uint8_t>& a_packed,
+    const std::vector<std::uint8_t>& a_scales,
+    const std::vector<std::uint8_t>& b_packed,
+    const std::vector<std::uint8_t>& b_scales,
+    bool print) {
+  for (int lane = 0; lane < nemotron::kP1FragmentDebugLaneCount; ++lane) {
+    for (int reg = 0; reg < 4; ++reg) {
+      const std::uint32_t expected = build_manual_a_word(a_packed, lane, reg);
+      const std::uint32_t actual = trace.tCrA_pre_shift[lane][reg];
+      if (expected != actual) {
+        if (print) {
+          std::cerr << "FAIL: manual_atom_contract A mismatch lane=" << lane
+                    << " reg=" << reg << " actual=0x" << std::hex << actual
+                    << " expected=0x" << expected << std::dec << "\n";
+        }
+        return false;
+      }
+    }
+    for (int reg = 0; reg < 2; ++reg) {
+      const std::uint32_t expected = build_manual_b_word(b_packed, lane, reg);
+      const std::uint32_t actual = trace.tCrB_pre_shift[lane][reg];
+      if (expected != actual) {
+        if (print) {
+          std::cerr << "FAIL: manual_atom_contract B mismatch lane=" << lane
+                    << " reg=" << reg << " actual=0x" << std::hex << actual
+                    << " expected=0x" << expected << std::dec << "\n";
+        }
+        return false;
+      }
+    }
+    const std::uint32_t expected_sfa =
+        pack_scale_word_from_row(a_scales, (lane >> 2) + ((lane & 1) ? 8 : 0));
+    if (expected_sfa != trace.tCrSFA[lane]) {
+      if (print) {
+        std::cerr << "FAIL: manual_atom_contract SFA mismatch lane=" << lane
+                  << " actual=0x" << std::hex << trace.tCrSFA[lane]
+                  << " expected=0x" << expected_sfa << std::dec << "\n";
+      }
+      return false;
+    }
+    const std::uint32_t expected_sfb =
+        pack_scale_word_from_row(b_scales, lane >> 2);
+    if (expected_sfb != trace.tCrSFB[lane]) {
+      if (print) {
+        std::cerr << "FAIL: manual_atom_contract SFB mismatch lane=" << lane
+                  << " actual=0x" << std::hex << trace.tCrSFB[lane]
+                  << " expected=0x" << expected_sfb << std::dec << "\n";
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 std::uint32_t build_expected_scale_word(
     const std::vector<std::uint8_t>& block_scales,
     int logical_cols,
@@ -402,6 +579,43 @@ bool compare_c_atom_bucket(
   return true;
 }
 
+bool compare_c_atom_manual_store_bucket(
+    const P1FragmentDebugTrace& trace,
+    const std::vector<float>& reference,
+    bool print) {
+  for (int lane = 0; lane < nemotron::kP1FragmentDebugLaneCount; ++lane) {
+    const int output_row = lane & 7;
+    const int row_group = (lane >> 3) * 4;
+    const int token_rows[4] = {
+        row_group + 0,
+        row_group + 2,
+        row_group + 1,
+        row_group + 3,
+    };
+    for (int reg = 0; reg < nemotron::kP1FragmentDebugCAtomCount; ++reg) {
+      const int token_row = token_rows[reg];
+      const float expected_value =
+          reference[static_cast<std::size_t>(token_row) * kOutputRows +
+                    static_cast<std::size_t>(output_row)];
+      const float actual_value = trace.c_atom_post_mma[lane][reg];
+      if (float_bits(actual_value) == float_bits(expected_value)) {
+        continue;
+      }
+      if (print) {
+        std::cerr << "FAIL: c_atom_manual_store mismatch lane=" << lane
+                  << " reg=" << reg << " coord=(" << token_row << ","
+                  << output_row << ") actual=" << actual_value
+                  << " expected=" << expected_value
+                  << " actual_bits=0x" << std::hex << float_bits(actual_value)
+                  << " expected_bits=0x" << float_bits(expected_value)
+                  << std::dec << "\n";
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 void print_target_coord_owner(
     const P1FragmentDebugTrace& trace,
     const std::vector<float>& reference) {
@@ -425,6 +639,39 @@ void print_target_coord_owner(
     }
   }
   std::cerr << "target_coord_owner: (" << kTargetTokenRow << ","
+            << kTargetOutputRow << ") not found in first c atom\n";
+}
+
+void print_manual_target_coord_owner(
+    const P1FragmentDebugTrace& trace,
+    const std::vector<float>& reference) {
+  for (int lane = 0; lane < nemotron::kP1FragmentDebugLaneCount; ++lane) {
+    const int output_row = lane & 7;
+    const int row_group = (lane >> 3) * 4;
+    const int token_rows[4] = {
+        row_group + 0,
+        row_group + 2,
+        row_group + 1,
+        row_group + 3,
+    };
+    for (int reg = 0; reg < nemotron::kP1FragmentDebugCAtomCount; ++reg) {
+      if (token_rows[reg] != kTargetTokenRow || output_row != kTargetOutputRow) {
+        continue;
+      }
+      const float expected =
+          reference[static_cast<std::size_t>(kTargetTokenRow) * kOutputRows +
+                    static_cast<std::size_t>(kTargetOutputRow)];
+      const float actual = trace.c_atom_post_mma[lane][reg];
+      std::cerr << "target_coord_owner_manual: (" << kTargetTokenRow << ","
+                << kTargetOutputRow << ") lane=" << lane << " reg=" << reg
+                << " actual=" << actual << " expected=" << expected
+                << " actual_bits=0x" << std::hex << float_bits(actual)
+                << " expected_bits=0x" << float_bits(expected)
+                << std::dec << "\n";
+      return;
+    }
+  }
+  std::cerr << "target_coord_owner_manual: (" << kTargetTokenRow << ","
             << kTargetOutputRow << ") not found in first c atom\n";
 }
 
@@ -586,7 +833,16 @@ int main() {
       2,
       true,
       false);
-  const bool c_equal = compare_c_atom_bucket(trace, reference, false);
+  const bool manual_atom_contract_equal = compare_manual_atom_contract(
+      trace,
+      input_pack->packed,
+      input_pack->block_scales,
+      weight_pack->packed,
+      weight_pack->block_scales,
+      false);
+  const bool c_partition_equal = compare_c_atom_bucket(trace, reference, false);
+  const bool c_manual_equal =
+      compare_c_atom_manual_store_bucket(trace, reference, false);
 
   std::string first_bucket;
   if (!sfa_smem_equal) {
@@ -664,9 +920,18 @@ int main() {
         2,
         true,
         true);
-  } else if (!c_equal) {
+  } else if (!c_partition_equal) {
     first_bucket = "c_atom_post_mma";
     compare_c_atom_bucket(trace, reference, true);
+  }
+  if (!manual_atom_contract_equal) {
+    compare_manual_atom_contract(
+        trace,
+        input_pack->packed,
+        input_pack->block_scales,
+        weight_pack->packed,
+        weight_pack->block_scales,
+        true);
   }
 
   const bool sfa_fragment_cosize_match =
@@ -686,12 +951,17 @@ int main() {
             << (sfa_smem_equal ? "true" : "false")
             << " sfa_scale_match=" << (sfa_equal ? "true" : "false")
             << " sfb_scale_match=" << (sfb_equal ? "true" : "false")
+            << " manual_atom_contract_match="
+            << (manual_atom_contract_equal ? "true" : "false")
+            << " c_partition_match=" << (c_partition_equal ? "true" : "false")
+            << " c_manual_store_match=" << (c_manual_equal ? "true" : "false")
             << "\n";
   print_target_coord_owner(trace, reference);
+  print_manual_target_coord_owner(trace, reference);
 
   const bool fully_equal =
       sfa_smem_equal && sfa_equal && sfb_equal && a_pre_equal && a_post_equal &&
-      b_pre_equal && b_post_equal && c_equal;
+      b_pre_equal && b_post_equal && c_partition_equal;
 
   // This is intentionally a negative sentinel today: it localizes the first
   // fragment-level mismatch in the bespoke traced P1 fragment path. If the traced P1

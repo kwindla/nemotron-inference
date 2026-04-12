@@ -14258,6 +14258,47 @@ __global__ void P1FragmentDebugOracleKernel(
     g_p1_fragment_debug_trace.sfb_col_coord[tid][i] = sfb_cols[i];
   }
 
+  for (int reg = 0; reg < 4; ++reg) {
+    const int physical = reg * 8;
+    g_p1_fragment_debug_trace.tCrA_pre_shift[tid][reg] = PackFp4Register8(
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 0]][0], a_cols[physical + 0]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 1]][0], a_cols[physical + 1]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 2]][0], a_cols[physical + 2]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 3]][0], a_cols[physical + 3]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 4]][0], a_cols[physical + 4]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 5]][0], a_cols[physical + 5]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 6]][0], a_cols[physical + 6]),
+        LoadPackedFp4Nibble(
+            &a_packed[a_rows[physical + 7]][0], a_cols[physical + 7]));
+  }
+  for (int reg = 0; reg < 2; ++reg) {
+    const int physical = reg * 8;
+    g_p1_fragment_debug_trace.tCrB_pre_shift[tid][reg] = PackFp4Register8(
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 0]][0], b_cols[physical + 0]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 1]][0], b_cols[physical + 1]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 2]][0], b_cols[physical + 2]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 3]][0], b_cols[physical + 3]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 4]][0], b_cols[physical + 4]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 5]][0], b_cols[physical + 5]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 6]][0], b_cols[physical + 6]),
+        LoadPackedFp4Nibble(
+            &b_packed[b_rows[physical + 7]][0], b_cols[physical + 7]));
+  }
+
   const auto a_fragment =
       nvfp4_bridge::LoadFragmentA_RowMajor16x64TracedScaleTiledP1<
           nvfp4_bridge::TracedP1TiledMma,
@@ -14267,12 +14308,6 @@ __global__ void P1FragmentDebugOracleKernel(
           nvfp4_bridge::TracedP1TiledMma,
           kOutputTile>(&b_packed[0][0], b_scale_smem, tid, kNBase);
 
-  for (int reg = 0; reg < 4; ++reg) {
-    g_p1_fragment_debug_trace.tCrA_pre_shift[tid][reg] = a_fragment.regs[reg] >> 2u;
-  }
-  for (int reg = 0; reg < 2; ++reg) {
-    g_p1_fragment_debug_trace.tCrB_pre_shift[tid][reg] = b_fragment.regs[reg] >> 2u;
-  }
   g_p1_fragment_debug_trace.tCrSFA[tid] =
       static_cast<std::uint32_t>(a_fragment.scale[0]);
   g_p1_fragment_debug_trace.tCrSFB[tid] =
