@@ -366,7 +366,7 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/p1_*.cpp` (deleted), `testing/backend/p13_generic_direct_stage_oracle_test.cpp` (deleted), `testing/CMakeLists.txt`.
 
-- [ ] **4. Implement the new kP1 kernel from scratch, modeled on TRT-LLM through the BF16 boundary (3 sub-commits 4a-4c)**
+- [~] **4. Implement the new kP1 kernel from scratch, modeled on TRT-LLM through the BF16 boundary (3 sub-commits 4a-4c)**
   Write a fresh kernel path in `runtime/src/backend/fused_moe_prefill.cu` that matches TRT-LLM's architecture as documented in step 1 **through the BF16 GEMM boundary**, then layer the Nemotron-specific fused direct-pack epilogue on top.
 
   **New names** (no accidental reuse of deleted types):
@@ -471,9 +471,9 @@ Expected: `ALL CHECKS PASSED`.
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | done | `0afcb2e` | Architecture doc |
-| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | (this commit) | Per-tactic BF16 dumps + inputs.pt in `golden/`; tactic1 == plan-v6 P1 |
+| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | `1360eaf` | Per-tactic BF16 dumps + inputs.pt in `golden/`; tactic1 == plan-v6 P1 |
 | 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
-| 4 | Implement new kP1 kernel from scratch (3 sub-commits 4a-4c) | pending | — | New `NanoP1*` names |
+| 4 | Implement new kP1 kernel from scratch (3 sub-commits 4a-4c) | in-progress | 4a → (this commit) | 4a: `NanoP1*` type bundle + 20 probe values recorded; 4b/4c pending |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
 | 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |

@@ -394,6 +394,64 @@ using TracedP15TensorStorage = typename TracedP15CollectiveMainloop::TensorStora
 //     kernel and must not preserve the older row-packed a_packed/b_packed path
 constexpr int kTracedP15ScaleSmemCosizeA = cute::cosize_v<TracedP15SmemLayoutSFA>;
 constexpr int kTracedP15ScaleSmemCosizeB = cute::cosize_v<TracedP15SmemLayoutSFB>;
+
+using NanoP1Nvfp4MoeGemmArchTag = cutlass::arch::Sm120;
+using NanoP1Nvfp4MoeGemmTensorOp = cutlass::arch::OpClassBlockScaledTensorOp;
+using NanoP1Nvfp4MoeGemmElementAct = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+using NanoP1Nvfp4MoeGemmElementWeight = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+using NanoP1Nvfp4MoeGemmElementAccumulator = float;
+using NanoP1Nvfp4MoeGemmElementD = cutlass::bfloat16_t;
+using NanoP1Nvfp4MoeGemmLayoutA = cutlass::layout::RowMajor;
+using NanoP1Nvfp4MoeGemmLayoutB = cutlass::layout::ColumnMajor;
+static constexpr int NanoP1Nvfp4MoeGemmAlignmentA = 32;
+static constexpr int NanoP1Nvfp4MoeGemmAlignmentB = 32;
+using NanoP1Nvfp4MoeGemmMmaTileShape = cute::Shape<cute::Int<128>, cute::Int<128>, cute::Int<128>>;
+using NanoP1Nvfp4MoeGemmClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+using NanoP1Nvfp4MoeGemmKernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+using NanoP1Nvfp4MoeGemmEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;
+using NanoP1Nvfp4MoeGemmEpilogueSubTile = cutlass::epilogue::collective::EpilogueTileAuto;
+static constexpr int NanoP1Nvfp4MoeGemmAlignmentC = 8;
+static constexpr int NanoP1Nvfp4MoeGemmAlignmentD = 8;
+using NanoP1Nvfp4MoeGemmCollectiveEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        NanoP1Nvfp4MoeGemmArchTag,
+        NanoP1Nvfp4MoeGemmTensorOp,
+        NanoP1Nvfp4MoeGemmMmaTileShape,
+        NanoP1Nvfp4MoeGemmClusterShape,
+        NanoP1Nvfp4MoeGemmEpilogueSubTile,
+        NanoP1Nvfp4MoeGemmElementAccumulator,
+        NanoP1Nvfp4MoeGemmElementAccumulator,
+        NanoP1Nvfp4MoeGemmElementD,
+        cutlass::layout::RowMajor*,
+        NanoP1Nvfp4MoeGemmAlignmentC,
+        NanoP1Nvfp4MoeGemmElementD,
+        cutlass::layout::RowMajor*,
+        NanoP1Nvfp4MoeGemmAlignmentD,
+        NanoP1Nvfp4MoeGemmEpilogueSchedule>::CollectiveOp;
+using NanoP1Nvfp4MoeGemmStageCountAutoCarveout = cutlass::gemm::collective::StageCountAutoCarveout<
+    static_cast<int>(sizeof(typename NanoP1Nvfp4MoeGemmCollectiveEpilogue::SharedStorage))>;
+using NanoP1Nvfp4MoeGemmCollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        NanoP1Nvfp4MoeGemmArchTag,
+        NanoP1Nvfp4MoeGemmTensorOp,
+        NanoP1Nvfp4MoeGemmElementAct,
+        NanoP1Nvfp4MoeGemmLayoutA*,
+        NanoP1Nvfp4MoeGemmAlignmentA,
+        NanoP1Nvfp4MoeGemmElementWeight,
+        NanoP1Nvfp4MoeGemmLayoutB*,
+        NanoP1Nvfp4MoeGemmAlignmentB,
+        NanoP1Nvfp4MoeGemmElementAccumulator,
+        NanoP1Nvfp4MoeGemmMmaTileShape,
+        NanoP1Nvfp4MoeGemmClusterShape,
+        NanoP1Nvfp4MoeGemmStageCountAutoCarveout,
+        NanoP1Nvfp4MoeGemmKernelSchedule>::CollectiveOp;
+using NanoP1Nvfp4MoeGemmTiledMma = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::TiledMma;
+using NanoP1Nvfp4MoeGemmSmemLayoutA = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::SmemLayoutA;
+using NanoP1Nvfp4MoeGemmSmemLayoutB = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::SmemLayoutB;
+using NanoP1Nvfp4MoeGemmSmemLayoutSFA = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::SmemLayoutSFA;
+using NanoP1Nvfp4MoeGemmSmemLayoutSFB = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::SmemLayoutSFB;
+using NanoP1Nvfp4MoeGemmSmemCopyAtomSFA = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::SmemCopyAtomSFA;
+using NanoP1Nvfp4MoeGemmSmemCopyAtomSFB = typename NanoP1Nvfp4MoeGemmCollectiveMainloop::SmemCopyAtomSFB;
 #else
 using ARegister = std::uint32_t;
 using BRegister = std::uint32_t;
