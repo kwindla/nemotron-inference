@@ -1,0 +1,42 @@
+Step 4a probe values for the standalone `NanoP1` manual CUTE bundle
+====================================================================
+
+Source bundle:
+- `runtime/src/backend/fused_moe_prefill.cu`
+
+Probe build log:
+- `/tmp/step4a_probe_build.log`
+
+Recorded `ShowInt<N>` values
+----------------------------
+
+- `nano_p1_probe_atom_threads` -> `32`
+- `nano_p1_probe_smem_layout_a_cosize` -> `65536`
+- `nano_p1_probe_smem_layout_b_cosize` -> `65536`
+- `nano_p1_probe_smem_layout_sfa_cosize` -> `4096`
+- `nano_p1_probe_smem_layout_sfb_cosize` -> `4096`
+- `nano_p1_probe_stages` -> `4`
+- `nano_p1_probe_thread_count` -> `256`
+- `nano_p1_probe_tcra_k0_size0` -> `16`
+- `nano_p1_probe_tcra_k0_size1` -> `8`
+- `nano_p1_probe_tcrb_k0_size0` -> `32`
+- `nano_p1_probe_tcrb_k0_size1` -> `2`
+- `nano_p1_probe_tcrsfa_size0` -> `64`
+- `nano_p1_probe_tcrsfa_size1` -> `2`
+- `nano_p1_probe_tcrsfa_size2` -> `2`
+- `nano_p1_probe_tcrsfb_size0` -> `64`
+- `nano_p1_probe_tcrsfb_size1` -> `8`
+- `nano_p1_probe_tcrsfb_size2` -> `2`
+- `nano_p1_probe_tcrc_profile_size0` -> `4`
+- `nano_p1_probe_tcrc_profile_size1` -> `2`
+- `nano_p1_probe_tcrc_profile_size2` -> `8`
+
+Reconciliation notes
+--------------------
+
+- `NanoP1TiledMma` uses the cooperative SM120 block-scaled geometry: `AtomLayoutMNK = (_4,_2,_1)` and `ValLayoutMNK = Tile<128, ((_8,_2,_2), stride (1,16,8)), 64>`, which yields a `128x128x128` CTA tile over `256` threads with `32` threads per atom.
+- `NanoP1SmemLayoutA/B` use the canonical 4-bit UMMA shared-memory swizzle that actually divides `K=128` in this CUTLASS snapshot: `UMMA::Layout_K_SW64_Atom<uint4_t>`, staged with `tile_to_shape(..., Step<_1,_2,_3>)` for A and `Step<_2,_1,_3>` for B. That produces the expected total cosize `65536` for four `128x128` stages.
+- `NanoP1SmemLayoutSFA/SFB` come from `cutlass::detail::Sm1xxBlockScaledConfig<16>::tile_atom_to_shape_SFA/SFB` on the `128x128x128` CTA tile with `L=4` stages, which yields the expected `4096`-element scale shared-memory surfaces.
+- `tCrA_k0` / `tCrB_k0` were measured from the stage-0 shared-memory slices with the same operand convention the reverted reference used for this P1 geometry: `partition_fragment_B(sA_stage0)` gives the activation-thread fragment `(16,8)`, and `partition_fragment_A(sB_stage0)` gives the weight-thread fragment `(32,2)`.
+- `tCrSFA` / `tCrSFB` were measured with temporary builder-free helpers that mirror the CUTLASS `sm120_blockscaled_mma_tma.hpp` scale-fragment partition logic without instantiating any forbidden runtime `Collective*` surface. Those helpers produced `(64,2,2)` and `(64,8,2)`, matching the reverted reference exactly.
+- `tCrC_profile = (4,2,8)` comes from `cute::partition_fragment_C(NanoP1TiledMma{}, make_shape(_128{}, _128{}))` and matches the TRT-LLM P1 accumulator-profile target.

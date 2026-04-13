@@ -494,7 +494,7 @@ Expected: `ALL CHECKS PASSED`.
 | 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | done | `0afcb2e` | Architecture doc |
 | 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | (this commit) | Per-tactic BF16 dumps + inputs.pt in `golden/`; tactic1 == plan-v6 P1 |
 | 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
-| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | in-progress | reverted `9be1580` → `8ea9241` | Old 4a used CollectiveBuilder → violated Kernel Provenance policy; replanned to hand-written CUTE + PTX; 4a–4d all pending |
+| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | in-progress | reverted `9be1580` → `8ea9241`; new 4a → (this commit) | Hand-written CUTE bundle in place (`NanoP1MmaAtom` via `SM120_16x8x64_TN_VS`, `NanoP1TiledMma(4,2,1)`, `UMMA::Layout_K_SW64_Atom` smem, `Sm1xxBlockScaledConfig` scales). 20/20 probes match reverted reference. No `CollectiveBuilder` in new code. 4b/4c/4d pending. |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
 | 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |

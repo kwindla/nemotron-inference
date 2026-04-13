@@ -394,6 +394,63 @@ using TracedP15TensorStorage = typename TracedP15CollectiveMainloop::TensorStora
 //     kernel and must not preserve the older row-packed a_packed/b_packed path
 constexpr int kTracedP15ScaleSmemCosizeA = cute::cosize_v<TracedP15SmemLayoutSFA>;
 constexpr int kTracedP15ScaleSmemCosizeB = cute::cosize_v<TracedP15SmemLayoutSFB>;
+
+using NanoP1ElementAct = cutlass::nv_float4_t<nvfp4_cute::ElementAB>;
+using NanoP1ElementWeight = cutlass::nv_float4_t<nvfp4_cute::ElementAB>;
+using NanoP1ElementAccum = float;
+constexpr int NanoP1PipelineStages = 4;
+constexpr int NanoP1ThreadsPerCta = 256;
+using NanoP1MmaTileShape = cute::Shape<cute::Int<128>, cute::Int<128>, cute::Int<128>>;
+using NanoP1ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+// The logical kernel contract is nv_float4_t<e2m1>, but the vendored SM120
+// arch atom is specialized on the unpacked e2m1 MMA element type.
+using NanoP1MmaOp = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
+    nvfp4_cute::ElementAB,
+    nvfp4_cute::ElementAB,
+    NanoP1ElementAccum,
+    nvfp4_cute::ElementSFCompute,
+    nvfp4_cute::kScaleVecSize>;
+using NanoP1MmaAtom = cute::MMA_Atom<NanoP1MmaOp>;
+using NanoP1AtomLayoutMNK = cute::Layout<cute::Shape<cute::_4, cute::_2, cute::_1>>;
+using NanoP1ValLayoutMNK =
+    cute::Tile<cute::Int<128>, TracedP5PermTileN, cute::Int<64>>;
+using NanoP1TiledMma =
+    cute::TiledMMA<NanoP1MmaAtom, NanoP1AtomLayoutMNK, NanoP1ValLayoutMNK>;
+using NanoP1SmemLayoutAtomA = cute::UMMA::Layout_K_SW64_Atom<typename NanoP1TiledMma::ValTypeA>;
+using NanoP1SmemLayoutAtomB = cute::UMMA::Layout_K_SW64_Atom<typename NanoP1TiledMma::ValTypeB>;
+using NanoP1SmemLayoutA = decltype(cute::tile_to_shape(
+    NanoP1SmemLayoutAtomA{},
+    cute::make_shape(
+        cute::size<0>(NanoP1MmaTileShape{}) * cute::size<0>(NanoP1ClusterShape{}),
+        cute::size<2>(NanoP1MmaTileShape{}) * cute::size<2>(NanoP1ClusterShape{}),
+        cute::Int<NanoP1PipelineStages>{}),
+    cute::Step<cute::_1, cute::_2, cute::_3>{}));
+using NanoP1SmemLayoutB = decltype(cute::tile_to_shape(
+    NanoP1SmemLayoutAtomB{},
+    cute::make_shape(
+        cute::size<1>(NanoP1MmaTileShape{}) * cute::size<1>(NanoP1ClusterShape{}),
+        cute::size<2>(NanoP1MmaTileShape{}) * cute::size<2>(NanoP1ClusterShape{}),
+        cute::Int<NanoP1PipelineStages>{}),
+    cute::Step<cute::_2, cute::_1, cute::_3>{}));
+using NanoP1ScaleConfig = cutlass::detail::Sm1xxBlockScaledConfig<nvfp4_cute::kScaleVecSize>;
+using NanoP1SmemLayoutSFA = decltype(NanoP1ScaleConfig::tile_atom_to_shape_SFA(
+    cute::make_shape(
+        cute::size<0>(NanoP1MmaTileShape{}) * cute::size<0>(NanoP1ClusterShape{}),
+        cute::size<1>(NanoP1MmaTileShape{}) * cute::size<1>(NanoP1ClusterShape{}),
+        cute::size<2>(NanoP1MmaTileShape{}) * cute::size<2>(NanoP1ClusterShape{}),
+        cute::Int<NanoP1PipelineStages>{})));
+using NanoP1SmemLayoutSFB = decltype(NanoP1ScaleConfig::tile_atom_to_shape_SFB(
+    cute::make_shape(
+        cute::size<0>(NanoP1MmaTileShape{}) * cute::size<0>(NanoP1ClusterShape{}),
+        cute::size<1>(NanoP1MmaTileShape{}) * cute::size<1>(NanoP1ClusterShape{}),
+        cute::size<2>(NanoP1MmaTileShape{}) * cute::size<2>(NanoP1ClusterShape{}),
+        cute::Int<NanoP1PipelineStages>{})));
+static_assert(cute::size(NanoP1TiledMma{}) == NanoP1ThreadsPerCta);
+static_assert(cute::size(typename NanoP1TiledMma::AtomThrID{}) == 32);
+static_assert(cute::cosize_v<NanoP1SmemLayoutA> == 65536);
+static_assert(cute::cosize_v<NanoP1SmemLayoutB> == 65536);
+static_assert(cute::cosize_v<NanoP1SmemLayoutSFA> == 4096);
+static_assert(cute::cosize_v<NanoP1SmemLayoutSFB> == 4096);
 #else
 using ARegister = std::uint32_t;
 using BRegister = std::uint32_t;
