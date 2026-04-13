@@ -595,39 +595,6 @@ CUTE_HOST_DEVICE void FillPhysicalCoordMapCopyViewLimited(
     int* col_coords);
 
 template <>
-struct UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1> {
-  using CollectiveMainloop = TracedP1CollectiveMainloop;
-  using TiledMma = TracedP1TiledMma;
-  using SmemLayoutA = TracedP1SmemLayoutA;
-  using SmemLayoutB = TracedP1SmemLayoutB;
-  using SmemLayoutSFA = TracedP1SmemLayoutSFA;
-  using SmemLayoutSFB = TracedP1SmemLayoutSFB;
-  using SmemCopyAtomA = TracedP1SmemCopyAtomA;
-  using SmemCopyAtomB = TracedP1SmemCopyAtomB;
-  using SmemCopyAtomSFA = TracedP1SmemCopyAtomSFA;
-  using SmemCopyAtomSFB = TracedP1SmemCopyAtomSFB;
-  using SmemAllocA = typename TiledMma::ValTypeA;
-  using SmemAllocB = typename TiledMma::ValTypeB;
-  using AccumLayout = TracedP1AccumProfileLayout;
-  static constexpr int kOutputTile = 128;
-  static constexpr int kTokenRows = cute::tile_size<1>(TiledMma{});
-  static constexpr int kMacroTileK = 64;
-  static constexpr int kScaleSmemCosizeA = kTracedP1ScaleSmemCosizeA;
-  static constexpr int kScaleSmemCosizeB = kTracedP1ScaleSmemCosizeB;
-  static constexpr int kAccumProfileCosize = kTracedP1AccumProfileCosize;
-  static constexpr int kSwizzledAElems = cute::size(cute::take<0, 2>(SmemLayoutA{}));
-  static constexpr int kSwizzledBElems = cute::size(cute::take<0, 2>(SmemLayoutB{}));
-  static constexpr bool kEnableP15ScaleTrace = false;
-  static constexpr const char* kName = "P1";
-  CUTE_HOST_DEVICE static constexpr auto GetLayoutSFATV(auto const& mma) {
-    return GetTracedP1LayoutSFATV(mma);
-  }
-  CUTE_HOST_DEVICE static constexpr auto GetLayoutSFBTV(auto const& mma) {
-    return GetTracedP1LayoutSFBTV(mma);
-  }
-};
-
-template <>
 struct UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP5> {
   using CollectiveMainloop = TracedP5CollectiveMainloop;
   using TiledMma = TracedP5TiledMma;
