@@ -1,4 +1,4 @@
-# Plan: Native FP4 routed FC1 P1 kernel via TRT-LLM reference, from scratch (v5)
+# Plan: Native FP4 routed FC1 P1 kernel via TRT-LLM reference, from scratch (v6)
 
 Project directory: `./proj-2026-04-12-1022`
 
@@ -16,9 +16,9 @@ These numbers reflect the cumulative effect of preceding projects:
 - **proj-2026-04-10-2330**: Per-row FP4 tensor scales for batched MoE prefill
 - **proj-2026-04-11-0400**: Fused in-epilogue FP4 packing for routed FC1
 - **proj-2026-04-11-1554**: Warp-local direct FP4 pack epilogue; removed 23-token routed-MoE clamp; enabled 4096-token MoE prefill window
-- **proj-2026-04-11-2015**: Routed MoE FC1 profile unification (kP5/kP13 covered, kP1 bucket remains on BF16-WMMA fallback)
+- **proj-2026-04-11-2015**: Routed MoE FC1 profile unification (kP5/kP13 covered; it initially left kP1 on a BF16-WMMA fallback that step 3f later deleted)
 
-kP1 is currently served by the **BF16-WMMA fallback** `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct<128, 64>` (defined at `runtime/src/backend/fused_moe_prefill.cu:6710`, launched from the kP1 dispatch path at line 13137, commit `c36e020`). kP1 is the dominant FC1 profile for 4096-token single-request prefill (per `proj-2026-04-11-2015/diagnostics/prompt_4096_profile_mix.stderr.txt`: kP1 covers 100% of logged FC1 dispatches and 100% of logged active_selection_count at 4096 tokens). Without a native kP1 path, the `NEMOTRON_UNSAFE_ENABLE_NATIVE_DIRECT_MOE_PREFILL` env gate cannot be removed because the BF16-WMMA boundary is still required for one production-reachable case.
+Historically, commit `c36e020` kept kP1 on the BF16-WMMA fallback `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct<128, 64>`, and that legacy launch surface carried the 4096-token bucket. Step 3f deleted that path. In the current tree, `LaunchPlannedPackedInputMatVecBf16` has no kP1 BF16-output grouped kernel during the rebuild (`runtime/src/backend/fused_moe_prefill.cu:11240-11243` falls through to `false`), and `LaunchPlannedPackedInputMatVecFp4Direct` only implements kP5 today (`runtime/src/backend/fused_moe_prefill.cu:11454-11536`). kP1 is still the dominant FC1 profile for 4096-token single-request prefill (per `proj-2026-04-11-2015/diagnostics/prompt_4096_profile_mix.stderr.txt`: kP1 covers 100% of logged FC1 dispatches and 100% of logged active_selection_count at 4096 tokens). The job of steps 4-6 is therefore to rebuild the native kP1 path and wire it into the existing grouped dispatch surface, not to swap out a still-live fallback.
 
 Starting point for this plan:
 - Current branch: `unified-routed-fp4`
@@ -27,21 +27,21 @@ Starting point for this plan:
 
 ## Goal
 
-Ship a bitwise-correct native FP4 routed FC1 kernel for the kP1 bucket, replacing the BF16-WMMA fallback, with the kP1 kernel's correctness anchored to an instrumented TRT-LLM reference harness that produces ground-truth output values bit-for-bit.
+Ship a bitwise-correct native FP4 routed FC1 kernel for the kP1 bucket, replacing the deleted historical BF16-WMMA approach with a new standalone `NanoP1` implementation. Correctness is anchored to TRT-LLM through the SM120 P1 GEMM boundary: the new kernel must instantiate the same `CollectiveBuilder` / `TiledMma` structure and match TRT-LLM's BF16 `gemm1_output` bitwise on shared synthetic problems. The fused Nemotron FC1-to-FC2 direct-pack contract is validated separately against a local exact oracle patterned on the live P5 direct-pack surface.
 
 Correctness first, performance deferred. Once kP1 is correct end-to-end (vLLM parity, prompt sweep, per-layer diagnostic all green), a follow-on plan handles TMA enablement and roofline optimization.
 
 Short version:
-- pick TRT-LLM as the authoritative kernel-level reference
-- stand up an instrumented TRT-LLM reference harness that captures the highest-fidelity source-level reference surface it exposes
+- pick TRT-LLM as the authoritative kernel-level reference through the BF16 GEMM boundary
+- stand up a minimal TRT-LLM runtime harness that captures BF16 `gemm1_output` for one synthetic P1 problem
 - delete all kP1-specific broken code and tests before writing any new code
-- rebuild the kP1 kernel path from scratch with new names, modeled on TRT-LLM's architecture
-- validate each layer against that reference surface, bitwise where the contracts match and with a documented tolerance only where TRT-LLM exposes a dequantized or fused surface
+- rebuild the kP1 kernel path from scratch with new names, modeled on TRT-LLM's architecture through the BF16 boundary
+- validate the fused direct-pack epilogue separately against a local exact oracle because TRT-LLM does activation/pack in a second kernel
 - wire to production dispatch only after bitwise correctness and full end-to-end validation
-- delete the BF16-WMMA fallback only after the new path is in production
 
 Expanded version:
 - TRT-LLM is the primary external kernel-architecture reference because it is vendored at source under `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/`, pure C++/CUDA, NVIDIA-authored, and patchable for instrumentation. The `.venv-trtllm` FlashInfer wheel is **not** the authoritative kernel oracle for this plan: the local `flashinfer.fused_moe.trtllm_fp4_block_scale_*` entrypoints route through `get_trtllm_moe_sm100_module()`, so they may be useful as smoke checks but not as the source-level SM120 reference harness.
+- For this plan, "same structure as TRT-LLM" stops at the GEMM boundary. TRT-LLM's SM120 P1 GEMM writes BF16 dense output and then launches a separate `doActivationKernel` for `Relu²` + FP4 pack. Our production target is still a fused direct-pack kernel because materializing BF16 and launching a second kernel is the wrong end-state for TTFT and throughput on RTX 5090. So step 4 mirrors TRT-LLM exactly through BF16 `gemm1_output`, then layers the Nemotron-specific fused direct-pack epilogue on top.
 - vLLM remains the **end-to-end** behavioral oracle via `tools/oracle/compare_chat_runtimes.py` (unchanged from prior plans). That is the acceptance gate in step 6, not the kernel-level reference.
 - Every previous kP1 debugging attempt assumed the existing broken code was close enough to correct to be worth fixing. After 1.5 days the probe stack is deep and we still don't have a story for why the v3-probe "one-line AccumLayout fix" produced bit-for-bit identical wrong outputs. The accumulated confusion is the bug — not a specific layout mismatch. Delete-before-rewrite breaks the loop.
 
@@ -49,8 +49,9 @@ Expanded version:
 
 In scope:
 - The kP1 bucket of routed MoE FC1 (16-row and 24-row token chunks, dominant at 4096 tokens)
-- The correctness-level reference harness against TRT-LLM
+- A minimal TRT-LLM BF16 `gemm1_output` reference harness for the shared GEMM boundary
 - Deletion of broken kP1-specific surfaces (kernels, Traits, tests, bridge helpers, dormant branches)
+- A local exact direct-pack oracle for the fused Nemotron FC2-input contract
 - Wiring the new kP1 kernel into production dispatch
 - End-to-end validation (vLLM parity, prompt sweep, per-layer diagnostic)
 
@@ -58,16 +59,18 @@ Out of scope for this plan (deferred to a follow-on roofline plan):
 - TMA enablement for kP1 (the unified kernel's `use_p5_tma_*` constexpr gates are kP5-only today)
 - Roofline analysis and perf optimization
 - kP1 scale layout optimization (the production kP1 input pack's `kSwizzled128x4` layout must be respected; performance optimization of the swizzle handling is out of scope)
+- A full TRT-LLM post-GEMM activation / pack harness beyond the minimal BF16 `gemm1_output` capture
 - Any changes to kP5, kP12, kP13, or kP15 paths
 - Changes to other routed FC1 buckets
 - Decode-path changes
 
 ## Current state
 
-### What works and must stay live
+### What is live now, and what the rebuild must preserve
 
-- **BF16-WMMA fallback kernel**: `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct<128, 64>` at `runtime/src/backend/fused_moe_prefill.cu:6710` (launched from the kP1 dispatch path at line 13137). This is the only kP1 path that produces correct Nemotron Nano tokens today. Stays live through step 6; deleted in step 7 after the new kernel passes full end-to-end validation.
-- **kP1 dispatch entry**: `LaunchPlannedPackedInputMatVecRelu2Pack` at `runtime/src/backend/fused_moe_prefill.cu:13066`. The actual dispatch call at line 13137 routes to the BF16-WMMA fallback during bring-up, then switches to the new kernel in step 6.
+- **Grouped BF16 dispatcher**: `LaunchPlannedPackedInputMatVecBf16` at `runtime/src/backend/fused_moe_prefill.cu:11173`. kP0 / kP4 / kP5 / kP7 are live. kP1 currently has an explicit rebuild hole at `runtime/src/backend/fused_moe_prefill.cu:11240-11243` that falls through to `false`.
+- **Grouped FP4-direct dispatcher**: `LaunchPlannedPackedInputMatVecFp4Direct` at `runtime/src/backend/fused_moe_prefill.cu:11416`. The kP5 direct-pack path is live. kP1 currently has no case and therefore falls through to `false` via the default at `runtime/src/backend/fused_moe_prefill.cu:11454-11536`.
+- **Top-level routed FC1 grouped-launch selection**: the kP1 / kP5 FP4-direct decision currently lives at `runtime/src/backend/fused_moe_prefill.cu:12065-12130`. Step 6 wires the new `NanoP1` kernel under this existing surface; step 4 does not change top-level dispatch.
 - **Unified swap-true kernel**: `Nvfp4LaunchPlannedPackedInputGroupedFp4UnifiedSwapTrueKernel` at line 7863. Used by kP5 and kP13 production dispatches. This plan does **not** instantiate the existing unified kernel for kP1 unless step 4 first adds a dedicated kP1-specialized FP4-direct epilogue and reintroduces a sound `UnifiedRoutedFp4Traits<kP1>` surface. The default implementation path in this plan is a standalone `NanoP1Nvfp4MoeGemmKernel`. The existing unified kernel otherwise stays untouched except for the deletion of the dormant kP1 scale-load branch at line 8744.
 - **All kP5, kP12, kP13, kP15 infrastructure**: CollectiveMainloop / Traits / kernels / tests / production dispatch. Untouched by this plan.
 - **The vLLM behavioral oracle harness** at `tools/oracle/compare_chat_runtimes.py` and the full ctest suite minus the three known pre-existing failures listed in PLAN_RULES.md.
@@ -81,14 +84,14 @@ Out of scope for this plan (deferred to a follow-on roofline plan):
 
 ### What to delete in step 3, and why (exhaustive list)
 
-All file paths are in `runtime/src/backend/fused_moe_prefill.cu` unless noted. Deletions are sequenced in sub-commits 3a-3e to keep the tree buildable at each step.
+All file paths are in `runtime/src/backend/fused_moe_prefill.cu` unless noted. Deletions are sequenced in sub-commits 3a-3f to keep the tree buildable at each step.
 
 **Group A — Bespoke kP1 kernels**
 
 - `Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSmemP1Direct` (~line 7444)
 - `Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSmemP1` (~line 7235)
 
-**Why delete:** These were the first two native kP1 attempts. Neither has ever produced correct output in any test. Both are built on the bespoke `nvfp4_bridge::Gemm` + `CFragment64` / `AFragment64` / `BFragment64` surface with hand-coded SM80_16x8 fragment layouts that probe-verification has shown disagree with the canonical PTX spec (the `compare_manual_atom_contract` test artifact in `p1_fragment_debug_oracle_test` is a direct symptom of this disagreement). Neither is reachable from production dispatch — kP1 production currently dispatches to the BF16-WMMA fallback. Keeping them in the tree makes future debugging harder because git-grep for `P1` keeps surfacing these as candidate-reference-implementations that they are not.
+**Why delete:** These were the first two native kP1 attempts. Neither has ever produced correct output in any test. Both are built on the bespoke `nvfp4_bridge::Gemm` + `CFragment64` / `AFragment64` / `BFragment64` surface with hand-coded SM80_16x8 fragment layouts that probe-verification has shown disagree with the canonical PTX spec (the `compare_manual_atom_contract` test artifact in `p1_fragment_debug_oracle_test` is a direct symptom of this disagreement). Neither is reachable from the current grouped dispatch surface. Historically kP1 detoured through the BF16-WMMA fallback; after step 3f there is no surviving dedicated kP1 implementation to confuse with a valid reference. Keeping these in the tree makes future debugging harder because git-grep for `P1` keeps surfacing them as candidate-reference-implementations that they are not.
 
 **Group B — `TracedP1*` Traits and constants**
 
@@ -103,7 +106,7 @@ All file paths are in `runtime/src/backend/fused_moe_prefill.cu` unless noted. D
 
 - The `if constexpr (Profile == UnifiedRoutedFp4Profile::kP1)` branch at `runtime/src/backend/fused_moe_prefill.cu:8744` that reads `input_matmul_block_scales` with row-major offsets (`source_row * blocks_per_row + block_base + scale_index`)
 
-**Why delete:** Production routed-FC1 input packs are built with `Nvfp4ScaleLayout::kSwizzled128x4` (`runtime/src/backend/request_context.cpp:62` returns `kSwizzled128x4`; see also `request_context.cpp:301` and `expert_layer.cpp:934`). The `Profile == kP1` branch at line 8744 bypasses layout-aware loading and interprets the scale buffer as row-major — an assumption that does not match production. The branch has never been exercised in production because the kP1 dispatch routes to the BF16-WMMA fallback, not the unified swap-true kernel. It is dead code with a wrong assumption. A correct kP1 dispatch through the unified kernel must use the layout-aware `LoadExecutionScaleByte` path (the `else` branch at line 8750) — which means the current kP1 branch has to go regardless of which direction step 4's new kernel takes.
+**Why delete:** Production routed-FC1 input packs are built with `Nvfp4ScaleLayout::kSwizzled128x4` (`runtime/src/backend/request_context.cpp:62` returns `kSwizzled128x4`; see also `request_context.cpp:301` and `expert_layer.cpp:934`). The `Profile == kP1` branch at line 8744 bypasses layout-aware loading and interprets the scale buffer as row-major — an assumption that does not match production. The branch has never been exercised in production: historically the old BF16-WMMA fallback bypassed it, and in the current tree the kP1 rebuild slots are explicit `false`-return holes, not unified-kernel launches. It is dead code with a wrong assumption. A correct kP1 dispatch through the unified kernel must use the layout-aware `LoadExecutionScaleByte` path (the `else` branch at line 8750) — which means the current kP1 branch has to go regardless of which direction step 4's new kernel takes.
 
 **Group D — kP1 test oracles and their infrastructure**
 
@@ -120,7 +123,7 @@ All file paths are in `runtime/src/backend/fused_moe_prefill.cu` unless noted. D
 - `p1_fragment_debug_oracle_test` uses hand-coded SM80_16x8 layouts in `compare_manual_atom_contract` (`build_manual_a_word` / `build_manual_b_word`) and `compare_c_atom_manual_store_bucket` (the `{row_group, row_group+2, row_group+1, row_group+3}` token_rows formula). Both disagree with the canonical PTX spec. The third C-side check, `compare_c_atom_bucket`, stages `kPlannedWmmaTileM = 16` rows of input into smem but `partition_C` walks 32 rows, leaving rows 16-31 reading uninitialized smem. All three C-side failures are test artifacts compounded by the underlying broken TracedP1 Traits.
 - `p1_native_fp4_mma_oracle_test` tests the bespoke `LoadFragmentA_RowMajor16x64TracedScale*TiledP1` + `nvfp4_bridge::Gemm` bridge — which is the exact surface we are deleting in Group F. Even if its hand-coded layout tables were right, it would only validate a kernel surface that is going away.
 
-All three oracles compounded false leads during debugging. None has produced a trustworthy kernel-level oracle for kP1. The replacement in steps 2, 4, and 5 is a bitwise comparison against the TRT-LLM reference harness, which is authoritative.
+All three oracles compounded false leads during debugging. None has produced a trustworthy kernel-level oracle for kP1. The replacement in steps 2, 4, and 5 is split: bitwise BF16 GEMM-boundary comparison against the TRT-LLM reference harness, plus bitwise packed-output comparison against the local direct-pack oracle.
 
 **Group E — Bespoke FP4 MMA bridge helpers**
 
@@ -150,7 +153,7 @@ All three oracles compounded false leads during debugging. None has produced a t
 - The `UnifiedRoutedFp4Profile::kP1` enum value itself (even without a Traits spec, the enum constant may still be referenced by the dispatch selector in `SelectRoutedGemm1Profile`). Step 3 removes only the Traits specialization; step 4 re-adds it with new underlying types.
 - All non-P1 tests in the ctest suite
 
-After step 3, a grep for `P1` in `runtime/src/backend/fused_moe_prefill.cu` should show only: (a) the BF16-WMMA fallback kernel, (b) the kP1 dispatch entry / launch site in `LaunchPlannedPackedInputMatVecRelu2Pack`, (c) the `UnifiedRoutedFp4Profile::kP1` enum constant wherever it is referenced in the profile selector / launch planner, and (d) any explanatory comments.
+After step 3, a grep for `P1` in `runtime/src/backend/fused_moe_prefill.cu` should show only: (a) the grouped BF16 / FP4-direct dispatcher references for kP1, (b) the top-level grouped-launch selection logic, (c) the `UnifiedRoutedFp4Profile::kP1` enum constant wherever it is referenced in the profile selector / launch planner, and (d) explanatory comments. No dedicated fallback kernel or bespoke P1 oracle surface should remain.
 
 ### Branch
 
@@ -169,19 +172,19 @@ Latest commits on the branch:
 
 Plan v1-v4 assumed the existing broken kP1 surface was close enough to correct that probe-then-fix iteration would converge. It did not, over ~1.5 days. The root failure mode was not any single wrong hypothesis — it was that each probe's result had to be interpreted against a tree full of stale/broken/entangled reference points, and every "fix" had to thread through the same confusion.
 
-v5 makes three structural bets:
+v6 makes three structural bets:
 
 1. **Delete-before-rewrite.** The broken code cannot remain in the tree while new code is being written. Name collisions, muscle-memory references, and git-grep false positives will repeatedly drag the new implementation back toward the old shape. Step 3 is a big aggressive delete pass with sub-commits for safety.
 
-2. **External reference, not self-constructed oracle.** Every test oracle we built for kP1 in v1-v4 turned out to have an independent bug (hand-coded SM80_16x8 layouts, flat walks, under-staging, wrong token_row formulas). Self-constructing a kernel-level oracle is harder than we thought. TRT-LLM is NVIDIA-authored, vendored at source, and provides a known-good implementation of the same contract. Step 2 stands up a reference harness that captures TRT-LLM's exact output tensors for a synthetic problem; steps 5 and 6 validate the new kP1 kernel bitwise against that harness.
+2. **External reference, not self-constructed oracle.** Every test oracle we built for kP1 in v1-v4 turned out to have an independent bug (hand-coded SM80_16x8 layouts, flat walks, under-staging, wrong token_row formulas). Self-constructing a kernel-level oracle is harder than we thought. TRT-LLM is NVIDIA-authored, vendored at source, and provides a known-good implementation of the same GEMM boundary. Step 2 stands up a reference harness that captures TRT-LLM's BF16 `gemm1_output` for a synthetic problem; steps 4b and 5 validate the new kP1 kernel bitwise at that boundary, while steps 4c and 5 validate the fused packed-output contract against the local direct-pack oracle.
 
-3. **Correctness first, performance deferred.** v1-v4 tried to combine correctness and performance in the same plan. v5 ships bitwise correctness via a cooperative-load path in steps 4-7, and explicitly defers all performance work (TMA enablement, roofline optimization, scale layout optimization) to a follow-on plan that starts from a working kernel.
+3. **Correctness first, performance deferred.** v1-v4 tried to combine correctness and performance in the same plan. v6 ships bitwise correctness via the new standalone kernel in steps 4-6, and explicitly defers all performance work (TMA enablement, roofline optimization, scale layout optimization) to a follow-on plan that starts from a working kernel.
 
 ## Rules
 
 ### Safety and sequencing (from PLAN_RULES.md)
 
-- Keep the BF16-WMMA fallback kernel live through steps 1-6. It is the only kP1 production path that produces correct Nemotron tokens today. It may not be deleted until step 7, after the new kernel passes full end-to-end validation.
+- Do not reintroduce a shadow fallback path for kP1 during the rebuild. The historical BF16-WMMA fallback was deleted in step 3f; step 6 must wire the new kernel into the existing grouped dispatch surface instead of adding a one-off launcher.
 - Reuse existing payload buffers unless duplication is required by a measured optimization.
 - New kernels and launcher paths enter the existing planning, tracing, and benchmarking architecture (`AppendLinearOpTraceEntry`, `GemmKernelFamily`, `GemmHeuristicCache`). No untracked one-off launcher paths.
 - Kernels must support arbitrary token counts (1-512+), including partial row tiles.
@@ -190,7 +193,7 @@ v5 makes three structural bets:
 
 - **Per-layer diagnostic** (`NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY=1`): per-layer drift detector
 - **Behavioral parity oracle on RTX 5090**: constrained greedy comparison against local vendored vLLM via `tools/oracle/compare_chat_runtimes.py`. Final acceptance gate.
-- **Secondary external reference**: local vendored TRT-LLM. In v5, TRT-LLM is promoted from "gross regression detection only" to the **kernel-level correctness oracle** for the new kP1 kernel.
+- **Secondary external reference**: local vendored TRT-LLM. In v6, TRT-LLM is the source-level architecture reference and the bitwise oracle only for the shared BF16 `gemm1_output` boundary.
 - **Claude coherence scoring**: smoke test only
 - **Primary performance gate**: end-to-end prefill latency (deferred to the follow-on roofline plan)
 - **Secondary diagnostic metrics**: hot kernel time and cold descriptor-build/setup overhead (also deferred)
@@ -232,15 +235,19 @@ Expected: `ALL CHECKS PASSED`.
 
 ### Correctness
 
-- Do not reintroduce BF16 truncation before `Relu²`. The new kP1 kernel must keep the accumulator in FP32 through activation and quantize directly to FP4 — matching the native-direct contract established in proj-2026-04-11-0400.
+- Do not reintroduce BF16 truncation before `Relu²` in the final production path. Step 4b temporarily materializes the TRT-compatible BF16 `gemm1_output` boundary for oracle purposes, but step 4c and the shipping kernel must keep the accumulator in FP32 through activation and quantize directly to FP4 — matching the native-direct contract established in proj-2026-04-11-0400.
 - The new kP1 kernel must preserve the FC2-facing `DeviceNvfp4Matrix` contract. Any divergence from kP5's output layout must be explicitly justified and revalidated.
 - Do not change the canonical token-major `topk_ids` / `topk_weights` routing contract or move shipping-path routing reconstruction back onto the host.
 
 ### Plan-specific rules
 
-- **TRT-LLM is the external kernel reference, not an unqualified bitwise oracle for our packed output contract.** Step 2 must first document the highest-fidelity surface TRT-LLM can expose on a source-level SM120 path. Use bitwise comparison only when the compared surface is actually the same. If TRT-LLM only exposes dequantized or fused outputs, use it to validate mainloop and activation numerics, and use a local direct-pack contract reference patterned on `RunP5NativeDirectPackOracleForTesting` for packed-bytes and scale-buffer validation.
+- **TRT-LLM is the external kernel reference, not an unqualified bitwise oracle for our packed output contract.** Step 2 must capture the shared BF16 `gemm1_output` boundary on a source-level SM120 path. Use TRT-LLM for bitwise comparison only on that shared surface. Use a local direct-pack contract reference patterned on `RunP5NativeDirectPackOracleForTesting` for the fused FC2-facing packed buffers.
+- **TRT equivalence stops at the GEMM boundary.** For this plan, "same structure as TRT-LLM" means same `CollectiveBuilder`, same `TiledMma`, same dense BF16 epilogue boundary, and bitwise BF16 `gemm1_output` on shared synthetic problems. The fused direct-pack epilogue is a Nemotron-specific optimization layer validated separately.
 - **Delete-before-rewrite.** Step 3 deletes all broken kP1 code BEFORE any new code is written. This is the only way to prevent accidental reuse of confusing types and names.
 - **New names for new code.** The new kP1 kernel, Traits, and tests get names prefixed with `Nano` (e.g. `NanoP1Nvfp4MoeGemm*`). This avoids git-grep false positives against any residual references to deleted types, and avoids any chance of template-instantiation collisions during the transition.
+- **Minimal runtime oracle before 4b.** Step 2 must land a minimal TRT-LLM runtime harness that captures BF16 `gemm1_output` for one synthetic P1 problem before step 4b begins. Live compile-probe capture is deferred unless step 4a's local probes disagree with the documented builder shape.
+- **Keep `UnifiedRoutedFp4Traits<kP1>` optional until the standalone kernel is proven.** Do not reintroduce it in step 4a or 4b unless standalone kernel plumbing truly requires shared helper reuse. The standalone `NanoP1Nvfp4MoeGemmKernel` is the primary implementation surface.
+- **Source code wins over prose.** For the P1 probe's `partition_fragment_B(sA)` / `partition_fragment_A(sB)` pattern, the canonical reference is the literal TRT-LLM launcher source. If `trtllm_reference/NOTES.md` prose disagrees with the source snippet, fix the note or ignore the prose; do not "interpret" the inversion from memory.
 - **Bitwise correctness before performance.** Steps 1-7 are correctness-only. Performance work (TMA enablement, roofline, scale layout optimization) is deferred to a follow-on plan.
 - **Probe-then-decide.** Per `CLAUDE.md`, compile-time probes first, then synthetic-data oracle tests, then fragment-level dump oracles, then end-to-end. This plan applies probe-then-decide to reading TRT-LLM in step 1 and to the new kernel's sub-commits in step 4.
 - **Operative N width is 1920, not 1856.** All kernel contract code, oracle gate criteria, and benchmarks must use 1920. Earlier plan iterations that used 1856 must be updated.
@@ -248,10 +255,12 @@ Expected: `ALL CHECKS PASSED`.
 
 ## Success criteria
 
-- The TRT-LLM reference harness in step 2 produces reproducible reference artifacts for the highest-fidelity surface TRT-LLM exposes for a minimal synthetic NVFP4 MoE GEMM problem, with the exact observable contract and any unavoidable tolerance documented explicitly.
+- Step 2 produces reproducible TRT-LLM BF16 `gemm1_output` artifacts for a minimal synthetic SM120 P1 problem, along with the exact input contract, alpha handling, and buffer boundary documentation needed for step 4b.
 - Step 3 leaves the tree buildable and the existing ctest suite green (minus the three pre-existing failures and minus deleted P1-specific tests).
-- The new kP1 kernel produced in step 4 passes its isolated oracle test bitwise against TRT-LLM on the shared observable surface, and its packed output channels pass bitwise against a local direct-pack contract reference patterned on the existing P5 direct-pack oracle.
-- The new kP1 kernel passes the same two-part oracle at a realistic Nano bucket (`h=2688`, `i=1920`, `n_experts=128`, 16-row and 24-row token chunks) in step 5.
+- Step 4a reproduces TRT-LLM's documented `CollectiveBuilder` / `TiledMma` shape and per-thread probe outputs well enough that any mismatch against TRT-LLM's documented probe fields is either eliminated or explicitly explained from the CUTLASS snapshot in use.
+- Step 4b writes the TRT-compatible BF16 `gemm1_output` boundary and matches the step 2 TRT-LLM artifact bitwise on the shared synthetic problem.
+- Step 4c produces packed FC2-input channels that pass bitwise against a local direct-pack contract reference patterned on the existing P5 direct-pack oracle.
+- Step 5 passes the same split oracle at a realistic Nano bucket (`h=2688`, `i=1920`, `n_experts=128`, 16-row and 24-row token chunks): BF16 GEMM boundary bitwise against TRT-LLM, packed FC2-input contract bitwise against the local direct-pack oracle.
 - Step 6 end-to-end validation is fully green:
   - `cmake --build` clean
   - `ctest -j1` with no new failures
@@ -259,7 +268,7 @@ Expected: `ALL CHECKS PASSED`.
   - `prompt_length_sweep.py --runtimes native --skip-claude-eval` reports `ALL CHECKS PASSED`
   - `tools/oracle/compare_chat_runtimes.py` against vLLM is bitwise-identical for a defined eval slice
   - Per-layer diagnostic reports no per-layer drift with `NEMOTRON_DEBUG_COMPARE_PREFILL_VS_LEGACY=1`
-- Step 7 deletes the BF16-WMMA fallback and step 8 opens a follow-on roofline plan. At that point, the kP1 path has one native-FP4 implementation with no BF16 boundary.
+- Step 7 documents the final kP1 architecture and opens a follow-on roofline plan. At that point, the kP1 path has one native-FP4 implementation and no BF16-WMMA legacy path remains.
 
 ## Steps
 
@@ -267,13 +276,13 @@ Expected: `ALL CHECKS PASSED`.
   Read the NVFP4 MoE GEMM path in `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/` from its top-level dispatcher down through the kernel template, mainloop, epilogue, and scale handling. Walk the code — do not skim.
 
   Specific facts to document in `proj-2026-04-12-1022/trtllm_architecture.md`:
-  - **Top-level entry point**: which function is the entry for an NVFP4 grouped GEMM with FP4 direct output
+  - **Top-level entry point**: which function is the entry for an NVFP4 grouped GEMM used by FC1, and where BF16 `gemm1_output` is handed off to the post-GEMM activation / pack kernel
   - **Input layout and scale format**: how A (activations) and B (weights) are expected, what scale format (row-major? swizzled? per-block FP8?), how per-row tensor scales and output scales are threaded
   - **CollectiveBuilder instantiation**: TensorOp, MmaTileShape, ClusterShape, ElementSFCompute, stages — the exact template argument list
   - **TiledMma construction**: built via CollectiveBuilder or hand-assembled from `SM120_MXF4NVF4_SS_m16n8k64_SB` atoms? What is the atom layout shape?
   - **Mainloop structure**: how TRT-LLM iterates K, M, N; how it partitions `partition_fragment_C` (at CTA tile or at a sub-tile); how many MMA atom invocations per CTA tile; whether `cute::gemm` or `mma_atom.call` is used
-  - **Epilogue structure**: how the accumulator is consumed, how `Relu²` is applied, how per-block FP8 scale is computed, how FP4 nibble packing is done, how output is laid out (packed bytes + scale blocks)
-  - **Output shapes**: packed FP4 tensor shape, per-block scale tensor shape, activation-output-scale tensor shape
+  - **Epilogue structure**: how the GEMM epilogue consumes the accumulator into BF16 dense output, and separately how `doActivationKernel` applies `Relu²`, computes per-block scales, and packs FP4
+  - **Output shapes**: BF16 `gemm1_output` shape at the GEMM boundary, plus the post-activation packed FP4 tensor shape and scale tensor shapes
   - **Existing TRT-LLM tests**: which tests in TRT-LLM's own test suite exercise this NVFP4 MoE GEMM path; we can use them as the first reference for valid inputs/outputs
   - **Key file paths and line numbers** for each of the above, so step 2 can find them quickly
 
@@ -283,33 +292,31 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/` (read-only), `proj-2026-04-12-1022/trtllm_architecture.md` (new).
 
-- [ ] **2. Document TRT-LLM's exact CollectiveBuilder / TiledMma template arguments for step 4a; runtime harness deferred**
-  Step 1's `trtllm_architecture.md` §4.1–§4.2 and §5.1 already contain the complete source-level CollectiveBuilder and Epilogue argument lists for TRT-LLM's SM120 NVFP4 P1 path, with file:line citations. For step 4 to build a bitwise-matching `NanoP1*` Traits, what it needs is exactly those template arguments — not a runtime capture.
+- [ ] **2. Stand up a minimal TRT-LLM BF16 `gemm1_output` harness for step 4b; live compile-probe capture deferred**
+  Step 1 and `trtllm_reference/NOTES.md` already document the source-level `CollectiveBuilder` / `TiledMma` construction for SM120 NVFP4 P1. That is sufficient for step 4a. It is **not** sufficient for step 4b if we want a real external boundary oracle, because our runtime compiles against the local CUTLASS snapshot under `.venv-trtllm/.../flashinfer/data/cutlass/include`, not a TRT-LLM-owned build surface. So step 2 is reopened in a narrower form: produce the smallest possible TRT-LLM runtime artifact that gives step 4b a true BF16 boundary oracle.
 
-  After reconnaissance, a runtime harness against TRT-LLM's `MoeGemmRunner::moeGemm` entry point turned out to cost more than the expected value it adds:
-  - **C++ harness (option a/b)** requires linking against `libtensorrt_llm.so` (editable-installed at `third_party/TensorRT-LLM/tensorrt_llm/libs/`) which has a transitive torch dependency (`libtorch_cpu.so`, `libc10.so`, `libtorch_cuda.so`) and would require either building TRT-LLM's own cutlass_kernels tree (complex CMake with generated instantiations) or a CMake target that pulls in torch.
-  - **Python harness via `torch.classes.trtllm.FusedMoeRunner.run_moe`** (the correct entry point, which routes `cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl` and can trigger the compile probes) requires constructing the full `CutlassMoeFCRunner` argument set (routing logits, per-expert alpha, workspace) and no existing TRT-LLM unit test exercises it directly with NVFP4 inputs — all the existing NVFP4 tests go through `trtllm_fp4_block_scale_moe` instead, which is a **different** C++ path (`kernels/trtllmGenKernels/blockScaleMoe/`) that does not hit the P1 compile probe. We'd have to reverse-engineer the FusedMoeRunner input contract from `cpp/tensorrt_llm/thop/moeOp.cpp` to write the harness.
-  - The **P1 compile probe launcher path specifically does not early-return** after printing (unlike P5 and P15 at `moe_gemm_tma_ws_launcher.inl:813–816, 825–828`), so we cannot shortcut the kernel launch to avoid providing valid workspace / stream / tensors.
+  **Required scope**:
+  - Capture TRT-LLM's BF16 `gemm1_output` immediately after `MoeGemmRunner::moeGemm(...)` returns for one synthetic SM120 P1 problem and before `doActivationKernel` runs
+  - Record the exact input contract used to produce that artifact: activations, weights, expert selection, per-expert alpha / tensor-scale inputs, and any workspace assumptions
+  - Confirm the BF16 boundary that step 4b must match: row-major dense output, post-epilogue cast, post-alpha application, pre-activation, pre-pack
+  - Do **not** spend time in this step on reproducing TRT-LLM's post-GEMM activation / pack buffers; that is intentionally out of scope for this plan
 
-  **Revised scope**: capture the reference at the **template-argument** level, not the **runtime-data** level. For step 4a this is functionally equivalent — a bitwise `NanoP1*` Traits match is achieved by instantiating the same template arguments, not by runtime comparison.
-
-  **Deliverable**: write `proj-2026-04-12-1022/trtllm_reference/NOTES.md` containing a **quick-reference** distillation of `trtllm_architecture.md` §4–§5 specifically for step 4a consumption:
-  - The exact `CollectiveBuilder` argument list for SM120 NVFP4 P1 Mainloop (from `moe_gemm_tma_ws_launcher.inl:797–803`), including every template argument with its concrete type alias for SwapAB=false, CTA_M=128, CTA_N=128, CTA_K_bytes=64 (128 FP4 elements), cluster=1x1x1
-  - The exact `CollectiveBuilder` argument list for SM120 NVFP4 Default (no-fusion) Epilogue (from `moe_gemm_tma_ws_launcher.inl:724–731`)
-  - The exact `MmaTileShape`, `ClusterShape`, `StageCountAutoCarveout`, `KernelSchedule`, `TensorOp`, `EpilogueTensorOp`, `EpilogueSchedule`, `EpilogueSubTile`, `EpilogueOp`, alignment values, and element-type aliases
-  - Cross-references to `fp4_gemm/nvfp4_nvfp4_gemm_template_sm120.h:109–114` (plain-FP4 SM120 path) as a secondary source
-  - A "step 4a checklist" section naming each `NanoP1Nvfp4MoeGemm*` alias that step 4a must define and the TRT-LLM alias it must match
-
-  **Deferred**: runtime harness (surface 1 BF16 reference data + surface 2 live compile-probe capture). If step 4b's mainloop validation against a local host fp32 reference proves insufficient — for example, if we hit a bug that we can't explain with fp32 reference alone — we'll revisit this as step 2b. Until then, the host fp32 reference (dequantize the NVFP4 inputs, run fp32 GEMM, round to BF16) is mathematically unambiguous for the MMA core contract and doesn't require TRT-LLM runtime.
+  **Build-path guidance**:
+  - Prefer the cheapest runtime path that reaches the real TRT-LLM P1 launcher and exposes the BF16 boundary. This may be a thin Python wrapper around `torch.classes.trtllm.FusedMoeRunner.run_moe` or a small C++ harness linked against `libtensorrt_llm.so`.
+  - Do **not** use the `.venv-trtllm` FlashInfer wheel wrappers (`trtllm_fp4_block_scale_*`) as the authoritative path; they route through the SM100 path and are not the P1 launcher we are matching.
+  - Live capture of TRT-LLM's `maybePrintSm120P1CompileProbe` output is explicitly deferred unless step 4a's local probes disagree with the documented builder shape. It is not a deliverable for the narrowed step 2.
+  - Sequencing: step 4a may proceed once the runtime path is chosen and `NOTES.md` is updated, but step 4b must not begin until this step has produced the BF16 `gemm1_output` artifact.
 
   **Output of this step**:
-  - `proj-2026-04-12-1022/trtllm_reference/NOTES.md` — the quick reference + step 4a checklist
+  - `proj-2026-04-12-1022/trtllm_reference/NOTES.md` updated with the exact BF16 boundary contract, alpha application semantics, and the chosen runtime path
+  - `proj-2026-04-12-1022/trtllm_reference/README.md` with precise run instructions for reproducing the artifact
+  - `proj-2026-04-12-1022/trtllm_reference/golden/` with the minimal synthetic problem inputs and the captured BF16 `gemm1_output` artifact
 
-  Gate: `NOTES.md` exists, contains the full CollectiveBuilder argument lists with file:line citations, and has a step 4a checklist. Step 4a can proceed from this file without re-reading TRT-LLM source.
+  Gate: the harness runs on the target GPU, reaches the real TRT-LLM SM120 P1 path, and produces a reproducible BF16 `gemm1_output` artifact that step 4b can compare bitwise against.
 
-  Key files: `proj-2026-04-12-1022/trtllm_reference/NOTES.md` (new).
+  Key files: `proj-2026-04-12-1022/trtllm_reference/NOTES.md`, `proj-2026-04-12-1022/trtllm_reference/README.md` (new), `proj-2026-04-12-1022/trtllm_reference/golden/` (new).
 
-- [ ] **3. Delete all kP1-specific broken code (5 sub-commits 3a-3e)**
+- [ ] **3. Delete all kP1-specific broken code (6 sub-commits 3a-3f)**
   Hard delete pass. See "What to delete in step 3, and why" in the Current State section for the exhaustive list and the per-item justification. Commit order is chosen to keep the tree buildable at every step.
 
   **3a — Delete the P1 test oracles**
@@ -334,12 +341,12 @@ Expected: `ALL CHECKS PASSED`.
   - `Nvfp4LaunchPlannedPackedInputGroupedFp4KernelSwapFalseK64ScaleSmemP1` (Group A)
   - The `if constexpr (Profile == UnifiedRoutedFp4Profile::kP1)` branch at line 8744 in the unified kernel (Group C)
   - Diagnostic globals tied to the bespoke P1 path (verify via grep before deletion)
-  - Run `cmake --build` + `ctest -j1` — no new failures. The BF16-WMMA fallback at line 6710 still dispatches for production kP1.
+  - Run `cmake --build` + `ctest -j1` — no new failures. No surviving bespoke native-FP4 kP1 kernel launch surface should remain after this sub-commit; the historical BF16-WMMA fallback is deleted later in 3f.
 
   **3d — Delete `TracedP1*` Traits and constants**
   - Everything in Group B: `TracedP1MmaTileShape`, `TracedP1ClusterShape`, `TracedP1Epilogue`, `TracedP1StageCountAutoCarveout`, `TracedP1CollectiveMainloop`, `TracedP1TiledMma`, `TracedP1SmemLayout*`, `TracedP1SmemCopyAtom*`, `TracedP1AccumProfileLayout`, `kTracedP1AccumProfileCosize`, `kTracedP1ScaleSmemCosizeA/B`, `kTracedP1ScaleFragmentCosizeA/B`, and the stale comment block at lines 265-273
   - `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization (leave the `UnifiedRoutedFp4Profile::kP1` enum constant itself intact — only the Traits spec goes)
-  - Note: between step 3d and step 4a, any code that instantiates `UnifiedRoutedFp4Traits<kP1>` will fail to compile. Verify via grep that no production path does so. The BF16-WMMA fallback at line 6710 does not use Traits<kP1>.
+  - Note: between step 3d and step 4a, any code that instantiates `UnifiedRoutedFp4Traits<kP1>` will fail to compile. Verify via grep that no production path does so. By the time step 4a begins, the grouped BF16 dispatcher's kP1 slot should be an explicit `false` return and the grouped FP4-direct dispatcher should have no kP1 case yet, so neither should instantiate `Traits<kP1>`.
   - Run `cmake --build` + `ctest -j1` — no new failures.
 
   **3e — Delete bespoke FP4 MMA bridge helpers (Group E), conditional on grep**
@@ -348,58 +355,65 @@ Expected: `ALL CHECKS PASSED`.
   - For symbols still used by kP13/kP15/kP12 production paths: leave intact and document in a short comment.
   - Run `cmake --build` + `ctest -j1` — no new failures.
 
-  Source-size target: ~1500-2500 lines deleted from `fused_moe_prefill.cu` across sub-commits 3a-3e.
+  **3f — Delete the historical BF16-WMMA fallback launch surface**
+  - Delete `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct<128, 64>` and any launcher / helper code exclusively used by that historical kP1 path (verify via grep first).
+  - Replace stale comments and plan notes with the explicit rebuild-state story: `LaunchPlannedPackedInputMatVecBf16` has no kP1 BF16-output kernel yet, and `LaunchPlannedPackedInputMatVecFp4Direct` currently only implements kP5.
+  - Run `cmake --build` + `ctest -j1` — no new failures.
 
-  Gate: after 3e, `cmake --build` clean, `ctest -j1` passes all remaining tests, BF16-WMMA fallback still dispatches for production kP1 from `LaunchPlannedPackedInputMatVecRelu2Pack`, and a git-grep for `P1` in `runtime/src/backend/fused_moe_prefill.cu` shows only the BF16-WMMA fallback kernel, the dispatch site, the `UnifiedRoutedFp4Profile::kP1` enum constant, and explanatory comments.
+  Source-size target: ~1500-2500 lines deleted from `fused_moe_prefill.cu` across sub-commits 3a-3f.
+
+  Gate: after 3f, `cmake --build` clean, `ctest -j1` passes all remaining tests, no dedicated kP1 fallback kernel or launch site remains, and a git-grep for `P1` in `runtime/src/backend/fused_moe_prefill.cu` shows only the grouped BF16 / FP4-direct dispatch surfaces, the top-level grouped-launch selection, the `UnifiedRoutedFp4Profile::kP1` enum constant, and explanatory comments.
 
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/p1_*.cpp` (deleted), `testing/backend/p13_generic_direct_stage_oracle_test.cpp` (deleted), `testing/CMakeLists.txt`.
 
-- [ ] **4. Implement the new kP1 kernel from scratch, modeled on TRT-LLM (3 sub-commits 4a-4c)**
-  Write a fresh kernel path in `runtime/src/backend/fused_moe_prefill.cu` that matches TRT-LLM's architecture as documented in step 1.
+- [ ] **4. Implement the new kP1 kernel from scratch, modeled on TRT-LLM through the BF16 boundary (3 sub-commits 4a-4c)**
+  Write a fresh kernel path in `runtime/src/backend/fused_moe_prefill.cu` that matches TRT-LLM's architecture as documented in step 1 **through the BF16 GEMM boundary**, then layer the Nemotron-specific fused direct-pack epilogue on top.
 
   **New names** (no accidental reuse of deleted types):
   - `NanoP1Nvfp4MoeGemmCollectiveMainloop`
   - `NanoP1Nvfp4MoeGemmTiledMma`
   - `NanoP1Nvfp4MoeGemmSmemLayoutA` / `SmemLayoutB` / `SmemLayoutSFA` / `SmemLayoutSFB`
   - `NanoP1Nvfp4MoeGemmAccumLayout`
-  - `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization (same name as the deleted one, but referencing the new `NanoP1*` types) only if shared helper reuse genuinely requires it
+  - `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization only if shared helper reuse genuinely requires it after the standalone kernel is already proven
   - Kernel template: a new standalone `NanoP1Nvfp4MoeGemmKernel`. Reusing the existing unified swap-true kernel is out of scope for this plan unless a later sub-commit explicitly adds a kP1-specialized FP4-direct epilogue branch and documents that architecture change.
 
   **Sub-commits**:
 
-  - **4a — Traits + TiledMma + smem layouts**
-    Instantiate the CollectiveBuilder with TRT-LLM's exact template argument list. Define all the new `NanoP1*` types and, only if helpful for shared helper reuse, the `UnifiedRoutedFp4Traits<kP1>` specialization that references them. No kernel yet — compile-only. Add compile-time `ShowInt<N>` probes (ifdef-guarded) for the per-thread partition mode sizes of A/B/C and remove them after the first successful build to confirm the layout matches TRT-LLM's documented per-thread mode sizes. Gate: `cmake --build` clean, probe values match TRT-LLM's documented per-thread mode sizes.
+  - **4a — NanoP1 type bundle + TiledMma + smem layouts**
+    Instantiate the CollectiveBuilder with TRT-LLM's exact template argument list. Define the new `NanoP1*` types in a standalone type bundle; do **not** reintroduce `UnifiedRoutedFp4Traits<kP1>` yet unless standalone kernel compile plumbing absolutely requires it. No kernel yet — compile-only. Add compile-time `ShowInt<N>` probes (ifdef-guarded) for the per-thread partition mode sizes of A/B/C and remove them after the first successful build to confirm the layout matches TRT-LLM's documented per-thread mode sizes. Follow the literal TRT P1 probe code for the partition calls (`tCrA = partition_fragment_B(sA)`, `tCrB = partition_fragment_A(sB)`); if any prose note disagrees, the source snippet wins. Gate: `cmake --build` clean, probe values match TRT-LLM's documented per-thread mode sizes, and any residual mismatch is explained from the CUTLASS snapshot in use.
 
-  - **4b — Mainloop (FP32 dense accumulator output, bypass the direct-pack epilogue)**
-    Implement the new kernel's mainloop: smem A/B staging, `fp4_shift` handling, MMA loop, accumulator write-back into smem as FP32 dense. Bypass the direct-pack epilogue for this sub-commit to keep the MMA core isolated. New test `testing/backend/nano_p1_mainloop_oracle_test.cpp` that runs the mainloop on the step 2 synthetic problem and compares against the highest-fidelity TRT-LLM surface step 2 can actually expose. If step 2 can dump a pre-epilogue accumulator or post-mainloop activation tile, compare bitwise to that. If step 2 only exposes a dequantized final surface, compare mainloop plus a temporary dense activation store against that surface and document why accumulator-level capture is unavailable. Gate: mainloop test passes against the step 2 reference surface with the exact comparison mode documented in step 2.
+  - **4b — TRT-compatible GEMM boundary (BF16 dense output, no fused direct-pack)**
+    Implement the new kernel's mainloop: smem A/B staging, `fp4_shift` handling, MMA loop, and the same dense BF16 epilogue boundary that TRT-LLM's GEMM writes to `gemm1_output`. This sub-commit intentionally mirrors TRT-LLM **only through the GEMM boundary**: apply the same alpha path and BF16 cast, but do **not** apply `Relu²` and do **not** pack FP4 yet. New test `testing/backend/nano_p1_mainloop_oracle_test.cpp` runs the kernel on the exact synthetic problem captured in step 2 and compares the BF16 dense output bitwise against the TRT-LLM `gemm1_output` artifact. A host fp32→bf16 reference may be used as a secondary diagnostic, but it is not the acceptance oracle. Gate: BF16 output matches the step 2 TRT-LLM artifact bitwise.
 
-  - **4c — Epilogue (Relu², per-block max-abs, FP8 scale encode, FP4 nibble pack)**
-    Implement the direct-pack epilogue on top of 4b's mainloop. **Anchor the direct-pack contract to the existing positive P5 direct-pack surface**: mirror the structure of `RunP5NativeDirectPackOracleForTesting` / `testing/backend/staged_fp4_pack_test.cpp`, but specialized for the new `NanoP1*` kernel. **Derive the lane→coord mapping at runtime** from `partition_C(make_identity_tensor(...))` + `FillPhysicalCoordMapCopyViewLimited` (pattern from `StoreTracedP13CFragmentsRowMajor` at line 5124). Do NOT hand-code SM80_16x8 warp/lane tables — the deleted v1-v4 P1 oracles all produced test artifacts because of hand-coded tables, and the new implementation must not repeat that mistake. New test `testing/backend/nano_p1_direct_pack_oracle_test.cpp` that runs the full kernel (mainloop + epilogue), compares all 4 packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against a local host direct-pack reference, and separately dequantizes the result to compare against the TRT-LLM reference surface from step 2 when available. Gate: oracle test passes bitwise on all 4 packed output channels, and the dequantized output agrees with TRT-LLM on the shared observable surface.
+  - **4c — Nemotron fused direct-pack epilogue (Relu², per-block max-abs, FP8 scale encode, FP4 nibble pack)**
+    Implement the fused direct-pack epilogue on top of 4b's mainloop. This sub-commit intentionally diverges from TRT-LLM: TRT-LLM performs activation and pack in a separate `doActivationKernel`, while our production target fuses that stage into the FC1 kernel. **Anchor the direct-pack contract to the existing positive P5 direct-pack surface**: mirror the structure of `RunP5NativeDirectPackOracleForTesting` / `testing/backend/staged_fp4_pack_test.cpp`, but specialized for the new `NanoP1*` kernel. **Derive the lane→coord mapping at runtime** from `partition_C(make_identity_tensor(...))` + `FillPhysicalCoordMapCopyViewLimited` (pattern from `StoreTracedP13CFragmentsRowMajor` at line 5124). Do NOT hand-code SM80_16x8 warp/lane tables — the deleted v1-v4 P1 oracles all produced test artifacts because of hand-coded tables, and the new implementation must not repeat that mistake. New test `testing/backend/nano_p1_direct_pack_oracle_test.cpp` runs the full kernel (mainloop + fused direct-pack epilogue) and compares all 4 packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against a local host direct-pack reference. Gate: oracle test passes bitwise on all 4 packed output channels.
 
-  Each sub-commit must build clean and pass its own test. The BF16-WMMA fallback remains the production dispatch through all of step 4.
+  Each sub-commit must build clean and pass its own test. Step 4 intentionally does not modify the top-level routed FC1 dispatch surface; it only makes the standalone `NanoP1` kernel and its oracles real.
 
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/nano_p1_*.cpp` (new), `testing/CMakeLists.txt`.
 
 - [ ] **5. Scale the bitwise oracle to a realistic Nano bucket**
-  Run the new kP1 kernel and the TRT-LLM reference harness on a production-realistic bucket:
+  Run the new kP1 kernel and the TRT-LLM BF16 boundary harness on a production-realistic bucket:
   - `h = 2688` (Nano hidden dimension)
   - `i = 1920` (Nano padded intermediate width — NOT 1856)
   - `n_experts = 128` (Nano expert count)
   - 16-row and 24-row token chunks (representative of kP1's dominant prefill buckets)
   - Synthetic weights and inputs seeded identically across both runners
 
-  Compare using the same two-part oracle as step 4c:
+  Compare using the same split oracle as step 4:
+  - BF16 GEMM boundary bitwise against the TRT-LLM `gemm1_output` artifact for the same bucket
   - packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against the local host direct-pack reference
-  - dequantized output against the TRT-LLM reference surface from step 2 on the shared observable contract
 
-  Gate: all 4 packed output channels match bitwise at both bucket sizes, and the dequantized output agrees with TRT-LLM on the shared observable surface. If TRT-LLM only exposes a tolerance-based surface, document the tolerance and any residual quantitatively (including bounded `max_abs_diff`).
+  Gate: the BF16 GEMM boundary matches TRT-LLM bitwise at both bucket sizes, and all 4 packed output channels match the local direct-pack oracle bitwise.
 
-  Extend `proj-2026-04-12-1022/trtllm_reference/` with the larger synthetic problem and the new kernel's output comparison.
+  Extend `proj-2026-04-12-1022/trtllm_reference/` with the larger synthetic problem and the BF16 boundary artifact comparison.
 
-  Key files: `proj-2026-04-12-1022/trtllm_reference/` (extend), `testing/backend/nano_p1_direct_pack_oracle_test.cpp` (extend with the larger test case).
+  Key files: `proj-2026-04-12-1022/trtllm_reference/` (extend), `testing/backend/nano_p1_mainloop_oracle_test.cpp` (extend with the larger BF16-boundary case), `testing/backend/nano_p1_direct_pack_oracle_test.cpp` (extend with the larger packed-output case).
 
-- [ ] **6. Wire the new kP1 kernel into production dispatch and run full validation**
-  Replace the BF16-WMMA fallback dispatch at `runtime/src/backend/fused_moe_prefill.cu:13137` with a call to the new kernel. The dispatch entry (`LaunchPlannedPackedInputMatVecRelu2Pack` at line 13066) remains the same — only the kernel launch argument changes.
+- [ ] **6. Wire the new kP1 kernel into the existing grouped dispatch surface and run full validation**
+  Add the new kP1 case to the existing grouped FP4-direct dispatcher `LaunchPlannedPackedInputMatVecFp4Direct` at `runtime/src/backend/fused_moe_prefill.cu:11416` so `RoutedGemm1Profile::kP1_128x128x64_SwapFalse` launches the new `NanoP1` kernel. Update any remaining top-level routing comments / gating around the grouped kP1 direct path at `runtime/src/backend/fused_moe_prefill.cu:12065-12130` so real kP1 traffic reaches that case.
+
+  If a BF16-output kP1 surface is still needed for diagnostics after step 4b, wire it explicitly and document the reason. Otherwise leave `LaunchPlannedPackedInputMatVecBf16`'s kP1 case unsupported and make the shipping kP1 path FP4-direct-only. The plan's default end-state is one production kP1 path, not a resurrected BF16 fallback.
 
   Verify via `NEMOTRON_ROUTED_PROFILE_DEBUG=1` that kP1 hits the new kernel path in a real forward pass at the 4096-token bucket.
 
@@ -413,23 +427,14 @@ Expected: `ALL CHECKS PASSED`.
 
   Save all artifact logs under `proj-2026-04-12-1022/post_implementation_validation/`.
 
-  Gate: all validation green. The BF16-WMMA fallback remains in the source code (not yet deleted) for reversion safety until step 7.
+  Gate: all validation green. The historical BF16-WMMA fallback is already gone; after this step the only kP1 implementation in the tree is the new native-FP4 path.
 
-  Key files: `runtime/src/backend/fused_moe_prefill.cu:13137` (dispatch site), `proj-2026-04-12-1022/post_implementation_validation/` (new, artifacts).
+  Key files: `runtime/src/backend/fused_moe_prefill.cu` (grouped dispatch and top-level routing), `proj-2026-04-12-1022/post_implementation_validation/` (new, artifacts).
 
-- [ ] **7. Delete the BF16-WMMA fallback kernel**
-  Only after step 6's validation is fully clean. Delete:
-  - `Nvfp4LaunchPlannedPackedInputGroupedKernelSwapFalseFp4Direct<128, 64>` at line 6710
-  - Any WMMA bridge helpers exclusively used by it (verify via grep first)
-
-  Re-run the full validation hierarchy from step 6. Gate: all green, production still works, no regressions.
-
-  Key files: `runtime/src/backend/fused_moe_prefill.cu`.
-
-- [ ] **8. Document the new kP1 architecture; open the follow-on roofline plan**
+- [ ] **7. Document the new kP1 architecture; open the follow-on roofline plan**
   Write `proj-2026-04-12-1022/architecture.md` (final version, post-implementation) documenting:
   - The final kernel construction (new `NanoP1Nvfp4MoeGemm*` types, their CollectiveBuilder arguments, their per-thread partition layout)
-  - The exact divergences from TRT-LLM (if any) and the rationale for each
+  - The exact point where the implementation matches TRT-LLM (through BF16 `gemm1_output`) and the exact point where it intentionally diverges (fused direct-pack epilogue), with the rationale for each
   - The v1-v4 hypotheses that turned out wrong and why, as a caveat list for future maintainers (a short post-mortem)
   - Performance state: cooperative-load path is correct but unoptimized. TMA enablement, scale layout optimization, and roofline analysis are deferred to the follow-on plan.
 
@@ -447,11 +452,10 @@ Expected: `ALL CHECKS PASSED`.
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | pending | — | Read-only; no code changes |
-| 2 | Document TRT-LLM CollectiveBuilder / TiledMma template args for step 4a | pending | — | Runtime harness deferred as step 2b |
-| 3 | Delete all kP1-specific broken code (5 sub-commits 3a-3e) | pending | — | BF16-WMMA fallback stays live |
+| 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | completed | — | Architecture doc exists |
+| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | in_progress | — | `NOTES.md` exists; BF16 runtime artifact still needed before 4b |
+| 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | completed | — | Historical BF16-WMMA fallback removed; grouped kP1 rebuild holes now explicit |
 | 4 | Implement new kP1 kernel from scratch (3 sub-commits 4a-4c) | pending | — | New `NanoP1*` names |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
-| 6 | Wire new kP1 to production dispatch; full validation | pending | — | BF16-WMMA fallback kept as safety net |
-| 7 | Delete BF16-WMMA fallback | pending | — | Only after step 6 green |
-| 8 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |
+| 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
+| 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |
