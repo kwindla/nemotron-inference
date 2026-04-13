@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 #include "nemotron/expert_routing_device.h"
 #include "nemotron/fused_moe_decode.h"
@@ -109,6 +110,17 @@ const char* SelectRoutedGemm1ProfileNameForTesting(std::size_t num_rows);
 const char* ClassifyRoutedGemm1ProfileForTesting(std::size_t num_rows);
 const char* SelectRoutedGemm2ProfileNameForTesting(std::size_t num_rows);
 const char* ClassifyRoutedGemm2ProfileForTesting(std::size_t num_rows);
+
+bool RunNanoP1KernelForTesting(
+    void const* input_fp4,
+    void const* weight_fp4,
+    void const* input_sf,
+    void const* weight_sf,
+    void* accumulator_scratch,
+    int64_t num_rows,
+    int64_t hidden_size,
+    int64_t inter_size,
+    cudaStream_t stream);
 
 // Testing hook: runs the live P5 native direct-pack epilogue against a
 // synthetic 128x128 accumulator tile laid out with the real CUTE

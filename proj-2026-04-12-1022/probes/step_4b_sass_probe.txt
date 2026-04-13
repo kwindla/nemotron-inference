@@ -1,0 +1,33 @@
+Step 4b SASS Probe
+==================
+
+Object:
+- `build/runtime/CMakeFiles/nemotron_runtime_backend.dir/src/backend/fused_moe_prefill.cu.o`
+
+SASS grep:
+- Command:
+  `cuobjdump --dump-sass build/runtime/CMakeFiles/nemotron_runtime_backend.dir/src/backend/fused_moe_prefill.cu.o 2>/dev/null | grep -E "OMMA\\.SF\\.16864\\.F32\\.E2M1\\.E2M1\\.UE4M3\\.4X" | head -n 12`
+- Match count:
+  `161`
+
+Matching SASS lines:
+```text
+        /*4bf0*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R4, R12, R34, R4, R9, R24, URZ ;                 /* 0x718009220c04747f */
+        /*bfc0*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R4, R40, R24, R4, R112, R52, URZ ;               /* 0x734070182804747f */
+        /*bfe0*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R12, R40, R26, R12, R112, R44, URZ ;             /* 0x72c0701a280c747f */
+        /*c000*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R8, R36, R24, R8, R86, R52, URZ ;                /* 0x734056182408747f */
+        /*c020*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R20, R36, R26, R20, R86, R44, URZ ;              /* 0x72c0561a2414747f */
+        /*c040*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R4, R32, R16, R4, R67, R2, URZ ;                 /* 0x702043102004747f */
+        /*c060*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R12, R32, R18, R12, R67, R0, URZ ;               /* 0x70004312200c747f */
+        /*c080*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R8, R28, R16, R8, R3, R2, URZ ;                  /* 0x702003101c08747f */
+        /*c0a0*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R20, R28, R18, R20, R3, R0, URZ ;                /* 0x700003121c14747f */
+        /*fda0*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R4, R24, R28.reuse, R4, R0, R2.reuse, URZ ;      /* 0x7028001c1804747f */
+        /*fdd0*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R8, R32, R28, R8, R3, R2, URZ ;                  /* 0x7020031c2008747f */
+        /*fe00*/                   OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X R12, R24, R30.reuse, R12, R0, R16.reuse, URZ ;   /* 0x7108001e180c747f */
+```
+
+PTX cross-check:
+- Command:
+  `cuobjdump --dump-ptx build/runtime/CMakeFiles/nemotron_runtime_backend.dir/src/backend/fused_moe_prefill.cu.o 2>/dev/null | grep -E -c "mma\\.sync\\.aligned\\.kind::mxf4nvf4\\.block_scale\\.scale_vec::4X\\.m16n8k64"`
+- Match count:
+  `324`
