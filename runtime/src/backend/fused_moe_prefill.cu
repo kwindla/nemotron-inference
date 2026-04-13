@@ -5,6 +5,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -454,19 +455,163 @@ using NanoP1AccumLayout = decltype(
         .layout());
 using NanoP1SmemAllocA = typename NanoP1TiledMma::ValTypeA;
 using NanoP1SmemAllocB = typename NanoP1TiledMma::ValTypeB;
+using NanoP1SmemCopyAtomA = cute::Copy_Atom<
+    decltype(cutlass::gemm::collective::detail::sm120_rr_smem_copy_selector_A<
+             NanoP1ElementAct,
+             NanoP1ElementWeight,
+             false>()),
+    NanoP1SmemAllocA>;
+using NanoP1SmemCopyAtomB = cute::Copy_Atom<
+    decltype(cutlass::gemm::collective::detail::sm120_rr_smem_copy_selector_B<
+             NanoP1ElementAct,
+             NanoP1ElementWeight,
+             false>()),
+    NanoP1SmemAllocB>;
+using NanoP1SmemCopyAtomSF = cute::Copy_Atom<
+    cute::UniversalCopy<nvfp4_cute::ElementSFCompute>,
+    nvfp4_cute::ElementSFCompute>;
+using NanoP1SmemCopyAtomSFA = NanoP1SmemCopyAtomSF;
+using NanoP1SmemCopyAtomSFB = NanoP1SmemCopyAtomSF;
 constexpr int kNanoP1SwizzledAElems = cute::size(cute::take<0, 2>(NanoP1SmemLayoutA{}));
 constexpr int kNanoP1SwizzledBElems = cute::size(cute::take<0, 2>(NanoP1SmemLayoutB{}));
 constexpr int kNanoP1ScaleStageElemsA = cute::cosize(cute::take<0, 2>(NanoP1SmemLayoutSFA{}));
 constexpr int kNanoP1ScaleStageElemsB = cute::cosize(cute::take<0, 2>(NanoP1SmemLayoutSFB{}));
+constexpr int kNanoP1AccumCoordCount = cute::cosize_v<NanoP1AccumLayout>;
+constexpr int kNanoP1NFragments = cute::size<1>(NanoP1AccumLayout{});
+constexpr int kNanoP1MFragments = cute::size<2>(NanoP1AccumLayout{});
 static_assert(cute::size(NanoP1TiledMma{}) == NanoP1ThreadsPerCta);
 static_assert(cute::size(typename NanoP1TiledMma::AtomThrID{}) == 32);
 static_assert(cute::cosize_v<NanoP1SmemLayoutA> == 65536);
 static_assert(cute::cosize_v<NanoP1SmemLayoutB> == 65536);
 static_assert(cute::cosize_v<NanoP1SmemLayoutSFA> == 4096);
 static_assert(cute::cosize_v<NanoP1SmemLayoutSFB> == 4096);
-static_assert(cute::cosize_v<NanoP1AccumLayout> == 64);
+static_assert(kNanoP1AccumCoordCount == 64);
+static_assert(kNanoP1NFragments == 2);
+static_assert(kNanoP1MFragments == 8);
 static_assert(kNanoP1ScaleStageElemsA * NanoP1PipelineStages == cute::cosize_v<NanoP1SmemLayoutSFA>);
 static_assert(kNanoP1ScaleStageElemsB * NanoP1PipelineStages == cute::cosize_v<NanoP1SmemLayoutSFB>);
+
+template <class SFATensor, class AtomT, class TiledThr, class TiledPerm>
+CUTE_HOST_DEVICE constexpr auto NanoP1ThrfrgSFA(
+    SFATensor&& sfatensor,
+    cute::TiledMMA<AtomT, TiledThr, TiledPerm>& mma) {
+  CUTE_STATIC_ASSERT_V(cute::rank(sfatensor) >= cute::Int<2>{});
+
+  using AtomShape_MNK = typename AtomT::Shape_MNK;
+  using AtomLayoutSFA_TV = typename AtomT::Traits::SFALayout;
+
+  auto permutation_mnk = TiledPerm{};
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+
+  auto t_tile = cute::make_tile(cute::get<0>(permutation_mnk), cute::get<2>(permutation_mnk));
+  auto t_tensor = cute::logical_divide(sfatensor, t_tile);
+
+  auto a_tile = cute::make_tile(
+      cute::make_layout(cute::size<0>(AtomShape_MNK{})),
+      cute::make_layout(cute::size<2>(AtomShape_MNK{})));
+  auto a_tensor = cute::zipped_divide(t_tensor, a_tile);
+
+  auto tv_tensor = a_tensor.compose(AtomLayoutSFA_TV{}, cute::_);
+  auto thr_tile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(cute::size<1>(thr_layout_vmnk)),
+          cute::make_layout(cute::size<3>(thr_layout_vmnk))));
+  return cute::zipped_divide(tv_tensor, thr_tile);
+}
+
+template <class SFBTensor, class AtomT, class TiledThr, class TiledPerm>
+CUTE_HOST_DEVICE constexpr auto NanoP1ThrfrgSFB(
+    SFBTensor&& sfbtensor,
+    cute::TiledMMA<AtomT, TiledThr, TiledPerm>& mma) {
+  CUTE_STATIC_ASSERT_V(cute::rank(sfbtensor) >= cute::Int<2>{});
+
+  using AtomShape_MNK = typename AtomT::Shape_MNK;
+  using AtomLayoutSFB_TV = typename AtomT::Traits::SFBLayout;
+
+  auto permutation_mnk = TiledPerm{};
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+
+  auto t_tile = cute::make_tile(cute::get<1>(permutation_mnk), cute::get<2>(permutation_mnk));
+  auto t_tensor = cute::logical_divide(sfbtensor, t_tile);
+
+  auto a_tile = cute::make_tile(
+      cute::make_layout(cute::size<1>(AtomShape_MNK{})),
+      cute::make_layout(cute::size<2>(AtomShape_MNK{})));
+  auto a_tensor = cute::zipped_divide(t_tensor, a_tile);
+
+  auto tv_tensor = a_tensor.compose(AtomLayoutSFB_TV{}, cute::_);
+  auto thr_tile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(cute::size<2>(thr_layout_vmnk)),
+          cute::make_layout(cute::size<3>(thr_layout_vmnk))));
+  return cute::zipped_divide(tv_tensor, thr_tile);
+}
+
+template <class TiledMma>
+CUTE_HOST_DEVICE constexpr auto NanoP1GetLayoutSFATV(TiledMma& mma) {
+  auto tile_shape_mnk = cute::tile_shape(mma);
+  auto ref_a = cute::make_layout(
+      cute::make_shape(cute::size<0>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto thr_tensor = NanoP1ThrfrgSFA(ref_a, mma);
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+  auto atile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(
+              cute::make_shape(cute::size<1>(thr_layout_vmnk), cute::size<2>(thr_layout_vmnk)),
+              cute::make_stride(cute::Int<1>{}, cute::Int<0>{})),
+          cute::_));
+  auto thridx_2_thrid = cute::right_inverse(thr_layout_vmnk);
+  return thr_tensor.compose(atile, cute::_).compose(thridx_2_thrid, cute::_);
+}
+
+template <class TiledMma>
+CUTE_HOST_DEVICE constexpr auto NanoP1GetLayoutSFBTV(TiledMma& mma) {
+  auto tile_shape_mnk = cute::tile_shape(mma);
+  auto ref_b = cute::make_layout(
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto thr_tensor = NanoP1ThrfrgSFB(ref_b, mma);
+  auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
+  auto btile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(
+              cute::make_shape(cute::size<1>(thr_layout_vmnk), cute::size<2>(thr_layout_vmnk)),
+              cute::make_stride(cute::Int<0>{}, cute::Int<1>{})),
+          cute::_));
+  auto thridx_2_thrid = cute::right_inverse(thr_layout_vmnk);
+  return thr_tensor.compose(btile, cute::_).compose(thridx_2_thrid, cute::_);
+}
+
+template <class SFATensor, class ThrMma>
+CUTE_HOST_DEVICE constexpr auto NanoP1PartitionScaleA(SFATensor&& sfatensor, ThrMma& thread_mma) {
+  using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSF;
+  auto thr_tensor = cute::make_tensor(
+      static_cast<SFATensor&&>(sfatensor).data(),
+      NanoP1ThrfrgSFA(sfatensor.layout(), thread_mma));
+  auto thr_vmnk = thread_mma.thr_vmnk_;
+  auto thr_vmk =
+      cute::make_coord(cute::get<0>(thr_vmnk), cute::make_coord(cute::get<1>(thr_vmnk), cute::get<3>(thr_vmnk)));
+  auto partition_sfa =
+      thr_tensor(thr_vmk, cute::make_coord(cute::_, cute::repeat<cute::rank<1, 1>(thr_tensor)>(cute::_)));
+  return cute::make_fragment_like<ValTypeSF>(partition_sfa);
+}
+
+template <class SFBTensor, class ThrMma>
+CUTE_HOST_DEVICE constexpr auto NanoP1PartitionScaleB(SFBTensor&& sfbtensor, ThrMma& thread_mma) {
+  using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSF;
+  auto thr_tensor = cute::make_tensor(
+      static_cast<SFBTensor&&>(sfbtensor).data(),
+      NanoP1ThrfrgSFB(sfbtensor.layout(), thread_mma));
+  auto thr_vmnk = thread_mma.thr_vmnk_;
+  auto thr_vnk =
+      cute::make_coord(cute::get<0>(thr_vmnk), cute::make_coord(cute::get<2>(thr_vmnk), cute::get<3>(thr_vmnk)));
+  auto partition_sfb =
+      thr_tensor(thr_vnk, cute::make_coord(cute::_, cute::repeat<cute::rank<1, 1>(thr_tensor)>(cute::_)));
+  return cute::make_fragment_like<ValTypeSF>(partition_sfb);
+}
 #else
 using ARegister = std::uint32_t;
 using BRegister = std::uint32_t;
@@ -487,6 +632,18 @@ struct BFragment64 {
 struct CFragment64 {
   CRegister regs[4];
 };
+
+template <typename OutputType>
+__device__ __forceinline__ void StoreNanoP1CFragmentsRowMajor(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int output_col_base,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
+    std::size_t output_stride,
+    OutputType* output);
 
 constexpr int kTiledCopyCoordCapacityA = 32;
 constexpr int kTiledCopyCoordCapacityB = 16;
@@ -4012,29 +4169,30 @@ __device__ __forceinline__ void Sm120BlockScaledFp4Mma(
     std::uint32_t sfa,
     std::uint32_t sfb) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-  nvfp4_cute::MmaOp::fma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, d0, d1, d2, d3, sfa, sfb);
-#else
   static constexpr std::uint16_t kBidA = 0;
   static constexpr std::uint16_t kTidA = 0;
   static constexpr std::uint16_t kBidB = 0;
   static constexpr std::uint16_t kTidB = 0;
+  const float c0 = d0;
+  const float c1 = d1;
+  const float c2 = d2;
+  const float c3 = d3;
   asm volatile(
       "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
       "{%0, %1, %2, %3},"
       "{%4, %5, %6, %7},"
       "{%8, %9},"
-      "{%0, %1, %2, %3},"
-      "{%10},"
-      "{%11, %12},"
-      "{%13},"
-      "{%14, %15};\n"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      "{%10, %11, %12, %13},"
+      "{%14},"
+      "{%15, %16},"
+      "{%17},"
+      "{%18, %19};\n"
+      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
         "r"(b0), "r"(b1),
+        "f"(c0), "f"(c1), "f"(c2), "f"(c3),
         "r"(sfa), "h"(kBidA), "h"(kTidA),
         "r"(sfb), "h"(kBidB), "h"(kTidB));
-#endif
 #endif
 }
 
@@ -4951,6 +5109,73 @@ __device__ __forceinline__ void nvfp4_bridge::StoreTracedP13CFragmentsRowMajor(
           output);
     }
   }
+#endif
+}
+
+template <typename OutputType>
+__device__ __forceinline__ void nvfp4_bridge::StoreNanoP1CFragmentsRowMajor(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int output_col_base,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
+    std::size_t output_stride,
+    OutputType* output) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  auto mma = NanoP1TiledMma{};
+  auto thread_mma = mma.get_thread_slice(thread_idx);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(NanoP1MmaTileShape{}),
+          cute::size<1>(NanoP1MmaTileShape{})));
+  auto part_c = thread_mma.partition_C(dense_c);
+  auto accum_tensor = cute::make_tensor(
+      const_cast<CRegister*>(accum_storage),
+      NanoP1AccumLayout{});
+  static_assert(cute::size<0>(decltype(part_c){}) == cute::size<0>(NanoP1AccumLayout{}));
+  static_assert(cute::size<1>(decltype(part_c){}) == cute::size<1>(NanoP1AccumLayout{}));
+  static_assert(cute::size<2>(decltype(part_c){}) == cute::size<2>(NanoP1AccumLayout{}));
+#pragma unroll
+  for (int reg = 0; reg < static_cast<int>(cute::size<0>(NanoP1AccumLayout{})); ++reg) {
+#pragma unroll
+    for (int n_fragment = 0; n_fragment < static_cast<int>(cute::size<1>(NanoP1AccumLayout{})); ++n_fragment) {
+#pragma unroll
+      for (int m_fragment = 0; m_fragment < static_cast<int>(cute::size<2>(NanoP1AccumLayout{})); ++m_fragment) {
+        auto coord = part_c(cute::make_coord(reg, n_fragment, m_fragment));
+        const int output_col_offset = CoordGet0(coord);
+        const int token_row = CoordGet1(coord);
+        if (token_row < 0 ||
+            token_row >= valid_rows ||
+            output_col_offset < 0 ||
+            output_col_offset >= valid_cols) {
+          continue;
+        }
+        const std::size_t row_index =
+            static_cast<std::size_t>(row_start + token_row);
+        const std::size_t col_index =
+            static_cast<std::size_t>(output_col_base + output_col_offset);
+        const float value = alpha * accum_tensor(reg, n_fragment, m_fragment);
+        if constexpr (std::is_same_v<OutputType, __nv_bfloat16>) {
+          output[row_index * output_stride + col_index] =
+              __float2bfloat16(value);
+        } else {
+          output[row_index * output_stride + col_index] = value;
+        }
+      }
+    }
+  }
+#else
+  (void)alpha;
+  (void)accum_storage;
+  (void)thread_idx;
+  (void)output_col_base;
+  (void)row_start;
+  (void)valid_rows;
+  (void)valid_cols;
+  (void)output_stride;
+  (void)output;
 #endif
 }
 
@@ -11723,6 +11948,11 @@ bool LaunchAccumulateSharedOutput(
 constexpr int kNanoP1MicroTileK = 64;
 constexpr int kNanoP1MicroTileBytes = kNanoP1MicroTileK / 2;
 constexpr int kNanoP1MicroScaleBytes = kNanoP1MicroTileK / fused_decode::kNvfp4BlockWidth;
+constexpr int kNanoP1ProbeDebugOffset =
+    nvfp4_bridge::NanoP1ThreadsPerCta * nvfp4_bridge::kNanoP1AccumCoordCount;
+constexpr int kNanoP1ProbeFinalThread0Offset = kNanoP1ProbeDebugOffset + 8;
+constexpr int kNanoP1ProbeDeadLaneDebugOffset = kNanoP1ProbeFinalThread0Offset + 64;
+constexpr int kNanoP1ProbeFinalThread2Offset = kNanoP1ProbeDeadLaneDebugOffset + 8;
 static_assert(kNanoP1MicroScaleBytes == 4);
 
 struct NanoP1SharedStorage {
@@ -11747,10 +11977,12 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
     void const* weight_fp4,
     void const* input_sf,
     void const* weight_sf,
-    void* accumulator_scratch,
+    __nv_bfloat16* bf16_output,
+    float const* g1_alphas,
     int64_t num_rows,
     int64_t hidden_size,
-    int64_t inter_size) {
+    int64_t inter_size,
+    float* accumulator_scratch) {
   using NanoP1TiledMma = nvfp4_bridge::NanoP1TiledMma;
   using NanoP1AccumLayout = nvfp4_bridge::NanoP1AccumLayout;
 
@@ -11765,7 +11997,8 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
 
   if (input_fp4 == nullptr ||
       weight_fp4 == nullptr ||
-      accumulator_scratch == nullptr ||
+      bf16_output == nullptr ||
+      g1_alphas == nullptr ||
       num_rows <= 0 ||
       hidden_size <= 0 ||
       inter_size <= 0 ||
@@ -11777,22 +12010,26 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
   auto const* weight_packed = static_cast<std::uint8_t const*>(weight_fp4);
   auto const* input_exec_scales = static_cast<std::uint8_t const*>(input_sf);
   auto const* weight_exec_scales = static_cast<std::uint8_t const*>(weight_sf);
-  auto* scratch = static_cast<float*>(accumulator_scratch);
+  const float alpha = g1_alphas[0];
 
   auto const stage0_A = nvfp4_bridge::NanoP1SmemLayoutA{}(cute::_, cute::_, cute::Int<0>{});
   auto const stage0_B = nvfp4_bridge::NanoP1SmemLayoutB{}(cute::_, cute::_, cute::Int<0>{});
-  auto const stage0_SFA = nvfp4_bridge::NanoP1SmemLayoutSFA{}(cute::_, cute::_, cute::Int<0>{});
-  auto const stage0_SFB = nvfp4_bridge::NanoP1SmemLayoutSFB{}(cute::_, cute::_, cute::Int<0>{});
-
-  auto sA_ = cute::make_tensor(cute::make_smem_ptr(shared.smem_A.data()), stage0_A);
-  auto sB_ = cute::make_tensor(cute::make_smem_ptr(shared.smem_B.data()), stage0_B);
-  auto sSFA_ = cute::make_tensor(cute::make_smem_ptr(shared.smem_SFA.data()), stage0_SFA);
-  auto sSFB_ = cute::make_tensor(cute::make_smem_ptr(shared.smem_SFB.data()), stage0_SFB);
+  auto sA_ = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_A.data()),
+      nvfp4_bridge::NanoP1SmemLayoutA{});
+  auto sB_ = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_B.data()),
+      nvfp4_bridge::NanoP1SmemLayoutB{});
+  auto sSFA_ = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFA.data()),
+      nvfp4_bridge::NanoP1SmemLayoutSFA{});
+  auto sSFB_ = cute::make_tensor(
+      cute::make_smem_ptr(shared.smem_SFB.data()),
+      nvfp4_bridge::NanoP1SmemLayoutSFB{});
   auto sA = cute::as_position_independent_swizzle_tensor(sA_);
   auto sB = cute::as_position_independent_swizzle_tensor(sB_);
   auto sScaleA = cute::as_position_independent_swizzle_tensor(sSFA_);
   auto sScaleB = cute::as_position_independent_swizzle_tensor(sSFB_);
-
   auto* swizzled_a_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_A.data());
   auto* swizzled_b_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_B.data());
 
@@ -11813,33 +12050,61 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
   const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
   const std::uint32_t unit_scale_word = nvfp4_bridge::MakePackedUnitScaleWord();
   const std::uint8_t unit_scale_byte = nvfp4_bridge::LoadScaleByte(unit_scale_word, 0);
-  constexpr int kNanoP1NFragments = cute::size<1>(NanoP1AccumLayout{});
-  constexpr int kNanoP1MFragments = cute::size<2>(NanoP1AccumLayout{});
-  static_assert(cute::size<0>(NanoP1AccumLayout{}) == 4);
-  static_assert(kNanoP1NFragments == 2);
-  static_assert(kNanoP1MFragments == 8);
+  nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kNanoP1AccumCoordCount];
+  auto accum_tensor = cute::make_tensor(&accum_storage[0], NanoP1AccumLayout{});
+  cute::clear(accum_tensor);
 
-  nvfp4_bridge::CFragment64 accum[kNanoP1MFragments][kNanoP1NFragments];
-#pragma unroll
-  for (int m_fragment = 0; m_fragment < kNanoP1MFragments; ++m_fragment) {
-#pragma unroll
-    for (int n_fragment = 0; n_fragment < kNanoP1NFragments; ++n_fragment) {
-#pragma unroll
-      for (int reg = 0; reg < 4; ++reg) {
-        accum[m_fragment][n_fragment].regs[reg] = 0.0f;
-      }
-    }
-  }
+  auto mma = NanoP1TiledMma{};
+  auto thread_mma = mma.get_thread_slice(tid);
+  auto sA_stage0 = sA(cute::_, cute::_, cute::Int<0>{});
+  auto sB_stage0 = sB(cute::_, cute::_, cute::Int<0>{});
+  auto sSFA_stage0 = sSFA_(cute::_, cute::_, cute::Int<0>{});
+  auto sSFB_stage0 = sSFB_(cute::_, cute::_, cute::Int<0>{});
 
-  auto* row_major_a = shared.row_major_A.data();
-  auto* row_major_b = shared.row_major_B.data();
-  auto* scale_words_a = shared.scale_words_A.data();
-  auto* scale_words_b = shared.scale_words_B.data();
+  auto tCrA = thread_mma.partition_fragment_A(sA_stage0);
+  auto tCrB = thread_mma.partition_fragment_B(sB_stage0);
+  auto tCrSFA = nvfp4_bridge::NanoP1PartitionScaleA(sSFA_stage0, thread_mma);
+  auto tCrSFB = nvfp4_bridge::NanoP1PartitionScaleB(sSFB_stage0, thread_mma);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
+  auto part_c = thread_mma.partition_C(dense_c);
 
-  for (int64_t k_base = 0; k_base < hidden_size; k_base += kNanoP1MicroTileK) {
+  static_assert(cute::size<1>(decltype(tCrA){}) == cute::size<1>(decltype(tCrSFA){}));
+  static_assert(cute::size<1>(decltype(tCrB){}) == cute::size<1>(decltype(tCrSFB){}));
+
+  auto s2r_copy_A = cute::make_tiled_copy_A(nvfp4_bridge::NanoP1SmemCopyAtomA{}, mma);
+  auto s2r_thr_A = s2r_copy_A.get_thread_slice(tid);
+  auto tCsA = s2r_thr_A.partition_S(sA);
+  auto tCrA_cv = s2r_thr_A.retile_D(tCrA);
+
+  auto s2r_copy_B = cute::make_tiled_copy_B(nvfp4_bridge::NanoP1SmemCopyAtomB{}, mma);
+  auto s2r_thr_B = s2r_copy_B.get_thread_slice(tid);
+  auto tCsB = s2r_thr_B.partition_S(sB);
+  auto tCrB_cv = s2r_thr_B.retile_D(tCrB);
+
+  auto tile_shape_mnk = cute::tile_shape(mma);
+  auto s2r_copy_SFA = cute::make_tiled_copy_impl(
+      nvfp4_bridge::NanoP1SmemCopyAtomSFA{},
+      nvfp4_bridge::NanoP1GetLayoutSFATV(mma),
+      cute::make_shape(cute::size<0>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFA = s2r_copy_SFA.get_thread_slice(tid);
+  auto tCsSFA = s2r_thr_SFA.partition_S(sScaleA);
+  auto tCrSFA_cv = s2r_thr_SFA.retile_D(tCrSFA);
+
+  auto s2r_copy_SFB = cute::make_tiled_copy_impl(
+      nvfp4_bridge::NanoP1SmemCopyAtomSFB{},
+      nvfp4_bridge::NanoP1GetLayoutSFBTV(mma),
+      cute::make_shape(cute::size<1>(tile_shape_mnk), cute::size<2>(tile_shape_mnk)));
+  auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
+  auto tCsSFB = s2r_thr_SFB.partition_S(sScaleB);
+  auto tCrSFB_cv = s2r_thr_SFB.retile_D(tCrSFB);
+
+  // NanoP1's shared-memory tile is K=128. Each iteration must populate the
+  // full CTA K slice before issuing both per-thread k-block MMAs.
+  for (int64_t k_base = 0; k_base < hidden_size; k_base += kTileK) {
     const int64_t remaining_k = hidden_size - k_base;
     const std::size_t available_k = static_cast<std::size_t>(
-        remaining_k < static_cast<int64_t>(kNanoP1MicroTileK) ? remaining_k : kNanoP1MicroTileK);
+        remaining_k < static_cast<int64_t>(kTileK) ? remaining_k : kTileK);
     const std::size_t available_bytes = available_k / 2u;
     const std::size_t available_blocks =
         available_k / fused_decode::kNvfp4BlockWidth;
@@ -11851,7 +12116,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
       const bool row_valid = row < valid_cols;
       const std::size_t source_row = static_cast<std::size_t>(output_col_base + row);
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
-      auto* row_major_dst = row_major_a + static_cast<std::size_t>(row) * kNanoP1MicroTileBytes;
       for (int byte_index = 0; byte_index < kMacroTileBytes; ++byte_index) {
         std::uint8_t value = 0u;
         if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
@@ -11859,9 +12123,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
         }
         const auto elem_offset = stage0_A(row, byte_index * 2);
         swizzled_a_bytes[static_cast<int>(elem_offset) / 2] = value;
-        if (byte_index < kNanoP1MicroTileBytes) {
-          row_major_dst[byte_index] = value;
-        }
       }
       std::uint8_t scale_bytes[kMacroScaleBytes];
       if (row_valid) {
@@ -11880,26 +12141,20 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
           }
           scale_bytes[scale_index] = value;
         }
-        nvfp4_bridge::StoreTracedScaleBytes(sSFA_, scale_bytes, row);
+        nvfp4_bridge::StoreTracedScaleBytes(sSFA_stage0, scale_bytes, row);
       } else {
 #pragma unroll
         for (int scale_index = 0; scale_index < kMacroScaleBytes; ++scale_index) {
           scale_bytes[scale_index] = 0u;
         }
-        nvfp4_bridge::ZeroTracedP5ScaleRow(sSFA_, row);
+        nvfp4_bridge::ZeroTracedP5ScaleRow(sSFA_stage0, row);
       }
-      scale_words_a[row] = PackScaleWord4(
-          scale_bytes[0],
-          scale_bytes[1],
-          scale_bytes[2],
-          scale_bytes[3]);
     }
 
     for (int row = tid; row < kTileM; row += blockDim.x) {
       const bool row_valid = row < valid_rows;
       const std::size_t source_row = static_cast<std::size_t>(row_start + row);
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
-      auto* row_major_dst = row_major_b + static_cast<std::size_t>(row) * kNanoP1MicroTileBytes;
       for (int byte_index = 0; byte_index < kMacroTileBytes; ++byte_index) {
         std::uint8_t value = 0u;
         if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
@@ -11907,9 +12162,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
         }
         const auto elem_offset = stage0_B(row, byte_index * 2);
         swizzled_b_bytes[static_cast<int>(elem_offset) / 2] = value;
-        if (byte_index < kNanoP1MicroTileBytes) {
-          row_major_dst[byte_index] = value;
-        }
       }
       std::uint8_t scale_bytes[kMacroScaleBytes];
       if (row_valid) {
@@ -11928,60 +12180,111 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
           }
           scale_bytes[scale_index] = value;
         }
-        nvfp4_bridge::StoreTracedScaleBytes(sSFB_, scale_bytes, row);
+        nvfp4_bridge::StoreTracedScaleBytes(sSFB_stage0, scale_bytes, row);
       } else {
 #pragma unroll
         for (int scale_index = 0; scale_index < kMacroScaleBytes; ++scale_index) {
           scale_bytes[scale_index] = 0u;
         }
-        nvfp4_bridge::ZeroTracedP5ScaleRow(sSFB_, row);
+        nvfp4_bridge::ZeroTracedP5ScaleRow(sSFB_stage0, row);
       }
-      scale_words_b[row] = PackScaleWord4(
-          scale_bytes[0],
-          scale_bytes[1],
-          scale_bytes[2],
-          scale_bytes[3]);
     }
 
     NanoP1CtaBarrier();
 
-    nvfp4_bridge::AFragment64 a_fragments[kNanoP1MFragments];
-    nvfp4_bridge::BFragment64 b_fragments[kNanoP1NFragments];
+    cute::copy(s2r_copy_A, tCsA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrA_cv);
+    cute::copy(s2r_copy_B, tCsB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrB_cv);
+    cute::copy(tCsSFA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFA_cv);
+    cute::copy(tCsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_cv);
 
-#pragma unroll
-    for (int m_fragment = 0; m_fragment < kNanoP1MFragments; ++m_fragment) {
-      a_fragments[m_fragment] =
-          nvfp4_bridge::LoadFragmentA_RowMajor16x64Tiled<NanoP1TiledMma, kTileM>(
-              row_major_a,
-              scale_words_a,
-              m_fragment * 16,
-              tid);
+    using MMAOp = typename NanoP1TiledMma::MMA_Op;
+    for (int k_block = 0; k_block < cute::size<2>(tCrA_cv); ++k_block) {
+      cute::fp4_shift_A(MMAOp{}, tCrA_cv(cute::_, cute::_, k_block));
+      cute::fp4_shift_B(MMAOp{}, tCrB_cv(cute::_, cute::_, k_block));
     }
 
-#pragma unroll
-    for (int n_fragment = 0; n_fragment < kNanoP1NFragments; ++n_fragment) {
-      b_fragments[n_fragment] =
-          nvfp4_bridge::LoadFragmentB_ColMajor64x8Tiled<NanoP1TiledMma, kTileN>(
-              row_major_b,
-              scale_words_b,
-              tid,
-              n_fragment * 8);
+    if (accumulator_scratch != nullptr &&
+        k_base == 0 &&
+        blockIdx.x == 0 &&
+        blockIdx.y == 0 &&
+        (tid == 0 || tid == 2)) {
+      auto rA = cute::recast<nvfp4_bridge::ARegister>(tCrA);
+      auto rB = cute::recast<nvfp4_bridge::BRegister>(tCrB);
+      auto rSFA = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFA));
+      auto rSFB = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFB));
+      const int debug_offset =
+          tid == 0 ? kNanoP1ProbeDebugOffset : kNanoP1ProbeDeadLaneDebugOffset;
+      accumulator_scratch[debug_offset + 0] =
+          __uint_as_float(static_cast<std::uint32_t>(rA(0)));
+      accumulator_scratch[debug_offset + 1] =
+          __uint_as_float(static_cast<std::uint32_t>(rA(1)));
+      accumulator_scratch[debug_offset + 2] =
+          __uint_as_float(static_cast<std::uint32_t>(rA(2)));
+      accumulator_scratch[debug_offset + 3] =
+          __uint_as_float(static_cast<std::uint32_t>(rA(3)));
+      accumulator_scratch[debug_offset + 4] =
+          __uint_as_float(static_cast<std::uint32_t>(rSFA(0)));
+      accumulator_scratch[debug_offset + 5] =
+          __uint_as_float(static_cast<std::uint32_t>(rB(0)));
+      accumulator_scratch[debug_offset + 6] =
+          __uint_as_float(static_cast<std::uint32_t>(rB(1)));
+      accumulator_scratch[debug_offset + 7] =
+          __uint_as_float(static_cast<std::uint32_t>(rSFB(0)));
     }
 
+    constexpr int kMmaKBlocks = cute::size<2>(decltype(tCrA){});
+    for (int k_block = 0; k_block < kMmaKBlocks; ++k_block) {
+      cute::gemm(
+          mma,
+          cute::make_zip_tensor(tCrA(cute::_, cute::_, k_block), tCrSFA(cute::_, cute::_, k_block)),
+          cute::make_zip_tensor(tCrB(cute::_, cute::_, k_block), tCrSFB(cute::_, cute::_, k_block)),
+          accum_tensor);
+      if (accumulator_scratch != nullptr &&
+          k_base == 0 &&
+          k_block == 0 &&
+          blockIdx.x == 0 &&
+          blockIdx.y == 0) {
+        const std::size_t thread_offset =
+            static_cast<std::size_t>(threadIdx.x) *
+            static_cast<std::size_t>(nvfp4_bridge::kNanoP1AccumCoordCount);
 #pragma unroll
-    for (int m_fragment = 0; m_fragment < kNanoP1MFragments; ++m_fragment) {
-#pragma unroll
-      for (int n_fragment = 0; n_fragment < kNanoP1NFragments; ++n_fragment) {
-        nvfp4_bridge::Gemm(accum[m_fragment][n_fragment], a_fragments[m_fragment], b_fragments[n_fragment]);
+        for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
+          accumulator_scratch[thread_offset + static_cast<std::size_t>(physical)] =
+              accum_storage[physical];
+        }
       }
     }
 
     NanoP1CtaBarrier();
   }
 
-  const std::size_t scratch_index =
-      ((static_cast<std::size_t>(blockIdx.y) * gridDim.x) + blockIdx.x) * blockDim.x + threadIdx.x;
-  scratch[scratch_index] = accum[0][0].regs[0];
+  if (accumulator_scratch != nullptr &&
+      blockIdx.x == 0 &&
+      blockIdx.y == 0 &&
+      tid == 0) {
+    for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
+      accumulator_scratch[kNanoP1ProbeFinalThread0Offset + physical] = accum_storage[physical];
+    }
+  }
+  if (accumulator_scratch != nullptr &&
+      blockIdx.x == 0 &&
+      blockIdx.y == 0 &&
+      tid == 2) {
+    for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
+      accumulator_scratch[kNanoP1ProbeFinalThread2Offset + physical] = accum_storage[physical];
+    }
+  }
+
+  nvfp4_bridge::StoreNanoP1CFragmentsRowMajor(
+      alpha,
+      accum_storage,
+      tid,
+      output_col_base,
+      row_start,
+      valid_rows,
+      valid_cols,
+      static_cast<std::size_t>(inter_size),
+      bf16_output);
 }
 
 bool RunNanoP1KernelForTestingImpl(
@@ -11989,14 +12292,17 @@ bool RunNanoP1KernelForTestingImpl(
     void const* weight_fp4,
     void const* input_sf,
     void const* weight_sf,
-    void* accumulator_scratch,
+    __nv_bfloat16* bf16_output,
+    float const* g1_alphas,
     int64_t num_rows,
     int64_t hidden_size,
     int64_t inter_size,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    float* accumulator_scratch) {
   if (input_fp4 == nullptr ||
       weight_fp4 == nullptr ||
-      accumulator_scratch == nullptr ||
+      bf16_output == nullptr ||
+      g1_alphas == nullptr ||
       num_rows <= 0 ||
       hidden_size <= 0 ||
       inter_size <= 0 ||
@@ -12023,10 +12329,12 @@ bool RunNanoP1KernelForTestingImpl(
       weight_fp4,
       input_sf,
       weight_sf,
-      accumulator_scratch,
+      bf16_output,
+      g1_alphas,
       num_rows,
       hidden_size,
-      inter_size);
+      inter_size,
+      accumulator_scratch);
   return CheckCuda(cudaGetLastError()) && CheckCuda(cudaStreamSynchronize(stream));
 }
 #endif
@@ -12173,32 +12481,38 @@ bool RunNanoP1KernelForTesting(
     void const* weight_fp4,
     void const* input_sf,
     void const* weight_sf,
-    void* accumulator_scratch,
+    __nv_bfloat16* bf16_output,
+    float const* g1_alphas,
     int64_t num_rows,
     int64_t hidden_size,
     int64_t inter_size,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    float* accumulator_scratch) {
 #if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   return RunNanoP1KernelForTestingImpl(
       input_fp4,
       weight_fp4,
       input_sf,
       weight_sf,
-      accumulator_scratch,
+      bf16_output,
+      g1_alphas,
       num_rows,
       hidden_size,
       inter_size,
-      stream);
+      stream,
+      accumulator_scratch);
 #else
   (void)input_fp4;
   (void)weight_fp4;
   (void)input_sf;
   (void)weight_sf;
-  (void)accumulator_scratch;
+  (void)bf16_output;
+  (void)g1_alphas;
   (void)num_rows;
   (void)hidden_size;
   (void)inter_size;
   (void)stream;
+  (void)accumulator_scratch;
   return false;
 #endif
 }

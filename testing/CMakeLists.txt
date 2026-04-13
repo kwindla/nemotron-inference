@@ -563,6 +563,26 @@ target_compile_features(staged_fp4_pack_test PRIVATE cxx_std_17)
 nemotron_add_test(staged_fp4_pack_test)
 
 add_executable(
+  nano_p1_mainloop_oracle_test
+  backend/nano_p1_mainloop_oracle_test.cpp
+)
+
+target_link_libraries(
+  nano_p1_mainloop_oracle_test
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+target_compile_features(nano_p1_mainloop_oracle_test PRIVATE cxx_std_17)
+target_compile_definitions(
+  nano_p1_mainloop_oracle_test
+  PRIVATE
+    NEMOTRON_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+nemotron_add_test(nano_p1_mainloop_oracle_test)
+
+add_executable(
   nvfp4_pack_compare_test
   backend/nvfp4_pack_compare_test.cpp
 )
