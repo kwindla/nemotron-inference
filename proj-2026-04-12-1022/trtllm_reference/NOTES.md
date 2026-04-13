@@ -145,15 +145,21 @@ Translation: when we write our own kernel, we should use **the same inversion pa
 
 ---
 
-## 4. Step 4a checklist
+## 4. Step 4a reference — TRT-LLM CollectiveBuilder alias table (REFERENCE ONLY — do not copy into runtime/)
 
-Step 4a's job is to define a standalone `NanoP1*` type bundle that produces a bitwise-identical `CollectiveMainloop` and `TiledMma` to what TRT-LLM's launcher macro would produce for the P1 tile shape with Nemotron-relevant parameters (`ElementAct = float_e2m1_t`, `ElementWeight = float_e2m1_t`, `OutputType = __nv_bfloat16`, SwapAB=false, CTA=128x128x128 elements, cluster=1x1x1, KernelScheduleAuto).
+**Kernel Provenance constraint** (`PLAN_RULES.md § Kernel Provenance`): the production NanoP1 kernel lives on the prefill hot path and must be written from scratch using only the CUTE atom/layout allow-list plus inline PTX for the SM120 block-scaled MMA. **`cutlass::gemm::collective::CollectiveBuilder` is forbidden in `runtime/`.** The alias table below is the TRT-LLM reference — it documents what the TRT-LLM launcher would produce for the P1 tile — but it is NOT a template for our runtime code. Step 4a's job is to define equivalent hand-written types using `cute::MMA_Atom<cute::SM120_16x8x64_TN_VS<...>>`, `cute::TiledMMA`, `cute::Copy_Atom`, `cute::Layout`, swizzle functors, and `Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB`, reproducing the same shapes, stage counts, and per-thread fragment layouts that the reference would have produced.
 
-Per PLAN.md v6 steps 3d/4a, **do NOT reintroduce a `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization in step 4a**. That specialization is explicitly kept deleted — it only comes back later, if and only if the standalone `NanoP1Nvfp4MoeGemmKernel` is already proven correct AND a shared-helper reuse story genuinely requires it. The default step 4 path is the standalone kernel + standalone `NanoP1*` type bundle; a resurrected `Traits<kP1>` surface is opt-in.
+The old (reverted) step 4a commit `9be1580` instantiated `CollectiveBuilder` directly in `runtime/src/backend/fused_moe_prefill.cu` and was reverted in `8ea9241` because that violated the policy. Every future reference to "`NanoP1*` type bundle" in this file should be read as "our hand-written equivalent of what the table below would have produced".
 
-### Required type aliases
+Per PLAN.md v6 step 3d, **`UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` remains deleted** and is NOT reintroduced by step 4. The `UnifiedRoutedFp4Profile::kP1` enum constant stays intact.
 
-| New `NanoP1*` alias | Must be equal to |
+### TRT-LLM reference types (for our hand-written kernel to mirror, not to instantiate)
+
+The names below use the old `NanoP1Nvfp4MoeGemm*` prefix because they were copy-pasted from the reverted design. Read every row as "TRT-LLM's CollectiveBuilder would emit type X for this slot; our hand-written runtime code must produce an equivalent CUTE structure under name Y per `PLAN.md` step 4a".
+
+### Reference type aliases (TRT-LLM would emit these — our runtime code mirrors the shapes, not the names)
+
+| TRT-LLM reference alias | Would be equal to (CollectiveBuilder output) |
 |---|---|
 | `NanoP1Nvfp4MoeGemmArchTag` | `cutlass::arch::Sm120` |
 | `NanoP1Nvfp4MoeGemmTensorOp` | `cutlass::arch::OpClassBlockScaledTensorOp` |
@@ -185,23 +191,22 @@ Per PLAN.md v6 steps 3d/4a, **do NOT reintroduce a `UnifiedRoutedFp4Traits<Unifi
 
 ### Step 4a compile-time `ShowInt<N>` probe checklist
 
-After instantiating the aliases above, step 4a should add temporary `ShowInt<N>` probes for the following values (dump them during compilation, then revert the probes before committing 4a):
+After instantiating OUR OWN hand-written types (`NanoP1MmaAtom`, `NanoP1TiledMma`, `NanoP1SmemLayoutA/B/SFA/SFB`, etc. per `PLAN.md` step 4a), add temporary `ShowInt<N>` probes for the following values (dump during compilation, then remove the probes before committing 4a). These verify that OUR hand-written CUTE types produce the shapes we designed — the values below are the TRT-LLM reference the design spec came from.
 
-1. `cute::size<0>(NanoP1Nvfp4MoeGemmTiledMma::AtomThrID{})` — threads per atom (expected: 32 for SM120 m16n8 atom)
-2. `cute::cosize_v<NanoP1Nvfp4MoeGemmSmemLayoutA{}>` (after resolving stage axis)
-3. `cute::cosize_v<NanoP1Nvfp4MoeGemmSmemLayoutB{}>`
-4. `cute::cosize_v<NanoP1Nvfp4MoeGemmSmemLayoutSFA{}>`
-5. `cute::cosize_v<NanoP1Nvfp4MoeGemmSmemLayoutSFB{}>`
-6. `NanoP1Nvfp4MoeGemmCollectiveMainloop::DispatchPolicy::Stages` (pipeline stage count)
-7. `NanoP1Nvfp4MoeGemmCollectiveMainloop::ThreadCount`
-8. For a representative thread id (e.g. 0): each of `cute::size<i>` on the output of
-   - `thread_mma.partition_fragment_A(sA(_, _, Int<0>{}))` — gives `tCrA` shape
-   - `thread_mma.partition_fragment_B(sB(_, _, Int<0>{}))` — gives `tCrB` shape
-   - `collective_mainloop.partition_fragment_SFA(sSFA(_, _, Int<0>{}), thread_mma)` — `tCrSFA` shape
-   - `collective_mainloop.partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma)` — `tCrSFB` shape
-   - `thread_mma.partition_fragment_C(Shape<_128, _128>{})` — accumulator shape
+| Probe | Source (our hand-written type) | Reference (what TRT-LLM would emit) |
+|---|---|---|
+| threads per atom | `cute::size(typename NanoP1TiledMma::AtomThrID{})` | `32` (SM120 m16n8 atom) |
+| smem A cosize | `cute::cosize_v<NanoP1SmemLayoutA{}>` | see `step_4a_probe_values.txt` from reverted commit `9be1580` for the reference values we'd compute against |
+| smem B cosize | `cute::cosize_v<NanoP1SmemLayoutB{}>` | same |
+| smem SFA cosize | `cute::cosize_v<NanoP1SmemLayoutSFA{}>` | same |
+| smem SFB cosize | `cute::cosize_v<NanoP1SmemLayoutSFB{}>` | same |
+| pipeline stages | `NanoP1PipelineStages` (we pick this, not a `DispatchPolicy::Stages`) | `4` |
+| thread count | `NanoP1ThreadsPerCta` (we pick this) | `256` |
+| tCrA / tCrB shapes | our partition on `NanoP1SmemLayoutA/B` slices | see `trtllm_architecture.md` §5.3 |
+| tCrSFA / tCrSFB shapes | our partition on `NanoP1SmemLayoutSFA/B` | same |
+| tCrC profile | `cute::partition_fragment_C(NanoP1TiledMma{}, Shape<_128, _128>{})` | same |
 
-Expected values: see `trtllm_architecture.md` §5.3 for the set of layouts TRT-LLM's P1 probe function dumps (`SmemLayoutAtomSFA/B`, `SmemLayoutSFA/B`, `LayoutSFA_TV`, `tCrA_k0`, `tCrB_k0`, `tCsSFA`, `tCsSFB`, `tCrSFA_copy_view`, `tCrSFB_copy_view`, `tCrC_profile`).
+The reverted step 4a commit `9be1580` captured the TRT-LLM-equivalent probe values by running the CollectiveBuilder; those values are still the design target, just not the runtime implementation. Re-capture them via the same probe pattern against OUR hand-written types to confirm we reproduced the intended shapes.
 
 For a value-level sanity check against TRT-LLM specifically (not required; `ShowInt<N>` probe self-consistency is the primary gate), step 2b (optional follow-up) would build a minimal C++ harness that links against `libtensorrt_llm.so` and calls TRT-LLM's own `maybePrintSm120P1CompileProbe<CollectiveMainloop>()` to emit the exact strings TRT-LLM would dump, for side-by-side comparison. That is deferred.
 

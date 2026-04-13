@@ -366,47 +366,68 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/p1_*.cpp` (deleted), `testing/backend/p13_generic_direct_stage_oracle_test.cpp` (deleted), `testing/CMakeLists.txt`.
 
-- [ ] **4. Implement the new kP1 kernel from scratch, modeled on TRT-LLM through the BF16 boundary (3 sub-commits 4a-4c)**
-  Write a fresh kernel path in `runtime/src/backend/fused_moe_prefill.cu` that matches TRT-LLM's architecture as documented in step 1 **through the BF16 GEMM boundary**, then layer the Nemotron-specific fused direct-pack epilogue on top.
+- [~] **4. Implement a from-scratch NanoP1 kP1 kernel, guided by TRT-LLM but not using it (4 sub-commits 4a-4d)**
 
-  **New names** (no accidental reuse of deleted types):
-  - `NanoP1Nvfp4MoeGemmCollectiveMainloop`
-  - `NanoP1Nvfp4MoeGemmTiledMma`
-  - `NanoP1Nvfp4MoeGemmSmemLayoutA` / `SmemLayoutB` / `SmemLayoutSFA` / `SmemLayoutSFB`
-  - `NanoP1Nvfp4MoeGemmAccumLayout`
-  - `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization only if shared helper reuse genuinely requires it after the standalone kernel is already proven
-  - Kernel template: a new standalone `NanoP1Nvfp4MoeGemmKernel`. Reusing the existing unified swap-true kernel is out of scope for this plan unless a later sub-commit explicitly adds a kP1-specialized FP4-direct epilogue branch and documents that architecture change.
+  **Kernel Provenance policy (`PLAN_RULES.md § Kernel Provenance`)**: this kernel ships on the prefill hot path, so it MUST be written from scratch. No `cutlass::gemm::collective::CollectiveBuilder`, no `GemmUniversalAdapter`, no `GemmKernel`, no `MainloopSm*` dispatch policy, no FlashInfer/TRT-LLM runtime code. Permitted primitives: hand-written CUDA, inline PTX for the SM120 block-scaled MMA, and the explicit allow-list of CUTE atoms and layout primitives — `cute::MMA_Atom<cute::SM120_16x8x64_TN_VS<...>>`, `cute::TiledMMA`, `cute::Copy_Atom<cute::SM90_TMA_LOAD>`, `cute::Copy_Atom<cute::SM75_U32x4_LDSM_N>`, `cute::Layout`, `cute::Tensor`, swizzle functors, and `cutlass::detail::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB`.
+
+  TRT-LLM is used only as a **reference guide** per the Kernel Provenance rule: we study the CollectiveBuilder output (shapes, stage counts, atom selection, scale-factor layouts) and **re-emit that structure as hand-written CUDA**. We do not link against, #include, or instantiate CollectiveBuilder itself inside `runtime/`.
+
+  This is a meaningful departure from the earlier (reverted) `NanoP1*` type-bundle approach that used CollectiveBuilder directly. The step 2 flashinfer BF16 `gemm1_output` capture remains the BF16-boundary oracle — that harness is off-hot-path test code and is not affected by the Kernel Provenance rule.
+
+  **New names** (no accidental reuse of deleted types, no reintroduction of the reverted `NanoP1Nvfp4MoeGemm*` CollectiveBuilder bundle from commit `9be1580`):
+  - `NanoP1MmaAtom` / `NanoP1TiledMma` — hand-instantiated from `cute::MMA_Atom<cute::SM120_16x8x64_TN_VS<cutlass::nv_float4_t<cutlass::float_e2m1_t>>>` and a `cute::TiledMMA` wrapping it
+  - `NanoP1SmemLayoutA` / `SmemLayoutB` / `SmemLayoutSFA` / `SmemLayoutSFB` — defined from `cute::Layout` + swizzle functors, with scale-factor layouts derived via `Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB`
+  - `NanoP1TmaLoadA` / `NanoP1TmaLoadB` — `cute::Copy_Atom<cute::SM90_TMA_LOAD>` specialisations (or `SM75_U32x4_LDSM_N` for scale factors / fallback)
+  - `NanoP1AccumLayout` — hand-written per-thread accumulator layout
+  - `NanoP1MmaPtxIntrinsic` — a `__device__` inline wrapper around the `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` PTX, taking raw register inputs and producing fp32 accumulator outputs
+  - `NanoP1Kernel` — standalone `__global__` CUDA kernel. No GemmUniversalAdapter. No dispatch policy types.
+  - `RunNanoP1KernelForTesting(...)` — host launcher exposed via `runtime/include/nemotron/fused_moe_prefill.h` for off-hot-path oracle tests
 
   **Sub-commits**:
 
-  - **4a — NanoP1 type bundle + TiledMma + smem layouts**
-    Instantiate the CollectiveBuilder with TRT-LLM's exact template argument list. Define the new `NanoP1*` types in a standalone type bundle; do **not** reintroduce `UnifiedRoutedFp4Traits<kP1>` yet unless standalone kernel compile plumbing absolutely requires it. No kernel yet — compile-only. Add compile-time `ShowInt<N>` probes (ifdef-guarded) for the per-thread partition mode sizes of A/B/C and remove them after the first successful build to confirm the layout matches TRT-LLM's documented per-thread mode sizes. Follow the literal TRT P1 probe code for the partition calls (`tCrA = partition_fragment_B(sA)`, `tCrB = partition_fragment_A(sB)`); if any prose note disagrees, the source snippet wins.
+  - **4a — NanoP1 CUTE type bundle + TiledMma + smem layouts (compile-only)**
+    Define the hand-written CUTE type bundle in `runtime/src/backend/fused_moe_prefill.cu`. No CollectiveBuilder. Everything comes from the allow-list: `cute::MMA_Atom<cute::SM120_16x8x64_TN_VS<...>>`, `cute::TiledMMA`, `cute::Copy_Atom`, `cute::Layout`, swizzle functors, `Sm1xxBlkScaledConfig`. The shapes (CTA_M=128, CTA_N=128, CTA_K=128 elements, cluster=1x1x1) are the design spec from step 1 / NOTES.md §0, not extracted from a CollectiveBuilder.
 
-    **Load-bearing note** (new after step 2 completion): the step 2 capture revealed that on the default synthetic problem (M=128, K=256, N=256), all 8 runtime GEMM1 tactics converge to bitwise-identical BF16 output — a math property of FP4 × FP4 reductions rounded to BF16 at the epilogue boundary (see `proj-2026-04-12-1022/trtllm_reference/NOTES.md §5 "Observed convergence"`). That makes step 4b's runtime bitwise oracle a *necessary-but-not-sufficient* correctness gate for small problems. The step 4a `ShowInt<N>` probes are therefore the primary mechanism that pins the new `NanoP1*` type bundle to the exact TRT-LLM P1 `CollectiveBuilder` / `TiledMma` instantiation. Treat the probe checklist in `NOTES.md §4` as load-bearing, not just a sanity check: every residual mismatch must be explained from the CUTLASS snapshot in use before moving to step 4b.
+    Values we were going to compute via `ShowInt<N>` from CollectiveBuilder outputs in the old 4a design are now **inputs to our design, not observations of CUTLASS's design.** That is: we pick the stage count, thread count, smem sizes, and per-thread fragment shapes ourselves, based on the TRT-LLM reference values (which are documented in NOTES.md §4 as the target we're reproducing). Any discrepancy between our chosen values and TRT-LLM's needs justification from SM120 hardware constraints, not from template instantiation artifacts.
 
-    Gate: `cmake --build` clean, all probe values match TRT-LLM's documented per-thread mode sizes, any residual mismatch explained from the CUTLASS snapshot, and `UnifiedRoutedFp4Traits<kP1>` remains deleted.
+    No kernel, no launcher, no test yet — this sub-commit is compile-only types. Compile-time `ShowInt<N>` probes for our own `NanoP1TiledMma::AtomThrID`, `NanoP1SmemLayoutA` cosize, etc., are still allowed and recommended: they verify our hand-written types produce the expected shapes. The probe values live in `proj-2026-04-12-1022/probes/step_4a_probe_values.txt` and must match our design spec exactly — any mismatch blocks the commit.
 
-  - **4b — TRT-compatible GEMM boundary (BF16 dense output, no fused direct-pack)**
-    Implement the new kernel's mainloop: smem A/B staging, `fp4_shift` handling, MMA loop, and the same dense BF16 epilogue boundary that TRT-LLM's GEMM writes to `gemm1_output`. This sub-commit intentionally mirrors TRT-LLM **only through the GEMM boundary**: apply the same alpha path and BF16 cast, but do **not** apply `Relu²` and do **not** pack FP4 yet.
+    Gate: `cmake --build` clean, probe values match design spec, no `CollectiveBuilder` / `GemmUniversalAdapter` / `GemmKernel` / `CollectiveMma` / `CollectiveEpilogue` / `MainloopSm*` / `KernelSchedule*` identifier appears in the new code, no `#include` under `cutlass/gemm/collective/`, `cutlass/gemm/device/`, `cutlass/gemm/kernel/`, or `cutlass/epilogue/collective/` is added to `runtime/`. `UnifiedRoutedFp4Traits<kP1>` remains deleted.
 
-    New test `testing/backend/nano_p1_mainloop_oracle_test.cpp` runs the kernel on the exact synthetic problem captured in step 2 (inputs replayed from `proj-2026-04-12-1022/trtllm_reference/golden/inputs.pt`, tactic `bf16_gemm1_tactic1.bin` — plan-v6 P1, `CtaShape128x128x64B_Cluster1x1x1`, `SwapAB=false`) and compares the BF16 dense output bitwise against the step 2 artifact.
+  - **4b — NanoP1 mainloop body, hand-written (compile + compile-time probes)**
+    Write the `NanoP1Kernel` `__global__` function body: TMA loads of A/B and scale factors into smem, smem → register staging via `Copy_Atom<SM75_U32x4_LDSM_N>` (or `SM90_TMA_LOAD` ringed into circular buffers per stage), the MMA loop that calls `NanoP1MmaPtxIntrinsic` on each atom tile, and fp32 accumulator bookkeeping per warp. Pipeline stages are driven by hand-written named barriers, not `cutlass::arch::NamedBarrier` or any `MainloopSm*` pipeline policy.
 
-    **Read the oracle contract carefully** (new after step 2 completion): for the small default problem, all 8 step-2 tactics are bitwise-identical. A bitwise match against `tactic1` therefore proves the `NanoP1` kernel is **mathematically consistent with some legal SM120 NVFP4 MoE GEMM kernel**, but does **not** by itself prove "same tile shape / same reduction order as TRT-LLM's P1". The "same CollectiveBuilder instantiation as TRT-LLM P1" claim is established at step 4a by the compile-time probes, not at step 4b by runtime bitwise. This is fine — 4a and 4b together form a complete proof — but the test file must say so in a comment so a future maintainer does not read too much into a passing 4b.
+    No epilogue yet. No output tensor writes. This sub-commit compiles the mainloop body and exposes compile-time probes (`ShowInt<N>`) for expected dead-store elimination behavior — e.g. that the MMA atom is actually emitted in SASS when the kernel is compiled for `sm_120a`. Use `cuobjdump --dump-sass` on the resulting .o file to confirm at least one `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` instruction is present. Record the SASS check result in a new file `proj-2026-04-12-1022/probes/step_4b_sass_probe.txt`.
 
-    **If 4b's oracle ever fails**, diagnose in this order:
-    1. Re-check step 4a probes (did the CUTLASS snapshot drift between 4a and 4b?).
-    2. Cross-check against other SwapAB=false dumps (`tactic0`, `tactic2`, `tactic3`) — if they all fail the same way, the kernel is wrong; if only `tactic1` fails, the kernel picked a different-but-legal reduction order.
-    3. Rerun the step 2 harness with a larger K (e.g. `NEMOTRON_HARNESS_K=4096` or bigger) to push past the convergence regime. Different tactics should diverge at large enough K, and a kernel bug that was hidden by small-K convergence will be surfaced.
-    4. As a last resort, use a host fp32 reference as a tie-breaker — not as the acceptance oracle.
+    Gate: `cmake --build` clean, SASS probe shows the MMA instruction is emitted, `git grep` for forbidden CUTLASS symbols under `runtime/` is still empty for this new code.
 
-    Gate: BF16 output matches `golden/bf16_gemm1_tactic1.bin` bitwise on the default step-2 problem, and the test file documents the necessary-but-not-sufficient nature of the match with a comment block referring to `trtllm_reference/NOTES.md §5 "Observed convergence"`.
+  - **4c — NanoP1 BF16 dense epilogue + mainloop oracle test**
+    Add the hand-written BF16 dense epilogue: accumulator → fp32 alpha scale → bf16 cast → global-memory row-major store, matching TRT-LLM's `LinearCombination<bf16, float, ElementC, float>` semantics but as our own CUDA code.
 
-  - **4c — Nemotron fused direct-pack epilogue (Relu², per-block max-abs, FP8 scale encode, FP4 nibble pack)**
-    Implement the fused direct-pack epilogue on top of 4b's mainloop. This sub-commit intentionally diverges from TRT-LLM: TRT-LLM performs activation and pack in a separate `doActivationKernel`, while our production target fuses that stage into the FC1 kernel. **Anchor the direct-pack contract to the existing positive P5 direct-pack surface**: mirror the structure of `RunP5NativeDirectPackOracleForTesting` / `testing/backend/staged_fp4_pack_test.cpp`, but specialized for the new `NanoP1*` kernel. **Derive the lane→coord mapping at runtime** from `partition_C(make_identity_tensor(...))` + `FillPhysicalCoordMapCopyViewLimited` (pattern from `StoreTracedP13CFragmentsRowMajor` at line 5124). Do NOT hand-code SM80_16x8 warp/lane tables — the deleted v1-v4 P1 oracles all produced test artifacts because of hand-coded tables, and the new implementation must not repeat that mistake. New test `testing/backend/nano_p1_direct_pack_oracle_test.cpp` runs the full kernel (mainloop + fused direct-pack epilogue) and compares all 4 packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against a local host direct-pack reference. Gate: oracle test passes bitwise on all 4 packed output channels.
+    Add `testing/backend/nano_p1_mainloop_oracle_test.cpp` — **off-hot-path, unrestricted** — that loads `proj-2026-04-12-1022/trtllm_reference/golden/inputs.pt` (hs, FP4 weights, scales, g1_alphas), calls `RunNanoP1KernelForTesting(...)`, and compares the BF16 output **bitwise** against `proj-2026-04-12-1022/trtllm_reference/golden/bf16_gemm1_tactic1.bin` (plan-v6 P1, `CtaShape128x128x64B_Cluster1x1x1`, SwapAB=false). The test file may include any library for input loading (libtorch for `.pt`, numpy for bytes, etc.) — tests are unrestricted per the Kernel Provenance rule.
 
-  Each sub-commit must build clean and pass its own test. Step 4 intentionally does not modify the top-level routed FC1 dispatch surface; it only makes the standalone `NanoP1` kernel and its oracles real.
+    **Oracle contract (unchanged from the reverted plan)**: for the small default problem (M=128, K=256, N=256), all 8 step-2 tactics produced bitwise-identical BF16 output because fp32 accumulation error at that scale is below the BF16 LSB — see `proj-2026-04-12-1022/trtllm_reference/NOTES.md §5 "Observed convergence"`. A bitwise match at this scale proves the kernel is **mathematically consistent with some legal SM120 NVFP4 MoE GEMM kernel**, not specifically "same reduction order as TRT-LLM's P1". The "same structure as TRT-LLM P1" claim is established at step 4a/4b by our explicit design matching the TRT-LLM reference shapes. The test file MUST carry a comment block referring to `NOTES.md §5` that says so, so a future reader does not over-read a passing 4c.
 
-  Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/nano_p1_*.cpp` (new), `testing/CMakeLists.txt`.
+    **If 4c's oracle fails**, diagnose in this order:
+    1. Re-check step 4a/4b probes — did our hand-written MMA_Atom or TiledMMA drift from the TRT-LLM reference shapes?
+    2. Cross-check against other SwapAB=false dumps (`tactic0`, `tactic2`, `tactic3`) — if they all fail the same way, the kernel is wrong; if only `tactic1` fails, we picked a different-but-legal reduction order.
+    3. Rerun the step 2 harness with a larger K (e.g. `NEMOTRON_HARNESS_K=4096`) to push past the convergence regime. Different tactics should diverge at large enough K, surfacing bugs hidden by small-K convergence.
+    4. Host fp32 reference as a tie-breaker — not the acceptance oracle.
+
+    Gate: BF16 output matches `golden/bf16_gemm1_tactic1.bin` bitwise on the default step-2 problem.
+
+  - **4d — Nemotron fused direct-pack epilogue (Relu², per-block max-abs, FP8 scale encode, FP4 nibble pack)**
+    Replace 4c's BF16 dense epilogue with a fused Relu² + per-block max-abs + FP8 scale encode + FP4 nibble pack epilogue, targeting the same four-channel output contract as the existing P5 direct-pack surface. This sub-commit intentionally diverges from TRT-LLM: TRT-LLM performs activation and pack in a separate `doActivationKernel`, while our production target fuses that stage into the FC1 kernel.
+
+    **Anchor the direct-pack contract to the existing positive P5 direct-pack surface**: mirror the structure of `RunP5NativeDirectPackOracleForTesting` / `testing/backend/staged_fp4_pack_test.cpp`, but as hand-written CUDA for the new `NanoP1` kernel. **Derive the lane→coord mapping at runtime** from `partition_C(make_identity_tensor(...))` + `FillPhysicalCoordMapCopyViewLimited` (pattern from `StoreTracedP13CFragmentsRowMajor` at line 5124). Do NOT hand-code SM80_16x8 warp/lane tables — the deleted v1-v4 P1 oracles all produced test artifacts because of hand-coded tables, and the new implementation must not repeat that mistake.
+
+    New test `testing/backend/nano_p1_direct_pack_oracle_test.cpp` runs the full kernel (mainloop + fused direct-pack epilogue) and compares all 4 packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against a local host direct-pack reference.
+
+    Gate: direct-pack oracle test passes bitwise on all 4 packed output channels, SASS still shows the native MMA instruction is emitted, no new forbidden CUTLASS symbols under `runtime/`.
+
+  Each sub-commit must build clean and pass its own test (4a/4b are compile-only gates, 4c/4d run their oracle tests). Step 4 intentionally does not modify the top-level routed FC1 dispatch surface; it only makes the standalone `NanoP1` kernel and its oracles real.
+
+  Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/nano_p1_*.cpp` (new), `testing/CMakeLists.txt`, `proj-2026-04-12-1022/probes/` (new probe-value files per sub-commit).
 
 - [ ] **5. Scale the bitwise oracle to a realistic Nano bucket**
   Run the new kP1 kernel and the TRT-LLM BF16 boundary harness on a production-realistic bucket:
@@ -473,7 +494,7 @@ Expected: `ALL CHECKS PASSED`.
 | 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | done | `0afcb2e` | Architecture doc |
 | 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | (this commit) | Per-tactic BF16 dumps + inputs.pt in `golden/`; tactic1 == plan-v6 P1 |
 | 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
-| 4 | Implement new kP1 kernel from scratch (3 sub-commits 4a-4c) | pending | — | New `NanoP1*` names |
+| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | in-progress | reverted `9be1580` → `8ea9241` | Old 4a used CollectiveBuilder → violated Kernel Provenance policy; replanned to hand-written CUTE + PTX; 4a–4d all pending |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
 | 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |
