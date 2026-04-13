@@ -273,8 +273,6 @@ using TracedP1SmemCopyAtomSFB = typename TracedP1CollectiveMainloop::SmemCopyAto
 // or accumulator assumptions.
 constexpr int kTracedP1ScaleSmemCosizeA = cute::cosize_v<TracedP1SmemLayoutSFA>;
 constexpr int kTracedP1ScaleSmemCosizeB = cute::cosize_v<TracedP1SmemLayoutSFB>;
-constexpr int kTracedP1ScaleFragmentCosizeA = 8;
-constexpr int kTracedP1ScaleFragmentCosizeB = 32;
 using TracedP1AccumProfileLayout = decltype(
     cute::partition_fragment_C(
         TracedP1TiledMma{},
@@ -521,18 +519,6 @@ CUTE_HOST_DEVICE constexpr auto GetSingleAtomTiledMma() {
 
 CUTE_HOST_DEVICE constexpr auto GetTracedP5TiledMma() {
   return TracedP5TiledMma{};
-}
-
-CUTE_HOST_DEVICE constexpr auto GetTracedP1LayoutSFATV(auto const& mma) {
-  auto collective_mainloop = TracedP1CollectiveMainloop{};
-  auto mma_copy = mma;
-  return collective_mainloop.get_layoutSFA_TV(mma_copy);
-}
-
-CUTE_HOST_DEVICE constexpr auto GetTracedP1LayoutSFBTV(auto const& mma) {
-  auto collective_mainloop = TracedP1CollectiveMainloop{};
-  auto mma_copy = mma;
-  return collective_mainloop.get_layoutSFB_TV(mma_copy);
 }
 
 CUTE_HOST_DEVICE constexpr auto GetTracedP13LayoutSFATV(auto const& mma) {
@@ -1347,88 +1333,6 @@ CUTE_HOST_DEVICE constexpr auto MakeLocalTiledCopySFB(TiledMma const& mma) {
   return LocalTiledCopy<CopyAtom, LayoutTV, TilerMN>{};
 }
 
-template <class TiledMma>
-CUTE_HOST_DEVICE constexpr auto MakeTracedP1TiledCopySFA(TiledMma const& mma) {
-  using CopyAtom = LocalCopyAtom<cute::UniversalCopy<nvfp4_cute::ElementSFCompute>, nvfp4_cute::ElementSFCompute>;
-  using LayoutTV = decltype(GetTracedP1LayoutSFATV(mma));
-  using TilerMN = decltype(cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<2>(mma)));
-  return LocalTiledCopy<CopyAtom, LayoutTV, TilerMN>{};
-}
-
-template <class TiledMma>
-CUTE_HOST_DEVICE constexpr auto MakeTracedP1TiledCopySFB(TiledMma const& mma) {
-  using CopyAtom = LocalCopyAtom<cute::UniversalCopy<nvfp4_cute::ElementSFCompute>, nvfp4_cute::ElementSFCompute>;
-  using LayoutTV = decltype(GetTracedP1LayoutSFBTV(mma));
-  using TilerMN = decltype(cute::make_shape(cute::tile_size<1>(mma), cute::tile_size<2>(mma)));
-  return LocalTiledCopy<CopyAtom, LayoutTV, TilerMN>{};
-}
-
-CUTE_HOST_DEVICE void FillTracedP1FragmentDebugCoordMaps(
-    int thread_idx,
-    int a_rows[kTiledCopyCoordCapacityA],
-    int a_cols[kTiledCopyCoordCapacityA],
-    int b_rows[kTiledCopyCoordCapacityB],
-    int b_cols[kTiledCopyCoordCapacityB],
-    int sfa_rows[kTracedP1ScaleFragmentCosizeA],
-    int sfa_cols[kTracedP1ScaleFragmentCosizeA],
-    int sfb_rows[kTracedP1ScaleFragmentCosizeB],
-    int sfb_cols[kTracedP1ScaleFragmentCosizeB]) {
-  auto mma = TracedP1TiledMma{};
-  auto thr_mma = mma.get_thread_slice(thread_idx);
-  auto ref_a = cute::make_identity_tensor(
-      cute::make_shape(
-          cute::size<0>(typename TracedP1TiledMma::AtomShape_MNK{}),
-          cute::size<2>(typename TracedP1TiledMma::AtomShape_MNK{})));
-  auto ref_b = cute::make_identity_tensor(
-      cute::make_shape(
-          cute::size<1>(typename TracedP1TiledMma::AtomShape_MNK{}),
-          cute::size<2>(typename TracedP1TiledMma::AtomShape_MNK{})));
-  auto ref_sfa = cute::make_identity_tensor(
-      cute::make_shape(
-          cute::size<0>(typename TracedP1TiledMma::AtomShape_MNK{}),
-          cute::Int<4>{}));
-  auto ref_sfb = cute::make_identity_tensor(
-      cute::make_shape(
-          cute::size<1>(typename TracedP1TiledMma::AtomShape_MNK{}),
-          cute::Int<4>{}));
-  auto part_a = thr_mma.partition_A(ref_a);
-  auto part_b = thr_mma.partition_B(ref_b);
-  auto part_sfa = PartitionScaleA(ref_sfa, thr_mma);
-  auto part_sfb = PartitionScaleB(ref_sfb, thr_mma);
-
-  auto smem_tiled_copy_a = MakeLocalTiledCopyA<cute::SM75_U32x4_LDSM_N>(mma);
-  auto smem_tiled_copy_b = MakeLocalTiledCopyB<cute::SM75_U32x4_LDSM_N>(mma);
-  auto smem_tiled_copy_sfa = MakeTracedP1TiledCopySFA(mma);
-  auto smem_tiled_copy_sfb = MakeTracedP1TiledCopySFB(mma);
-  auto smem_thr_copy_a = smem_tiled_copy_a.get_thread_slice(thread_idx);
-  auto smem_thr_copy_b = smem_tiled_copy_b.get_thread_slice(thread_idx);
-  auto smem_thr_copy_sfa = smem_tiled_copy_sfa.get_thread_slice(thread_idx);
-  auto smem_thr_copy_sfb = smem_tiled_copy_sfb.get_thread_slice(thread_idx);
-  auto copy_view_sfa = smem_thr_copy_sfa.retile_D(part_sfa);
-  auto copy_view_sfb = smem_thr_copy_sfb.retile_D(part_sfb);
-
-  FillPhysicalCoordMapCopyViewLimited(
-      smem_thr_copy_a.retile_D(part_a),
-      kTiledCopyCoordCapacityA,
-      a_rows,
-      a_cols);
-  FillPhysicalCoordMapCopyViewLimited(
-      smem_thr_copy_b.retile_D(part_b),
-      kTiledCopyCoordCapacityB,
-      b_rows,
-      b_cols);
-  FillPhysicalCoordMapCopyViewLimited(
-      copy_view_sfa,
-      kTracedP1ScaleFragmentCosizeA,
-      sfa_rows,
-      sfa_cols);
-  FillPhysicalCoordMapCopyViewLimited(
-      copy_view_sfb,
-      kTracedP1ScaleFragmentCosizeB,
-      sfb_rows,
-      sfb_cols);
-}
-
 CUTE_HOST_DEVICE void FillSingleAtomCLayoutCoords(
     int thread_idx,
     int token_rows[4],
@@ -1713,20 +1617,6 @@ template <class TiledMma, int kRowsPerTile>
 __device__ __forceinline__ BFragment64 LoadFragmentB_ColMajor64x8Tiled(
     const std::uint8_t* packed_rows,
     const std::uint32_t* scale_words,
-    int thread_idx,
-    int n_base);
-
-template <class TiledMma, int kRowsPerTile>
-__device__ __forceinline__ AFragment64 LoadFragmentA_RowMajor16x64TracedScaleTiledP1(
-    const std::uint8_t* packed_rows,
-    const std::uint8_t* scale_smem,
-    int row_base,
-    int thread_idx);
-
-template <class TiledMma, int kRowsPerTile>
-__device__ __forceinline__ BFragment64 LoadFragmentB_ColMajor64x8TracedScaleTiledP1(
-    const std::uint8_t* packed_rows,
-    const std::uint8_t* scale_smem,
     int thread_idx,
     int n_base);
 
@@ -4769,95 +4659,6 @@ nvfp4_bridge::LoadFragmentB_ColMajor64x8TracedScaleTiled(
   FillPhysicalCoordMapCopyViewLimited(
       copy_view_sfb,
       kTracedP5ScaleFragmentCosizeB,
-      scale_rows,
-      scale_cols);
-  const int fragment_index = n_base / 8;
-  std::uint32_t packed_scale = 0u;
-#pragma unroll
-  for (int elem = 0; elem < 4; ++elem) {
-    const int physical = fragment_index * 4 + elem;
-    packed_scale |= static_cast<std::uint32_t>(
-                        sSFB(scale_rows[physical], scale_cols[physical], cute::Int<0>{}))
-                    << (elem * 8);
-  }
-  fragment.scale[0] = static_cast<SFRegister>(packed_scale);
-#else
-  (void)scale_smem;
-#endif
-  return fragment;
-}
-
-template <class TiledMma, int kRowsPerTile>
-__device__ __forceinline__ nvfp4_bridge::AFragment64
-nvfp4_bridge::LoadFragmentA_RowMajor16x64TracedScaleTiledP1(
-    const std::uint8_t* packed_rows,
-    const std::uint8_t* scale_smem,
-    int row_base,
-    int thread_idx) {
-  auto fragment =
-      LoadFragmentA_RowMajor16x64Tiled<TiledMma, kRowsPerTile>(packed_rows, nullptr, row_base, thread_idx);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-  auto mma = TiledMma{};
-  auto thr_mma = mma.get_thread_slice(thread_idx);
-  auto sSFA = cute::make_tensor(
-      cute::make_smem_ptr(const_cast<std::uint8_t*>(scale_smem)),
-      TracedP1SmemLayoutSFA{});
-  auto ref_sfa =
-      cute::make_identity_tensor(cute::make_shape(cute::size<0>(typename TiledMma::AtomShape_MNK{}), cute::Int<4>{}));
-  auto part_sfa = PartitionScaleA(ref_sfa, thr_mma);
-  auto smem_tiled_copy_sfa = MakeTracedP1TiledCopySFA(mma);
-  auto smem_thr_copy_sfa = smem_tiled_copy_sfa.get_thread_slice(thread_idx);
-  auto copy_view_sfa = smem_thr_copy_sfa.retile_D(part_sfa);
-  int scale_rows[kTracedP1ScaleFragmentCosizeA];
-  int scale_cols[kTracedP1ScaleFragmentCosizeA];
-  FillPhysicalCoordMapCopyViewLimited(
-      copy_view_sfa,
-      kTracedP1ScaleFragmentCosizeA,
-      scale_rows,
-      scale_cols);
-  const int fragment_index = row_base / 16;
-  std::uint32_t packed_scale = 0u;
-#pragma unroll
-  for (int elem = 0; elem < 4; ++elem) {
-    const int physical = fragment_index * 4 + elem;
-    packed_scale |= static_cast<std::uint32_t>(
-                        sSFA(scale_rows[physical], scale_cols[physical], cute::Int<0>{}))
-                    << (elem * 8);
-  }
-  fragment.scale[0] = static_cast<SFRegister>(packed_scale);
-#else
-  (void)scale_smem;
-#endif
-  return fragment;
-}
-
-
-template <class TiledMma, int kRowsPerTile>
-__device__ __forceinline__ nvfp4_bridge::BFragment64
-nvfp4_bridge::LoadFragmentB_ColMajor64x8TracedScaleTiledP1(
-    const std::uint8_t* packed_rows,
-    const std::uint8_t* scale_smem,
-    int thread_idx,
-    int n_base) {
-  auto fragment =
-      LoadFragmentB_ColMajor64x8Tiled<TiledMma, kRowsPerTile>(packed_rows, nullptr, thread_idx, n_base);
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-  auto mma = TiledMma{};
-  auto thr_mma = mma.get_thread_slice(thread_idx);
-  auto sSFB = cute::make_tensor(
-      cute::make_smem_ptr(const_cast<std::uint8_t*>(scale_smem)),
-      TracedP1SmemLayoutSFB{});
-  auto ref_sfb =
-      cute::make_identity_tensor(cute::make_shape(cute::size<1>(typename TiledMma::AtomShape_MNK{}), cute::Int<4>{}));
-  auto part_sfb = PartitionScaleB(ref_sfb, thr_mma);
-  auto smem_tiled_copy_sfb = MakeTracedP1TiledCopySFB(mma);
-  auto smem_thr_copy_sfb = smem_tiled_copy_sfb.get_thread_slice(thread_idx);
-  auto copy_view_sfb = smem_thr_copy_sfb.retile_D(part_sfb);
-  int scale_rows[kTracedP1ScaleFragmentCosizeB];
-  int scale_cols[kTracedP1ScaleFragmentCosizeB];
-  FillPhysicalCoordMapCopyViewLimited(
-      copy_view_sfb,
-      kTracedP1ScaleFragmentCosizeB,
       scale_rows,
       scale_cols);
   const int fragment_index = n_base / 8;
