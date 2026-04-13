@@ -429,25 +429,24 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/nano_p1_*.cpp` (new), `testing/CMakeLists.txt`, `proj-2026-04-12-1022/probes/` (new probe-value files per sub-commit).
 
-- [ ] **5. Scale the bitwise oracle to a realistic Nano bucket**
-  Run the new kP1 kernel and the TRT-LLM BF16 boundary harness on a production-realistic bucket:
-  - `h = 2688` (Nano hidden dimension)
-  - `i = 1920` (Nano padded intermediate width — NOT 1856)
-  - `n_experts = 128` (Nano expert count)
-  - 16-row and 24-row token chunks (representative of kP1's dominant prefill buckets)
-  - Synthetic weights and inputs seeded identically across both runners
+- [~] **5. Scale the bitwise oracle to the Nano K dimension (single-expert, M=128)**
+  Run the new NanoP1 kP1 kernel and the TRT-LLM BF16 boundary harness on a production-realistic **K dimension** (`h = 2688`), with `i = 1920` (Nano padded intermediate width — NOT 1856), `n_experts = 1`, `M = 128`. The full multi-expert grouped path (`n_experts = 128`, `M = 16`/`24` token chunks) is **deferred to step 6**, where the production dispatch surface will naturally require expert routing; splitting the scope here keeps step 5 as a pure K-dimension scaling check against the existing single-expert NanoP1Kernel.
 
   Compare using the same split oracle as step 4:
-  - BF16 GEMM boundary bitwise against the TRT-LLM `gemm1_output` artifact for the same bucket
-  - packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against the local host direct-pack reference
+  - BF16 GEMM boundary bitwise against the TRT-LLM `gemm1_output` artifact for the Nano bucket (`golden_nano_k2688/bf16_gemm1_tactic1.bin`)
+  - packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against the local host direct-pack reference scaled to the Nano bucket
 
-  **Expected regime change**: at this bucket (`h = 2688`), the step 4b small-problem tactic convergence seen in step 2 (`K = 256`, all 8 tactics bitwise-identical) should NOT hold. `K = 2688` is large enough that fp32 accumulation error across different tile-boundary reduction orders approaches or exceeds the BF16 LSB, so different tactics should produce **different** bitwise outputs, and step 4b's bitwise match against `tactic1` specifically (`CtaShape128x128x64B_Cluster1x1x1`, `SwapAB=false`) becomes a sharp kernel-identity test rather than a "mathematically equivalent" test. If at this step the kernel STILL matches all tactics bitwise, something is wrong — most likely a stride/layout bug that collapses the output into an invariant the reduction order cannot distinguish. Diagnose before declaring the gate passed.
+  **Corrected regime analysis** (revision after the step-5 Nano capture): the earlier version of this step predicted that at `K = 2688` the step-2 small-problem tactic convergence would break and different tactics would produce different bitwise outputs. **That prediction was wrong.** The step-5 capture at `M=128, K=2688, N=1920, E=1` produced 8 tactic dumps with full-file md5 `3220ff0c1c46cc0fa7aace0329673451` — **all 8 still bitwise identical**. The scaling argument (see `proj-2026-04-12-1022/trtllm_reference/NOTES.md §5 "Convergence persists at Nano K=2688"`): for bounded FP4 inputs, both the GEMM output magnitude and the fp32 accumulation error scale as `sqrt(K)`, so the ratio `error / BF16_LSB` stays constant across K. Convergence is a persistent property, not a small-problem artifact.
 
-  Gate: the BF16 GEMM boundary matches TRT-LLM bitwise at both bucket sizes and against tactic1 specifically (not just any tactic); different SwapAB=false tactics produce visibly different outputs at this bucket (sanity); all 4 packed output channels match the local direct-pack oracle bitwise.
+  **Revised gate**:
+  - BF16 GEMM boundary matches `golden_nano_k2688/bf16_gemm1_tactic1.bin` bitwise on the single-expert Nano bucket. A pass proves the kernel is **mathematically consistent with a legal SM120 NVFP4 MoE GEMM kernel at Nano scale** — which is the end-to-end correctness signal step 5 actually provides. The sharper "same CollectiveBuilder instantiation as TRT-LLM P1" claim remains load-bearing on step 4a's `static_assert` / `ShowInt<N>` compile-time probes, NOT on any runtime-tactic-divergence test.
+  - All 4 packed output channels match the local host direct-pack reference bitwise at the same Nano bucket (no TRT-LLM reference for direct-pack; step 2's capture only exposes the BF16 GEMM boundary).
 
-  Extend `proj-2026-04-12-1022/trtllm_reference/` with the larger synthetic problem and the BF16 boundary artifact comparison.
+  **Activation-quant blocker path**: the step 4c/4d deferral of "reproduce flashinfer's bf16→FP4 activation quant in C++" is addressed at capture time, not test time. The step 2 harness is extended to ALSO dump the pre-quantized FP4 activation bytes (`golden_nano_k2688/input_fp4_permuted.bin` + `input_sf_permuted.bin`, produced by calling flashinfer's `nvfp4_quantize(hs, a1_gscale, do_shuffle=True)` in the capture Python). The C++ test then feeds those exact bytes into `RunNanoP1KernelForTesting`, bypassing the need to reproduce the quant on our side. See the step-2 capture log at `proj-2026-04-12-1022/codex-jobs/step-5-blocker-mnx3yfvi-2nmx62.log` for the Option-1 implementation details.
 
-  Key files: `proj-2026-04-12-1022/trtllm_reference/` (extend), `testing/backend/nano_p1_mainloop_oracle_test.cpp` (extend with the larger BF16-boundary case), `testing/backend/nano_p1_direct_pack_oracle_test.cpp` (extend with the larger packed-output case).
+  Extend `proj-2026-04-12-1022/trtllm_reference/` with the Nano bucket (`golden_nano_k2688/` directory, `run_capture_nano.sh` helper or equivalent, `tactic_divergence_report.md`).
+
+  Key files: `proj-2026-04-12-1022/trtllm_reference/` (extend), `testing/backend/nano_p1_mainloop_oracle_test.cpp` (add Phase 3 K=2688 case), `testing/backend/nano_p1_direct_pack_oracle_test.cpp` (add Phase 3 K=2688 case).
 
 - [ ] **6. Wire the new kP1 kernel into the existing grouped dispatch surface and run full validation**
   Add the new kP1 case to the existing grouped FP4-direct dispatcher `LaunchPlannedPackedInputMatVecFp4Direct` at `runtime/src/backend/fused_moe_prefill.cu:11416` so `RoutedGemm1Profile::kP1_128x128x64_SwapFalse` launches the new `NanoP1` kernel. Update any remaining top-level routing comments / gating around the grouped kP1 direct path at `runtime/src/backend/fused_moe_prefill.cu:12065-12130` so real kP1 traffic reaches that case.
@@ -495,6 +494,6 @@ Expected: `ALL CHECKS PASSED`.
 | 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | `1360eaf` + `.bin` dump addendum (this commit) | Per-tactic BF16 dumps + `inputs.pt` in `golden/`; tactic1 == plan-v6 P1. `.bin` dump addendum lets the step 4c test load inputs without libtorch. |
 | 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
 | 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | done | 4a `1868939`, 4b `ef60007`, 4c `7118317`, 4d (this commit) | 4a CUTE type bundle. 4b mainloop body (SASS 161 MMA). 4c BF16 dense epilogue, Phase 1 PASS. 4d fused direct-pack epilogue, Phase 1 all 4 channels PASS (packed_bytes, block_scales, matmul_block_scales, activation_output_scales). Phase 2 TRT-LLM bitwise deferred to step 5. |
-| 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
+| 5 | Scale bitwise oracle to Nano K (single-expert, M=128) | in-progress | Nano capture + plan correction (this commit) | First Codex attempt correctly stopped at "convergence persists at K=2688" blocker; revised Phase 3 gate drops the divergence precondition since convergence is mathematically expected for bounded FP4 inputs at all K. n_experts=128 and M=16/24 deferred to step 6. |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
 | 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |

@@ -1,0 +1,107 @@
+{
+  "seed": 12648430,
+  "shape": {
+    "num_tokens": 128,
+    "hidden_size": 2688,
+    "inter_size": 1920,
+    "num_experts": 1,
+    "top_k": 1,
+    "expanded_num_rows": 128,
+    "fc1_out_size": 1920,
+    "is_gated": false,
+    "activation": "Relu2",
+    "dtype": "bfloat16",
+    "quant_dtype": "nvfp4"
+  },
+  "bf16_header_bytes": 64,
+  "bf16_body_bytes_expected": 491520,
+  "captured_tactics": [
+    {
+      "tactic_id": 0,
+      "expected_tile_label": "CtaShape128x128x128B_Cluster1x1x1",
+      "expected_swap_ab": false,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic0.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.5880752,
+      "is_plan_v6_p1": false
+    },
+    {
+      "tactic_id": 1,
+      "expected_tile_label": "CtaShape128x128x64B_Cluster1x1x1",
+      "expected_swap_ab": false,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic1.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.5885317,
+      "is_plan_v6_p1": true
+    },
+    {
+      "tactic_id": 2,
+      "expected_tile_label": "CtaShape128x256x64B_Cluster1x1x1",
+      "expected_swap_ab": false,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic2.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.5893693,
+      "is_plan_v6_p1": false
+    },
+    {
+      "tactic_id": 3,
+      "expected_tile_label": "CtaShape256x128x64B_Cluster1x1x1",
+      "expected_swap_ab": false,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic3.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.590195,
+      "is_plan_v6_p1": false
+    },
+    {
+      "tactic_id": 4,
+      "expected_tile_label": "CtaShape128x128x128B_Cluster1x1x1",
+      "expected_swap_ab": true,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic4.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.5904944,
+      "is_plan_v6_p1": false
+    },
+    {
+      "tactic_id": 5,
+      "expected_tile_label": "CtaShape128x128x64B_Cluster1x1x1",
+      "expected_swap_ab": true,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic5.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.590943,
+      "is_plan_v6_p1": false
+    },
+    {
+      "tactic_id": 6,
+      "expected_tile_label": "CtaShape128x256x64B_Cluster1x1x1",
+      "expected_swap_ab": true,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic6.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.591277,
+      "is_plan_v6_p1": false
+    },
+    {
+      "tactic_id": 7,
+      "expected_tile_label": "CtaShape256x128x64B_Cluster1x1x1",
+      "expected_swap_ab": true,
+      "dump_path": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic7.bin",
+      "dump_size": 491584,
+      "dump_mtime": 1776080089.5915802,
+      "is_plan_v6_p1": false
+    }
+  ],
+  "gemm1_tactic_count": 8,
+  "gemm2_tactic_count": 16,
+  "gemm2_tactic_used": 0,
+  "p1_gemm1_tactic_id": 1,
+  "p1_gemm1_tactic_label": "CtaShape128x128x64B_Cluster1x1x1",
+  "p1_gemm1_swap_ab": false,
+  "flashinfer_src_root": "/home/khkramer/src/nemotron-inference/vllm-env-cu128/lib/python3.12/site-packages/flashinfer/data/csrc",
+  "venv_root": "/home/khkramer/src/nemotron-inference/vllm-env-cu128",
+  "runner_class": "flashinfer.jit.fused_moe.gen_cutlass_fused_moe_sm120_module().build_and_load().init(...)",
+  "invocation": "fused_moe_runner.run_moe(..., [tactic_id, gemm2_tactic_id], ...) (AutoTuner bypassed)",
+  "permuted_activation_dump": {
+    "input_fp4_permuted": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_fp4_permuted.bin",
+    "input_sf_permuted": "/home/khkramer/src/nemotron-inference/proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_sf_permuted.bin"
+  },
+  "elapsed_sec": 0.019
+}

@@ -17,6 +17,7 @@ Output:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 
@@ -24,7 +25,16 @@ import torch
 
 
 def main() -> int:
-    golden = pathlib.Path(__file__).resolve().parent / "golden"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--golden-dir",
+        type=pathlib.Path,
+        default=pathlib.Path(__file__).resolve().parent / "golden",
+        help="Directory containing inputs.pt and where raw .bin dumps are written.",
+    )
+    args = parser.parse_args()
+
+    golden = args.golden_dir
     inputs_pt = golden / "inputs.pt"
     if not inputs_pt.exists():
         raise SystemExit(f"missing {inputs_pt} — run run_capture.sh first")

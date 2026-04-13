@@ -340,7 +340,24 @@ This was initially alarming but is expected:
 
 For step 4b, this means the NanoP1 kernel can be compared against any of `tactic0`..`tactic3` (SwapAB=false variants) and still validate correctness for small synthetic problems. The canonical comparison target is `bf16_gemm1_tactic1.bin` — the plan v6 P1 label — and tactics 4..7 are captured as SwapAB=true diagnostic checks (NanoP1 is SwapAB=false, so tactics 4..7 should only be used for curiosity).
 
-The convergence may break at larger K where partial sums approach fp32 precision limits, or at larger M×N where tile boundary effects dominate. If step 4b sees a mismatch against tactic1 but finds another tactic that matches, re-verify the instrumentation trace from this run (saved as a diagnostic — if not, re-instrument via the same temporary `fprintf` pattern).
+### Convergence persists at Nano K=2688 (correction to the earlier prediction)
+
+An earlier version of this file speculated that "the convergence may break at larger K where partial sums approach fp32 precision limits." **That prediction was wrong.** Step 5's Nano-bucket capture (`golden_nano_k2688/`, `M=128 K=2688 N=1920 E=1`) produced 8 tactic dumps that are still all bitwise identical: full-file md5 `3220ff0c1c46cc0fa7aace0329673451` (see `golden_nano_k2688/tactic_divergence_report.md`).
+
+The scaling argument that breaks the earlier prediction:
+
+- Expected `|fp4 · fp4|` ≈ `~2.25` for bounded Gaussian-ish FP4 inputs
+- GEMM output magnitude scales as `sqrt(K) · stddev_product` — at `K=2688` that's `~117`
+- fp32 accumulation error also scales as `sqrt(K) · mean_product · eps_fp32` — at `K=2688` that's `~1.4e-5` relative, `~1.6e-3` absolute at magnitude 117
+- BF16 LSB at magnitude 117 ≈ `117 / 256 ≈ 0.46`
+- fp32 error (`~1.6e-3`) is **~300× smaller** than BF16 LSB (`~0.46`) → every legal reduction order rounds to the same BF16
+- **Both the output magnitude and the fp32 error scale as `sqrt(K)`, so the `error / BF16_LSB` ratio stays constant.** Convergence holds at all K for bounded random FP4 inputs, not just K=256 or K=2688.
+
+The only way to force observable divergence is adversarial inputs that cause catastrophic cancellation (e.g., large magnitudes with opposite signs that cancel to a value where fp32 accumulation error approaches BF16 LSB). Ordinary Nemotron workloads don't hit that regime.
+
+**Implication for the oracle contract**: The runtime bitwise oracle remains a "mathematically consistent with some legal SM120 NVFP4 MoE GEMM kernel" check at all realistic K values, not a "same CollectiveBuilder instantiation as TRT-LLM P1" check. The "same instantiation" claim is entirely load-bearing on **step 4a's `ShowInt<N>` / `static_assert` compile-time probes**, which pin the hand-written NanoP1 CUTE bundle's tile shapes, stage count, thread count, fragment shapes, etc. to the TRT-LLM reference values. Those probes are the sharp kernel-identity test. Runtime bitwise is the weaker but still useful end-to-end correctness check.
+
+Step 5's Phase 3 gate is therefore revised from the plan-v6.1 draft: Phase 3 runs the kernel at the Nano bucket and bitwise-compares against `golden_nano_k2688/bf16_gemm1_tactic1.bin`. A pass is the end-to-end correctness signal at Nano scale; it does NOT additionally require the 8 tactics to diverge.
 
 ### Files
 

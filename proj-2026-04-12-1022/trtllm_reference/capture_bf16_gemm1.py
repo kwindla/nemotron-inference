@@ -68,6 +68,16 @@ def quant_one_expert(w_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tor
     return w_fp4, w_sf, w_gs
 
 
+def write_tensor_raw(tensor: torch.Tensor, path: pathlib.Path) -> None:
+    t = tensor.detach().cpu().contiguous()
+    byte_view = t.view(torch.uint8) if t.dtype == torch.bfloat16 else t
+    try:
+        raw = byte_view.numpy().tobytes()
+    except TypeError:
+        raw = bytes(byte_view.untyped_storage())
+    path.write_bytes(raw)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=128)
@@ -213,6 +223,24 @@ def main() -> int:
         str(args.input_save_dir / "inputs.pt"),
     )
 
+    if num_experts == 1 and top_k == 1:
+        from flashinfer.fp4_quantization import nvfp4_quantize, SfLayout
+
+        input_fp4_permuted, input_sf_permuted = nvfp4_quantize(
+            hs.contiguous(),
+            a1_gscale[0],
+            sfLayout=SfLayout.layout_128x4,
+            do_shuffle=True,
+        )
+        write_tensor_raw(
+            input_fp4_permuted,
+            args.input_save_dir / "input_fp4_permuted.bin",
+        )
+        write_tensor_raw(
+            input_sf_permuted,
+            args.input_save_dir / "input_sf_permuted.bin",
+        )
+
     # Resolve the low-level fused_moe_runner directly so we bypass the tuner.
     # Note: flashinfer's top-level helper `get_cutlass_fused_moe_module` returns
     # a `SimpleNamespace(cutlass_fused_moe=...)` that only exposes the high-level
@@ -353,6 +381,12 @@ def main() -> int:
         "venv_root": str(args.venv_root),
         "runner_class": "flashinfer.jit.fused_moe.gen_cutlass_fused_moe_sm120_module().build_and_load().init(...)",
         "invocation": "fused_moe_runner.run_moe(..., [tactic_id, gemm2_tactic_id], ...) (AutoTuner bypassed)",
+        "permuted_activation_dump": {
+            "input_fp4_permuted": str((args.input_save_dir / "input_fp4_permuted.bin").resolve())
+            if num_experts == 1 and top_k == 1 else None,
+            "input_sf_permuted": str((args.input_save_dir / "input_sf_permuted.bin").resolve())
+            if num_experts == 1 and top_k == 1 else None,
+        },
         "elapsed_sec": round(time.monotonic() - overall_t0, 3),
     }
     args.metadata_path.parent.mkdir(parents=True, exist_ok=True)

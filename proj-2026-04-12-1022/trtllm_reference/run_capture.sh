@@ -7,7 +7,7 @@
 # the patch. Fails loudly if detection is ambiguous.
 #
 # Usage:
-#   bash proj-2026-04-12-1022/trtllm_reference/run_capture.sh
+#   bash proj-2026-04-12-1022/trtllm_reference/run_capture.sh [--golden-dir DIR]
 #
 # Problem-shape knobs (env vars):
 #   NEMOTRON_HARNESS_M        num_tokens          (default 128)
@@ -23,6 +23,24 @@ PROJ_REF_DIR="${REPO_ROOT}/proj-2026-04-12-1022/trtllm_reference"
 PATCH_FILE="${PROJ_REF_DIR}/patches/flashinfer_bf16_gemm1_dump.patch"
 BUILD_NINJA="${HOME}/.cache/flashinfer/0.6.6/120a/cached_ops/fused_moe_120/build.ninja"
 GOLDEN_DIR="${PROJ_REF_DIR}/golden"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --golden-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --golden-dir requires a path" >&2
+        exit 1
+      fi
+      GOLDEN_DIR="$2"
+      shift 2
+      ;;
+    *)
+      echo "ERROR: unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 METADATA_PATH="${GOLDEN_DIR}/bf16_gemm1_metadata.json"
 INPUT_SAVE_DIR="${GOLDEN_DIR}"
 
@@ -111,8 +129,13 @@ echo "[run_capture] patch target: ${PATCH_TARGET}"
 mkdir -p "${GOLDEN_DIR}"
 rm -f \
   "${GOLDEN_DIR}"/bf16_gemm1_tactic*.bin \
+  "${GOLDEN_DIR}"/input_fp4_permuted.bin \
+  "${GOLDEN_DIR}"/input_sf_permuted.bin \
+  "${GOLDEN_DIR}"/tactic_divergence_report.md \
   "${GOLDEN_DIR}"/bf16_gemm1_metadata.json \
   "${GOLDEN_DIR}"/inputs.pt \
+  "${GOLDEN_DIR}"/inputs_*.bin \
+  "${GOLDEN_DIR}"/inputs_bin_manifest.json \
   "${GOLDEN_DIR}"/final_moe_output.pt
 echo "[run_capture] cleared stale artifacts under ${GOLDEN_DIR}"
 
