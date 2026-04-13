@@ -491,6 +491,11 @@ static_assert(kNanoP1MFragments == 8);
 static_assert(kNanoP1ScaleStageElemsA * NanoP1PipelineStages == cute::cosize_v<NanoP1SmemLayoutSFA>);
 static_assert(kNanoP1ScaleStageElemsB * NanoP1PipelineStages == cute::cosize_v<NanoP1SmemLayoutSFB>);
 
+enum class NanoP1EpilogueMode {
+  kBf16Dense,
+  kDirectPack,
+};
+
 template <class SFATensor, class AtomT, class TiledThr, class TiledPerm>
 CUTE_HOST_DEVICE constexpr auto NanoP1ThrfrgSFA(
     SFATensor&& sfatensor,
@@ -644,6 +649,31 @@ __device__ __forceinline__ void StoreNanoP1CFragmentsRowMajor(
     int valid_cols,
     std::size_t output_stride,
     OutputType* output);
+
+__device__ __forceinline__ void AccumulateNanoP1DirectPackRowMaxAbs(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
+    float* activation_output_scales);
+
+__device__ __forceinline__ void StoreNanoP1DirectPackCFragments(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int output_col_base,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
+    int num_rows_global,
+    int inter_size_global,
+    std::uint8_t* packed_bytes,
+    std::uint8_t* block_scales,
+    std::uint8_t* matmul_block_scales,
+    float* activation_output_scales,
+    float* staging_tile);
 
 constexpr int kTiledCopyCoordCapacityA = 32;
 constexpr int kTiledCopyCoordCapacityB = 16;
@@ -5176,6 +5206,208 @@ __device__ __forceinline__ void nvfp4_bridge::StoreNanoP1CFragmentsRowMajor(
   (void)valid_cols;
   (void)output_stride;
   (void)output;
+#endif
+}
+
+__device__ __forceinline__ void nvfp4_bridge::AccumulateNanoP1DirectPackRowMaxAbs(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
+    float* activation_output_scales) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  auto mma = NanoP1TiledMma{};
+  auto thread_mma = mma.get_thread_slice(thread_idx);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(NanoP1MmaTileShape{}),
+          cute::size<1>(NanoP1MmaTileShape{})));
+  auto part_c = thread_mma.partition_C(dense_c);
+  auto accum_tensor = cute::make_tensor(
+      const_cast<CRegister*>(accum_storage),
+      NanoP1AccumLayout{});
+#pragma unroll
+  for (int reg = 0; reg < static_cast<int>(cute::size<0>(NanoP1AccumLayout{})); ++reg) {
+#pragma unroll
+    for (int n_fragment = 0; n_fragment < static_cast<int>(cute::size<1>(NanoP1AccumLayout{})); ++n_fragment) {
+#pragma unroll
+      for (int m_fragment = 0; m_fragment < static_cast<int>(cute::size<2>(NanoP1AccumLayout{})); ++m_fragment) {
+        auto coord = part_c(cute::make_coord(reg, n_fragment, m_fragment));
+        const int output_col_offset = CoordGet0(coord);
+        const int token_row = CoordGet1(coord);
+        if (token_row < 0 ||
+            token_row >= valid_rows ||
+            output_col_offset < 0 ||
+            output_col_offset >= valid_cols) {
+          continue;
+        }
+        const float activated = fused_decode::Relu2(
+            alpha * accum_tensor(reg, n_fragment, m_fragment));
+        atomicMax(
+            reinterpret_cast<unsigned int*>(
+                activation_output_scales + static_cast<std::size_t>(row_start + token_row)),
+            __float_as_uint(activated));
+      }
+    }
+  }
+#else
+  (void)alpha;
+  (void)accum_storage;
+  (void)thread_idx;
+  (void)row_start;
+  (void)valid_rows;
+  (void)valid_cols;
+  (void)activation_output_scales;
+#endif
+}
+
+__device__ __forceinline__ void nvfp4_bridge::StoreNanoP1DirectPackCFragments(
+    float alpha,
+    const CRegister* accum_storage,
+    int thread_idx,
+    int output_col_base,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
+    int num_rows_global,
+    int inter_size_global,
+    std::uint8_t* packed_bytes,
+    std::uint8_t* block_scales,
+    std::uint8_t* matmul_block_scales,
+    float* activation_output_scales,
+    float* staging_tile) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  if (packed_bytes == nullptr ||
+      block_scales == nullptr ||
+      matmul_block_scales == nullptr ||
+      activation_output_scales == nullptr ||
+      staging_tile == nullptr ||
+      inter_size_global <= 0 ||
+      (inter_size_global % fused_decode::kNvfp4BlockWidth) != 0) {
+    return;
+  }
+
+  auto mma = NanoP1TiledMma{};
+  auto thread_mma = mma.get_thread_slice(thread_idx);
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(NanoP1MmaTileShape{}),
+          cute::size<1>(NanoP1MmaTileShape{})));
+  auto part_c = thread_mma.partition_C(dense_c);
+  auto accum_tensor = cute::make_tensor(
+      const_cast<CRegister*>(accum_storage),
+      NanoP1AccumLayout{});
+  constexpr int kTileCols = cute::size<1>(NanoP1MmaTileShape{});
+  const std::size_t blocks_per_row =
+      static_cast<std::size_t>(inter_size_global) / fused_decode::kNvfp4BlockWidth;
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
+  const std::size_t packed_row_bytes = static_cast<std::size_t>(inter_size_global) / 2u;
+
+#pragma unroll
+  for (int reg = 0; reg < static_cast<int>(cute::size<0>(NanoP1AccumLayout{})); ++reg) {
+#pragma unroll
+    for (int n_fragment = 0; n_fragment < static_cast<int>(cute::size<1>(NanoP1AccumLayout{})); ++n_fragment) {
+#pragma unroll
+      for (int m_fragment = 0; m_fragment < static_cast<int>(cute::size<2>(NanoP1AccumLayout{})); ++m_fragment) {
+        auto coord = part_c(cute::make_coord(reg, n_fragment, m_fragment));
+        const int output_col_offset = CoordGet0(coord);
+        const int token_row = CoordGet1(coord);
+        if (token_row < 0 ||
+            token_row >= valid_rows ||
+            output_col_offset < 0 ||
+            output_col_offset >= valid_cols) {
+          continue;
+        }
+        staging_tile[
+            static_cast<std::size_t>(token_row) * static_cast<std::size_t>(kTileCols) +
+            static_cast<std::size_t>(output_col_offset)] =
+            fused_decode::Relu2(alpha * accum_tensor(reg, n_fragment, m_fragment));
+      }
+    }
+  }
+  __syncthreads();
+
+  const int blocks_this_tile =
+      (valid_cols + fused_decode::kNvfp4BlockWidth - 1) / fused_decode::kNvfp4BlockWidth;
+  for (int row_block = thread_idx;
+       row_block < valid_rows * blocks_this_tile;
+       row_block += NanoP1ThreadsPerCta) {
+    const int token_row = row_block / blocks_this_tile;
+    const int block_in_tile = row_block % blocks_this_tile;
+    const int col_in_tile = block_in_tile * fused_decode::kNvfp4BlockWidth;
+    const int global_col = output_col_base + col_in_tile;
+    const int global_row = row_start + token_row;
+    if (global_row < 0 ||
+        global_row >= num_rows_global ||
+        global_col < 0 ||
+        (global_col + fused_decode::kNvfp4BlockWidth) > inter_size_global) {
+      continue;
+    }
+
+    const float row_scale = activation_output_scales[static_cast<std::size_t>(global_row)];
+    float block_max_abs = 0.0f;
+#pragma unroll
+    for (int offset = 0; offset < fused_decode::kNvfp4BlockWidth; ++offset) {
+      const float value = staging_tile[
+          static_cast<std::size_t>(token_row) * static_cast<std::size_t>(kTileCols) +
+          static_cast<std::size_t>(col_in_tile + offset)];
+      block_max_abs = fmaxf(block_max_abs, fabsf(value));
+    }
+
+    const float raw_block_scale = fused_decode::ClampNvfp4Scale(
+        block_max_abs / fused_decode::kNvfp4Fp4MaxFinite);
+    const float stabilized_block_scale = fused_decode::ClampNvfp4Scale(
+        block_max_abs / (fused_decode::kNvfp4Fp4MaxFinite * row_scale));
+    const std::uint8_t raw_encoded = fused_decode::EncodeFp8Scale(raw_block_scale);
+    const std::uint8_t stabilized_encoded =
+        fused_decode::EncodeFp8Scale(stabilized_block_scale);
+    const std::size_t global_block =
+        static_cast<std::size_t>(global_col) / fused_decode::kNvfp4BlockWidth;
+    const std::size_t scale_offset = ExecutionScaleOffset(
+        static_cast<std::size_t>(global_row),
+        global_block,
+        padded_blocks_per_row,
+        Nvfp4ScaleLayout::kSwizzled128x4);
+    block_scales[scale_offset] = raw_encoded;
+    matmul_block_scales[scale_offset] = stabilized_encoded;
+
+    const float pack_scale = row_scale * stabilized_block_scale;
+    const std::size_t packed_offset =
+        static_cast<std::size_t>(global_row) * packed_row_bytes +
+        static_cast<std::size_t>(global_col) / 2u;
+#pragma unroll
+    for (int pair = 0; pair < (fused_decode::kNvfp4BlockWidth / 2); ++pair) {
+      const float lhs = staging_tile[
+          static_cast<std::size_t>(token_row) * static_cast<std::size_t>(kTileCols) +
+          static_cast<std::size_t>(col_in_tile + pair * 2 + 0)];
+      const float rhs = staging_tile[
+          static_cast<std::size_t>(token_row) * static_cast<std::size_t>(kTileCols) +
+          static_cast<std::size_t>(col_in_tile + pair * 2 + 1)];
+      const std::uint8_t lhs_nibble = fused_decode::EncodeFp4(lhs / pack_scale);
+      const std::uint8_t rhs_nibble = fused_decode::EncodeFp4(rhs / pack_scale);
+      packed_bytes[packed_offset + static_cast<std::size_t>(pair)] =
+          static_cast<std::uint8_t>(
+              (lhs_nibble & 0x0Fu) | ((rhs_nibble & 0x0Fu) << 4u));
+    }
+  }
+  __syncthreads();
+#else
+  (void)alpha;
+  (void)accum_storage;
+  (void)thread_idx;
+  (void)output_col_base;
+  (void)row_start;
+  (void)valid_rows;
+  (void)valid_cols;
+  (void)num_rows_global;
+  (void)inter_size_global;
+  (void)packed_bytes;
+  (void)block_scales;
+  (void)matmul_block_scales;
+  (void)activation_output_scales;
+  (void)staging_tile;
 #endif
 }
 
@@ -11972,17 +12204,21 @@ __device__ __forceinline__ void NanoP1CtaBarrier() {
   asm volatile("bar.sync 0;\n" : : : "memory");
 }
 
-__global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kernel(
-    void const* input_fp4,
-    void const* weight_fp4,
-    void const* input_sf,
-    void const* weight_sf,
-    __nv_bfloat16* bf16_output,
-    float const* g1_alphas,
-    int64_t num_rows,
+template <bool kCaptureAccumulatorScratch>
+__device__ __forceinline__ void ComputeNanoP1AccumTile(
+    NanoP1SharedStorage& shared,
+    const std::uint8_t* input_packed,
+    const std::uint8_t* weight_packed,
+    const std::uint8_t* input_exec_scales,
+    const std::uint8_t* weight_exec_scales,
+    int tid,
+    int output_col_base,
+    int row_start,
+    int valid_rows,
+    int valid_cols,
     int64_t hidden_size,
-    int64_t inter_size,
-    float* accumulator_scratch) {
+    float* accumulator_scratch,
+    nvfp4_bridge::CRegister* accum_storage) {
   using NanoP1TiledMma = nvfp4_bridge::NanoP1TiledMma;
   using NanoP1AccumLayout = nvfp4_bridge::NanoP1AccumLayout;
 
@@ -11991,27 +12227,19 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
   constexpr int kTileK = cute::size<2>(nvfp4_bridge::NanoP1MmaTileShape{});
   constexpr int kMacroTileBytes = kTileK / 2;
   constexpr int kMacroScaleBytes = kTileK / fused_decode::kNvfp4BlockWidth;
-  static_assert(fused_decode::kNvfp4BlockWidth == 16);
 
-  __shared__ NanoP1SharedStorage shared;
+  const std::size_t packed_row_bytes = static_cast<std::size_t>(hidden_size) / 2u;
+  const std::size_t blocks_per_row =
+      static_cast<std::size_t>(hidden_size) / fused_decode::kNvfp4BlockWidth;
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
+  const std::uint32_t unit_scale_word = nvfp4_bridge::MakePackedUnitScaleWord();
+  const std::uint8_t unit_scale_byte = nvfp4_bridge::LoadScaleByte(unit_scale_word, 0);
 
-  if (input_fp4 == nullptr ||
-      weight_fp4 == nullptr ||
-      bf16_output == nullptr ||
-      g1_alphas == nullptr ||
-      num_rows <= 0 ||
-      hidden_size <= 0 ||
-      inter_size <= 0 ||
-      (hidden_size % fused_decode::kNvfp4BlockWidth) != 0) {
-    return;
-  }
+  auto accum_tensor = cute::make_tensor(accum_storage, NanoP1AccumLayout{});
+  cute::clear(accum_tensor);
 
-  auto const* input_packed = static_cast<std::uint8_t const*>(input_fp4);
-  auto const* weight_packed = static_cast<std::uint8_t const*>(weight_fp4);
-  auto const* input_exec_scales = static_cast<std::uint8_t const*>(input_sf);
-  auto const* weight_exec_scales = static_cast<std::uint8_t const*>(weight_sf);
-  const float alpha = g1_alphas[0];
-
+  auto mma = NanoP1TiledMma{};
+  auto thread_mma = mma.get_thread_slice(tid);
   auto const stage0_A = nvfp4_bridge::NanoP1SmemLayoutA{}(cute::_, cute::_, cute::Int<0>{});
   auto const stage0_B = nvfp4_bridge::NanoP1SmemLayoutB{}(cute::_, cute::_, cute::Int<0>{});
   auto sA_ = cute::make_tensor(
@@ -12033,29 +12261,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
   auto* swizzled_a_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_A.data());
   auto* swizzled_b_bytes = reinterpret_cast<std::uint8_t*>(shared.smem_B.data());
 
-  const int tid = static_cast<int>(threadIdx.x);
-  const int output_col_base = static_cast<int>(blockIdx.x) * kTileN;
-  const int row_start = static_cast<int>(blockIdx.y) * kTileM;
-  const int valid_rows =
-      max(0, min(static_cast<int>(num_rows) - row_start, kTileM));
-  const int valid_cols =
-      max(0, min(static_cast<int>(inter_size) - output_col_base, kTileN));
-  if (valid_rows <= 0 || valid_cols <= 0) {
-    return;
-  }
-
-  const std::size_t packed_row_bytes = static_cast<std::size_t>(hidden_size) / 2u;
-  const std::size_t blocks_per_row =
-      static_cast<std::size_t>(hidden_size) / fused_decode::kNvfp4BlockWidth;
-  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, kNvfp4ScaleBlockTile);
-  const std::uint32_t unit_scale_word = nvfp4_bridge::MakePackedUnitScaleWord();
-  const std::uint8_t unit_scale_byte = nvfp4_bridge::LoadScaleByte(unit_scale_word, 0);
-  nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kNanoP1AccumCoordCount];
-  auto accum_tensor = cute::make_tensor(&accum_storage[0], NanoP1AccumLayout{});
-  cute::clear(accum_tensor);
-
-  auto mma = NanoP1TiledMma{};
-  auto thread_mma = mma.get_thread_slice(tid);
   auto sA_stage0 = sA(cute::_, cute::_, cute::Int<0>{});
   auto sB_stage0 = sB(cute::_, cute::_, cute::Int<0>{});
   auto sSFA_stage0 = sSFA_(cute::_, cute::_, cute::Int<0>{});
@@ -12065,12 +12270,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
   auto tCrB = thread_mma.partition_fragment_B(sB_stage0);
   auto tCrSFA = nvfp4_bridge::NanoP1PartitionScaleA(sSFA_stage0, thread_mma);
   auto tCrSFB = nvfp4_bridge::NanoP1PartitionScaleB(sSFB_stage0, thread_mma);
-  auto dense_c = cute::make_identity_tensor(
-      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<1>(mma)));
-  auto part_c = thread_mma.partition_C(dense_c);
-
-  static_assert(cute::size<1>(decltype(tCrA){}) == cute::size<1>(decltype(tCrSFA){}));
-  static_assert(cute::size<1>(decltype(tCrB){}) == cute::size<1>(decltype(tCrSFB){}));
 
   auto s2r_copy_A = cute::make_tiled_copy_A(nvfp4_bridge::NanoP1SmemCopyAtomA{}, mma);
   auto s2r_thr_A = s2r_copy_A.get_thread_slice(tid);
@@ -12099,8 +12298,9 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
   auto tCsSFB = s2r_thr_SFB.partition_S(sScaleB);
   auto tCrSFB_cv = s2r_thr_SFB.retile_D(tCrSFB);
 
-  // NanoP1's shared-memory tile is K=128. Each iteration must populate the
-  // full CTA K slice before issuing both per-thread k-block MMAs.
+  static_assert(cute::size<1>(decltype(tCrA){}) == cute::size<1>(decltype(tCrSFA){}));
+  static_assert(cute::size<1>(decltype(tCrB){}) == cute::size<1>(decltype(tCrSFB){}));
+
   for (int64_t k_base = 0; k_base < hidden_size; k_base += kTileK) {
     const int64_t remaining_k = hidden_size - k_base;
     const std::size_t available_k = static_cast<std::size_t>(
@@ -12143,10 +12343,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
         }
         nvfp4_bridge::StoreTracedScaleBytes(sSFA_stage0, scale_bytes, row);
       } else {
-#pragma unroll
-        for (int scale_index = 0; scale_index < kMacroScaleBytes; ++scale_index) {
-          scale_bytes[scale_index] = 0u;
-        }
         nvfp4_bridge::ZeroTracedP5ScaleRow(sSFA_stage0, row);
       }
     }
@@ -12182,10 +12378,6 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
         }
         nvfp4_bridge::StoreTracedScaleBytes(sSFB_stage0, scale_bytes, row);
       } else {
-#pragma unroll
-        for (int scale_index = 0; scale_index < kMacroScaleBytes; ++scale_index) {
-          scale_bytes[scale_index] = 0u;
-        }
         nvfp4_bridge::ZeroTracedP5ScaleRow(sSFB_stage0, row);
       }
     }
@@ -12203,33 +12395,35 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
       cute::fp4_shift_B(MMAOp{}, tCrB_cv(cute::_, cute::_, k_block));
     }
 
-    if (accumulator_scratch != nullptr &&
-        k_base == 0 &&
-        blockIdx.x == 0 &&
-        blockIdx.y == 0 &&
-        (tid == 0 || tid == 2)) {
-      auto rA = cute::recast<nvfp4_bridge::ARegister>(tCrA);
-      auto rB = cute::recast<nvfp4_bridge::BRegister>(tCrB);
-      auto rSFA = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFA));
-      auto rSFB = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFB));
-      const int debug_offset =
-          tid == 0 ? kNanoP1ProbeDebugOffset : kNanoP1ProbeDeadLaneDebugOffset;
-      accumulator_scratch[debug_offset + 0] =
-          __uint_as_float(static_cast<std::uint32_t>(rA(0)));
-      accumulator_scratch[debug_offset + 1] =
-          __uint_as_float(static_cast<std::uint32_t>(rA(1)));
-      accumulator_scratch[debug_offset + 2] =
-          __uint_as_float(static_cast<std::uint32_t>(rA(2)));
-      accumulator_scratch[debug_offset + 3] =
-          __uint_as_float(static_cast<std::uint32_t>(rA(3)));
-      accumulator_scratch[debug_offset + 4] =
-          __uint_as_float(static_cast<std::uint32_t>(rSFA(0)));
-      accumulator_scratch[debug_offset + 5] =
-          __uint_as_float(static_cast<std::uint32_t>(rB(0)));
-      accumulator_scratch[debug_offset + 6] =
-          __uint_as_float(static_cast<std::uint32_t>(rB(1)));
-      accumulator_scratch[debug_offset + 7] =
-          __uint_as_float(static_cast<std::uint32_t>(rSFB(0)));
+    if constexpr (kCaptureAccumulatorScratch) {
+      if (accumulator_scratch != nullptr &&
+          k_base == 0 &&
+          output_col_base == 0 &&
+          row_start == 0 &&
+          (tid == 0 || tid == 2)) {
+        auto rA = cute::recast<nvfp4_bridge::ARegister>(tCrA);
+        auto rB = cute::recast<nvfp4_bridge::BRegister>(tCrB);
+        auto rSFA = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFA));
+        auto rSFB = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFB));
+        const int debug_offset =
+            tid == 0 ? kNanoP1ProbeDebugOffset : kNanoP1ProbeDeadLaneDebugOffset;
+        accumulator_scratch[debug_offset + 0] =
+            __uint_as_float(static_cast<std::uint32_t>(rA(0)));
+        accumulator_scratch[debug_offset + 1] =
+            __uint_as_float(static_cast<std::uint32_t>(rA(1)));
+        accumulator_scratch[debug_offset + 2] =
+            __uint_as_float(static_cast<std::uint32_t>(rA(2)));
+        accumulator_scratch[debug_offset + 3] =
+            __uint_as_float(static_cast<std::uint32_t>(rA(3)));
+        accumulator_scratch[debug_offset + 4] =
+            __uint_as_float(static_cast<std::uint32_t>(rSFA(0)));
+        accumulator_scratch[debug_offset + 5] =
+            __uint_as_float(static_cast<std::uint32_t>(rB(0)));
+        accumulator_scratch[debug_offset + 6] =
+            __uint_as_float(static_cast<std::uint32_t>(rB(1)));
+        accumulator_scratch[debug_offset + 7] =
+            __uint_as_float(static_cast<std::uint32_t>(rSFB(0)));
+      }
     }
 
     constexpr int kMmaKBlocks = cute::size<2>(decltype(tCrA){});
@@ -12239,18 +12433,20 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
           cute::make_zip_tensor(tCrA(cute::_, cute::_, k_block), tCrSFA(cute::_, cute::_, k_block)),
           cute::make_zip_tensor(tCrB(cute::_, cute::_, k_block), tCrSFB(cute::_, cute::_, k_block)),
           accum_tensor);
-      if (accumulator_scratch != nullptr &&
-          k_base == 0 &&
-          k_block == 0 &&
-          blockIdx.x == 0 &&
-          blockIdx.y == 0) {
-        const std::size_t thread_offset =
-            static_cast<std::size_t>(threadIdx.x) *
-            static_cast<std::size_t>(nvfp4_bridge::kNanoP1AccumCoordCount);
+      if constexpr (kCaptureAccumulatorScratch) {
+        if (accumulator_scratch != nullptr &&
+            k_base == 0 &&
+            k_block == 0 &&
+            output_col_base == 0 &&
+            row_start == 0) {
+          const std::size_t thread_offset =
+              static_cast<std::size_t>(threadIdx.x) *
+              static_cast<std::size_t>(nvfp4_bridge::kNanoP1AccumCoordCount);
 #pragma unroll
-        for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
-          accumulator_scratch[thread_offset + static_cast<std::size_t>(physical)] =
-              accum_storage[physical];
+          for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
+            accumulator_scratch[thread_offset + static_cast<std::size_t>(physical)] =
+                accum_storage[physical];
+          }
         }
       }
     }
@@ -12258,33 +12454,210 @@ __global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kerne
     NanoP1CtaBarrier();
   }
 
-  if (accumulator_scratch != nullptr &&
-      blockIdx.x == 0 &&
-      blockIdx.y == 0 &&
-      tid == 0) {
-    for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
-      accumulator_scratch[kNanoP1ProbeFinalThread0Offset + physical] = accum_storage[physical];
+  if constexpr (kCaptureAccumulatorScratch) {
+    if (accumulator_scratch != nullptr &&
+        output_col_base == 0 &&
+        row_start == 0 &&
+        tid == 0) {
+      for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
+        accumulator_scratch[kNanoP1ProbeFinalThread0Offset + physical] = accum_storage[physical];
+      }
+    }
+    if (accumulator_scratch != nullptr &&
+        output_col_base == 0 &&
+        row_start == 0 &&
+        tid == 2) {
+      for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
+        accumulator_scratch[kNanoP1ProbeFinalThread2Offset + physical] = accum_storage[physical];
+      }
     }
   }
-  if (accumulator_scratch != nullptr &&
-      blockIdx.x == 0 &&
-      blockIdx.y == 0 &&
-      tid == 2) {
-    for (int physical = 0; physical < nvfp4_bridge::kNanoP1AccumCoordCount; ++physical) {
-      accumulator_scratch[kNanoP1ProbeFinalThread2Offset + physical] = accum_storage[physical];
+}
+
+template <nvfp4_bridge::NanoP1EpilogueMode Mode>
+__global__ __launch_bounds__(nvfp4_bridge::NanoP1ThreadsPerCta) void NanoP1Kernel(
+    void const* input_fp4,
+    void const* weight_fp4,
+    void const* input_sf,
+    void const* weight_sf,
+    __nv_bfloat16* bf16_output,
+    std::uint8_t* packed_output,
+    std::uint8_t* block_scales_output,
+    std::uint8_t* matmul_block_scales_output,
+    float* activation_output_scales,
+    float* direct_pack_staging,
+    float const* g1_alphas,
+    int64_t num_rows,
+    int64_t hidden_size,
+    int64_t inter_size,
+    float* accumulator_scratch) {
+  constexpr int kTileM = cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{});
+  constexpr int kTileN = cute::size<1>(nvfp4_bridge::NanoP1MmaTileShape{});
+  static_assert(fused_decode::kNvfp4BlockWidth == 16);
+
+  __shared__ NanoP1SharedStorage shared;
+
+  if (input_fp4 == nullptr ||
+      weight_fp4 == nullptr ||
+      g1_alphas == nullptr ||
+      num_rows <= 0 ||
+      hidden_size <= 0 ||
+      inter_size <= 0 ||
+      (hidden_size % fused_decode::kNvfp4BlockWidth) != 0) {
+    return;
+  }
+  if constexpr (Mode == nvfp4_bridge::NanoP1EpilogueMode::kBf16Dense) {
+    if (bf16_output == nullptr) {
+      return;
+    }
+  } else {
+    if (packed_output == nullptr ||
+        block_scales_output == nullptr ||
+        matmul_block_scales_output == nullptr ||
+        activation_output_scales == nullptr ||
+        direct_pack_staging == nullptr ||
+        (inter_size % fused_decode::kNvfp4BlockWidth) != 0) {
+      return;
     }
   }
 
-  nvfp4_bridge::StoreNanoP1CFragmentsRowMajor(
-      alpha,
-      accum_storage,
-      tid,
-      output_col_base,
-      row_start,
-      valid_rows,
-      valid_cols,
-      static_cast<std::size_t>(inter_size),
-      bf16_output);
+  auto const* input_packed = static_cast<std::uint8_t const*>(input_fp4);
+  auto const* weight_packed = static_cast<std::uint8_t const*>(weight_fp4);
+  auto const* input_exec_scales = static_cast<std::uint8_t const*>(input_sf);
+  auto const* weight_exec_scales = static_cast<std::uint8_t const*>(weight_sf);
+  const float alpha = g1_alphas[0];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int row_start = static_cast<int>(blockIdx.y) * kTileM;
+  const int valid_rows =
+      max(0, min(static_cast<int>(num_rows) - row_start, kTileM));
+  if (valid_rows <= 0) {
+    return;
+  }
+
+  if constexpr (Mode == nvfp4_bridge::NanoP1EpilogueMode::kBf16Dense) {
+    const int output_col_base = static_cast<int>(blockIdx.x) * kTileN;
+    const int valid_cols =
+        max(0, min(static_cast<int>(inter_size) - output_col_base, kTileN));
+    if (valid_cols <= 0) {
+      return;
+    }
+
+    nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kNanoP1AccumCoordCount];
+    ComputeNanoP1AccumTile<true>(
+        shared,
+        input_packed,
+        weight_packed,
+        input_exec_scales,
+        weight_exec_scales,
+        tid,
+        output_col_base,
+        row_start,
+        valid_rows,
+        valid_cols,
+        hidden_size,
+        accumulator_scratch,
+        accum_storage);
+    nvfp4_bridge::StoreNanoP1CFragmentsRowMajor(
+        alpha,
+        accum_storage,
+        tid,
+        output_col_base,
+        row_start,
+        valid_rows,
+        valid_cols,
+        static_cast<std::size_t>(inter_size),
+        bf16_output);
+    return;
+  }
+
+  if (blockIdx.x != 0) {
+    return;
+  }
+
+  for (int output_col_base = 0; output_col_base < inter_size; output_col_base += kTileN) {
+    const int valid_cols =
+        max(0, min(static_cast<int>(inter_size) - output_col_base, kTileN));
+    if (valid_cols <= 0) {
+      continue;
+    }
+    nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kNanoP1AccumCoordCount];
+    ComputeNanoP1AccumTile<false>(
+        shared,
+        input_packed,
+        weight_packed,
+        input_exec_scales,
+        weight_exec_scales,
+        tid,
+        output_col_base,
+        row_start,
+        valid_rows,
+        valid_cols,
+        hidden_size,
+        nullptr,
+        accum_storage);
+    nvfp4_bridge::AccumulateNanoP1DirectPackRowMaxAbs(
+        alpha,
+        accum_storage,
+        tid,
+        row_start,
+        valid_rows,
+        valid_cols,
+        activation_output_scales);
+  }
+  __syncthreads();
+
+  for (int row = tid; row < valid_rows; row += blockDim.x) {
+    const std::size_t row_index = static_cast<std::size_t>(row_start + row);
+    const float max_abs = activation_output_scales[row_index];
+    float row_scale = 1.0f;
+    if (max_abs > kNvfp4ActivationMaxFinite) {
+      row_scale = ClampNvfp4TensorScale(max_abs / kNvfp4ActivationMaxFinite);
+    }
+    activation_output_scales[row_index] = row_scale;
+  }
+  __syncthreads();
+
+  constexpr std::size_t kStagingTileElements =
+      static_cast<std::size_t>(kTileM) * static_cast<std::size_t>(kTileN);
+  float* staging_tile =
+      direct_pack_staging + (static_cast<std::size_t>(blockIdx.y) * kStagingTileElements);
+  for (int output_col_base = 0; output_col_base < inter_size; output_col_base += kTileN) {
+    const int valid_cols =
+        max(0, min(static_cast<int>(inter_size) - output_col_base, kTileN));
+    if (valid_cols <= 0) {
+      continue;
+    }
+    nvfp4_bridge::CRegister accum_storage[nvfp4_bridge::kNanoP1AccumCoordCount];
+    ComputeNanoP1AccumTile<false>(
+        shared,
+        input_packed,
+        weight_packed,
+        input_exec_scales,
+        weight_exec_scales,
+        tid,
+        output_col_base,
+        row_start,
+        valid_rows,
+        valid_cols,
+        hidden_size,
+        nullptr,
+        accum_storage);
+    nvfp4_bridge::StoreNanoP1DirectPackCFragments(
+        alpha,
+        accum_storage,
+        tid,
+        output_col_base,
+        row_start,
+        valid_rows,
+        valid_cols,
+        static_cast<int>(num_rows),
+        static_cast<int>(inter_size),
+        packed_output,
+        block_scales_output,
+        matmul_block_scales_output,
+        activation_output_scales,
+        staging_tile);
+  }
 }
 
 bool RunNanoP1KernelForTestingImpl(
@@ -12324,18 +12697,117 @@ bool RunNanoP1KernelForTestingImpl(
     return false;
   }
 
-  NanoP1Kernel<<<grid, block, 0, stream>>>(
+  NanoP1Kernel<nvfp4_bridge::NanoP1EpilogueMode::kBf16Dense><<<grid, block, 0, stream>>>(
       input_fp4,
       weight_fp4,
       input_sf,
       weight_sf,
       bf16_output,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
       g1_alphas,
       num_rows,
       hidden_size,
       inter_size,
       accumulator_scratch);
   return CheckCuda(cudaGetLastError()) && CheckCuda(cudaStreamSynchronize(stream));
+}
+
+bool RunNanoP1DirectPackKernelForTestingImpl(
+    void const* input_fp4,
+    void const* weight_fp4,
+    void const* input_sf,
+    void const* weight_sf,
+    std::uint8_t* packed_output,
+    std::uint8_t* block_scales_output,
+    std::uint8_t* matmul_block_scales_output,
+    float* activation_output_scales,
+    float const* g1_alphas,
+    int64_t num_rows,
+    int64_t hidden_size,
+    int64_t inter_size,
+    cudaStream_t stream) {
+  if (input_fp4 == nullptr ||
+      weight_fp4 == nullptr ||
+      packed_output == nullptr ||
+      block_scales_output == nullptr ||
+      matmul_block_scales_output == nullptr ||
+      activation_output_scales == nullptr ||
+      g1_alphas == nullptr ||
+      num_rows <= 0 ||
+      hidden_size <= 0 ||
+      inter_size <= 0 ||
+      (hidden_size % fused_decode::kNvfp4BlockWidth) != 0 ||
+      (inter_size % fused_decode::kNvfp4BlockWidth) != 0) {
+    return false;
+  }
+
+  const std::size_t packed_nbytes =
+      static_cast<std::size_t>(num_rows) * (static_cast<std::size_t>(inter_size) / 2u);
+  const std::size_t padded_blocks_per_row = RoundUp(
+      static_cast<std::size_t>(inter_size) / fused_decode::kNvfp4BlockWidth,
+      kNvfp4ScaleBlockTile);
+  const std::size_t scale_nbytes = static_cast<std::size_t>(num_rows) * padded_blocks_per_row;
+  const std::size_t row_tile_count =
+      (static_cast<std::size_t>(num_rows) +
+       static_cast<std::size_t>(cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{})) - 1u) /
+      static_cast<std::size_t>(cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{}));
+  float* direct_pack_staging_dev = nullptr;
+  const std::size_t staging_count =
+      row_tile_count *
+      static_cast<std::size_t>(cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{})) *
+      static_cast<std::size_t>(cute::size<1>(nvfp4_bridge::NanoP1MmaTileShape{}));
+  if (!CheckCuda(cudaMalloc(
+          reinterpret_cast<void**>(&direct_pack_staging_dev),
+          staging_count * sizeof(float)))) {
+    return false;
+  }
+  if (!CheckCuda(cudaMemsetAsync(packed_output, 0, packed_nbytes, stream)) ||
+      !CheckCuda(cudaMemsetAsync(block_scales_output, 0, scale_nbytes, stream)) ||
+      !CheckCuda(cudaMemsetAsync(matmul_block_scales_output, 0, scale_nbytes, stream)) ||
+      !CheckCuda(cudaMemsetAsync(
+          activation_output_scales,
+          0,
+          static_cast<std::size_t>(num_rows) * sizeof(float),
+          stream))) {
+    cudaFree(direct_pack_staging_dev);
+    return false;
+  }
+
+  const dim3 block(nvfp4_bridge::NanoP1ThreadsPerCta);
+  const dim3 grid(
+      1u,
+      static_cast<unsigned int>(
+          (static_cast<std::size_t>(num_rows) +
+           static_cast<std::size_t>(cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{})) - 1u) /
+          static_cast<std::size_t>(cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{}))));
+  if (grid.y == 0) {
+    return false;
+  }
+
+  NanoP1Kernel<nvfp4_bridge::NanoP1EpilogueMode::kDirectPack><<<grid, block, 0, stream>>>(
+      input_fp4,
+      weight_fp4,
+      input_sf,
+      weight_sf,
+      nullptr,
+      packed_output,
+      block_scales_output,
+      matmul_block_scales_output,
+      activation_output_scales,
+      direct_pack_staging_dev,
+      g1_alphas,
+      num_rows,
+      hidden_size,
+      inter_size,
+      nullptr);
+  const bool ok =
+      CheckCuda(cudaGetLastError()) && CheckCuda(cudaStreamSynchronize(stream));
+  cudaFree(direct_pack_staging_dev);
+  return ok;
 }
 #endif
 
@@ -12513,6 +12985,53 @@ bool RunNanoP1KernelForTesting(
   (void)inter_size;
   (void)stream;
   (void)accumulator_scratch;
+  return false;
+#endif
+}
+
+bool RunNanoP1DirectPackKernelForTesting(
+    void const* input_fp4,
+    void const* weight_fp4,
+    void const* input_sf,
+    void const* weight_sf,
+    std::uint8_t* packed_output,
+    std::uint8_t* block_scales_output,
+    std::uint8_t* matmul_block_scales_output,
+    float* activation_output_scales,
+    float const* g1_alphas,
+    int64_t num_rows,
+    int64_t hidden_size,
+    int64_t inter_size,
+    cudaStream_t stream) {
+#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
+  return RunNanoP1DirectPackKernelForTestingImpl(
+      input_fp4,
+      weight_fp4,
+      input_sf,
+      weight_sf,
+      packed_output,
+      block_scales_output,
+      matmul_block_scales_output,
+      activation_output_scales,
+      g1_alphas,
+      num_rows,
+      hidden_size,
+      inter_size,
+      stream);
+#else
+  (void)input_fp4;
+  (void)weight_fp4;
+  (void)input_sf;
+  (void)weight_sf;
+  (void)packed_output;
+  (void)block_scales_output;
+  (void)matmul_block_scales_output;
+  (void)activation_output_scales;
+  (void)g1_alphas;
+  (void)num_rows;
+  (void)hidden_size;
+  (void)inter_size;
+  (void)stream;
   return false;
 #endif
 }

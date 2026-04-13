@@ -124,6 +124,21 @@ bool RunNanoP1KernelForTesting(
     cudaStream_t stream,
     float* accumulator_scratch = nullptr);
 
+bool RunNanoP1DirectPackKernelForTesting(
+    void const* input_fp4,
+    void const* weight_fp4,
+    void const* input_sf,
+    void const* weight_sf,
+    std::uint8_t* packed_output,
+    std::uint8_t* block_scales_output,
+    std::uint8_t* matmul_block_scales_output,
+    float* activation_output_scales,
+    float const* g1_alphas,
+    int64_t num_rows,
+    int64_t hidden_size,
+    int64_t inter_size,
+    cudaStream_t stream);
+
 // Testing hook: runs the live P5 native direct-pack epilogue against a
 // synthetic 128x128 accumulator tile laid out with the real CUTE
 // `TracedP5AccumProfileLayout`.

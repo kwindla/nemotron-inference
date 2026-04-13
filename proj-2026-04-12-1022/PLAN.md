@@ -366,7 +366,7 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `runtime/src/backend/fused_moe_prefill.cu`, `runtime/include/nemotron/fused_moe_prefill.h`, `testing/backend/p1_*.cpp` (deleted), `testing/backend/p13_generic_direct_stage_oracle_test.cpp` (deleted), `testing/CMakeLists.txt`.
 
-- [~] **4. Implement a from-scratch NanoP1 kP1 kernel, guided by TRT-LLM but not using it (4 sub-commits 4a-4d)**
+- [x] **4. Implement a from-scratch NanoP1 kP1 kernel, guided by TRT-LLM but not using it (4 sub-commits 4a-4d)**
 
   **Kernel Provenance policy (`PLAN_RULES.md § Kernel Provenance`)**: this kernel ships on the prefill hot path, so it MUST be written from scratch. No `cutlass::gemm::collective::CollectiveBuilder`, no `GemmUniversalAdapter`, no `GemmKernel`, no `MainloopSm*` dispatch policy, no FlashInfer/TRT-LLM runtime code. Permitted primitives: hand-written CUDA, inline PTX for the SM120 block-scaled MMA, and the explicit allow-list of CUTE atoms and layout primitives — `cute::MMA_Atom<cute::SM120_16x8x64_TN_VS<...>>`, `cute::TiledMMA`, `cute::Copy_Atom<cute::SM90_TMA_LOAD>`, `cute::Copy_Atom<cute::SM75_U32x4_LDSM_N>`, `cute::Layout`, `cute::Tensor`, swizzle functors, and `cutlass::detail::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB`.
 
@@ -494,7 +494,7 @@ Expected: `ALL CHECKS PASSED`.
 | 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | done | `0afcb2e` | Architecture doc |
 | 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | `1360eaf` + `.bin` dump addendum (this commit) | Per-tactic BF16 dumps + `inputs.pt` in `golden/`; tactic1 == plan-v6 P1. `.bin` dump addendum lets the step 4c test load inputs without libtorch. |
 | 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
-| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | in-progress | 4a → `1868939`, 4b → `ef60007`, 4c → (this commit) | 4a: CUTE type bundle. 4b: NanoP1Kernel body (SASS 161 MMA). 4c: BF16 dense epilogue (via `cute::partition_C(identity_tensor)`) + `nano_p1_mainloop_oracle_test` — **Phase 1 all-ones synthetic PASS**, Phase 2 TRT-LLM bitwise deferred to step 5 (host-side interpretation of captured pre-packed FP4 layout requires reproducing flashinfer's quant). Root-cause fixes: K loop advances full CTA tile (not 64); store uses full `128x128` profile, not native mma tile. 4d: fused direct-pack epilogue (pending). |
+| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | done | 4a `1868939`, 4b `ef60007`, 4c `7118317`, 4d (this commit) | 4a CUTE type bundle. 4b mainloop body (SASS 161 MMA). 4c BF16 dense epilogue, Phase 1 PASS. 4d fused direct-pack epilogue, Phase 1 all 4 channels PASS (packed_bytes, block_scales, matmul_block_scales, activation_output_scales). Phase 2 TRT-LLM bitwise deferred to step 5. |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
 | 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |
