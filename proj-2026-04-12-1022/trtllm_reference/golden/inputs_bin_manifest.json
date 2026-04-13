@@ -1,0 +1,156 @@
+{
+  "generated_by": "proj-2026-04-12-1022/trtllm_reference/dump_inputs_bin.py",
+  "source_pt": "inputs.pt",
+  "tensors": {
+    "hs": {
+      "file": "inputs_hs.bin",
+      "shape": [
+        128,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "element_size": 2,
+      "nbytes": 65536
+    },
+    "w1_16": {
+      "file": "inputs_w1_16.bin",
+      "shape": [
+        1,
+        256,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "element_size": 2,
+      "nbytes": 131072
+    },
+    "w2_16": {
+      "file": "inputs_w2_16.bin",
+      "shape": [
+        1,
+        256,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "element_size": 2,
+      "nbytes": 131072
+    },
+    "w1_fp4": {
+      "file": "inputs_w1_fp4.bin",
+      "shape": [
+        1,
+        256,
+        128
+      ],
+      "dtype": "torch.uint8",
+      "element_size": 1,
+      "nbytes": 32768
+    },
+    "w2_fp4": {
+      "file": "inputs_w2_fp4.bin",
+      "shape": [
+        1,
+        256,
+        128
+      ],
+      "dtype": "torch.uint8",
+      "element_size": 1,
+      "nbytes": 32768
+    },
+    "w1_sf": {
+      "file": "inputs_w1_sf.bin",
+      "shape": [
+        1,
+        256,
+        16
+      ],
+      "dtype": "torch.uint8",
+      "element_size": 1,
+      "nbytes": 4096
+    },
+    "w2_sf": {
+      "file": "inputs_w2_sf.bin",
+      "shape": [
+        1,
+        256,
+        16
+      ],
+      "dtype": "torch.uint8",
+      "element_size": 1,
+      "nbytes": 4096
+    },
+    "w1_gs": {
+      "file": "inputs_w1_gs.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 4
+    },
+    "w2_gs": {
+      "file": "inputs_w2_gs.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 4
+    },
+    "a1_gscale": {
+      "file": "inputs_a1_gscale.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 4
+    },
+    "a2_gscale": {
+      "file": "inputs_a2_gscale.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 4
+    },
+    "g1_alphas": {
+      "file": "inputs_g1_alphas.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 4
+    },
+    "g2_alphas": {
+      "file": "inputs_g2_alphas.bin",
+      "shape": [
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 4
+    },
+    "token_selected_experts": {
+      "file": "inputs_token_selected_experts.bin",
+      "shape": [
+        128,
+        1
+      ],
+      "dtype": "torch.int32",
+      "element_size": 4,
+      "nbytes": 512
+    },
+    "token_final_scales": {
+      "file": "inputs_token_final_scales.bin",
+      "shape": [
+        128,
+        1
+      ],
+      "dtype": "torch.float32",
+      "element_size": 4,
+      "nbytes": 512
+    }
+  }
+}

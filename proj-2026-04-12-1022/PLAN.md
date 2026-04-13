@@ -492,9 +492,9 @@ Expected: `ALL CHECKS PASSED`.
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
 | 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | done | `0afcb2e` | Architecture doc |
-| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | (this commit) | Per-tactic BF16 dumps + inputs.pt in `golden/`; tactic1 == plan-v6 P1 |
+| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | `1360eaf` + `.bin` dump addendum (this commit) | Per-tactic BF16 dumps + `inputs.pt` in `golden/`; tactic1 == plan-v6 P1. `.bin` dump addendum lets the step 4c test load inputs without libtorch. |
 | 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
-| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | in-progress | 4a → `1868939`, 4b → (this commit) | 4a: hand-written CUTE bundle. 4b: `NanoP1Kernel` + `RunNanoP1KernelForTesting`, single-stage, fragment-path MMA via `nvfp4_bridge::Gemm` + existing `LoadFragment*` helpers. SASS shows 161 native SM120 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` instructions; PTX 324 matches. Deviation: smem swizzled layouts allocated but fragment load still reads from row-major scratch — to be addressed in 4c if the oracle mismatch requires it. 4c/4d pending. |
+| 4 | Implement from-scratch NanoP1 kP1 kernel (4 sub-commits 4a-4d) | in-progress | 4a → `1868939`, 4b → `ef60007` | 4a: hand-written CUTE bundle. 4b: `NanoP1Kernel` body with native SM120 MMA (SASS 161 matches, PTX 324). 4c: BF16 epilogue + oracle test vs tactic1.bin (pending). 4d: fused direct-pack epilogue (pending). |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |
 | 7 | Document architecture; open follow-on roofline plan | pending | — | Performance work deferred |
