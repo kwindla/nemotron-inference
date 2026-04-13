@@ -40,11 +40,13 @@ For SwapAB=false (P1):
 
 ### Layouts (grouped GEMM pointer variants)
 
-From `:793–796`:
-- `LayoutA = TmaWarpSpecializedGroupedGemmInput::LayoutA` — `cutlass::layout::RowMajor` at `moe_gemm_kernels.h:~` (grouped-gemm pointer layout, one pointer per expert)
-- `LayoutB = TmaWarpSpecializedGroupedGemmInput::LayoutB` — `cutlass::layout::ColumnMajor`
-- `LayoutC = TmaWarpSpecializedGroupedGemmInput::LayoutC` (for SwapAB=false per `:714–715`) — likely `RowMajor`
-- `LayoutD = TmaWarpSpecializedGroupedGemmInput::LayoutD` (for SwapAB=false per `:718–719`) — likely `RowMajor`
+From `moe_gemm_kernels.h:82-89` (authoritative source, not speculation):
+- `LayoutA = cutlass::layout::RowMajor` (grouped-gemm pointer layout, one pointer per expert)
+- `LayoutB = cutlass::layout::ColumnMajor`
+- `LayoutC = cutlass::layout::RowMajor` (for SwapAB=false; transposed to `LayoutC_T = ColumnMajor` when SwapAB=true)
+- `LayoutD = cutlass::layout::RowMajor` (for SwapAB=false; transposed to `LayoutD_T = ColumnMajor` when SwapAB=true)
+
+The header comment at `moe_gemm_kernels.h:80-81` confirms: "These are always the layout of A & B matrices, activations and weights will be assigned to either A or B based on swap_ab". SwapAB=false (our P1) binds activations → A (RowMajor) and weights → B (ColumnMajor).
 
 All Layouts are passed to the builder as **pointer types** (`LayoutA*`, `LayoutB*`, `LayoutC*`, `LayoutD*`) because this is the pointer-array grouped-GEMM convention.
 
@@ -145,7 +147,9 @@ Translation: when we write our own kernel, we should use **the same inversion pa
 
 ## 4. Step 4a checklist
 
-Step 4a's job is to create a new `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization that produces a bitwise-identical `CollectiveMainloop` and `TiledMma` to what TRT-LLM's launcher macro would produce for the P1 tile shape with Nemotron-relevant parameters (`ElementAct = float_e2m1_t`, `ElementWeight = float_e2m1_t`, `OutputType = __nv_bfloat16`, SwapAB=false, CTA=128x128x128 elements, cluster=1x1x1, KernelScheduleAuto).
+Step 4a's job is to define a standalone `NanoP1*` type bundle that produces a bitwise-identical `CollectiveMainloop` and `TiledMma` to what TRT-LLM's launcher macro would produce for the P1 tile shape with Nemotron-relevant parameters (`ElementAct = float_e2m1_t`, `ElementWeight = float_e2m1_t`, `OutputType = __nv_bfloat16`, SwapAB=false, CTA=128x128x128 elements, cluster=1x1x1, KernelScheduleAuto).
+
+Per PLAN.md v6 steps 3d/4a, **do NOT reintroduce a `UnifiedRoutedFp4Traits<UnifiedRoutedFp4Profile::kP1>` specialization in step 4a**. That specialization is explicitly kept deleted — it only comes back later, if and only if the standalone `NanoP1Nvfp4MoeGemmKernel` is already proven correct AND a shared-helper reuse story genuinely requires it. The default step 4 path is the standalone kernel + standalone `NanoP1*` type bundle; a resurrected `Traits<kP1>` surface is opt-in.
 
 ### Required type aliases
 
@@ -203,20 +207,149 @@ For a value-level sanity check against TRT-LLM specifically (not required; `Show
 
 ---
 
-## 5. Deferred — step 2b runtime harness (if ever needed)
+## 5. Step 2b runtime harness — chosen path
 
-A runtime harness that captures:
-- **Surface 1**: BF16 output of `MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>::moeGemm(...)` immediately after the kernel returns (before `doActivationKernel`), as a bitwise reference for step 4b's mainloop validation
-- **Surface 2**: live emission of `maybePrintSm120P1CompileProbe` text for side-by-side comparison against step 4a's `ShowInt<N>` probe output
+Plan v6 step 2 was reopened in a narrower form: capture TRT-LLM's BF16 `gemm1_output` immediately after `MoeGemmRunner::moeGemm(...)` returns for one synthetic SM120 P1 problem, so that step 4b's mainloop test can compare bitwise against a real external BF16 boundary rather than only against a host fp32→bf16 reference.
 
-is deferred. Current state:
+### Path not taken
 
-- `libtensorrt_llm.so` exists with embedded SM120 SASS and exports the `MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>::moeGemm` symbol (verified via `nm -D`). Linking against it works in principle but requires transitive torch dependencies (`libtorch_cpu.so`, `libc10.so`, `libtorch_cuda.so`, `libcublas.so.13`) that are **not** part of our current CMake target chain.
-- The Python torch-op entry point `torch.classes.trtllm.FusedMoeRunner.run_moe` is the correct Python binding (from `cpp/tensorrt_llm/thop/moeOp.cpp:1274–1281`) — it routes through `CutlassMoeFCRunner → MoeGemmRunner::moeGemm → tma_warp_specialized_generic_moe_gemm_kernelLauncher`, which is where the P1 compile probe fires. But no existing TRT-LLM test exercises it with NVFP4 inputs; reproducing the input contract would require reverse-engineering `moeOp.cpp`.
-- The P1 compile probe branch in the launcher does NOT short-circuit after printing (unlike P5 and P15). So capturing the P1 probe requires the kernel to actually launch with valid workspace + stream + tensors, not just an abort-after-print.
+- **Direct link against `libtensorrt_llm.so`** — rejected. The exports we need (`CutlassMoeFCRunner::runMoe`, `MoeGemmRunner::moeGemm`) pull in `libtorch_cpu.so`, `libc10.so`, `libtorch_cuda.so`, and `libcublas.so.13` as transitive dependencies, none of which are currently part of Nemotron's CMake target chain. Adding them would turn step 2 into a multi-day build-system project.
+- **Hand-rolled CUTLASS harness** — rejected. `moeGemm` consumes a populated `GroupedGemmInput` + `TmaWarpSpecializedGroupedGemmInput` whose strides/SF pointers are normally computed by `CutlassMoeFCRunner::computeStridesTmaWarpSpecialized`. Reimplementing that logic from scratch would dwarf the step-4b kernel itself.
+- **vLLM `FlashInferExperts` path** — rejected for step 2b-as-source-of-truth. It routes through the same flashinfer binding we're using, so it would only add an extra wrapper layer between Nemotron and the real kernel.
+- **`trtllm_fp4_block_scale_*` flashinfer top-level entry** — rejected. That one maps to `gen_trtllm_gen_fused_moe_sm100_module`, which is the SM100 trtllm-gen path, NOT the SM120 CUTLASS path. Plan v6 step 2 explicitly warns against it.
 
-Re-open step 2b if:
-- step 4b's mainloop test fails against a host fp32 reference and we can't explain the discrepancy, or
-- step 4a's compile-time probes disagree with the architecture doc's documented types in a way that can't be explained from the CollectiveBuilder argument list alone.
+### Path taken
 
-Otherwise, the architecture-level reference in this file plus the host fp32 reference for step 4b are sufficient for correctness-only bring-up.
+Drive flashinfer's vendored TRT-LLM MoE GEMM sources directly through the low-level binding `fused_moe_runner.run_moe(...)`. The Python wrapper `flashinfer.fused_moe.core.cutlass_fused_moe(...)` is intentionally NOT used — it routes through the flashinfer AutoTuner, which leaves tactic-cache state in the process that contaminates reproducibility. The harness grabs the raw tvm-ffi JIT module by calling the JIT spec directly:
+
+```python
+from flashinfer.jit.fused_moe import gen_cutlass_fused_moe_sm120_module
+raw_jit_module = gen_cutlass_fused_moe_sm120_module(use_fast_build=False).build_and_load()
+fused_moe_runner = raw_jit_module.init(bf16, torch.int64, bf16, False, False, False, False)
+# ... later, once per GEMM1 tactic:
+fused_moe_runner.run_moe(..., [tactic_id, gemm2_tactic_id], ...)
+```
+
+**Not** `flashinfer.fused_moe.core.get_cutlass_fused_moe_module(backend="120").init(...)` — that helper at `core.py:333-715` returns a `SimpleNamespace(cutlass_fused_moe=...)` that only exposes the high-level wrapper, not the tvm-ffi module with `.init(...)`. Getting the raw module requires either calling the JIT spec directly (what the harness does) or constructing a `MoERunner(...)` instance and pulling `moe_runner.fused_moe_runner` off it. The JIT-spec path is cleaner because it bypasses `MoERunner` altogether.
+
+The JIT sources live under
+
+    <venv>/lib/python3.12/site-packages/flashinfer/data/csrc/
+      nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/...   # TRT-LLM kernel .cu/.cuh
+      fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh         # moe_kernels.cu equivalent
+      fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu  # Python binding
+
+On SM120 the backend is `gen_cutlass_fused_moe_sm120_module`, which compiles the same `moe_gemm_tma_ws_launcher.inl` kernel instantiations we target in step 4b. The warm build is cached under `~/.cache/flashinfer/0.6.6/120a/cached_ops/fused_moe_120/` — the ninja file there has absolute source paths baked in, so `run_capture.sh` must patch whichever venv that cache references (auto-detected via `awk` on `build.ninja`). In the current environment that's `vllm-env-cu128/.../flashinfer/data/csrc`, not `.venv-trtllm/.../flashinfer/data/csrc`.
+
+### The BF16 boundary contract
+
+At the call site in `cutlass_fused_moe_kernels.cuh::CutlassMoeFCRunner::gemm1(...)`, the TMA warp-specialized NVFP4 branch pulls the following pointers from scope:
+
+- `T` = `__nv_fp4_e2m1` (NVFP4 weights/acts)
+- `WeightType` = `__nv_fp4_e2m1`
+- `OutputType` = `__nv_bfloat16`
+- `UnfusedGemmOutputType` = alias of `OutputType` = `__nv_bfloat16`
+- `has_different_gemm_output_type = true` (T ≠ OutputType) → `has_intermediate = true`
+- `gemm_output = intermediate_result` (the `glu_inter_result_` / `fc1_result_` workspace chunk passed in from the outer `runMoe`)
+- `fc1_out_size` = `is_gated_activation ? inter_size * 2 : inter_size`; for Nemotron ReLU² this is `inter_size`
+- Post-GEMM, `gemm_output` holds `expanded_num_rows * fc1_out_size` BF16 elements, row-major, stride `fc1_out_size`
+
+The BF16 boundary is **post-alpha-scaled, post-BF16 epilogue cast, pre-activation, pre-pack**. This is the `alpha * (FP4 A · FP4 B) + beta*C` output of `cutlass::epilogue::fusion::LinearCombination<bf16, float, ElementC, float>` with `beta=0, ElementC=void`. No `Relu²`, no block-scale recompute, no FP4 pack. Any subsequent transform happens inside `doActivation`, which this hook intentionally precedes.
+
+### What the patch does
+
+`patches/flashinfer_bf16_gemm1_dump.patch` adds exactly two hunks to `cutlass_fused_moe_kernels.cuh`:
+
+1. Five `#include`s (`<cstdint>`, `<cstdio>`, `<cstdlib>`, `<cstring>`, `<vector>`) at the top of the file.
+2. A 42-line env-gated dump immediately after the `sync_check_cuda_error(stream)` that follows `gemm_runner.moeGemm(universal_input, tma_ws_input)` in the TMA WS branch of `gemm1()`. When `NEMOTRON_TRTLLM_DUMP_GEMM1=<path>` is set, the hook `cudaMemcpyAsync`s `expanded_num_rows * fc1_out_size * sizeof(UnfusedGemmOutputType)` bytes from `gemm_output` to host, and writes a 64-byte header plus the raw BF16 body to that path. See `README.md` for the byte-level header layout.
+
+The hook is strictly a device→host copy + `std::fwrite`; it does not mutate the kernel state, does not allocate on the CUDA stream, and is compiled as a runtime branch that only fires when the env var is set. The patch is applied by `run_capture.sh`, which also reverts it on exit via an EXIT trap — the flashinfer installed tree is left unchanged after each capture run.
+
+### Tactic selection: enumerate, do not rely on fallback
+
+The SM120 NVFP4 grouped-GEMM base tactic list from `cutlass_heuristic.cpp:601-616` is four entries:
+
+| base_id | `CutlassTileConfigSM120` |
+|---|---|
+| 0 | `CtaShape128x128x128B` |
+| 1 | `CtaShape128x128x64B` |
+| 2 | `CtaShape128x256x64B` |
+| 3 | `CtaShape256x128x64B` |
+
+That base list is then duplicated with `swap_ab = true` by `MoeGemmRunner::getTmaWarpSpecializedConfigs` at `moe_gemm_template_dispatch.h:657-663`, giving **8** GEMM1 tactics total. `mAllProfiles` in the binding is populated from this 8-entry list for GEMM1, then extended with GEMM2 tactics. See "Observed runtime" below for the full `tactic_id → (tile, swap_ab)` table that step 4b reads.
+
+The previous harness approach ("pass `-1`, take `mAllProfiles.front()`") would have captured `tactic_id = 0` = `CtaShape128x128x128B` (SwapAB=false), which is NOT the tile shape plan v6 calls P1 (plan-v6 P1 = `CtaShape128x128x64B` SwapAB=false = `tactic_id = 1`). The current harness instead:
+
+1. Bypasses `cutlass_fused_moe(...)` (and therefore the AutoTuner) entirely — it builds the raw JIT module with `gen_cutlass_fused_moe_sm120_module(...).build_and_load()`, calls `raw_jit_module.init(...)` to construct the low-level `fused_moe_runner`, and then issues `fused_moe_runner.run_moe(..., [tactic_id, gemm2_tactic_id], ...)` directly with explicit profile IDs. See "Path taken" above for the exact call sequence.
+2. Resets `AutoTuner.get().profiling_cache` before the first call as paranoia against any other in-process tuning state leaking in.
+3. Loops over every GEMM1 tactic id `0..get_gemm1_tactic_count()-1`, captures one BF16 dump per tactic to `bf16_gemm1_tactic${tactic_id}.bin`, and records `(tactic_id → expected tile label, expected swap_ab)` plus the `is_plan_v6_p1` flag in `bf16_gemm1_metadata.json`.
+4. Verifies each dump file exists, is non-trivially sized, and has `mtime ≥ t0_of_this_run` (guards against an old file false-passing the existence check).
+
+Step 4b's oracle picks the tactic whose `is_plan_v6_p1 == true` (currently `tactic_id == 1`, `CtaShape128x128x64B_Cluster1x1x1`, SwapAB=false), reads the corresponding dump, and compares bitwise against the NanoP1 kernel output. If `get_gemm1_tactic_count()` differs from the expected **8**, the harness emits a WARN and the metadata surfaces `gemm1_tactic_count` so step 4b can re-verify against `cutlass_heuristic.cpp` + `moe_gemm_template_dispatch.h` before trusting the label.
+
+### Observed runtime: `get_gemm1_tactic_count() == 8`
+
+In the current flashinfer build (`0.6.6`, `vllm-env-cu128`) `get_gemm1_tactic_count()` returns **8**. The reason is in `moe_gemm_template_dispatch.h:657`:
+
+```cpp
+auto swap_ab_configs = tma_ws_configs;
+std::transform(swap_ab_configs.begin(), swap_ab_configs.end(),
+               std::back_inserter(tma_ws_configs),
+               [](auto& config) { config.swap_ab = true; return config; });
+```
+
+`getConfigs` duplicates every base tile shape with `swap_ab = true` appended, so the effective list is:
+
+| tactic_id | label                              | swap_ab |
+|---|---|---|
+| 0 | `CtaShape128x128x128B_Cluster1x1x1` | false  |
+| 1 | `CtaShape128x128x64B_Cluster1x1x1`  | false ← **plan v6 P1** |
+| 2 | `CtaShape128x256x64B_Cluster1x1x1`  | false  |
+| 3 | `CtaShape256x128x64B_Cluster1x1x1`  | false  |
+| 4 | `CtaShape128x128x128B_Cluster1x1x1` | true   |
+| 5 | `CtaShape128x128x64B_Cluster1x1x1`  | true   |
+| 6 | `CtaShape128x256x64B_Cluster1x1x1`  | true   |
+| 7 | `CtaShape256x128x64B_Cluster1x1x1`  | true   |
+
+The harness captures one dump per tactic and labels both fields in `bf16_gemm1_metadata.json`. Plan v6 P1 (`SwapAB=false`, `CtaShape128x128x64B`) remains tactic_id 1.
+
+### Observed convergence across tactics (expected and benign)
+
+On the default synthetic problem (M=128, K=256, N=256, seed=0xC0FFEE), all 8 tactic dumps are **bitwise identical**. For the current capture:
+
+- full-file md5 (64 B header + 65536 B body): `d220d1c7aaa6d1b19190c5b6f02b2d1d`
+- body-only md5 (65536 B BF16 payload, no header): `fd46efaa59d45cd081eeb14d64d62bf1`
+
+Both hashes are stable across tactic 0..7. Use whichever representation your diff tool makes easy; the body-only hash is invariant to header-format changes, the full-file hash is what `md5sum golden/*.bin` reports.
+
+This was initially alarming but is expected:
+
+1. An instrumented build (temporary `fprintf` on `config.tile_config_sm120 / config.swap_ab`) confirmed the runtime dispatch is actually selecting different tactics per call — tactic 1 hits `tile_config_sm120=128128064, swap_ab=0`, tactic 5 hits the same tile with `swap_ab=1`, etc. The underlying CUTLASS kernels are in fact different template instantiations (the primary `DispatchToTmaWSFunction<>` template at `moe_gemm_tma_ws_launcher.inl:95` is empty; an un-instantiated tile would fail to compile rather than silently falling back).
+
+2. The observed convergence is a property of the math + low-precision output:
+   - FP4 values are bounded in `[-6, 6]`, so each product `A·B` is bounded in `[-36, 36]`
+   - For `K=256` (and tested up to `K=2048`), fp32 partial sums stay well below fp32's ~7-digit precision range
+   - The fp32 reduction error across different tile boundaries is ≲ `1e-3`
+   - BF16 has 8 mantissa bits → LSB of a value near 1.0 is ~`3.9e-3`
+   - fp32 rounding error `<` BF16 LSB → every legal reduction order rounds to the **same** BF16 bit pattern
+
+For step 4b, this means the NanoP1 kernel can be compared against any of `tactic0`..`tactic3` (SwapAB=false variants) and still validate correctness for small synthetic problems. The canonical comparison target is `bf16_gemm1_tactic1.bin` — the plan v6 P1 label — and tactics 4..7 are captured as SwapAB=true diagnostic checks (NanoP1 is SwapAB=false, so tactics 4..7 should only be used for curiosity).
+
+The convergence may break at larger K where partial sums approach fp32 precision limits, or at larger M×N where tile boundary effects dominate. If step 4b sees a mismatch against tactic1 but finds another tactic that matches, re-verify the instrumentation trace from this run (saved as a diagnostic — if not, re-instrument via the same temporary `fprintf` pattern).
+
+### Files
+
+- `README.md` — operator-facing overview and run instructions
+- `capture_bf16_gemm1.py` — per-tactic harness: builds synthetic inputs, enumerates `get_gemm1_tactic_count()`, calls `fused_moe_runner.run_moe(..., [tactic_id, gemm2_tactic_id], ...)` for each tactic, verifies dump mtime, writes metadata
+- `run_capture.sh` — auto-detect venv from warm ninja cache → clean stale `golden/` artifacts → apply patch → run harness → revert patch (always, via trap)
+- `patches/flashinfer_bf16_gemm1_dump.patch` — the ~47-line unified diff; applies cleanly to any flashinfer data/csrc tree the warm cache points at
+- `golden/` — run output: per-tactic `bf16_gemm1_tactic${id}.bin` dumps, `bf16_gemm1_metadata.json`, `inputs.pt`, `final_moe_output.pt`
+
+### Gate for step 4b
+
+Once `run_capture.sh` has produced `golden/bf16_gemm1_tactic1.bin` (= the plan-v6 P1 tactic: `CtaShape128x128x64B_Cluster1x1x1`) plus the full set of other tactic dumps, `bf16_gemm1_metadata.json`, and `inputs.pt`, step 4b has:
+- The BF16 reference tensor to compare bitwise against (tactic 1 specifically; the others are captured for diagnostic reference)
+- The exact synthetic inputs to feed the new NanoP1 kernel (so step 4b reproduces the problem deterministically)
+- A metadata record naming the tactic labels, shapes, seed, source tree, and venv so any mismatch can be traced
+
+Step 4b is blocked until this capture exists.

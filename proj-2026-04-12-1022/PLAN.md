@@ -272,7 +272,7 @@ Expected: `ALL CHECKS PASSED`.
 
 ## Steps
 
-- [ ] **1. Read TRT-LLM NVFP4 MoE GEMM end-to-end; produce architecture summary**
+- [x] **1. Read TRT-LLM NVFP4 MoE GEMM end-to-end; produce architecture summary**
   Read the NVFP4 MoE GEMM path in `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/` from its top-level dispatcher down through the kernel template, mainloop, epilogue, and scale handling. Walk the code — do not skim.
 
   Specific facts to document in `proj-2026-04-12-1022/trtllm_architecture.md`:
@@ -292,7 +292,7 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `third_party/TensorRT-LLM/cpp/tensorrt_llm/kernels/cutlass_kernels/` (read-only), `proj-2026-04-12-1022/trtllm_architecture.md` (new).
 
-- [ ] **2. Stand up a minimal TRT-LLM BF16 `gemm1_output` harness for step 4b; live compile-probe capture deferred**
+- [x] **2. Stand up a minimal TRT-LLM BF16 `gemm1_output` harness for step 4b; live compile-probe capture deferred**
   Step 1 and `trtllm_reference/NOTES.md` already document the source-level `CollectiveBuilder` / `TiledMma` construction for SM120 NVFP4 P1. That is sufficient for step 4a. It is **not** sufficient for step 4b if we want a real external boundary oracle, because our runtime compiles against the local CUTLASS snapshot under `.venv-trtllm/.../flashinfer/data/cutlass/include`, not a TRT-LLM-owned build surface. So step 2 is reopened in a narrower form: produce the smallest possible TRT-LLM runtime artifact that gives step 4b a true BF16 boundary oracle.
 
   **Required scope**:
@@ -316,7 +316,7 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `proj-2026-04-12-1022/trtllm_reference/NOTES.md`, `proj-2026-04-12-1022/trtllm_reference/README.md` (new), `proj-2026-04-12-1022/trtllm_reference/golden/` (new).
 
-- [ ] **3. Delete all kP1-specific broken code (6 sub-commits 3a-3f)**
+- [x] **3. Delete all kP1-specific broken code (6 sub-commits 3a-3f)**
   Hard delete pass. See "What to delete in step 3, and why" in the Current State section for the exhaustive list and the per-item justification. Commit order is chosen to keep the tree buildable at every step.
 
   **3a — Delete the P1 test oracles**
@@ -380,10 +380,26 @@ Expected: `ALL CHECKS PASSED`.
   **Sub-commits**:
 
   - **4a — NanoP1 type bundle + TiledMma + smem layouts**
-    Instantiate the CollectiveBuilder with TRT-LLM's exact template argument list. Define the new `NanoP1*` types in a standalone type bundle; do **not** reintroduce `UnifiedRoutedFp4Traits<kP1>` yet unless standalone kernel compile plumbing absolutely requires it. No kernel yet — compile-only. Add compile-time `ShowInt<N>` probes (ifdef-guarded) for the per-thread partition mode sizes of A/B/C and remove them after the first successful build to confirm the layout matches TRT-LLM's documented per-thread mode sizes. Follow the literal TRT P1 probe code for the partition calls (`tCrA = partition_fragment_B(sA)`, `tCrB = partition_fragment_A(sB)`); if any prose note disagrees, the source snippet wins. Gate: `cmake --build` clean, probe values match TRT-LLM's documented per-thread mode sizes, and any residual mismatch is explained from the CUTLASS snapshot in use.
+    Instantiate the CollectiveBuilder with TRT-LLM's exact template argument list. Define the new `NanoP1*` types in a standalone type bundle; do **not** reintroduce `UnifiedRoutedFp4Traits<kP1>` yet unless standalone kernel compile plumbing absolutely requires it. No kernel yet — compile-only. Add compile-time `ShowInt<N>` probes (ifdef-guarded) for the per-thread partition mode sizes of A/B/C and remove them after the first successful build to confirm the layout matches TRT-LLM's documented per-thread mode sizes. Follow the literal TRT P1 probe code for the partition calls (`tCrA = partition_fragment_B(sA)`, `tCrB = partition_fragment_A(sB)`); if any prose note disagrees, the source snippet wins.
+
+    **Load-bearing note** (new after step 2 completion): the step 2 capture revealed that on the default synthetic problem (M=128, K=256, N=256), all 8 runtime GEMM1 tactics converge to bitwise-identical BF16 output — a math property of FP4 × FP4 reductions rounded to BF16 at the epilogue boundary (see `proj-2026-04-12-1022/trtllm_reference/NOTES.md §5 "Observed convergence"`). That makes step 4b's runtime bitwise oracle a *necessary-but-not-sufficient* correctness gate for small problems. The step 4a `ShowInt<N>` probes are therefore the primary mechanism that pins the new `NanoP1*` type bundle to the exact TRT-LLM P1 `CollectiveBuilder` / `TiledMma` instantiation. Treat the probe checklist in `NOTES.md §4` as load-bearing, not just a sanity check: every residual mismatch must be explained from the CUTLASS snapshot in use before moving to step 4b.
+
+    Gate: `cmake --build` clean, all probe values match TRT-LLM's documented per-thread mode sizes, any residual mismatch explained from the CUTLASS snapshot, and `UnifiedRoutedFp4Traits<kP1>` remains deleted.
 
   - **4b — TRT-compatible GEMM boundary (BF16 dense output, no fused direct-pack)**
-    Implement the new kernel's mainloop: smem A/B staging, `fp4_shift` handling, MMA loop, and the same dense BF16 epilogue boundary that TRT-LLM's GEMM writes to `gemm1_output`. This sub-commit intentionally mirrors TRT-LLM **only through the GEMM boundary**: apply the same alpha path and BF16 cast, but do **not** apply `Relu²` and do **not** pack FP4 yet. New test `testing/backend/nano_p1_mainloop_oracle_test.cpp` runs the kernel on the exact synthetic problem captured in step 2 and compares the BF16 dense output bitwise against the TRT-LLM `gemm1_output` artifact. A host fp32→bf16 reference may be used as a secondary diagnostic, but it is not the acceptance oracle. Gate: BF16 output matches the step 2 TRT-LLM artifact bitwise.
+    Implement the new kernel's mainloop: smem A/B staging, `fp4_shift` handling, MMA loop, and the same dense BF16 epilogue boundary that TRT-LLM's GEMM writes to `gemm1_output`. This sub-commit intentionally mirrors TRT-LLM **only through the GEMM boundary**: apply the same alpha path and BF16 cast, but do **not** apply `Relu²` and do **not** pack FP4 yet.
+
+    New test `testing/backend/nano_p1_mainloop_oracle_test.cpp` runs the kernel on the exact synthetic problem captured in step 2 (inputs replayed from `proj-2026-04-12-1022/trtllm_reference/golden/inputs.pt`, tactic `bf16_gemm1_tactic1.bin` — plan-v6 P1, `CtaShape128x128x64B_Cluster1x1x1`, `SwapAB=false`) and compares the BF16 dense output bitwise against the step 2 artifact.
+
+    **Read the oracle contract carefully** (new after step 2 completion): for the small default problem, all 8 step-2 tactics are bitwise-identical. A bitwise match against `tactic1` therefore proves the `NanoP1` kernel is **mathematically consistent with some legal SM120 NVFP4 MoE GEMM kernel**, but does **not** by itself prove "same tile shape / same reduction order as TRT-LLM's P1". The "same CollectiveBuilder instantiation as TRT-LLM P1" claim is established at step 4a by the compile-time probes, not at step 4b by runtime bitwise. This is fine — 4a and 4b together form a complete proof — but the test file must say so in a comment so a future maintainer does not read too much into a passing 4b.
+
+    **If 4b's oracle ever fails**, diagnose in this order:
+    1. Re-check step 4a probes (did the CUTLASS snapshot drift between 4a and 4b?).
+    2. Cross-check against other SwapAB=false dumps (`tactic0`, `tactic2`, `tactic3`) — if they all fail the same way, the kernel is wrong; if only `tactic1` fails, the kernel picked a different-but-legal reduction order.
+    3. Rerun the step 2 harness with a larger K (e.g. `NEMOTRON_HARNESS_K=4096` or bigger) to push past the convergence regime. Different tactics should diverge at large enough K, and a kernel bug that was hidden by small-K convergence will be surfaced.
+    4. As a last resort, use a host fp32 reference as a tie-breaker — not as the acceptance oracle.
+
+    Gate: BF16 output matches `golden/bf16_gemm1_tactic1.bin` bitwise on the default step-2 problem, and the test file documents the necessary-but-not-sufficient nature of the match with a comment block referring to `trtllm_reference/NOTES.md §5 "Observed convergence"`.
 
   - **4c — Nemotron fused direct-pack epilogue (Relu², per-block max-abs, FP8 scale encode, FP4 nibble pack)**
     Implement the fused direct-pack epilogue on top of 4b's mainloop. This sub-commit intentionally diverges from TRT-LLM: TRT-LLM performs activation and pack in a separate `doActivationKernel`, while our production target fuses that stage into the FC1 kernel. **Anchor the direct-pack contract to the existing positive P5 direct-pack surface**: mirror the structure of `RunP5NativeDirectPackOracleForTesting` / `testing/backend/staged_fp4_pack_test.cpp`, but specialized for the new `NanoP1*` kernel. **Derive the lane→coord mapping at runtime** from `partition_C(make_identity_tensor(...))` + `FillPhysicalCoordMapCopyViewLimited` (pattern from `StoreTracedP13CFragmentsRowMajor` at line 5124). Do NOT hand-code SM80_16x8 warp/lane tables — the deleted v1-v4 P1 oracles all produced test artifacts because of hand-coded tables, and the new implementation must not repeat that mistake. New test `testing/backend/nano_p1_direct_pack_oracle_test.cpp` runs the full kernel (mainloop + fused direct-pack epilogue) and compares all 4 packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against a local host direct-pack reference. Gate: oracle test passes bitwise on all 4 packed output channels.
@@ -404,7 +420,9 @@ Expected: `ALL CHECKS PASSED`.
   - BF16 GEMM boundary bitwise against the TRT-LLM `gemm1_output` artifact for the same bucket
   - packed output channels (packed bytes, block scales, matmul block scales, activation output scales) bitwise against the local host direct-pack reference
 
-  Gate: the BF16 GEMM boundary matches TRT-LLM bitwise at both bucket sizes, and all 4 packed output channels match the local direct-pack oracle bitwise.
+  **Expected regime change**: at this bucket (`h = 2688`), the step 4b small-problem tactic convergence seen in step 2 (`K = 256`, all 8 tactics bitwise-identical) should NOT hold. `K = 2688` is large enough that fp32 accumulation error across different tile-boundary reduction orders approaches or exceeds the BF16 LSB, so different tactics should produce **different** bitwise outputs, and step 4b's bitwise match against `tactic1` specifically (`CtaShape128x128x64B_Cluster1x1x1`, `SwapAB=false`) becomes a sharp kernel-identity test rather than a "mathematically equivalent" test. If at this step the kernel STILL matches all tactics bitwise, something is wrong — most likely a stride/layout bug that collapses the output into an invariant the reduction order cannot distinguish. Diagnose before declaring the gate passed.
+
+  Gate: the BF16 GEMM boundary matches TRT-LLM bitwise at both bucket sizes and against tactic1 specifically (not just any tactic); different SwapAB=false tactics produce visibly different outputs at this bucket (sanity); all 4 packed output channels match the local direct-pack oracle bitwise.
 
   Extend `proj-2026-04-12-1022/trtllm_reference/` with the larger synthetic problem and the BF16 boundary artifact comparison.
 
@@ -452,9 +470,9 @@ Expected: `ALL CHECKS PASSED`.
 
 | # | Step | Status | Commit | Notes |
 |---|------|--------|--------|-------|
-| 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | completed | — | Architecture doc exists |
-| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | in_progress | — | `NOTES.md` exists; BF16 runtime artifact still needed before 4b |
-| 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | completed | — | Historical BF16-WMMA fallback removed; grouped kP1 rebuild holes now explicit |
+| 1 | Read TRT-LLM NVFP4 MoE GEMM; produce `trtllm_architecture.md` | done | `0afcb2e` | Architecture doc |
+| 2 | Stand up minimal TRT-LLM BF16 `gemm1_output` harness | done | (this commit) | Per-tactic BF16 dumps + inputs.pt in `golden/`; tactic1 == plan-v6 P1 |
+| 3 | Delete all kP1-specific broken code (6 sub-commits 3a-3f) | done | `62e5619…3a7eb28` | kP1 rebuild hole explicit in dispatch |
 | 4 | Implement new kP1 kernel from scratch (3 sub-commits 4a-4c) | pending | — | New `NanoP1*` names |
 | 5 | Scale bitwise oracle to realistic Nano bucket | pending | — | h=2688, i=1920, n_experts=128 |
 | 6 | Wire new kP1 into grouped dispatch; full validation | pending | — | Shipping target is one FP4-direct kP1 path |

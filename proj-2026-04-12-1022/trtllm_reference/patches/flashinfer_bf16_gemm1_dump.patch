@@ -1,0 +1,67 @@
+--- a/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -19,11 +19,16 @@
+ #include <float.h>
+ #include <math.h>
+ 
+ #include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <numeric>
+ #include <random>
+ #include <sstream>
++#include <vector>
+ 
+ #include "tensorrt_llm/common/memoryUtils.h"
+ #include "tensorrt_llm/common/workspace.h"
+@@ -3065,6 +3070,47 @@
+ 
+     sync_check_cuda_error(stream);
+ 
++    // >>> NEMOTRON BF16 gemm1_output dump (step 2b, env-gated) >>>
++    if (char const* nemotron_dump_path = std::getenv("NEMOTRON_TRTLLM_DUMP_GEMM1")) {
++      using DumpElem = UnfusedGemmOutputType;
++      std::size_t const dump_rows = static_cast<std::size_t>(expanded_num_rows);
++      std::size_t const dump_cols = static_cast<std::size_t>(fc1_out_size);
++      std::size_t const dump_elems = dump_rows * dump_cols;
++      std::size_t const dump_bytes = dump_elems * sizeof(DumpElem);
++      std::vector<unsigned char> nemotron_host_buf(dump_bytes);
++      cudaError_t const nemotron_memcpy_err = cudaMemcpyAsync(
++          nemotron_host_buf.data(),
++          static_cast<DumpElem const*>(gemm_output),
++          dump_bytes,
++          cudaMemcpyDeviceToHost,
++          stream);
++      cudaStreamSynchronize(stream);
++      if (nemotron_memcpy_err == cudaSuccess) {
++        if (FILE* nemotron_fp = std::fopen(nemotron_dump_path, "wb")) {
++          unsigned char header[64] = {};
++          header[0] = 'N'; header[1] = 'E'; header[2] = 'M';
++          header[3] = 'O'; header[4] = 'P'; header[5] = '1';
++          std::uint32_t const version = 1u;
++          std::uint32_t const rows_u32 = static_cast<std::uint32_t>(dump_rows);
++          std::uint32_t const cols_u32 = static_cast<std::uint32_t>(dump_cols);
++          std::uint32_t const elem_bytes_u32 = static_cast<std::uint32_t>(sizeof(DumpElem));
++          std::uint32_t const gated_u32 = static_cast<std::uint32_t>(is_gated_activation ? 1u : 0u);
++          std::memcpy(header + 8, &version, 4);
++          std::memcpy(header + 12, &rows_u32, 4);
++          std::memcpy(header + 16, &cols_u32, 4);
++          std::memcpy(header + 20, &elem_bytes_u32, 4);
++          std::memcpy(header + 24, &gated_u32, 4);
++          std::fwrite(header, 1, sizeof(header), nemotron_fp);
++          std::fwrite(nemotron_host_buf.data(), 1, dump_bytes, nemotron_fp);
++          std::fclose(nemotron_fp);
++          std::fprintf(stderr,
++                       "[NEMOTRON] wrote %zu bytes of BF16 gemm1_output to %s (rows=%zu cols=%zu)\n",
++                       dump_bytes, nemotron_dump_path, dump_rows, dump_cols);
++        }
++      }
++    }
++    // <<< NEMOTRON BF16 gemm1_output dump <<<
++
+     // TODO: when bias_is_broadcast is false, fuse bias to gemm
+     using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+     bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
