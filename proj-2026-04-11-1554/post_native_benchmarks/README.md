@@ -6,6 +6,10 @@ Historical note:
 - This README reflects the state before removing Nano's hard-coded `23`-token routed-MoE prefill clamp.
 - The current default-runtime measurements live under `../post_default_direct_benchmarks/README.md`.
 
+Metric terminology note:
+- `hot` in the phased fused-decode benchmark means a warmed uncached run in the same process, not explicit prefix-cache reuse.
+- Actual cached-prefix measurements are the `hot-prefix TTFT` cases in the prefix-cache benchmark.
+
 ### Sequential test sweep
 
 - Command: `ctest --test-dir build-sm120-relwithdebinfo --output-on-failure -j1`

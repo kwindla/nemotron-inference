@@ -10,16 +10,23 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 namespace {
 
+constexpr const char* kSourceRoot = NEMOTRON_SOURCE_ROOT;
 constexpr int kNumRows = 128;
 constexpr int kHiddenSize = 256;
 constexpr int kInterSize = 256;
 constexpr int kNvfp4BlockWidth = 16;
 constexpr int kPackedRowBytes = kHiddenSize / 2;
 constexpr int kScaleBytesPerRow = kHiddenSize / kNvfp4BlockWidth;
+constexpr int kNanoNumRows = 128;
+constexpr int kNanoHiddenSize = 2688;
+constexpr int kNanoInterSize = 1920;
+constexpr int kNanoPackedRowBytes = kNanoHiddenSize / 2;
+constexpr int kNanoScaleBytesPerRow = kNanoHiddenSize / kNvfp4BlockWidth;
 constexpr float kNvfp4Fp4MaxFinite = 6.0f;
 constexpr float kNvfp4ActivationMaxFinite = 6.0f * 448.0f;
 constexpr float kNvfp4MinScale = 1.0f / 1024.0f;
@@ -76,6 +83,67 @@ bool CheckCuda(cudaError_t status, const char* what) {
 bool HasCudaDevice() {
   int device_count = 0;
   return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
+
+bool BuildSourcePath(const char* relative_path, char* out, std::size_t out_size) {
+  if (std::snprintf(out, out_size, "%s/%s", kSourceRoot, relative_path) >=
+      static_cast<int>(out_size)) {
+    return false;
+  }
+  return true;
+}
+
+bool ReadBinaryFile(const char* relative_path, std::vector<std::uint8_t>* bytes) {
+  char full_path[1024];
+  if (!BuildSourcePath(relative_path, full_path, sizeof(full_path))) {
+    std::printf("nano_p1_direct_pack_oracle_test: path too long for %s\n", relative_path);
+    return false;
+  }
+  std::ifstream input(full_path, std::ios::binary);
+  if (!input) {
+    std::printf("nano_p1_direct_pack_oracle_test: failed to open %s\n", full_path);
+    return false;
+  }
+  input.seekg(0, std::ios::end);
+  const std::streamsize size = input.tellg();
+  if (size < 0) {
+    std::printf("nano_p1_direct_pack_oracle_test: failed to stat %s\n", full_path);
+    return false;
+  }
+  input.seekg(0, std::ios::beg);
+  bytes->assign(static_cast<std::size_t>(size), 0u);
+  if (size > 0) {
+    input.read(reinterpret_cast<char*>(bytes->data()), size);
+    if (!input) {
+      std::printf("nano_p1_direct_pack_oracle_test: failed to read %s\n", full_path);
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename T>
+bool ReadTypedFile(
+    const char* relative_path,
+    std::size_t expected_count,
+    std::vector<T>* values) {
+  std::vector<std::uint8_t> bytes;
+  if (!ReadBinaryFile(relative_path, &bytes)) {
+    return false;
+  }
+  if (bytes.size() != expected_count * sizeof(T)) {
+    std::printf(
+        "nano_p1_direct_pack_oracle_test: size mismatch for %s: got=%zu expected=%zu\n",
+        relative_path,
+        bytes.size(),
+        expected_count * sizeof(T));
+    return false;
+  }
+  values->assign(expected_count, T{});
+  if (!bytes.empty()) {
+    std::memcpy(values->data(), bytes.data(), bytes.size());
+  }
+  return true;
 }
 
 std::size_t RoundUp(std::size_t value, std::size_t alignment) {
@@ -184,6 +252,35 @@ std::vector<float> DequantizeNvfp4Matrix(
   return output;
 }
 
+std::vector<float> DequantizeNvfp4MatrixFromExecutionScales(
+    const std::vector<std::uint8_t>& packed,
+    const std::vector<std::uint8_t>& execution_scales,
+    int rows,
+    int cols) {
+  std::vector<float> output(static_cast<std::size_t>(rows * cols), 0.0f);
+  const std::size_t logical_blocks_per_row = static_cast<std::size_t>(cols / kNvfp4BlockWidth);
+  const std::size_t padded_blocks_per_row = RoundUp(logical_blocks_per_row, 4u);
+  std::size_t packed_index = 0;
+  for (int row = 0; row < rows; ++row) {
+    for (std::size_t block = 0; block < logical_blocks_per_row; ++block) {
+      const float block_scale = DecodeFp8(
+          execution_scales[ExecutionScaleOffset(
+              static_cast<std::size_t>(row),
+              block,
+              padded_blocks_per_row)]);
+      const int col_start = static_cast<int>(block * kNvfp4BlockWidth);
+      for (int offset = 0; offset < kNvfp4BlockWidth; offset += 2) {
+        const std::uint8_t byte = packed[packed_index++];
+        output[static_cast<std::size_t>(row * cols + col_start + offset + 0)] =
+            DecodeFp4(byte & 0x0Fu) * block_scale;
+        output[static_cast<std::size_t>(row * cols + col_start + offset + 1)] =
+            DecodeFp4((byte >> 4) & 0x0Fu) * block_scale;
+      }
+    }
+  }
+  return output;
+}
+
 DirectPackOutputs BuildDirectPackReference(
     const std::vector<std::uint8_t>& input_fp4,
     const std::vector<std::uint8_t>& weight_fp4,
@@ -259,6 +356,98 @@ DirectPackOutputs BuildDirectPackReference(
             activated[static_cast<std::size_t>(row * kInterSize) + col_base + static_cast<std::size_t>(pair * 2 + 0)];
         const float rhs =
             activated[static_cast<std::size_t>(row * kInterSize) + col_base + static_cast<std::size_t>(pair * 2 + 1)];
+        const std::uint8_t lhs_nibble = EncodeFp4(lhs / pack_scale);
+        const std::uint8_t rhs_nibble = EncodeFp4(rhs / pack_scale);
+        output.packed_bytes[packed_offset + static_cast<std::size_t>(pair)] =
+            static_cast<std::uint8_t>(
+                (lhs_nibble & 0x0Fu) | ((rhs_nibble & 0x0Fu) << 4u));
+      }
+    }
+  }
+
+  return output;
+}
+
+DirectPackOutputs BuildDirectPackReferenceForShape(
+    const std::vector<std::uint8_t>& input_fp4,
+    const std::vector<std::uint8_t>& weight_fp4,
+    const std::vector<std::uint8_t>& input_sf_exec,
+    const std::vector<std::uint8_t>& weight_sf_exec,
+    int num_rows,
+    int hidden_size,
+    int inter_size,
+    float alpha) {
+  const std::size_t blocks_per_row =
+      static_cast<std::size_t>(inter_size / kNvfp4BlockWidth);
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, 4u);
+  const std::size_t packed_row_bytes = static_cast<std::size_t>(inter_size / 2);
+
+  DirectPackOutputs output;
+  output.packed_bytes.assign(static_cast<std::size_t>(num_rows) * packed_row_bytes, 0u);
+  output.block_scales.assign(static_cast<std::size_t>(num_rows) * padded_blocks_per_row, 0u);
+  output.matmul_block_scales.assign(
+      static_cast<std::size_t>(num_rows) * padded_blocks_per_row,
+      0u);
+  output.activation_output_scales.assign(static_cast<std::size_t>(num_rows), 0.0f);
+
+  const std::vector<float> activations =
+      DequantizeNvfp4MatrixFromExecutionScales(input_fp4, input_sf_exec, num_rows, hidden_size);
+  const std::vector<float> weights =
+      DequantizeNvfp4MatrixFromExecutionScales(weight_fp4, weight_sf_exec, inter_size, hidden_size);
+  std::vector<float> activated(static_cast<std::size_t>(num_rows * inter_size), 0.0f);
+
+  for (int row = 0; row < num_rows; ++row) {
+    float row_max_abs = 0.0f;
+    const float* activation_row =
+        activations.data() + static_cast<std::size_t>(row * hidden_size);
+    for (int col = 0; col < inter_size; ++col) {
+      const float* weight_row = weights.data() + static_cast<std::size_t>(col * hidden_size);
+      double accum = 0.0;
+      for (int k = 0; k < hidden_size; ++k) {
+        accum += static_cast<double>(activation_row[k]) *
+                 static_cast<double>(weight_row[k]);
+      }
+      const float value = Relu2(alpha * static_cast<float>(accum));
+      activated[static_cast<std::size_t>(row * inter_size + col)] = value;
+      row_max_abs = std::max(row_max_abs, std::fabs(value));
+    }
+    float row_scale = 1.0f;
+    if (row_max_abs > kNvfp4ActivationMaxFinite) {
+      row_scale = ClampNvfp4TensorScale(row_max_abs / kNvfp4ActivationMaxFinite);
+    }
+    output.activation_output_scales[static_cast<std::size_t>(row)] = row_scale;
+  }
+
+  for (int row = 0; row < num_rows; ++row) {
+    const float row_scale = output.activation_output_scales[static_cast<std::size_t>(row)];
+    for (std::size_t block = 0; block < blocks_per_row; ++block) {
+      const std::size_t col_base = block * kNvfp4BlockWidth;
+      float block_max_abs = 0.0f;
+      for (int offset = 0; offset < kNvfp4BlockWidth; ++offset) {
+        const float value = activated[static_cast<std::size_t>(row * inter_size) +
+                                      col_base + static_cast<std::size_t>(offset)];
+        block_max_abs = std::max(block_max_abs, std::fabs(value));
+      }
+
+      const float raw_block_scale =
+          ClampNvfp4Scale(block_max_abs / kNvfp4Fp4MaxFinite);
+      const float stabilized_block_scale = ClampNvfp4Scale(
+          block_max_abs / (kNvfp4Fp4MaxFinite * row_scale));
+      const std::size_t scale_offset = ExecutionScaleOffset(
+          static_cast<std::size_t>(row),
+          block,
+          padded_blocks_per_row);
+      output.block_scales[scale_offset] = EncodeFp8(raw_block_scale);
+      output.matmul_block_scales[scale_offset] = EncodeFp8(stabilized_block_scale);
+
+      const float pack_scale = row_scale * stabilized_block_scale;
+      const std::size_t packed_offset =
+          static_cast<std::size_t>(row) * packed_row_bytes + (col_base / 2u);
+      for (int pair = 0; pair < (kNvfp4BlockWidth / 2); ++pair) {
+        const float lhs = activated[static_cast<std::size_t>(row * inter_size) +
+                                    col_base + static_cast<std::size_t>(pair * 2 + 0)];
+        const float rhs = activated[static_cast<std::size_t>(row * inter_size) +
+                                    col_base + static_cast<std::size_t>(pair * 2 + 1)];
         const std::uint8_t lhs_nibble = EncodeFp4(lhs / pack_scale);
         const std::uint8_t rhs_nibble = EncodeFp4(rhs / pack_scale);
         output.packed_bytes[packed_offset + static_cast<std::size_t>(pair)] =
@@ -355,6 +544,153 @@ bool RunNanoP1DirectPackKernel(
           kNumRows,
           kHiddenSize,
           kInterSize,
+          nullptr)) {
+    std::printf(
+        "nano_p1_direct_pack_oracle_test: RunNanoP1DirectPackKernelForTesting returned false\n");
+    return false;
+  }
+
+  output->packed_bytes.assign(packed_output_dev.size(), 0u);
+  output->block_scales.assign(block_scales_output_dev.size(), 0u);
+  output->matmul_block_scales.assign(matmul_block_scales_output_dev.size(), 0u);
+  output->activation_output_scales.assign(activation_output_scales_dev.size(), 0.0f);
+  if (!CheckCuda(
+          cudaMemcpy(
+              output->packed_bytes.data(),
+              packed_output_dev.data(),
+              output->packed_bytes.size(),
+              cudaMemcpyDeviceToHost),
+          "copy packed_output") ||
+      !CheckCuda(
+          cudaMemcpy(
+              output->block_scales.data(),
+              block_scales_output_dev.data(),
+              output->block_scales.size(),
+              cudaMemcpyDeviceToHost),
+          "copy block_scales_output") ||
+      !CheckCuda(
+          cudaMemcpy(
+              output->matmul_block_scales.data(),
+              matmul_block_scales_output_dev.data(),
+              output->matmul_block_scales.size(),
+              cudaMemcpyDeviceToHost),
+          "copy matmul_block_scales_output") ||
+      !CheckCuda(
+          cudaMemcpy(
+              output->activation_output_scales.data(),
+              activation_output_scales_dev.data(),
+              output->activation_output_scales.size() * sizeof(float),
+              cudaMemcpyDeviceToHost),
+          "copy activation_output_scales")) {
+    return false;
+  }
+  return true;
+}
+
+bool RunNanoP1DirectPackKernelForShape(
+    const std::vector<std::uint8_t>& input_fp4,
+    const std::vector<std::uint8_t>& weight_fp4,
+    const std::vector<std::uint8_t>& input_sf_exec,
+    const std::vector<std::uint8_t>& weight_sf_exec,
+    const std::vector<float>& g1_alphas,
+    int num_rows,
+    int hidden_size,
+    int inter_size,
+    DirectPackOutputs* output) {
+  const std::size_t blocks_per_row =
+      static_cast<std::size_t>(inter_size / kNvfp4BlockWidth);
+  const std::size_t padded_blocks_per_row = RoundUp(blocks_per_row, 4u);
+  const std::size_t packed_row_bytes = static_cast<std::size_t>(inter_size / 2);
+  const std::size_t scale_bytes_per_row =
+      static_cast<std::size_t>(hidden_size / kNvfp4BlockWidth);
+
+  if (input_fp4.size() != static_cast<std::size_t>(num_rows) * (hidden_size / 2) ||
+      weight_fp4.size() != static_cast<std::size_t>(inter_size) * (hidden_size / 2) ||
+      input_sf_exec.size() != static_cast<std::size_t>(num_rows) * scale_bytes_per_row ||
+      weight_sf_exec.size() != static_cast<std::size_t>(inter_size) * scale_bytes_per_row ||
+      g1_alphas.size() != 1) {
+    std::printf(
+        "nano_p1_direct_pack_oracle_test: invalid host tensor sizes for shape rows=%d hidden=%d inter=%d\n",
+        num_rows,
+        hidden_size,
+        inter_size);
+    return false;
+  }
+
+  DeviceBuffer<std::uint8_t> input_fp4_dev;
+  DeviceBuffer<std::uint8_t> weight_fp4_dev;
+  DeviceBuffer<std::uint8_t> input_sf_dev;
+  DeviceBuffer<std::uint8_t> weight_sf_dev;
+  DeviceBuffer<float> g1_alphas_dev;
+  DeviceBuffer<std::uint8_t> packed_output_dev;
+  DeviceBuffer<std::uint8_t> block_scales_output_dev;
+  DeviceBuffer<std::uint8_t> matmul_block_scales_output_dev;
+  DeviceBuffer<float> activation_output_scales_dev;
+
+  if (!input_fp4_dev.Allocate(input_fp4.size()) ||
+      !weight_fp4_dev.Allocate(weight_fp4.size()) ||
+      !input_sf_dev.Allocate(input_sf_exec.size()) ||
+      !weight_sf_dev.Allocate(weight_sf_exec.size()) ||
+      !g1_alphas_dev.Allocate(g1_alphas.size()) ||
+      !packed_output_dev.Allocate(static_cast<std::size_t>(num_rows) * packed_row_bytes) ||
+      !block_scales_output_dev.Allocate(static_cast<std::size_t>(num_rows) * padded_blocks_per_row) ||
+      !matmul_block_scales_output_dev.Allocate(static_cast<std::size_t>(num_rows) * padded_blocks_per_row) ||
+      !activation_output_scales_dev.Allocate(static_cast<std::size_t>(num_rows))) {
+    std::printf("nano_p1_direct_pack_oracle_test: cudaMalloc failed\n");
+    return false;
+  }
+
+  if (!CheckCuda(
+          cudaMemcpy(
+              input_fp4_dev.data(),
+              input_fp4.data(),
+              input_fp4.size(),
+              cudaMemcpyHostToDevice),
+          "copy input_fp4") ||
+      !CheckCuda(
+          cudaMemcpy(
+              weight_fp4_dev.data(),
+              weight_fp4.data(),
+              weight_fp4.size(),
+              cudaMemcpyHostToDevice),
+          "copy weight_fp4") ||
+      !CheckCuda(
+          cudaMemcpy(
+              input_sf_dev.data(),
+              input_sf_exec.data(),
+              input_sf_exec.size(),
+              cudaMemcpyHostToDevice),
+          "copy input_sf") ||
+      !CheckCuda(
+          cudaMemcpy(
+              weight_sf_dev.data(),
+              weight_sf_exec.data(),
+              weight_sf_exec.size(),
+              cudaMemcpyHostToDevice),
+          "copy weight_sf") ||
+      !CheckCuda(
+          cudaMemcpy(
+              g1_alphas_dev.data(),
+              g1_alphas.data(),
+              g1_alphas.size() * sizeof(float),
+              cudaMemcpyHostToDevice),
+          "copy g1_alphas")) {
+    return false;
+  }
+
+  if (!RunNanoP1DirectPackKernelForTesting(
+          input_fp4_dev.data(),
+          weight_fp4_dev.data(),
+          input_sf_dev.data(),
+          weight_sf_dev.data(),
+          packed_output_dev.data(),
+          block_scales_output_dev.data(),
+          matmul_block_scales_output_dev.data(),
+          activation_output_scales_dev.data(),
+          g1_alphas_dev.data(),
+          num_rows,
+          hidden_size,
+          inter_size,
           nullptr)) {
     std::printf(
         "nano_p1_direct_pack_oracle_test: RunNanoP1DirectPackKernelForTesting returned false\n");
@@ -544,6 +880,92 @@ void PrintPhase2Deferred() {
       "nano_p1_direct_pack_oracle_test: Phase 2 DEFERRED (capture-backed direct-pack oracle is deferred to step 5; Phase 1 synthetic all-ones covers the fused NanoP1 direct-pack contract bitwise)\n");
 }
 
+bool RunPhase3NanoBucketK2688() {
+  std::vector<std::uint8_t> input_fp4;
+  std::vector<std::uint8_t> input_sf;
+  std::vector<std::uint8_t> weight_fp4;
+  std::vector<std::uint8_t> weight_sf;
+  std::vector<float> g1_alphas;
+  if (!ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_fp4_permuted.bin",
+          &input_fp4) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_sf_permuted.bin",
+          &input_sf) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/inputs_w1_fp4.bin",
+          &weight_fp4) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/inputs_w1_sf.bin",
+          &weight_sf) ||
+      !ReadTypedFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/inputs_g1_alphas.bin",
+          1,
+          &g1_alphas)) {
+    return false;
+  }
+
+  if (input_fp4.size() != static_cast<std::size_t>(kNanoNumRows * kNanoPackedRowBytes) ||
+      input_sf.size() != static_cast<std::size_t>(kNanoNumRows * kNanoScaleBytesPerRow) ||
+      weight_fp4.size() != static_cast<std::size_t>(kNanoInterSize * kNanoPackedRowBytes) ||
+      weight_sf.size() != static_cast<std::size_t>(kNanoInterSize * kNanoScaleBytesPerRow)) {
+    std::printf("nano_p1_direct_pack_oracle_test: Phase 3 unexpected tensor sizes\n");
+    return false;
+  }
+
+  DirectPackOutputs actual;
+  if (!RunNanoP1DirectPackKernelForShape(
+          input_fp4,
+          weight_fp4,
+          input_sf,
+          weight_sf,
+          g1_alphas,
+          kNanoNumRows,
+          kNanoHiddenSize,
+          kNanoInterSize,
+          &actual)) {
+    return false;
+  }
+
+  // `proj-2026-04-12-1022/trtllm_reference/NOTES.md` §5
+  // "Convergence persists at Nano K=2688" explains why the BF16 mainloop gate
+  // can use `tactic1.bin` as a mathematical-consistency oracle at this shape.
+  // TRT-LLM still stops at the BF16 GEMM boundary, so the fused direct-pack
+  // stage remains validated against this local exact host reference rather than
+  // as a "same CollectiveBuilder instantiation as TRT-LLM P1" claim. That
+  // sharper identity check remains step 4a's compile-time probe gate.
+  const DirectPackOutputs expected = BuildDirectPackReferenceForShape(
+      input_fp4,
+      weight_fp4,
+      input_sf,
+      weight_sf,
+      kNanoNumRows,
+      kNanoHiddenSize,
+      kNanoInterSize,
+      g1_alphas[0]);
+
+  const std::size_t packed_mismatches = ReportByteMismatches(
+      "Phase 3 packed_bytes",
+      actual.packed_bytes,
+      expected.packed_bytes);
+  const std::size_t block_scale_mismatches = ReportByteMismatches(
+      "Phase 3 block_scales",
+      actual.block_scales,
+      expected.block_scales);
+  const std::size_t matmul_scale_mismatches = ReportByteMismatches(
+      "Phase 3 matmul_block_scales",
+      actual.matmul_block_scales,
+      expected.matmul_block_scales);
+  const std::size_t activation_scale_mismatches = ReportFloatBitMismatches(
+      "Phase 3 activation_output_scales",
+      actual.activation_output_scales,
+      expected.activation_output_scales);
+  return packed_mismatches == 0 &&
+         block_scale_mismatches == 0 &&
+         matmul_scale_mismatches == 0 &&
+         activation_scale_mismatches == 0;
+}
+
 }  // namespace
 
 int main() {
@@ -557,6 +979,9 @@ int main() {
   }
 
   PrintPhase2Deferred();
+  if (!RunPhase3NanoBucketK2688()) {
+    return 1;
+  }
   std::printf("nano_p1_direct_pack_oracle_test: PASS\n");
   return 0;
 }

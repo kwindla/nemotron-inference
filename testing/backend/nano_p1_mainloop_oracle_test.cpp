@@ -20,12 +20,25 @@ constexpr int kInterSize = 256;
 constexpr int kNvfp4BlockWidth = 16;
 constexpr int kPackedRowBytes = kHiddenSize / 2;
 constexpr int kScaleBytesPerRow = kHiddenSize / kNvfp4BlockWidth;
+constexpr int kNanoNumRows = 128;
+constexpr int kNanoHiddenSize = 2688;
+constexpr int kNanoInterSize = 1920;
+constexpr int kNanoPackedRowBytes = kNanoHiddenSize / 2;
+constexpr int kNanoScaleBytesPerRow = kNanoHiddenSize / kNvfp4BlockWidth;
 constexpr std::uint16_t kExpectedAllOnesBits = 0x4380u;
 constexpr int kAccumProbeCount = 256 * 64;
 constexpr int kAccumProbeDebugOffset = kAccumProbeCount;
 constexpr int kAccumProbeFinalThread0Offset = kAccumProbeDebugOffset + 8;
 constexpr int kAccumProbeDeadLaneDebugOffset = kAccumProbeFinalThread0Offset + 64;
 constexpr int kAccumProbeFinalThread2Offset = kAccumProbeDeadLaneDebugOffset + 8;
+
+struct DumpHeader {
+  std::uint32_t version = 0;
+  std::uint32_t rows = 0;
+  std::uint32_t cols = 0;
+  std::uint32_t elem_bytes = 0;
+  std::uint32_t is_gated = 0;
+};
 
 std::size_t RoundUp(std::size_t value, std::size_t alignment) {
   return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
@@ -340,6 +353,124 @@ bool RunNanoP1Kernel(
   return true;
 }
 
+bool RunNanoP1KernelForShape(
+    const std::vector<std::uint8_t>& input_fp4,
+    const std::vector<std::uint8_t>& weight_fp4,
+    const std::vector<std::uint8_t>& input_sf,
+    const std::vector<std::uint8_t>& weight_sf,
+    const std::vector<float>& g1_alphas,
+    int num_rows,
+    int hidden_size,
+    int inter_size,
+    std::vector<__nv_bfloat16>* output_bf16) {
+  const std::size_t packed_row_bytes = static_cast<std::size_t>(hidden_size / 2);
+  const std::size_t scale_bytes_per_row =
+      static_cast<std::size_t>(hidden_size / kNvfp4BlockWidth);
+  if (input_fp4.size() != static_cast<std::size_t>(num_rows) * packed_row_bytes ||
+      weight_fp4.size() != static_cast<std::size_t>(inter_size) * packed_row_bytes ||
+      input_sf.size() != static_cast<std::size_t>(num_rows) * scale_bytes_per_row ||
+      weight_sf.size() != static_cast<std::size_t>(inter_size) * scale_bytes_per_row ||
+      g1_alphas.size() != 1) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: invalid host tensor sizes for shape rows=%d hidden=%d inter=%d\n",
+        num_rows,
+        hidden_size,
+        inter_size);
+    return false;
+  }
+
+  DeviceBuffer<std::uint8_t> input_fp4_dev;
+  DeviceBuffer<std::uint8_t> weight_fp4_dev;
+  DeviceBuffer<std::uint8_t> input_sf_dev;
+  DeviceBuffer<std::uint8_t> weight_sf_dev;
+  DeviceBuffer<float> g1_alphas_dev;
+  DeviceBuffer<__nv_bfloat16> output_bf16_dev;
+
+  if (!input_fp4_dev.Allocate(input_fp4.size()) ||
+      !weight_fp4_dev.Allocate(weight_fp4.size()) ||
+      !input_sf_dev.Allocate(input_sf.size()) ||
+      !weight_sf_dev.Allocate(weight_sf.size()) ||
+      !g1_alphas_dev.Allocate(g1_alphas.size()) ||
+      !output_bf16_dev.Allocate(static_cast<std::size_t>(num_rows) * inter_size)) {
+    std::printf("nano_p1_mainloop_oracle_test: cudaMalloc failed\n");
+    return false;
+  }
+
+  if (!CheckCuda(
+          cudaMemcpy(
+              input_fp4_dev.data(),
+              input_fp4.data(),
+              input_fp4.size(),
+              cudaMemcpyHostToDevice),
+          "copy input_fp4") ||
+      !CheckCuda(
+          cudaMemcpy(
+              weight_fp4_dev.data(),
+              weight_fp4.data(),
+              weight_fp4.size(),
+              cudaMemcpyHostToDevice),
+          "copy weight_fp4") ||
+      !CheckCuda(
+          cudaMemcpy(
+              input_sf_dev.data(),
+              input_sf.data(),
+              input_sf.size(),
+              cudaMemcpyHostToDevice),
+          "copy input_sf") ||
+      !CheckCuda(
+          cudaMemcpy(
+              weight_sf_dev.data(),
+              weight_sf.data(),
+              weight_sf.size(),
+              cudaMemcpyHostToDevice),
+          "copy weight_sf") ||
+      !CheckCuda(
+          cudaMemcpy(
+              g1_alphas_dev.data(),
+              g1_alphas.data(),
+              g1_alphas.size() * sizeof(float),
+              cudaMemcpyHostToDevice),
+          "copy g1_alphas") ||
+      !CheckCuda(
+          cudaMemset(
+              output_bf16_dev.data(),
+              0,
+              output_bf16_dev.size() * sizeof(__nv_bfloat16)),
+          "zero output_bf16")) {
+    return false;
+  }
+
+  if (!nemotron::RunNanoP1KernelForTesting(
+          input_fp4_dev.data(),
+          weight_fp4_dev.data(),
+          input_sf_dev.data(),
+          weight_sf_dev.data(),
+          output_bf16_dev.data(),
+          g1_alphas_dev.data(),
+          num_rows,
+          hidden_size,
+          inter_size,
+          nullptr,
+          nullptr)) {
+    std::printf("nano_p1_mainloop_oracle_test: RunNanoP1KernelForTesting returned false\n");
+    return false;
+  }
+
+  output_bf16->assign(
+      static_cast<std::size_t>(num_rows) * inter_size,
+      __float2bfloat16(0.0f));
+  if (!CheckCuda(
+          cudaMemcpy(
+              output_bf16->data(),
+              output_bf16_dev.data(),
+              output_bf16->size() * sizeof(__nv_bfloat16),
+              cudaMemcpyDeviceToHost),
+          "copy output_bf16")) {
+    return false;
+  }
+  return true;
+}
+
 bool ReportBitwiseMismatches(
     const char* label,
     const std::vector<__nv_bfloat16>& actual,
@@ -412,6 +543,56 @@ bool ReportBitwiseMismatches(
     }
   }
   return false;
+}
+
+std::size_t ReportBitwiseMismatchesForShape(
+    const char* label,
+    const std::vector<__nv_bfloat16>& actual,
+    const std::vector<std::uint16_t>& expected,
+    int rows,
+    int cols) {
+  if (actual.size() != expected.size()) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: %s size mismatch actual=%zu expected=%zu\n",
+        label,
+        actual.size(),
+        expected.size());
+    return actual.size() > expected.size() ? actual.size() - expected.size()
+                                           : expected.size() - actual.size();
+  }
+
+  std::size_t mismatch_count = 0;
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    const std::uint16_t kernel_bits = Bf16Bits(actual[index]);
+    const std::uint16_t reference_bits = expected[index];
+    if (kernel_bits == reference_bits) {
+      continue;
+    }
+    if (mismatch_count < 16) {
+      const int row = static_cast<int>(index / static_cast<std::size_t>(cols));
+      const int col = static_cast<int>(index % static_cast<std::size_t>(cols));
+      std::printf(
+          "nano_p1_mainloop_oracle_test: %s mismatch[%zu] row=%d col=%d kernel_bits=0x%04x reference_bits=0x%04x kernel=%g reference=%g\n",
+          label,
+          mismatch_count,
+          row,
+          col,
+          kernel_bits,
+          reference_bits,
+          __bfloat162float(actual[index]),
+          Bf16BitsToFloat(reference_bits));
+    }
+    ++mismatch_count;
+  }
+
+  std::printf(
+      "nano_p1_mainloop_oracle_test: %s %s mismatches=%zu rows=%d cols=%d\n",
+      label,
+      mismatch_count == 0 ? "PASS" : "FAIL",
+      mismatch_count,
+      rows,
+      cols);
+  return mismatch_count;
 }
 
 std::vector<std::uint16_t> BuildAllOnesExpected() {
@@ -615,6 +796,38 @@ bool ParseDumpHeader(
   return true;
 }
 
+bool ParseDumpHeaderFull(const std::vector<std::uint8_t>& bytes, DumpHeader* header) {
+  static constexpr char kMagic[8] = {'N', 'E', 'M', 'O', 'P', '1', '\0', '\0'};
+  if (bytes.size() < 64 || std::memcmp(bytes.data(), kMagic, sizeof(kMagic)) != 0) {
+    return false;
+  }
+  std::memcpy(&header->version, bytes.data() + 8, sizeof(header->version));
+  std::memcpy(&header->rows, bytes.data() + 12, sizeof(header->rows));
+  std::memcpy(&header->cols, bytes.data() + 16, sizeof(header->cols));
+  std::memcpy(&header->elem_bytes, bytes.data() + 20, sizeof(header->elem_bytes));
+  std::memcpy(&header->is_gated, bytes.data() + 24, sizeof(header->is_gated));
+  return true;
+}
+
+bool ExtractDumpBodyBf16(
+    const std::vector<std::uint8_t>& bytes,
+    std::size_t element_count,
+    std::vector<std::uint16_t>* values) {
+  const std::size_t body_bytes = element_count * sizeof(std::uint16_t);
+  if (bytes.size() != 64u + body_bytes) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: dump size mismatch bytes=%zu expected=%zu\n",
+        bytes.size(),
+        64u + body_bytes);
+    return false;
+  }
+  values->assign(element_count, 0u);
+  if (body_bytes != 0) {
+    std::memcpy(values->data(), bytes.data() + 64, body_bytes);
+  }
+  return true;
+}
+
 bool RunPhase1AllOnes() {
   const std::uint8_t packed_one = static_cast<std::uint8_t>(
       EncodeFp4(1.0f) | (EncodeFp4(1.0f) << 4));
@@ -757,6 +970,126 @@ void PrintDeferredTactic1Compare() {
       elem_bytes);
 }
 
+bool RunPhase3NanoBucketK2688() {
+  std::vector<std::uint8_t> input_fp4;
+  std::vector<std::uint8_t> input_sf;
+  std::vector<std::uint8_t> weight_fp4;
+  std::vector<std::uint8_t> weight_sf;
+  std::vector<float> g1_alphas;
+  std::vector<std::uint8_t> tactic1_dump;
+  if (!ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_fp4_permuted.bin",
+          &input_fp4) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_sf_permuted.bin",
+          &input_sf) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/inputs_w1_fp4.bin",
+          &weight_fp4) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/inputs_w1_sf.bin",
+          &weight_sf) ||
+      !ReadTypedFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/inputs_g1_alphas.bin",
+          1,
+          &g1_alphas) ||
+      !ReadBinaryFile(
+          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/bf16_gemm1_tactic1.bin",
+          &tactic1_dump)) {
+    return false;
+  }
+
+  if (input_fp4.size() != static_cast<std::size_t>(kNanoNumRows * kNanoPackedRowBytes) ||
+      input_sf.size() != static_cast<std::size_t>(kNanoNumRows * kNanoScaleBytesPerRow) ||
+      weight_fp4.size() != static_cast<std::size_t>(kNanoInterSize * kNanoPackedRowBytes) ||
+      weight_sf.size() != static_cast<std::size_t>(kNanoInterSize * kNanoScaleBytesPerRow)) {
+    std::printf("nano_p1_mainloop_oracle_test: Phase 3 unexpected tensor sizes\n");
+    return false;
+  }
+
+  DumpHeader header;
+  if (!ParseDumpHeaderFull(tactic1_dump, &header)) {
+    std::printf("nano_p1_mainloop_oracle_test: Phase 3 invalid tactic1 dump header\n");
+    return false;
+  }
+  if (header.version != 1u ||
+      header.rows != static_cast<std::uint32_t>(kNanoNumRows) ||
+      header.cols != static_cast<std::uint32_t>(kNanoInterSize) ||
+      header.elem_bytes != 2u ||
+      header.is_gated != 0u) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: Phase 3 unexpected tactic1 dump header version=%u rows=%u cols=%u elem_bytes=%u is_gated=%u\n",
+        header.version,
+        header.rows,
+        header.cols,
+        header.elem_bytes,
+        header.is_gated);
+    return false;
+  }
+
+  std::vector<std::uint16_t> reference_bits;
+  if (!ExtractDumpBodyBf16(
+          tactic1_dump,
+          static_cast<std::size_t>(kNanoNumRows * kNanoInterSize),
+          &reference_bits)) {
+    return false;
+  }
+
+  std::vector<__nv_bfloat16> output_bf16;
+  if (!RunNanoP1KernelForShape(
+          input_fp4,
+          weight_fp4,
+          input_sf,
+          weight_sf,
+          g1_alphas,
+          kNanoNumRows,
+          kNanoHiddenSize,
+          kNanoInterSize,
+          &output_bf16)) {
+    return false;
+  }
+
+  // Print first 8x8 kernel vs reference for pattern analysis.
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 kernel[row][col] vs reference[row][col] (first 8x8):\n");
+  for (int row = 0; row < 8; ++row) {
+    for (int col = 0; col < 8; ++col) {
+      const std::size_t idx = static_cast<std::size_t>(row) * kNanoInterSize + static_cast<std::size_t>(col);
+      const std::uint16_t kbits = Bf16Bits(output_bf16[idx]);
+      const std::uint16_t rbits = reference_bits[idx];
+      const float kval = __bfloat162float(output_bf16[idx]);
+      const float rval = Bf16BitsToFloat(rbits);
+      const bool match = (kbits == rbits);
+      std::printf("  [%d][%d]: kernel=%.5f(0x%04x) ref=%.5f(0x%04x) %s\n",
+                  row, col, kval, kbits, rval, rbits, match ? "MATCH" : "MISMATCH");
+    }
+  }
+  // Print which columns in row 0 match.
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 row=0 column match pattern (first 32 cols):\n");
+  for (int col = 0; col < 32; ++col) {
+    const std::size_t idx = static_cast<std::size_t>(col);
+    const std::uint16_t kbits = Bf16Bits(output_bf16[idx]);
+    const std::uint16_t rbits = reference_bits[idx];
+    const bool match = (kbits == rbits);
+    if (match) {
+      std::printf("  col=%d MATCH kernel=%.5f ref=%.5f\n", col,
+                  __bfloat162float(output_bf16[idx]), Bf16BitsToFloat(rbits));
+    }
+  }
+  // `proj-2026-04-12-1022/trtllm_reference/NOTES.md` §5
+  // "Convergence persists at Nano K=2688" records that all legal SM120 FP4
+  // MoE tactics converge bitwise here. Matching `tactic1.bin` therefore proves
+  // mathematical consistency with a legal SM120 FP4 MoE kernel at Nano scale;
+  // it does not, by itself, prove "same CollectiveBuilder instantiation as
+  // TRT-LLM P1". That sharper identity claim remains step 4a's compile-time
+  // probe gate.
+  return ReportBitwiseMismatchesForShape(
+             "Phase 3 Nano bucket K=2688",
+             output_bf16,
+             reference_bits,
+             kNanoNumRows,
+             kNanoInterSize) == 0;
+}
+
 }  // namespace
 
 int main() {
@@ -773,6 +1106,9 @@ int main() {
   }
 
   PrintDeferredTactic1Compare();
+  if (!RunPhase3NanoBucketK2688()) {
+    return 1;
+  }
   std::printf("nano_p1_mainloop_oracle_test: PASS\n");
   return 0;
 }

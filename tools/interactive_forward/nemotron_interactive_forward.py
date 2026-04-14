@@ -173,14 +173,26 @@ def render_chat_token_ids(
     return normalize_token_ids(token_ids)
 
 
-def extract_visible_assistant_text(raw_text: str) -> str:
-    if not raw_text:
-        return raw_text
-    if "</think>" in raw_text:
-        visible = raw_text.rsplit("</think>", maxsplit=1)[-1].strip()
-        if visible:
-            return visible
-    return raw_text.strip()
+def parse_assistant_output(raw_generated_text: str) -> tuple[str, str, str]:
+    """Parse raw generated text into (full_content, thinking_text, visible_text).
+
+    The chat template's generation prompt appends ``<think>\\n``, so the raw
+    generated tokens begin *inside* the think block.  The model emits the
+    ``</think>`` closing tag itself.  We reconstruct the full assistant
+    content (with both tags) for correct round-tripping through the template.
+    """
+    full_content = "<think>\n" + raw_generated_text
+
+    if "</think>" in raw_generated_text:
+        parts = raw_generated_text.split("</think>", maxsplit=1)
+        thinking_text = parts[0].strip()
+        visible_text = parts[1].strip()
+    else:
+        # Model hit max tokens before closing the think block.
+        thinking_text = raw_generated_text.strip()
+        visible_text = ""
+
+    return full_content, thinking_text, visible_text
 
 
 def build_turn_prompt_token_ids(
@@ -208,8 +220,16 @@ def build_turn_prompt_token_ids(
         add_generation_prompt=True,
     )
     history_length = len(rendered_history_token_ids)
-    if len(rendered_turn_token_ids) < history_length or rendered_turn_token_ids[:history_length] != rendered_history_token_ids:
-        raise RuntimeError("chat template did not preserve the completed history prefix")
+    # The chat template may legitimately rewrite the history prefix (e.g.
+    # truncate_history_thinking replaces thinking content in older assistant
+    # turns when a new user message is appended).  When that happens we
+    # cannot splice onto exact_history_token_ids — fall back to the fully
+    # rendered turn.
+    if (
+        len(rendered_turn_token_ids) < history_length
+        or rendered_turn_token_ids[:history_length] != rendered_history_token_ids
+    ):
+        return rendered_turn_token_ids
     if exact_history_token_ids != rendered_history_token_ids:
         return rendered_turn_token_ids
     return exact_history_token_ids + rendered_turn_token_ids[history_length:]
@@ -261,11 +281,15 @@ def print_turn_summary(
     response: dict[str, Any],
     tokenize_ms: float,
     detokenize_ms: float,
-    generated_text: str,
+    thinking_text: str,
+    visible_text: str,
     args: argparse.Namespace,
 ) -> None:
     print()
-    print(f"assistant> {generated_text if generated_text else '<empty>'}")
+    if thinking_text:
+        print(f"thinking> {thinking_text}")
+        print()
+    print(f"assistant> {visible_text if visible_text else '<empty>'}")
     print(
         "timing:"
         f" tokenize={format_ms(tokenize_ms)}"
@@ -432,15 +456,15 @@ def main() -> int:
                 clean_up_tokenization_spaces=False,
             )
             detokenize_ms = (time.perf_counter() - detokenize_start) * 1000.0
-            generated_text = extract_visible_assistant_text(raw_generated_text)
+            full_content, thinking_text, visible_text = parse_assistant_output(raw_generated_text)
 
-            messages = pending_messages + [{"role": "assistant", "content": generated_text}]
+            messages = pending_messages + [{"role": "assistant", "content": full_content}]
             committed_token_ids = render_chat_token_ids(
                 tokenizer,
                 messages,
                 add_generation_prompt=False,
             )
-            print_turn_summary(response, tokenize_ms, detokenize_ms, generated_text, args)
+            print_turn_summary(response, tokenize_ms, detokenize_ms, thinking_text, visible_text, args)
 
         if args.once is not None:
             run_turn(args.once)

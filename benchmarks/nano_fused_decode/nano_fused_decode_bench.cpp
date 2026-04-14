@@ -1,9 +1,12 @@
+#include "nemotron/attention_layer.h"
 #include "nemotron/cudnn_handle.h"
 #include "nemotron/device_argmax.h"
 #include "nemotron/device_tensor.h"
+#include "nemotron/expert_layer.h"
 #include "nemotron/expert_staging_counters.h"
 #include "nemotron/linear_op_counters.h"
 #include "nemotron/linear_op_trace.h"
+#include "nemotron/mamba_layer.h"
 #include "nemotron/manifest.h"
 #include "nemotron/runtime_environment.h"
 #include "nemotron/single_token_forward_model.h"
@@ -926,6 +929,29 @@ bool WriteJson(
          << expert_staging_counters.total_staging_calls.load(std::memory_order_relaxed) << ",\n";
   output << "    \"staging_elapsed_us\": "
          << expert_staging_counters.staging_elapsed_us.load(std::memory_order_relaxed) << "\n";
+  output << "  },\n";
+  const auto attention_counters = nemotron::GetAttentionLayerExecutionCounters();
+  const auto expert_counters = nemotron::GetExpertLayerExecutionCounters();
+  const auto mamba_counters = nemotron::GetMambaLayerExecutionCounters();
+  output << "  \"layer_execution_counters\": {\n";
+  output << "    \"attention\": {\n";
+  output << "      \"native_multi_token_runs\": " << attention_counters.native_multi_token_runs << ",\n";
+  output << "      \"native_multi_token_tokens\": " << attention_counters.native_multi_token_tokens << ",\n";
+  output << "      \"row_replay_runs\": " << attention_counters.row_replay_runs << ",\n";
+  output << "      \"row_replay_tokens\": " << attention_counters.row_replay_tokens << "\n";
+  output << "    },\n";
+  output << "    \"expert\": {\n";
+  output << "      \"native_multi_token_runs\": " << expert_counters.native_multi_token_runs << ",\n";
+  output << "      \"native_multi_token_tokens\": " << expert_counters.native_multi_token_tokens << ",\n";
+  output << "      \"row_replay_runs\": " << expert_counters.row_replay_runs << ",\n";
+  output << "      \"row_replay_tokens\": " << expert_counters.row_replay_tokens << "\n";
+  output << "    },\n";
+  output << "    \"mamba\": {\n";
+  output << "      \"native_multi_token_runs\": " << mamba_counters.native_multi_token_runs << ",\n";
+  output << "      \"native_multi_token_tokens\": " << mamba_counters.native_multi_token_tokens << ",\n";
+  output << "      \"row_replay_runs\": " << mamba_counters.row_replay_runs << ",\n";
+  output << "      \"row_replay_tokens\": " << mamba_counters.row_replay_tokens << "\n";
+  output << "    }\n";
   output << "  }\n";
   output << "}\n";
   return true;
@@ -1005,6 +1031,9 @@ int main(int argc, char** argv) {
 
   const std::vector<std::int32_t> prompt_token_ids =
       BuildPromptTokenIds(options.prompt_token_count);
+  nemotron::ResetAttentionLayerExecutionCounters();
+  nemotron::ResetExpertLayerExecutionCounters();
+  nemotron::ResetMambaLayerExecutionCounters();
   nemotron::ResetLinearOpCounters();
   nemotron::ResetLinearOpTrace();
   nemotron::ResetExpertStagingCounters();
@@ -1285,6 +1314,17 @@ int main(int argc, char** argv) {
 
   nemotron::PrintLinearOpCounterSummary(std::cout);
   nemotron::PrintExpertStagingCounterSummary(std::cout);
+  const auto attention_counters = nemotron::GetAttentionLayerExecutionCounters();
+  const auto expert_counters = nemotron::GetExpertLayerExecutionCounters();
+  const auto mamba_counters = nemotron::GetMambaLayerExecutionCounters();
+  std::cout << "nano_fused_decode_bench: layer_execution"
+            << " attention_native_runs=" << attention_counters.native_multi_token_runs
+            << " attention_row_replay_runs=" << attention_counters.row_replay_runs
+            << " expert_native_runs=" << expert_counters.native_multi_token_runs
+            << " expert_row_replay_runs=" << expert_counters.row_replay_runs
+            << " mamba_native_runs=" << mamba_counters.native_multi_token_runs
+            << " mamba_row_replay_runs=" << mamba_counters.row_replay_runs
+            << "\n";
   std::cout.flush();
 
   if (options.json_output_path.has_value() &&

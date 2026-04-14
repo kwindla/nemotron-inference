@@ -6,6 +6,13 @@ Captured on `2026-04-11` after:
 
 On this RTX 5090 setup, the default routed-MoE prefill window now resolves to `4096`.
 
+## Metric definitions
+
+- `model load` is excluded from all timings in this directory. The runtime environment and forward model are built before any timed run starts.
+- `cold prefill` / `cold first token` in `nano_fused_decode_bench` mean the first uncached full-prompt prefill run in a freshly built model/process. They do not use explicit prefix-cache restore.
+- `hot prefill` / `hot first token` in `nano_fused_decode_bench` mean later uncached full-prompt runs on fresh request contexts in the same already-warmed process. `hot` here means warmed runtime state, not cached prefix reuse.
+- `hot-prefix TTFT` in `nano_prefix_cache_ttft_bench` is the actual explicit prefix-cache path: the benchmark seeds the cache, looks up the matching prefix identity, restores model state, and then measures the tail prefill + first token.
+
 ## Sequential test sweep
 
 - Command: `ctest --test-dir build-sm120-relwithdebinfo --output-on-failure -j1`
