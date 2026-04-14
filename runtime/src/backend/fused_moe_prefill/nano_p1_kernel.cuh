@@ -122,6 +122,7 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
   static_assert(cute::size<1>(decltype(tCrA){}) == cute::size<1>(decltype(tCrSFA){}));
   static_assert(cute::size<1>(decltype(tCrB){}) == cute::size<1>(decltype(tCrSFB){}));
 
+
   for (int64_t k_base = 0; k_base < hidden_size; k_base += kTileK) {
     const int64_t remaining_k = hidden_size - k_base;
     const std::size_t available_k = static_cast<std::size_t>(
@@ -168,20 +169,44 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
       }
     }
 
+    // TracedP5PermTileN in NanoP1ValLayoutMNK introduces a per-32-row
+    // permutation on the B (token) axis of the MMA tile: [0..7]→identity,
+    // [8..15]↔[16..23] swap, [24..31]→identity. The staging loop on the
+    // source side accounts for this so that the physical smem positions
+    // each MMA atom invocation reads contain the correct token data.
+    // This is a partial fix — Phase 3 still reports structured mismatches
+    // (4074/245760 matches after this permutation vs. 2149/245760 without),
+    // so additional per-mf or per-K staging corrections are required for
+    // bitwise match against the flashinfer reference. See Phase 3 deferral
+    // in testing/backend/nano_p1_mainloop_oracle_test.cpp.
     for (int row = tid; row < kTileM; row += blockDim.x) {
       const bool row_valid = row < valid_rows;
-      const std::size_t source_row = static_cast<std::size_t>(row_start + row);
+      const int row_block = row & ~31;
+      const int row_in_block = row & 31;
+      int permuted_in_block;
+      if (row_in_block < 8) {
+        permuted_in_block = row_in_block;
+      } else if (row_in_block < 16) {
+        permuted_in_block = row_in_block + 8;
+      } else if (row_in_block < 24) {
+        permuted_in_block = row_in_block - 8;
+      } else {
+        permuted_in_block = row_in_block;
+      }
+      const int permuted_row = row_block + permuted_in_block;
+      const bool permuted_row_valid = row_valid && permuted_row < valid_rows;
+      const std::size_t source_row = static_cast<std::size_t>(row_start + permuted_row);
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
       for (int byte_index = 0; byte_index < kMacroTileBytes; ++byte_index) {
         std::uint8_t value = 0u;
-        if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
+        if (permuted_row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
           value = input_packed[src_offset + static_cast<std::size_t>(byte_index)];
         }
         const auto elem_offset = stage0_B(row, byte_index * 2);
         swizzled_b_bytes[static_cast<int>(elem_offset) / 2] = value;
       }
       std::uint8_t scale_bytes[kMacroScaleBytes];
-      if (row_valid) {
+      if (permuted_row_valid) {
 #pragma unroll
         for (int scale_index = 0; scale_index < kMacroScaleBytes; ++scale_index) {
           std::uint8_t value = unit_scale_byte;
