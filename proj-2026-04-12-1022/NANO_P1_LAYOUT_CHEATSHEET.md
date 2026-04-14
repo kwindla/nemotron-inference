@@ -9,7 +9,8 @@ Empirically-verified layout facts for `NanoP1TiledMma` and `ComputeNanoP1AccumTi
 ## Type bundle
 
 ```cpp
-// runtime/src/backend/fused_moe_prefill.cu (pre-cleanup line numbers; valid until Step 0 of proj-2026-04-13-1936)
+// runtime/src/backend/fused_moe_prefill/nvfp4_bridge.cuh
+// (post-split; pre-split source was runtime/src/backend/fused_moe_prefill.cu)
 using NanoP1MmaOp         = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<...>;
 using NanoP1MmaTileShape  = cute::Shape<cute::Int<128>, cute::Int<128>, cute::Int<128>>;
 using NanoP1AtomLayoutMNK = cute::Layout<cute::Shape<cute::_4, cute::_2, cute::_1>>;
@@ -124,10 +125,10 @@ That's a 6.25% match rate (4/64): 230,087 mismatches out of 245,760 elements, 93
 
 ## Where the DIAG infrastructure lives
 
-`StoreNanoP1CFragmentsRowMajor` in `runtime/src/backend/fused_moe_prefill.cu` (pre-cleanup, around line 5146). Printf guarded by `kDiagThread0 || kDiagThread1 || kDiagThread2`. Output format:
+`fused_moe_prefill/nano_p1_epilogue.cuh::StoreNanoP1CFragmentsRowMajor`. Printf guarded by `kDiagThread0 || kDiagThread1 || kDiagThread2`. Output format:
 
 ```
 DIAG tid=%d reg=%d nf=%d mf=%d M=%d N=%d raw=%.2f val=%.6f
 ```
 
-Post-split (after Step 1 of `proj-2026-04-13-1936`), this will live in `fused_moe_prefill/nano_p1_epilogue.cuh`. The printf is the only diagnostic infrastructure the killed session actually built and verified; preserve it until the bug is found.
+The printf is the only diagnostic infrastructure the killed session actually built and verified; preserve it until the bug is found.

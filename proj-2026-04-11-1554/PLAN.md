@@ -60,9 +60,9 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 
 ## Reference implementations
 
-**Working smem-staged path** (`fused_moe_prefill.cu:678-841`):
+**Working smem-staged path** (`fused_moe_prefill/nvfp4_bridge.cuh::StoreUnifiedRoutedFp4DirectPack` and siblings):
 - Historical correctness reference: a staged oracle that scatters `Relu2(row_alpha * accum)` using `part_c(logical)` linear iteration, where `row_alpha = per_row_tensor_scales[input_row] * weight_tensor_scale` when per-row scales are present
-- `PackUnifiedRoutedFp4DirectStaged` (line 743): cooperatively packs 16-wide blocks from smem — proven correct
+- `PackUnifiedRoutedFp4DirectStaged`: cooperatively packs 16-wide blocks from smem — proven correct
 - Key insight: `accum_tensor(logical)` and `part_c(logical)` with the same 1D index are guaranteed consistent
 
 **Step 2 partition_C analysis** (`proj-2026-04-11-0400/partition_c_analysis.md`):
@@ -71,9 +71,9 @@ The smem-staged FP4 direct epilogue (proj-2026-04-11-0400 step 7) is correct but
 - Each 16-element FP4 block is owned by one warp: 8 lanes at stride 4, each with 2 m-values
 - The analysis used `FillPhysicalCoordMapCopyViewLimited` (nested-loop iteration), which may differ from `part_c(i)` (linear 1D iteration)
 
-**BF16 epilogue** (`fused_moe_prefill.cu:899-993`): The P5 branch of `StoreUnifiedRoutedFp4Output` — useful as a math/activation reference, but it still uses `FillPhysicalCoordMapCopyViewLimited` plus 3D `accum_tensor(reg, m_fragment, n_fragment)` indexing and is not the mapping baseline for the warp-local design
+**BF16 epilogue** (`fused_moe_prefill/nvfp4_bridge.cuh::StoreUnifiedRoutedFp4Output`): The P5 branch — useful as a math/activation reference, but it still uses `FillPhysicalCoordMapCopyViewLimited` plus 3D `accum_tensor(reg, m_fragment, n_fragment)` indexing and is not the mapping baseline for the warp-local design
 
-**RoutedBf16Relu2PackKernel** (`fused_moe_prefill.cu:2288-2424`): Reference for FP4 packing math (scales, nibble encoding)
+**RoutedBf16Relu2PackKernel** (`fused_moe_prefill/trt_helpers_pre_nano_epilogue.cuh::RoutedBf16Relu2PackKernel`): Reference for FP4 packing math (scales, nibble encoding)
 
 ## Current state
 

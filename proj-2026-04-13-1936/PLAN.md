@@ -580,7 +580,7 @@ Do **not** hard-code an expected hit count. The grep output at execution time is
 
 For each `fused_moe_prefill.cu:<N>` or `fused_moe_prefill.cu:<N>-<M>` reference:
 1. Determine which symbol the line range corresponds to (use the Step 1 fragment layout table as a map).
-2. Rewrite to `fused_moe_prefill/<fragment>.cuh::<symbol>`. Example: `fused_moe_prefill.cu:12200-12510` → `fused_moe_prefill/nano_p1_mainloop.cuh::ComputeNanoP1AccumTile`.
+2. Rewrite to `fused_moe_prefill/<fragment>.cuh::<symbol>`. Example: a pre-split line range covering `ComputeNanoP1AccumTile` → `fused_moe_prefill/nano_p1_kernel.cuh::ComputeNanoP1AccumTile`. (Step 1's fragment layout consolidated the plan's originally-proposed `nano_p1_mainloop.cuh` into `nano_p1_kernel.cuh`.)
 3. If the reference was to a comment or non-symbol line, rewrite to the nearest containing symbol.
 4. Rewrite this cleanup plan's own example references too; Step 2 is incomplete if `proj-2026-04-13-1936/PLAN.md` still contains `fused_moe_prefill.cu:<line>` after the step.
 
