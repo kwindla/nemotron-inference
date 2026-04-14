@@ -147,6 +147,14 @@ add_library(
   src/backend/fused_mamba_decode.cu
   src/backend/fused_moe_decode.cu
   src/backend/fused_moe_prefill.cu
+  src/backend/fused_moe_prefill/common_helpers.cuh
+  src/backend/fused_moe_prefill/nvfp4_cute.cuh
+  src/backend/fused_moe_prefill/nvfp4_bridge.cuh
+  src/backend/fused_moe_prefill/trt_helpers_pre_nano_epilogue.cuh
+  src/backend/fused_moe_prefill/nano_p1_epilogue.cuh
+  src/backend/fused_moe_prefill/trt_helpers_post_nano_epilogue.cuh
+  src/backend/fused_moe_prefill/nano_p1_kernel.cuh
+  src/backend/fused_moe_prefill/public_exports.cuh
   src/backend/moe_launch_plan_device.cu
   src/backend/linear_op.cpp
   src/backend/linear_op_counters.cpp
