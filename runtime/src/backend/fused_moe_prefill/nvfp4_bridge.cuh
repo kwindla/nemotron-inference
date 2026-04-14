@@ -366,6 +366,21 @@ static_assert(kNanoP1MFragments == 8);
 static_assert(kNanoP1ScaleStageElemsA * NanoP1PipelineStages == cute::cosize_v<NanoP1SmemLayoutSFA>);
 static_assert(kNanoP1ScaleStageElemsB * NanoP1PipelineStages == cute::cosize_v<NanoP1SmemLayoutSFB>);
 
+CUTE_HOST_DEVICE constexpr int NanoP1PermuteBSourceRow(int row) {
+  const int row_block = row & ~31;
+  const int row_in_block = row & 31;
+  if (row_in_block < 8) {
+    return row;
+  }
+  if (row_in_block < 16) {
+    return row_block + row_in_block + 8;
+  }
+  if (row_in_block < 24) {
+    return row_block + row_in_block - 8;
+  }
+  return row;
+}
+
 enum class NanoP1EpilogueMode {
   kBf16Dense,
   kDirectPack,
@@ -1792,4 +1807,3 @@ __device__ __forceinline__ void StoreFragmentC_Transpose16x8(
     OutputType* output);
 
 }  // namespace nvfp4_bridge
-

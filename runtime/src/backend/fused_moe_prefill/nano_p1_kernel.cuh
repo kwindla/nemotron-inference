@@ -181,19 +181,7 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
     // in testing/backend/nano_p1_mainloop_oracle_test.cpp.
     for (int row = tid; row < kTileM; row += blockDim.x) {
       const bool row_valid = row < valid_rows;
-      const int row_block = row & ~31;
-      const int row_in_block = row & 31;
-      int permuted_in_block;
-      if (row_in_block < 8) {
-        permuted_in_block = row_in_block;
-      } else if (row_in_block < 16) {
-        permuted_in_block = row_in_block + 8;
-      } else if (row_in_block < 24) {
-        permuted_in_block = row_in_block - 8;
-      } else {
-        permuted_in_block = row_in_block;
-      }
-      const int permuted_row = row_block + permuted_in_block;
+      const int permuted_row = nvfp4_bridge::NanoP1PermuteBSourceRow(row);
       const bool permuted_row_valid = row_valid && permuted_row < valid_rows;
       const std::size_t source_row = static_cast<std::size_t>(row_start + permuted_row);
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
@@ -655,4 +643,3 @@ bool RunNanoP1DirectPackKernelForTestingImpl(
   cudaFree(direct_pack_staging_dev);
   return ok;
 }
-

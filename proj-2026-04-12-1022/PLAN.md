@@ -448,6 +448,36 @@ Expected: `ALL CHECKS PASSED`.
 
   Key files: `proj-2026-04-12-1022/trtllm_reference/` (extend), `testing/backend/nano_p1_mainloop_oracle_test.cpp` (add Phase 3 K=2688 case), `testing/backend/nano_p1_direct_pack_oracle_test.cpp` (add Phase 3 K=2688 case).
 
+  **Handoff notes for the next debugging pass** — Phase 3 is not yet
+  passing bitwise. The capture harness and test-side Phase 3 case are
+  landed, the NanoP1 kernel has a partial TracedP5PermTileN fix on the
+  B-side staging loop (match count 4074 / 245760), and the test
+  currently defers Phase 3 with a diagnostic printout (mirroring Phase
+  2's deferral pattern) so the ctest suite stays green while the
+  residual mismatch is tracked. Read these in order before touching the
+  kernel:
+
+  1. `proj-2026-04-12-1022/probes/nano_p1_phase3_session_2026-04-14.md`
+     — latest session closeout: current state, the partial fix, the
+     runtime-verified partC probe results (`tid 128 partC(0,0,0) =
+     (M=0, N=16)` confirms `atom_n=1` contributes `+16` on the N axis),
+     the residual match pattern, hypotheses already falsified with
+     forced-rebuild receipts, the build-system `touch` gotcha, and a
+     specific recommendation for the next probe.
+  2. `proj-2026-04-12-1022/NANO_P1_LAYOUT_CHEATSHEET.md` — empirically
+     verified layout facts for `NanoP1TiledMma` (thread → (M, N) formula,
+     `N_mf_table`, M/N role inversion notes, `SM80_16x8_Row` C-layout
+     reading).
+  3. `proj-2026-04-12-1022/probes/nano_p1_phase3_salvage_2026-04-13.md`
+     — prior-session ruled-out hypotheses and the G6+G1 probe recipe
+     used in the 2026-04-14 session. Don't re-run those probes; their
+     diagnostic is now permanently inlined in Phase 3's test output.
+  4. `proj-2026-04-12-1022/probes/nano_p1_phase3_layouts_2026-04-13.md`
+     — captured `tCsA`, `tCsB`, `tCrA`, `tCrB`, `tCrA_cv`, `tCrB_cv`,
+     `NanoP1AccumLayout`, and `partC` layout values from compile-time
+     `ShowInt<>` probes. These are the ground-truth layouts; re-deriving
+     them is wasted work.
+
 - [ ] **6. Wire the new kP1 kernel into the existing grouped dispatch surface and run full validation**
   Add the new kP1 case to the existing grouped FP4-direct dispatcher `fused_moe_prefill/trt_helpers_post_nano_epilogue.cuh::LaunchPlannedPackedInputMatVecFp4Direct` so `RoutedGemm1Profile::kP1_128x128x64_SwapFalse` launches the new `NanoP1` kernel. Update any remaining top-level routing comments / gating around the grouped kP1 direct path (`RoutedGemm1Profile` dispatch logic in the tail of `trt_helpers_post_nano_epilogue.cuh`) so real kP1 traffic reaches that case.
 

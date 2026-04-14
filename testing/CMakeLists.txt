@@ -568,6 +568,64 @@ target_compile_definitions(
 nemotron_add_test(nano_p1_mainloop_oracle_test)
 
 add_executable(
+  nano_p1_b_operand_probe
+  backend/nano_p1_b_operand_probe.cu
+)
+
+target_link_libraries(
+  nano_p1_b_operand_probe
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  nano_p1_b_operand_probe
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nano_p1_b_operand_probe
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+endif()
+
+target_compile_features(nano_p1_b_operand_probe PRIVATE cxx_std_20)
+
+add_executable(
+  nano_p1_reference_a_operand_probe
+  backend/nano_p1_reference_a_operand_probe.cu
+)
+
+target_link_libraries(
+  nano_p1_reference_a_operand_probe
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  nano_p1_reference_a_operand_probe
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nano_p1_reference_a_operand_probe
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+endif()
+
+target_compile_features(nano_p1_reference_a_operand_probe PRIVATE cxx_std_20)
+
+add_executable(
   nano_p1_direct_pack_oracle_test
   backend/nano_p1_direct_pack_oracle_test.cpp
 )
