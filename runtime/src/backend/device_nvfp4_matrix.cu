@@ -15,9 +15,7 @@
 #include "nemotron/gemm_planner.h"
 #include "nemotron/moe_launch_plan_device.h"
 #include "nemotron/nvfp4_scale_layout.h"
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
 #include "routed_p5_tma_descriptor.cuh"
-#endif
 
 namespace nemotron {
 namespace {
@@ -849,7 +847,6 @@ const std::uint8_t* DeviceNvfp4Matrix::tensor_scale_data() const {
 
 const void* DeviceNvfp4Matrix::p5_tma_load_b_descriptors(
     const DeviceMoeLaunchPlan& launch_plan) const {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   if (!valid() ||
       cols() == 0 ||
       (cols() % 128u) != 0 ||
@@ -915,15 +912,10 @@ const void* DeviceNvfp4Matrix::p5_tma_load_b_descriptors(
   impl_->cached_p5_tma_b_build_epoch = launch_plan.build_epoch();
   impl_->cached_p5_tma_b_descriptors = device_descriptors;
   return impl_->cached_p5_tma_b_descriptors;
-#else
-  (void) launch_plan;
-  return nullptr;
-#endif
 }
 
 const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
     const DeviceMoeLaunchPlan& launch_plan) const {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   if (!valid() ||
       scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4 ||
       cols() == 0 ||
@@ -1001,15 +993,10 @@ const void* DeviceNvfp4Matrix::p5_tma_load_sfb_descriptors(
   impl_->cached_p5_tma_sfb_build_epoch = launch_plan.build_epoch();
   impl_->cached_p5_tma_sfb_descriptors = device_descriptors;
   return impl_->cached_p5_tma_sfb_descriptors;
-#else
-  (void) launch_plan;
-  return nullptr;
-#endif
 }
 
 const void* DeviceNvfp4Matrix::p5_tma_load_a_descriptors(
     const DeviceMoeLaunchPlan& launch_plan) const {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   if (!valid() ||
       cols() == 0 ||
       (cols() % 128u) != 0 ||
@@ -1075,15 +1062,10 @@ const void* DeviceNvfp4Matrix::p5_tma_load_a_descriptors(
   impl_->cached_p5_tma_a_build_epoch = launch_plan.build_epoch();
   impl_->cached_p5_tma_a_descriptors = device_descriptors;
   return impl_->cached_p5_tma_a_descriptors;
-#else
-  (void) launch_plan;
-  return nullptr;
-#endif
 }
 
 const void* DeviceNvfp4Matrix::p5_tma_load_sfa_descriptors(
     const DeviceMoeLaunchPlan& launch_plan) const {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   if (!valid() ||
       scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4 ||
       cols() == 0 ||
@@ -1161,15 +1143,10 @@ const void* DeviceNvfp4Matrix::p5_tma_load_sfa_descriptors(
   impl_->cached_p5_tma_sfa_build_epoch = launch_plan.build_epoch();
   impl_->cached_p5_tma_sfa_descriptors = device_descriptors;
   return impl_->cached_p5_tma_sfa_descriptors;
-#else
-  (void) launch_plan;
-  return nullptr;
-#endif
 }
 
 const void* DeviceNvfp4Matrix::shared_p5_tma_load_b_descriptors(
     const GemmLaunchPlan& launch_plan) const {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   if (!valid() || !SupportsSharedP5Descriptors(launch_plan, rows(), cols())) {
     return nullptr;
   }
@@ -1234,15 +1211,10 @@ const void* DeviceNvfp4Matrix::shared_p5_tma_load_b_descriptors(
         };
       }();
   return device_descriptors;
-#else
-  (void) launch_plan;
-  return nullptr;
-#endif
 }
 
 const void* DeviceNvfp4Matrix::shared_p5_tma_load_sfb_descriptors(
     const GemmLaunchPlan& launch_plan) const {
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
   if (!valid() ||
       scale_layout() != Nvfp4ScaleLayout::kSwizzled128x4 ||
       !SupportsSharedP5Descriptors(launch_plan, rows(), cols())) {
@@ -1318,10 +1290,6 @@ const void* DeviceNvfp4Matrix::shared_p5_tma_load_sfb_descriptors(
         };
       }();
   return device_descriptors;
-#else
-  (void) launch_plan;
-  return nullptr;
-#endif
 }
 
 Nvfp4ScaleLayout DeviceNvfp4Matrix::scale_layout() const {

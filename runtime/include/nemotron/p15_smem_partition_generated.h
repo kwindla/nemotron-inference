@@ -4,11 +4,7 @@
 
 #include <cstdint>
 
-#if defined(__CUDACC__)
 #define NEMOTRON_P15_SMEM_HD __host__ __device__
-#else
-#define NEMOTRON_P15_SMEM_HD
-#endif
 
 namespace nemotron::p15_smem_partition_generated {
 

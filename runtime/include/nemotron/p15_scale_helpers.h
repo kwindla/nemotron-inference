@@ -5,8 +5,6 @@
 // types (float_e2m1_t operands, float_ue4m3_t scales, SFVecSize=16).
 #pragma once
 
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-
 #include <cstdint>
 
 #include <cute/algorithm/copy.hpp>
@@ -675,5 +673,3 @@ get_layoutSFB_TV(cute::TiledMMA<Atom, TiledThr, TiledPerm>& mma) {
 }
 
 }  // namespace nemotron::p15_scale
-
-#endif  // NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE

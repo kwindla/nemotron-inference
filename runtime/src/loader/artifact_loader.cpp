@@ -161,9 +161,7 @@ struct ArtifactLoader::Impl {
       }
       mapped_file.data = static_cast<const std::uint8_t*>(mapped);
     } else {
-#ifdef POSIX_FADV_SEQUENTIAL
       posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
       if (!ReadAllBytes(fd, mapped_file.size, &mapped_file.owned_bytes)) {
         close(fd);
         return false;

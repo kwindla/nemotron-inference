@@ -194,11 +194,6 @@ target_include_directories(
   PRIVATE
     ${NEMOTRON_LOCAL_CUTLASS_INCLUDE_DIR}
 )
-target_compile_definitions(
-  nemotron_runtime_backend
-  PRIVATE
-    NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
-)
 
 if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   target_include_directories(

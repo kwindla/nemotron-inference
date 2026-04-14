@@ -4,11 +4,7 @@
 
 #include <cstdint>
 
-#if defined(__CUDACC__)
 #define NEMOTRON_P15_PROBE_HD __host__ __device__
-#else
-#define NEMOTRON_P15_PROBE_HD
-#endif
 
 namespace nemotron::p15_probe_generated {
 

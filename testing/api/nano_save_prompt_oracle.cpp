@@ -24,9 +24,7 @@
 #include <string_view>
 #include <vector>
 
-#if !defined(_WIN32)
 extern char** environ;
-#endif
 
 namespace {
 
@@ -125,16 +123,12 @@ std::string AbsolutePathString(const std::filesystem::path& path) {
 }
 
 std::optional<std::filesystem::path> ExecutablePath() {
-#if defined(__linux__)
   std::error_code error;
   const std::filesystem::path path = std::filesystem::read_symlink("/proc/self/exe", error);
   if (error) {
     return std::nullopt;
   }
   return path.lexically_normal();
-#else
-  return std::nullopt;
-#endif
 }
 
 std::string ResolveBuildDir() {
@@ -151,7 +145,6 @@ std::string ResolveBuildDir() {
 
 std::vector<BackendFlag> CollectBackendFlags() {
   std::vector<BackendFlag> flags;
-#if !defined(_WIN32)
   if (environ != nullptr) {
     for (char** entry = environ; *entry != nullptr; ++entry) {
       const std::string_view env_entry(*entry);
@@ -170,7 +163,6 @@ std::vector<BackendFlag> CollectBackendFlags() {
       flags.push_back({std::string(name), std::string(value)});
     }
   }
-#endif
   std::sort(
       flags.begin(),
       flags.end(),
@@ -426,11 +418,7 @@ std::string FormatFloat(float value) {
 
 std::tm UtcTime(std::time_t timestamp) {
   std::tm utc_time{};
-#if defined(_WIN32)
-  gmtime_s(&utc_time, &timestamp);
-#else
   gmtime_r(&timestamp, &utc_time);
-#endif
   return utc_time;
 }
 

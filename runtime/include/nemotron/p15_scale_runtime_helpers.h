@@ -3,8 +3,6 @@
 // copy/probe machinery so it remains safe to include in the runtime TU.
 #pragma once
 
-#if defined(NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE)
-
 #include <cstdint>
 
 #include <cute/tensor.hpp>
@@ -137,5 +135,3 @@ CUTE_HOST_DEVICE void store_scale_word_k64(
 }
 
 }  // namespace nemotron::p15_scale_runtime
-
-#endif  // NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE

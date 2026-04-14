@@ -311,11 +311,6 @@ if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
     PRIVATE
       ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
   )
-  target_compile_definitions(
-    p15_swizzled_pipeline_test
-    PRIVATE
-      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
-  )
 endif()
 
 target_compile_features(p15_swizzled_pipeline_test PRIVATE cxx_std_20)
@@ -346,11 +341,6 @@ if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
     PRIVATE
       ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
   )
-  target_compile_definitions(
-    p5_swizzled_pipeline_test
-    PRIVATE
-      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
-  )
 endif()
 
 target_compile_features(p5_swizzled_pipeline_test PRIVATE cxx_std_20)
@@ -380,11 +370,6 @@ if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
     p5_swizzled_pipeline_test_120f
     PRIVATE
       ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
-  )
-  target_compile_definitions(
-    p5_swizzled_pipeline_test_120f
-    PRIVATE
-      NEMOTRON_RUNTIME_HAVE_LOCAL_CUTE=1
   )
 endif()
 
