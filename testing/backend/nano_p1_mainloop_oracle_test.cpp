@@ -5,6 +5,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,38 @@ constexpr int kNanoHiddenSize = 2688;
 constexpr int kNanoInterSize = 1920;
 constexpr int kNanoPackedRowBytes = kNanoHiddenSize / 2;
 constexpr int kNanoScaleBytesPerRow = kNanoHiddenSize / kNvfp4BlockWidth;
+// Gate and telemetry tolerances for Phase 3.
+//
+// The primary correctness gate is **bitwise equality between the runtime
+// kernel's bf16 output and the flashinfer reference dump**. Flashinfer's
+// P1 tactic and the runtime kernel both dispatch the same SM120 FP4
+// block-scaled MMA atom with the same accumulator precision, so on
+// identical inputs they must produce bit-identical output. Any bitwise
+// mismatch is a real runtime bug, not precision noise. The
+// cross-tactic convergence recorded in
+// `proj-2026-04-12-1022/trtllm_reference/NOTES.md` §5 (confirmed by
+// oracle_validation_2026-04-14.py run 1: tactic0 vs tactic1 bitwise match
+// = 245760/245760) makes the flashinfer dump a well-defined canonical
+// reference.
+//
+// The FP64-accumulated local math oracle at
+// `BuildExecutionMathReferenceExpectedForShape` is retained purely as
+// **diagnostic telemetry**. It cannot serve as a tight gate because a
+// correct FP4 kernel cannot match an FP64 reference at the bf16 LSB: the
+// oracle and flashinfer dump empirically reach only ~6.5% bitwise match
+// and ~49% match within 512 ULPs, with a long tail driven by
+// subtractive-cancellation amplification on small dot products. The
+// oracle is most useful at a wide tolerance (64-512 ULPs) as a sanity
+// check that the dump can be reproduced from first principles.
+//
+// Full derivation is in
+// `proj-2026-04-12-1022/probes/oracle_validation_2026-04-14.py` and the
+// follow-up runs 2..5 documented alongside it. Do not tighten
+// `kPhase3OracleTelemetryUlpWide` below 64 without re-running those
+// validations first.
+constexpr int kPhase3OracleTelemetryUlpTight = 8;
+constexpr int kPhase3OracleTelemetryUlpWide = 512;
+constexpr std::size_t kPhase3FlashinferMaxAllowedBitwiseMismatches = 0u;
 constexpr std::uint16_t kExpectedAllOnesBits = 0x4380u;
 constexpr int kAccumProbeCount = 256 * 64;
 constexpr int kAccumProbeDebugOffset = kAccumProbeCount;
@@ -198,6 +231,21 @@ float Bf16BitsToFloat(std::uint16_t bits) {
   __nv_bfloat16 value;
   std::memcpy(&value, &bits, sizeof(bits));
   return __bfloat162float(value);
+}
+
+std::int32_t OrderedBf16Bits(std::uint16_t bits) {
+  const std::int32_t signed_bits = static_cast<std::int32_t>(bits);
+  if ((bits & 0x8000u) != 0u) {
+    return 0x8000 - signed_bits;
+  }
+  return signed_bits + 0x8000;
+}
+
+int Bf16UlpDiff(std::uint16_t lhs, std::uint16_t rhs) {
+  const std::int32_t lhs_ordered = OrderedBf16Bits(lhs);
+  const std::int32_t rhs_ordered = OrderedBf16Bits(rhs);
+  const std::int32_t diff = lhs_ordered - rhs_ordered;
+  return diff < 0 ? -diff : diff;
 }
 
 float DecodeFp4(std::uint8_t raw_nibble) {
@@ -752,6 +800,184 @@ std::vector<float> DequantizeNvfp4Matrix(
   return output;
 }
 
+std::vector<float> DequantizeExecutionLayoutNvfp4Matrix(
+    const std::uint8_t* packed,
+    const std::uint8_t* execution_scales,
+    int rows,
+    int cols) {
+  std::vector<float> output(static_cast<std::size_t>(rows * cols), 0.0f);
+  if (packed == nullptr ||
+      execution_scales == nullptr ||
+      rows <= 0 ||
+      cols <= 0 ||
+      (cols % kNvfp4BlockWidth) != 0) {
+    return output;
+  }
+
+  const std::size_t logical_blocks_per_row =
+      static_cast<std::size_t>(cols / kNvfp4BlockWidth);
+  const std::size_t padded_blocks_per_row = RoundUp(logical_blocks_per_row, 4u);
+  std::size_t packed_index = 0u;
+  for (int row = 0; row < rows; ++row) {
+    for (std::size_t block = 0; block < logical_blocks_per_row; ++block) {
+      const std::size_t scale_offset =
+          ExecutionScaleOffset(static_cast<std::size_t>(row), block, padded_blocks_per_row);
+      // The saved NVFP4 scale bytes already include the tensor-global scale that
+      // flashinfer used during quantization. The GEMM epilogue's alpha (loaded
+      // from `inputs_g1_alphas.bin`) carries the corresponding inverse global
+      // scale, so the host-side math oracle should decode only the stored FP8
+      // byte here and apply alpha after the FP64 accumulation.
+      const float effective_scale = DecodeFp8(execution_scales[scale_offset]);
+      const int col_start = static_cast<int>(block) * kNvfp4BlockWidth;
+      for (int offset = 0; offset < kNvfp4BlockWidth; offset += 2) {
+        const std::uint8_t byte = packed[packed_index++];
+        output[static_cast<std::size_t>(row * cols + col_start + offset + 0)] =
+            DecodeFp4(byte & 0x0Fu) * effective_scale;
+        output[static_cast<std::size_t>(row * cols + col_start + offset + 1)] =
+            DecodeFp4((byte >> 4) & 0x0Fu) * effective_scale;
+      }
+    }
+  }
+  return output;
+}
+
+std::vector<std::uint16_t> BuildExecutionMathReferenceExpectedForShape(
+    const std::vector<std::uint8_t>& input_fp4,
+    const std::vector<std::uint8_t>& weight_fp4,
+    const std::vector<std::uint8_t>& input_execution_sf,
+    const std::vector<std::uint8_t>& weight_execution_sf,
+    float alpha,
+    int num_rows,
+    int hidden_size,
+    int inter_size) {
+  const std::vector<float> activations = DequantizeExecutionLayoutNvfp4Matrix(
+      input_fp4.data(),
+      input_execution_sf.data(),
+      num_rows,
+      hidden_size);
+  const std::vector<float> weights = DequantizeExecutionLayoutNvfp4Matrix(
+      weight_fp4.data(),
+      weight_execution_sf.data(),
+      inter_size,
+      hidden_size);
+
+  std::vector<std::uint16_t> expected(
+      static_cast<std::size_t>(num_rows * inter_size),
+      0u);
+  for (int row = 0; row < num_rows; ++row) {
+    const float* activation_row =
+        activations.data() + static_cast<std::size_t>(row * hidden_size);
+    for (int col = 0; col < inter_size; ++col) {
+      const float* weight_row =
+          weights.data() + static_cast<std::size_t>(col * hidden_size);
+      double accum = 0.0;
+      for (int k = 0; k < hidden_size; ++k) {
+        accum += static_cast<double>(activation_row[k]) *
+                 static_cast<double>(weight_row[k]);
+      }
+      const float scaled = alpha * static_cast<float>(accum);
+      expected[static_cast<std::size_t>(row * inter_size + col)] =
+          Bf16Bits(__float2bfloat16(scaled));
+    }
+  }
+  return expected;
+}
+
+void PrintBf16CompatibilitySummary(
+    const char* label,
+    const std::vector<std::uint16_t>& lhs_bits,
+    const std::vector<std::uint16_t>& rhs_bits,
+    int ulp_tolerance) {
+  if (lhs_bits.size() != rhs_bits.size()) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: %s size mismatch lhs=%zu rhs=%zu\n",
+        label,
+        lhs_bits.size(),
+        rhs_bits.size());
+    return;
+  }
+
+  std::size_t within_tolerance = 0u;
+  int max_ulp = 0;
+  float max_abs_diff = 0.0f;
+  std::size_t max_index = 0u;
+  for (std::size_t index = 0; index < lhs_bits.size(); ++index) {
+    const int ulp_diff = Bf16UlpDiff(lhs_bits[index], rhs_bits[index]);
+    if (ulp_diff <= ulp_tolerance) {
+      ++within_tolerance;
+    }
+    const float abs_diff =
+        std::fabs(Bf16BitsToFloat(lhs_bits[index]) - Bf16BitsToFloat(rhs_bits[index]));
+    if (ulp_diff > max_ulp || (ulp_diff == max_ulp && abs_diff > max_abs_diff)) {
+      max_ulp = ulp_diff;
+      max_abs_diff = abs_diff;
+      max_index = index;
+    }
+  }
+
+  std::printf(
+      "nano_p1_mainloop_oracle_test: %s within_%dulp=%zu/%zu max_ulp=%d max_abs_diff=%g worst_row=%zu worst_col=%zu\n",
+      label,
+      ulp_tolerance,
+      within_tolerance,
+      lhs_bits.size(),
+      max_ulp,
+      max_abs_diff,
+      max_index / static_cast<std::size_t>(kNanoInterSize),
+      max_index % static_cast<std::size_t>(kNanoInterSize));
+}
+
+// Emit a distribution of match counts at a fixed set of BF16 ULP
+// tolerances (bitwise, 1, 8, 64, 512, 2048). This replaces the prior
+// single-tolerance summary when we want to distinguish "approximately
+// correct under FP4 precision noise" from "structurally wrong". See the
+// comment on `kPhase3OracleTelemetryUlpWide` above for why a single
+// tight tolerance is the wrong instrument for an FP4-to-BF16 gate.
+void PrintBf16DistributionSummary(
+    const char* label,
+    const std::vector<std::uint16_t>& lhs_bits,
+    const std::vector<std::uint16_t>& rhs_bits) {
+  if (lhs_bits.size() != rhs_bits.size()) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: %s size mismatch lhs=%zu rhs=%zu\n",
+        label,
+        lhs_bits.size(),
+        rhs_bits.size());
+    return;
+  }
+  const std::size_t total = lhs_bits.size();
+  std::size_t bitwise = 0u;
+  std::size_t w1 = 0u;
+  std::size_t w8 = 0u;
+  std::size_t w64 = 0u;
+  std::size_t w512 = 0u;
+  std::size_t w2048 = 0u;
+  int max_ulp = 0;
+  for (std::size_t i = 0; i < total; ++i) {
+    const int d = Bf16UlpDiff(lhs_bits[i], rhs_bits[i]);
+    if (d == 0) ++bitwise;
+    if (d <= 1) ++w1;
+    if (d <= 8) ++w8;
+    if (d <= 64) ++w64;
+    if (d <= 512) ++w512;
+    if (d <= 2048) ++w2048;
+    if (d > max_ulp) max_ulp = d;
+  }
+  const double denom = total == 0 ? 1.0 : static_cast<double>(total);
+  std::printf(
+      "nano_p1_mainloop_oracle_test: %s bitwise=%zu/%zu (%.3f%%) "
+      "<=1u=%zu (%.3f%%) <=8u=%zu (%.3f%%) <=64u=%zu (%.3f%%) "
+      "<=512u=%zu (%.3f%%) <=2048u=%zu (%.3f%%) max_ulp=%d\n",
+      label,
+      bitwise, total, 100.0 * static_cast<double>(bitwise) / denom,
+      w1, 100.0 * static_cast<double>(w1) / denom,
+      w8, 100.0 * static_cast<double>(w8) / denom,
+      w64, 100.0 * static_cast<double>(w64) / denom,
+      w512, 100.0 * static_cast<double>(w512) / denom,
+      w2048, 100.0 * static_cast<double>(w2048) / denom,
+      max_ulp);
+}
+
 std::vector<std::uint16_t> BuildCaptureBackedExpected(
     const std::vector<std::uint8_t>& input_fp4,
     const std::vector<std::uint8_t>& weight_fp4,
@@ -1035,6 +1261,36 @@ bool RunPhase3NanoBucketK2688() {
     return false;
   }
 
+  // Build the FP64 local math reference from the saved execution payload
+  // *purely as telemetry*. `oracle_validation_2026-04-14.py` runs 1..5
+  // show this reference empirically reaches ~49% match within 512 BF16
+  // ULPs of the flashinfer dump and ~6% bitwise, with a long tail driven
+  // by subtractive cancellation on small dot products. That ceiling is
+  // the FP4 precision floor, not an implementation bug, so this oracle
+  // cannot serve as a tight correctness gate for any FP4 kernel —
+  // including a perfectly-correct one. It is reported here because it is
+  // cheap and because spotting a surprise in the oracle vs flashinfer
+  // tail is a useful sanity check on the reference dump itself.
+  //
+  // See also
+  // `proj-2026-04-12-1022/probes/oracle_validation_2026-04-14.py` and
+  // follow-up `oracle_validation_{2..5}_2026-04-14.py`.
+  const std::vector<std::uint16_t> math_reference_bits =
+      BuildExecutionMathReferenceExpectedForShape(
+          input_fp4,
+          weight_fp4,
+          input_sf,
+          weight_sf,
+          g1_alphas[0],
+          kNanoNumRows,
+          kNanoHiddenSize,
+          kNanoInterSize);
+
+  PrintBf16DistributionSummary(
+      "Phase 3 telemetry: local math oracle vs flashinfer tactic1",
+      math_reference_bits,
+      reference_bits);
+
   std::vector<__nv_bfloat16> output_bf16;
   if (!RunNanoP1KernelForShape(
           input_fp4,
@@ -1049,20 +1305,30 @@ bool RunPhase3NanoBucketK2688() {
     return false;
   }
 
-  // --- Diagnostic enrichment (G6 + G1 combined probe, 2026-04-13) ---
-  // Total match count sanity check.
-  std::size_t total_matches = 0;
-  for (std::size_t idx = 0; idx < output_bf16.size(); ++idx) {
-    if (Bf16Bits(output_bf16[idx]) == reference_bits[idx]) ++total_matches;
+  // Materialize the kernel output as bf16 bits once so the two
+  // comparisons below can reuse it cheaply.
+  std::vector<std::uint16_t> kernel_bits(output_bf16.size());
+  for (std::size_t i = 0; i < output_bf16.size(); ++i) {
+    kernel_bits[i] = Bf16Bits(output_bf16[i]);
   }
-  std::printf(
-      "nano_p1_mainloop_oracle_test: Phase 3 total matches=%zu/%zu (%.3f%%)\n",
-      total_matches,
-      output_bf16.size(),
-      100.0 * static_cast<double>(total_matches) /
-          static_cast<double>(output_bf16.size()));
 
-  // G6: per-axis histograms of match positions over M%32, N%32, M%8, N%8.
+  // Primary gate and secondary telemetry both go through the same
+  // multi-tolerance distribution helper so anyone reading the output log
+  // can see *the shape* of each comparison, not just a single-number
+  // pass/fail.
+  PrintBf16DistributionSummary(
+      "Phase 3 runtime kernel vs flashinfer tactic1 (PRIMARY GATE)",
+      kernel_bits,
+      reference_bits);
+  PrintBf16DistributionSummary(
+      "Phase 3 runtime kernel vs local math oracle (telemetry only)",
+      kernel_bits,
+      math_reference_bits);
+
+  // Per-axis histograms of bitwise-match positions against the flashinfer
+  // reference. These are keyed on the primary (bitwise) gate, which is
+  // what should drive any pattern-based reasoning about runtime
+  // correctness.
   int m_mod32_hist[32] = {0};
   int n_mod32_hist[32] = {0};
   int m_mod8_hist[8] = {0};
@@ -1072,7 +1338,9 @@ bool RunPhase3NanoBucketK2688() {
     for (int n = 0; n < kNanoInterSize; ++n) {
       const std::size_t idx = static_cast<std::size_t>(m) * kNanoInterSize +
                               static_cast<std::size_t>(n);
-      if (Bf16Bits(output_bf16[idx]) != reference_bits[idx]) continue;
+      if (kernel_bits[idx] != reference_bits[idx]) {
+        continue;
+      }
       ++m_mod32_hist[m % 32];
       ++n_mod32_hist[n % 32];
       ++m_mod8_hist[m % 8];
@@ -1080,95 +1348,86 @@ bool RunPhase3NanoBucketK2688() {
       ++m_match_hist[m];
     }
   }
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 M%%8 match histogram:\n");
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 M%%8 bitwise-match histogram:\n");
   for (int r = 0; r < 8; ++r) {
     std::printf("  M%%8=%d matches=%d\n", r, m_mod8_hist[r]);
   }
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 N%%8 match histogram:\n");
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 N%%8 bitwise-match histogram:\n");
   for (int r = 0; r < 8; ++r) {
     std::printf("  N%%8=%d matches=%d\n", r, n_mod8_hist[r]);
   }
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 M%%32 match histogram:\n");
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 M%%32 bitwise-match histogram:\n");
   for (int r = 0; r < 32; ++r) {
     std::printf("  M%%32=%d matches=%d\n", r, m_mod32_hist[r]);
   }
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 N%%32 match histogram:\n");
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 N%%32 bitwise-match histogram:\n");
   for (int r = 0; r < 32; ++r) {
     std::printf("  N%%32=%d matches=%d\n", r, n_mod32_hist[r]);
   }
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 per-row matches "
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 per-row bitwise-match counts "
               "(all rows with >=100 matches):\n");
   for (int r = 0; r < kNanoNumRows; ++r) {
     if (m_match_hist[r] >= 100) {
-      std::printf("  M=%d total_matches_in_row=%d\n", r, m_match_hist[r]);
+      std::printf("  M=%d total_bitwise_matches_in_row=%d\n", r, m_match_hist[r]);
     }
   }
 
-  // Print first 8x8 kernel vs reference for pattern analysis.
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 kernel[row][col] vs reference[row][col] (first 8x8):\n");
+  // First 8x8 kernel vs flashinfer reference dump.
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 kernel[row][col] vs flashinfer_ref[row][col] (first 8x8):\n");
   for (int row = 0; row < 8; ++row) {
     for (int col = 0; col < 8; ++col) {
       const std::size_t idx = static_cast<std::size_t>(row) * kNanoInterSize + static_cast<std::size_t>(col);
-      const std::uint16_t kbits = Bf16Bits(output_bf16[idx]);
+      const std::uint16_t kbits = kernel_bits[idx];
       const std::uint16_t rbits = reference_bits[idx];
       const float kval = __bfloat162float(output_bf16[idx]);
       const float rval = Bf16BitsToFloat(rbits);
-      const bool match = (kbits == rbits);
-      std::printf("  [%d][%d]: kernel=%.5f(0x%04x) ref=%.5f(0x%04x) %s\n",
-                  row, col, kval, kbits, rval, rbits, match ? "MATCH" : "MISMATCH");
+      const int ulp = Bf16UlpDiff(kbits, rbits);
+      const bool bitwise = (kbits == rbits);
+      std::printf("  [%d][%d]: kernel=%.5f(0x%04x) ref=%.5f(0x%04x) ulp=%d %s\n",
+                  row, col, kval, kbits, rval, rbits, ulp, bitwise ? "BITWISE" : "mismatch");
     }
   }
-  // Print which columns in row 0 match.
-  std::printf("nano_p1_mainloop_oracle_test: Phase 3 row=0 column match pattern (first 32 cols):\n");
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 row=0 column bitwise-match pattern (first 32 cols):\n");
   for (int col = 0; col < 32; ++col) {
     const std::size_t idx = static_cast<std::size_t>(col);
-    const std::uint16_t kbits = Bf16Bits(output_bf16[idx]);
-    const std::uint16_t rbits = reference_bits[idx];
-    const bool match = (kbits == rbits);
-    if (match) {
-      std::printf("  col=%d MATCH kernel=%.5f ref=%.5f\n", col,
-                  __bfloat162float(output_bf16[idx]), Bf16BitsToFloat(rbits));
+    if (kernel_bits[idx] == reference_bits[idx]) {
+      std::printf("  col=%d BITWISE kernel=%.5f ref=%.5f\n", col,
+                  __bfloat162float(output_bf16[idx]),
+                  Bf16BitsToFloat(reference_bits[idx]));
     }
   }
-  // G1: cross-reference runtime row 0 against reference rows {0, 8, 16, 24}
-  // which are the first four destinations of srcToDstBlk32RowMap applied to
-  // logical rows {0, 1, 2, 3}. If the runtime applies an inverse shuffle
-  // but the reference is in shuffled order, runtime row 0 would match
-  // reference row 8 / 16 / 24 instead of row 0.
-  {
-    std::printf("nano_p1_mainloop_oracle_test: Phase 3 G1 cross-row check "
-                "(runtime row 0 vs reference rows {0, 8, 16, 24}, cols 0..7):\n");
-    const int ref_rows[4] = {0, 8, 16, 24};
-    for (int r_idx = 0; r_idx < 4; ++r_idx) {
-      const int ref_row = ref_rows[r_idx];
-      int hits = 0;
-      for (int col = 0; col < 8; ++col) {
-        const std::size_t k_idx = static_cast<std::size_t>(col);
-        const std::size_t r_idx2 = static_cast<std::size_t>(ref_row) * kNanoInterSize +
-                                    static_cast<std::size_t>(col);
-        if (Bf16Bits(output_bf16[k_idx]) == reference_bits[r_idx2]) ++hits;
-      }
-      std::printf("  runtime_row=0 vs ref_row=%d hits=%d/8\n", ref_row, hits);
-    }
-  }
-  // Phase 3 is currently DEFERRED: the NanoP1 kernel still has a structured
-  // mismatch against the flashinfer reference for this bucket (see the
-  // TracedP5PermTileN partial fix in ComputeNanoP1AccumTile and the match
-  // histograms above). Phase 1 (synthetic all-ones) already validates the
-  // basic kernel correctness, so we treat Phase 3 as a regression-tracking
-  // probe rather than a gating test until the residual structured mismatch
-  // is root-caused. This mirrors Phase 2's deferral.
-  const std::size_t mismatch_count = ReportBitwiseMismatchesForShape(
-      "Phase 3 Nano bucket K=2688",
+
+  const std::size_t flashinfer_bitwise_mismatches = ReportBitwiseMismatchesForShape(
+      "Phase 3 Nano bucket K=2688 runtime vs flashinfer (primary gate)",
       output_bf16,
       reference_bits,
       kNanoNumRows,
       kNanoInterSize);
+
+  // Primary gate: runtime must bitwise match the flashinfer dump.
+  //
+  // The runtime kernel and flashinfer's P1 tactic both dispatch the same
+  // SM120 FP4 block-scaled MMA atom on the same inputs, so they must
+  // produce the same bf16 bits. Any non-zero mismatch is a real runtime
+  // bug. Allowing slack here would paper over real data-flow bugs
+  // (e.g., the 2D bit-interleaved B-staging encoding localized by the
+  // 2026-04-14 probe chain) while still allowing them to silently
+  // corrupt downstream results.
+  if (flashinfer_bitwise_mismatches > kPhase3FlashinferMaxAllowedBitwiseMismatches) {
+    std::printf(
+        "nano_p1_mainloop_oracle_test: Phase 3 Nano bucket K=2688 FAIL "
+        "(%zu bitwise mismatches vs flashinfer tactic1 dump; "
+        "allowed=%zu)\n",
+        flashinfer_bitwise_mismatches,
+        kPhase3FlashinferMaxAllowedBitwiseMismatches);
+    return false;
+  }
   std::printf(
-      "nano_p1_mainloop_oracle_test: Phase 3 Nano bucket K=2688 DEFERRED "
-      "(%zu mismatches against flashinfer reference; Phase 1 validates "
-      "basic kernel correctness)\n",
-      mismatch_count);
+      "nano_p1_mainloop_oracle_test: Phase 3 Nano bucket K=2688 PASS "
+      "(runtime bitwise matches flashinfer tactic1 on %zu elements)\n",
+      output_bf16.size());
+  (void)kPhase3OracleTelemetryUlpTight;
+  (void)kPhase3OracleTelemetryUlpWide;
   return true;
 }
 
