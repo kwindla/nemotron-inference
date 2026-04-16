@@ -1,67 +1,2920 @@
---- a/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-+++ b/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-@@ -19,11 +19,16 @@
- #include <float.h>
+--- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -20,6 +20,7 @@
  #include <math.h>
- 
+
  #include <algorithm>
-+#include <cstdint>
-+#include <cstdio>
-+#include <cstdlib>
 +#include <cstring>
  #include <memory>
  #include <numeric>
  #include <random>
- #include <sstream>
-+#include <vector>
- 
- #include "tensorrt_llm/common/memoryUtils.h"
- #include "tensorrt_llm/common/workspace.h"
-@@ -3065,6 +3070,47 @@
- 
-     sync_check_cuda_error(stream);
- 
-+    // >>> NEMOTRON BF16 gemm1_output dump (step 2b, env-gated) >>>
-+    if (char const* nemotron_dump_path = std::getenv("NEMOTRON_TRTLLM_DUMP_GEMM1")) {
-+      using DumpElem = UnfusedGemmOutputType;
-+      std::size_t const dump_rows = static_cast<std::size_t>(expanded_num_rows);
-+      std::size_t const dump_cols = static_cast<std::size_t>(fc1_out_size);
-+      std::size_t const dump_elems = dump_rows * dump_cols;
-+      std::size_t const dump_bytes = dump_elems * sizeof(DumpElem);
-+      std::vector<unsigned char> nemotron_host_buf(dump_bytes);
-+      cudaError_t const nemotron_memcpy_err = cudaMemcpyAsync(
-+          nemotron_host_buf.data(),
-+          static_cast<DumpElem const*>(gemm_output),
-+          dump_bytes,
-+          cudaMemcpyDeviceToHost,
-+          stream);
-+      cudaStreamSynchronize(stream);
-+      if (nemotron_memcpy_err == cudaSuccess) {
-+        if (FILE* nemotron_fp = std::fopen(nemotron_dump_path, "wb")) {
-+          unsigned char header[64] = {};
-+          header[0] = 'N'; header[1] = 'E'; header[2] = 'M';
-+          header[3] = 'O'; header[4] = 'P'; header[5] = '1';
-+          std::uint32_t const version = 1u;
-+          std::uint32_t const rows_u32 = static_cast<std::uint32_t>(dump_rows);
-+          std::uint32_t const cols_u32 = static_cast<std::uint32_t>(dump_cols);
-+          std::uint32_t const elem_bytes_u32 = static_cast<std::uint32_t>(sizeof(DumpElem));
-+          std::uint32_t const gated_u32 = static_cast<std::uint32_t>(is_gated_activation ? 1u : 0u);
-+          std::memcpy(header + 8, &version, 4);
-+          std::memcpy(header + 12, &rows_u32, 4);
-+          std::memcpy(header + 16, &cols_u32, 4);
-+          std::memcpy(header + 20, &elem_bytes_u32, 4);
-+          std::memcpy(header + 24, &gated_u32, 4);
-+          std::fwrite(header, 1, sizeof(header), nemotron_fp);
-+          std::fwrite(nemotron_host_buf.data(), 1, dump_bytes, nemotron_fp);
-+          std::fclose(nemotron_fp);
-+          std::fprintf(stderr,
-+                       "[NEMOTRON] wrote %zu bytes of BF16 gemm1_output to %s (rows=%zu cols=%zu)\n",
-+                       dump_bytes, nemotron_dump_path, dump_rows, dump_cols);
+@@ -38,6 +39,7 @@
+ // Order matters here, packed_stride.hpp is missing cute and convolution includes
+ #include "cutlass/array.h"
+ #include "cutlass/epilogue/thread/activation.h"
++#include "cutlass/gemm/collective/nemotron_operand_probe.hpp"
+ #include "cutlass/numeric_conversion.h"
+ #include "cutlass/numeric_types.h"
+ #include "cutlass/util/packed_stride.hpp"
+@@ -71,6 +73,738 @@
+ using namespace tensorrt_llm::common;
+
+ namespace tensorrt_llm::kernels::cutlass_kernels {
++
++using NemotronBOperandProbeState = cutlass::gemm::collective::nemotron_probe::BOperandProbeState;
++using NemotronBOperandProbeEntry = cutlass::gemm::collective::nemotron_probe::BOperandProbeEntry;
++
++inline void loadNemotronBOperandProbeOperandKind(NemotronBOperandProbeState& probe) {
++  probe.operand_kind = int(cutlass::gemm::collective::nemotron_probe::OperandKind::kWeight);
++  char const* operand_env = std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_OPERAND");
++  if (operand_env == nullptr || operand_env[0] == '\0') {
++    return;
++  }
++  if (std::strcmp(operand_env, "activation") == 0 ||
++      std::strcmp(operand_env, "input") == 0 ||
++      std::strcmp(operand_env, "a") == 0) {
++    probe.operand_kind = int(cutlass::gemm::collective::nemotron_probe::OperandKind::kActivation);
++  }
++}
++
++inline void configureNemotronBOperandProbePhysicalMapping(
++    NemotronBOperandProbeState& probe,
++    bool swap_ab) {
++  using OperandKind = cutlass::gemm::collective::nemotron_probe::OperandKind;
++  probe.swap_ab = swap_ab ? 1 : 0;
++  probe.physical_a_operand_kind =
++      swap_ab ? int(OperandKind::kWeight) : int(OperandKind::kActivation);
++  probe.physical_b_operand_kind =
++      swap_ab ? int(OperandKind::kActivation) : int(OperandKind::kWeight);
++}
++
++inline void loadNemotronBOperandProbeTrackedTids(NemotronBOperandProbeState& probe) {
++  probe.tracked_tid_count = cutlass::gemm::collective::nemotron_probe::kDefaultTrackedTidCount;
++  for (int idx = 0; idx < cutlass::gemm::collective::nemotron_probe::kMaxTrackedTidCount; ++idx) {
++    probe.tracked_tids[idx] = -1;
++  }
++  for (int idx = 0; idx < cutlass::gemm::collective::nemotron_probe::kDefaultTrackedTidCount; ++idx) {
++    probe.tracked_tids[idx] = cutlass::gemm::collective::nemotron_probe::kDefaultTrackedTids[idx];
++  }
++
++  char const* tracked_tids_env = std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_TIDS");
++  if (tracked_tids_env == nullptr || tracked_tids_env[0] == '\0') {
++    return;
++  }
++
++  int parsed_count = 0;
++  char const* cursor = tracked_tids_env;
++  while (*cursor != '\0' &&
++         parsed_count < cutlass::gemm::collective::nemotron_probe::kMaxTrackedTidCount) {
++    while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
++      ++cursor;
++    }
++    if (*cursor == '\0') {
++      break;
++    }
++    char* end_ptr = nullptr;
++    long const parsed_tid = std::strtol(cursor, &end_ptr, 10);
++    if (end_ptr == cursor) {
++      break;
++    }
++    probe.tracked_tids[parsed_count++] = static_cast<int>(parsed_tid);
++    cursor = end_ptr;
++  }
++  if (parsed_count > 0) {
++    probe.tracked_tid_count = parsed_count;
++  }
++}
++
++inline int loadNemotronEnvIntOrDefault(char const* env_name, int default_value) {
++  char const* env_value = std::getenv(env_name);
++  if (env_value == nullptr || env_value[0] == '\0') {
++    return default_value;
++  }
++  char* end_ptr = nullptr;
++  long const parsed = std::strtol(env_value, &end_ptr, 10);
++  if (end_ptr == env_value) {
++    return default_value;
++  }
++  return static_cast<int>(parsed);
++}
++
++inline void resetNemotronBOperandProbe(void* probe_workspace, size_t probe_workspace_size,
++                                       bool enable_probe, bool swap_ab) {
++  if (probe_workspace == nullptr ||
++      probe_workspace_size < cutlass::gemm::collective::nemotron_probe::ProbeStorageBytes()) {
++    return;
++  }
++  NemotronBOperandProbeState probe = {};
++  char const* any_thread = std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_ANY_THREAD");
++  char const* overwrite_all_threads =
++      std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_OVERWRITE_ALL_THREADS");
++  char const* stage_slot_low_byte =
++      std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_STAGE_SLOT_LOW_BYTE");
++  char const* stage_slot_bit =
++      std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_STAGE_SLOT_BIT");
++  probe.enabled = enable_probe ? 1 : 0;
++  probe.entry_count = cutlass::gemm::collective::nemotron_probe::kEntryCount;
++  probe.max_n_tiles = cutlass::gemm::collective::nemotron_probe::kMaxNTiles;
++  probe.max_k_blocks = cutlass::gemm::collective::nemotron_probe::kMaxKBlocks;
++  probe.dispatch_stages = -1;
++  probe.dispatch_scheduler_stages = -1;
++  probe.epilogue_shared_storage_bytes = -1;
++  probe.mainloop_shared_storage_bytes = -1;
++  probe.next_slot = 0;
++  probe.capture_any_thread =
++      (any_thread != nullptr && any_thread[0] != '\0' && any_thread[0] != '0') ? 1 : 0;
++  probe.overwrite_all_threads =
++      (overwrite_all_threads != nullptr &&
++       overwrite_all_threads[0] != '\0' &&
++       overwrite_all_threads[0] != '0') ? 1 : 0;
++  probe.filter_block_idx_x =
++      loadNemotronEnvIntOrDefault("NEMOTRON_TRTLLM_OPERAND_PROBE_BLOCK_X", -1);
++  probe.filter_block_idx_y =
++      loadNemotronEnvIntOrDefault("NEMOTRON_TRTLLM_OPERAND_PROBE_BLOCK_Y", -1);
++  probe.filter_block_idx_z =
++      loadNemotronEnvIntOrDefault("NEMOTRON_TRTLLM_OPERAND_PROBE_BLOCK_Z", -1);
++  loadNemotronBOperandProbeOperandKind(probe);
++  configureNemotronBOperandProbePhysicalMapping(probe, swap_ab);
++  probe.synthetic_b_mode = 0;
++  probe.synthetic_b_arg = -1;
++  if (stage_slot_bit != nullptr && stage_slot_bit[0] != '\0') {
++    probe.synthetic_b_mode =
++        int(cutlass::gemm::collective::nemotron_probe::SyntheticBMode::kStageSlotBit);
++    probe.synthetic_b_arg = std::atoi(stage_slot_bit);
++  } else if (stage_slot_low_byte != nullptr &&
++             stage_slot_low_byte[0] != '\0' &&
++             stage_slot_low_byte[0] != '0') {
++    probe.synthetic_b_mode =
++        int(cutlass::gemm::collective::nemotron_probe::SyntheticBMode::kStageSlotLowByte);
++  }
++  loadNemotronBOperandProbeTrackedTids(probe);
++  for (int stage = 0; stage < cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageCount; ++stage) {
++    std::fill_n(
++        probe.semantic_weight_rows[stage],
++        cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageByteSlots,
++        static_cast<std::int16_t>(-1));
++    std::fill_n(
++        probe.semantic_weight_byte_indices[stage],
++        cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageByteSlots,
++        static_cast<std::int16_t>(-1));
++    std::fill_n(
++        probe.semantic_weight_k_tiles[stage],
++        cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageByteSlots,
++        static_cast<std::int16_t>(-1));
++    std::fill_n(
++        probe.semantic_weight_rows_alt[stage],
++        cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageByteSlots,
++        static_cast<std::int16_t>(-1));
++    std::fill_n(
++        probe.semantic_weight_byte_indices_alt[stage],
++        cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageByteSlots,
++        static_cast<std::int16_t>(-1));
++    std::fill_n(
++        probe.semantic_weight_k_tiles_alt[stage],
++        cutlass::gemm::collective::nemotron_probe::kMaxSemanticStageByteSlots,
++        static_cast<std::int16_t>(-1));
++  }
++  probe.producer_debug_count = 0;
++  std::fill_n(
++      probe.producer_debug_stage,
++      cutlass::gemm::collective::nemotron_probe::kProducerDebugEntryCount,
++      -1);
++  std::fill_n(
++      probe.producer_debug_slot,
++      cutlass::gemm::collective::nemotron_probe::kProducerDebugEntryCount,
++      -1);
++  std::fill_n(
++      probe.producer_debug_value,
++      cutlass::gemm::collective::nemotron_probe::kProducerDebugEntryCount,
++      -1);
++  for (int idx = 0; idx < cutlass::gemm::collective::nemotron_probe::kProducerDebugEntryCount; ++idx) {
++    std::fill_n(
++        probe.producer_debug_src[idx],
++        cutlass::gemm::collective::nemotron_probe::kProducerDebugComponentCount,
++        -1);
++    std::fill_n(
++        probe.producer_debug_dst[idx],
++        cutlass::gemm::collective::nemotron_probe::kProducerDebugComponentCount,
++        -1);
++  }
++  cudaMemcpy(probe_workspace, &probe, sizeof(probe), cudaMemcpyHostToDevice);
++}
++
++__global__ void nemotronBOperandProbeSelfTestKernel() {
++  auto& probe = cutlass::gemm::collective::nemotron_probe::g_b_operand_probe;
++  probe.entries[0] = {};
++  probe.entries[0].valid = 1;
++  probe.entries[0].thread_idx = -777;
++  probe.entries[0].block_idx_x = static_cast<int>(blockIdx.x);
++  probe.entries[0].block_idx_y = static_cast<int>(blockIdx.y);
++  probe.entries[0].block_idx_z = static_cast<int>(blockIdx.z);
++  probe.entries[0].tile_m_idx = 7;
++  probe.entries[0].tile_n_idx = 8;
++  probe.entries[0].tile_l_idx = 9;
++  probe.entries[0].work_k_tile_start = 10;
++  probe.entries[0].work_k_tile_count = 11;
++  probe.entries[0].read_stage = 99;
++  probe.entries[0].n_tile = 88;
++  probe.entries[0].k_block = 77;
++  probe.entries[0].dispatch_stages = 6;
++  probe.entries[0].dispatch_scheduler_stages = 5;
++  probe.entries[0].part_c_row0 = 66;
++  probe.entries[0].part_c_col0 = 55;
++  probe.entries[0].local_row0 = 44;
++  probe.entries[0].local_col0 = 33;
++  probe.entries[0].local_row1 = 22;
++  probe.entries[0].local_col1 = 11;
++  probe.entries[0].stage0_offset0 = 0x1234;
++  probe.entries[0].stage0_offset1 = 0x5678;
++  probe.entries[0].sf_reg_word_count = 2;
++  probe.entries[0].sf_reg_words_pre[0] = 0xaaaaaaaau;
++  probe.entries[0].sf_reg_words_pre[1] = 0xbbbbbbbbu;
++  probe.entries[0].reg0_pre = 0x11111111u;
++  probe.entries[0].reg1_pre = 0x22222222u;
++  probe.entries[0].reg0_post = 0x33333333u;
++  probe.entries[0].reg1_post = 0x44444444u;
++}
++
++inline void maybeRunNemotronBOperandProbeSelfTest(cudaStream_t stream) {
++  char const* selftest = std::getenv("NEMOTRON_TRTLLM_OPERAND_PROBE_SELFTEST");
++  if (selftest == nullptr || selftest[0] == '\0' || selftest[0] == '0') {
++    return;
++  }
++  nemotronBOperandProbeSelfTestKernel<<<1, 1, 0, stream>>>();
++}
++
++inline void dumpNemotronBOperandProbe(char const* probe_path, void* probe_workspace,
++                                      size_t probe_workspace_size) {
++  if (probe_workspace == nullptr ||
++      probe_workspace_size < cutlass::gemm::collective::nemotron_probe::ProbeStorageBytes()) {
++    std::fprintf(stderr, "[NEMOTRON] probe workspace too small for operand probe\n");
++    return;
++  }
++  NemotronBOperandProbeState probe = {};
++  cudaError_t const probe_err =
++      cudaMemcpy(&probe, probe_workspace, sizeof(probe), cudaMemcpyDeviceToHost);
++  if (probe_err != cudaSuccess) {
++    std::fprintf(stderr,
++                 "[NEMOTRON] failed to copy B operand probe: %s\n",
++                 cudaGetErrorString(probe_err));
++    return;
++  }
++
++  FILE* probe_fp = std::fopen(probe_path, "w");
++  if (probe_fp == nullptr) {
++    std::fprintf(stderr, "[NEMOTRON] failed to open operand probe path %s\n", probe_path);
++    return;
++  }
++
++  char const* operand_label =
++      probe.operand_kind ==
++              int(cutlass::gemm::collective::nemotron_probe::OperandKind::kActivation)
++          ? "activation"
++          : "weight";
++  char const* physical_a_operand_label =
++      probe.physical_a_operand_kind ==
++              int(cutlass::gemm::collective::nemotron_probe::OperandKind::kActivation)
++          ? "activation"
++          : "weight";
++  char const* physical_b_operand_label =
++      probe.physical_b_operand_kind ==
++              int(cutlass::gemm::collective::nemotron_probe::OperandKind::kActivation)
++          ? "activation"
++          : "weight";
++
++  std::fprintf(
++      probe_fp,
++      "NEMOTRON_B_OPERAND_PROBE version=7 enabled=%d entry_count=%d max_n_tiles=%d max_k_blocks=%d dispatch=(%d,%d) shared_storage_bytes=(%d,%d) next_slot=%d capture_any_thread=%d overwrite_all_threads=%d block_filter=(%d,%d,%d) operand_kind=%d operand=%s swap_ab=%d physical_a_operand_kind=%d physical_a_operand=%s physical_b_operand_kind=%d physical_b_operand=%s synthetic_b_mode=%d synthetic_b_arg=%d tracked_tid_count=%d tracked_tids=",
++      probe.enabled,
++      probe.entry_count,
++      probe.max_n_tiles,
++      probe.max_k_blocks,
++      probe.dispatch_stages,
++      probe.dispatch_scheduler_stages,
++      probe.epilogue_shared_storage_bytes,
++      probe.mainloop_shared_storage_bytes,
++      probe.next_slot,
++      probe.capture_any_thread,
++      probe.overwrite_all_threads,
++      probe.filter_block_idx_x,
++      probe.filter_block_idx_y,
++      probe.filter_block_idx_z,
++      probe.operand_kind,
++      operand_label,
++      probe.swap_ab,
++      probe.physical_a_operand_kind,
++      physical_a_operand_label,
++      probe.physical_b_operand_kind,
++      physical_b_operand_label,
++      probe.synthetic_b_mode,
++      probe.synthetic_b_arg,
++      probe.tracked_tid_count);
++  int const safe_tracked_tid_count =
++      std::max(0, std::min(probe.tracked_tid_count,
++                           cutlass::gemm::collective::nemotron_probe::kMaxTrackedTidCount));
++  for (int idx = 0; idx < safe_tracked_tid_count; ++idx) {
++    std::fprintf(probe_fp, "%s%d", idx == 0 ? "" : ",", probe.tracked_tids[idx]);
++  }
++  std::fprintf(probe_fp, "\n");
++  int const safe_producer_debug_count =
++      std::max(0, std::min(probe.producer_debug_count,
++                           cutlass::gemm::collective::nemotron_probe::kProducerDebugEntryCount));
++  if (safe_producer_debug_count > 0) {
++    for (int idx = 0; idx < safe_producer_debug_count; ++idx) {
++      std::fprintf(
++          probe_fp,
++          "producer_debug=%d stage=%d slot=%d value=%d src=(",
++          idx,
++          probe.producer_debug_stage[idx],
++          probe.producer_debug_slot[idx],
++          probe.producer_debug_value[idx]);
++      for (int comp = 0;
++           comp < cutlass::gemm::collective::nemotron_probe::kProducerDebugComponentCount;
++           ++comp) {
++        std::fprintf(
++            probe_fp,
++            "%s%d",
++            comp == 0 ? "" : ",",
++            probe.producer_debug_src[idx][comp]);
++      }
++      std::fprintf(probe_fp, ") dst=(");
++      for (int comp = 0;
++           comp < cutlass::gemm::collective::nemotron_probe::kProducerDebugComponentCount;
++           ++comp) {
++        std::fprintf(
++            probe_fp,
++            "%s%d",
++            comp == 0 ? "" : ",",
++            probe.producer_debug_dst[idx][comp]);
++      }
++      std::fprintf(probe_fp, ")\n");
++    }
++  }
++  if (probe.stage_byte_snapshot_valid != 0) {
++    std::fprintf(
++        probe_fp,
++        "stage_byte_snapshot read_stage=%d values=",
++        probe.stage_byte_snapshot_read_stage);
++    for (int idx = 0;
++         idx < cutlass::gemm::collective::nemotron_probe::kStageByteSnapshotCount;
++         ++idx) {
++      std::fprintf(
++          probe_fp,
++          "%s%d:%d",
++          idx == 0 ? "" : ",",
++          cutlass::gemm::collective::nemotron_probe::kStageByteSnapshotSlots[idx],
++          probe.stage_byte_snapshot_values[idx]);
++    }
++    std::fprintf(probe_fp, "\n");
++  }
++
++  int const safe_entry_count =
++      std::max(0, std::min(probe.entry_count,
++                           cutlass::gemm::collective::nemotron_probe::kEntryCount));
++  if (probe.entry_count != safe_entry_count) {
++    std::fprintf(
++        probe_fp,
++        "warning=clamped_entry_count raw_entry_count=%d expected_max=%d\n",
++        probe.entry_count,
++        cutlass::gemm::collective::nemotron_probe::kEntryCount);
++  }
++
++  for (int entry_idx = 0; entry_idx < safe_entry_count; ++entry_idx) {
++    NemotronBOperandProbeEntry const& entry = probe.entries[entry_idx];
++    if (!entry.valid) {
++      continue;
++    }
++    std::fprintf(
++        probe_fp,
++        "entry=%d tid=%d block=(%d,%d,%d) tile=(%d,%d,%d) work_k=(%d,%d) read_stage=%d n_tile=%d k_block=%d "
++        "dispatch=(%d,%d) "
++        "k_counts=(%d,%d,%d) "
++        "shapes=tCrB(%d,%d,%d) tCrBcv(%d,%d,%d) tCsB(%d,%d,%d,%d) "
++        "sf_counts=(%d,%d,%d) "
++        "sf_shapes=tCrSFB(%d,%d,%d) tCrSFBcv(%d,%d,%d) tCsSFB(%d,%d,%d,%d) "
++        "sf_atom=(%d,%d,%d) "
++        "sf_layout=(%d,%d,%d,%d,%d,%d) "
++        "part_c0=(%d,%d) local0=(%d,%d) local1=(%d,%d) stage0_offsets=(%d,%d) "
++        "copy_sig_count=%d copy_sig=",
++        entry_idx,
++        entry.thread_idx,
++        entry.block_idx_x,
++        entry.block_idx_y,
++        entry.block_idx_z,
++        entry.tile_m_idx,
++        entry.tile_n_idx,
++        entry.tile_l_idx,
++        entry.work_k_tile_start,
++        entry.work_k_tile_count,
++        entry.read_stage,
++        entry.n_tile,
++        entry.k_block,
++        entry.dispatch_stages,
++        entry.dispatch_scheduler_stages,
++        entry.tcrb_k_blocks,
++        entry.tcrb_copy_view_k_blocks,
++        entry.tcsb_coord_k_blocks,
++        entry.tcrb_dim0,
++        entry.tcrb_dim1,
++        entry.tcrb_k_blocks,
++        entry.tcrb_copy_view_dim0,
++        entry.tcrb_copy_view_dim1,
++        entry.tcrb_copy_view_k_blocks,
++        entry.tcsb_coord_dim0,
++        entry.tcsb_coord_dim1,
++        entry.tcsb_coord_k_blocks,
++        entry.tcsb_coord_stage_count,
++        entry.tcrsfb_k_blocks,
++        entry.tcrsfb_copy_view_k_blocks,
++        entry.tcssfb_coord_k_blocks,
++        entry.tcrsfb_dim0,
++        entry.tcrsfb_dim1,
++        entry.tcrsfb_k_blocks,
++        entry.tcrsfb_copy_view_dim0,
++        entry.tcrsfb_copy_view_dim1,
++        entry.tcrsfb_copy_view_k_blocks,
++        entry.tcssfb_coord_dim0,
++        entry.tcssfb_coord_dim1,
++        entry.tcssfb_coord_k_blocks,
++        entry.tcssfb_coord_stage_count,
++        entry.sf_vec_size,
++        entry.smem_layout_atom_sfb_dim0,
++        entry.smem_layout_atom_sfb_dim1,
++        entry.sfb_stage_elems,
++        entry.sfb_total_elems,
++        entry.sfb_stage_shape_dim0,
++        entry.sfb_stage_shape_dim1,
++        entry.layout_sfb_tv_dim0,
++        entry.layout_sfb_tv_dim1,
++        entry.part_c_row0,
++        entry.part_c_col0,
++        entry.local_row0,
++        entry.local_col0,
++        entry.local_row1,
++        entry.local_col1,
++        entry.stage0_offset0,
++        entry.stage0_offset1,
++        entry.copy_view_sig_count);
++    int const safe_sig_count =
++        std::max(0, std::min(entry.copy_view_sig_count,
++                             cutlass::gemm::collective::nemotron_probe::kCopyViewSignatureLen));
++    for (int sig = 0; sig < safe_sig_count; ++sig) {
++      std::fprintf(
++          probe_fp,
++          "%s%d:%d",
++          sig == 0 ? "" : ",",
++          entry.copy_view_stage_offsets[sig],
++          entry.copy_view_stage_bytes[sig]);
++    }
++    std::fprintf(
++        probe_fp,
++        " scale_reg_word_count=%d scale_reg_pre=(0x%08x,0x%08x,0x%08x,0x%08x) scale_reg_post=(0x%08x,0x%08x,0x%08x,0x%08x) reg_pre=(0x%08x,0x%08x) reg_post=(0x%08x,0x%08x)\n",
++        entry.sf_reg_word_count,
++        entry.sf_reg_words_pre[0],
++        entry.sf_reg_words_pre[1],
++        entry.sf_reg_words_pre[2],
++        entry.sf_reg_words_pre[3],
++        entry.sf_reg_words_post[0],
++        entry.sf_reg_words_post[1],
++        entry.sf_reg_words_post[2],
++        entry.sf_reg_words_post[3],
++        entry.reg0_pre,
++        entry.reg1_pre,
++        entry.reg0_post,
++        entry.reg1_post);
++    int const safe_raw_sig_count =
++        std::max(0, std::min(entry.copy_view_raw_sig_count,
++                             cutlass::gemm::collective::nemotron_probe::kCopyViewRawSignatureLen));
++    if (safe_raw_sig_count > 0) {
++      std::fprintf(probe_fp, "raw_copy_view=");
++      for (int sig = 0; sig < safe_raw_sig_count; ++sig) {
++        std::fprintf(
++            probe_fp,
++            "%s(%d,%d):%d:%d:%d",
++            sig == 0 ? "" : ",",
++            entry.copy_view_raw_rows[sig],
++            entry.copy_view_raw_cols[sig],
++            entry.copy_view_raw_stage_offsets[sig],
++            entry.copy_view_raw_stage_bytes[sig],
++            entry.copy_view_raw_byte_indices[sig]);
++      }
++      std::fprintf(probe_fp, "\n");
++      std::fprintf(probe_fp, "raw_copy_view_components=");
++      for (int sig = 0; sig < safe_raw_sig_count; ++sig) {
++        std::fprintf(
++            probe_fp,
++            "%s(",
++            sig == 0 ? "" : ",");
++        for (int comp = 0;
++             comp < cutlass::gemm::collective::nemotron_probe::kProducerDebugComponentCount;
++             ++comp) {
++          std::fprintf(
++              probe_fp,
++              "%s%d",
++              comp == 0 ? "" : ",",
++              entry.copy_view_raw_coord_components[sig][comp]);
++        }
++        std::fprintf(probe_fp, ")");
++      }
++      std::fprintf(probe_fp, "\n");
++    }
++    bool show_semantic =
++        entry.semantic_row0 >= 0 ||
++        entry.semantic_byte0 >= 0 ||
++        entry.semantic_k_tile0 >= 0 ||
++        entry.semantic_row1 >= 0 ||
++        entry.semantic_byte1 >= 0 ||
++        entry.semantic_k_tile1 >= 0;
++    if (!show_semantic) {
++      for (int sig = 0; sig < safe_sig_count; ++sig) {
++        if (entry.copy_view_semantic_rows[sig] >= 0 ||
++            entry.copy_view_semantic_byte_indices[sig] >= 0 ||
++            entry.copy_view_semantic_k_tiles[sig] >= 0) {
++          show_semantic = true;
++          break;
 +        }
 +      }
 +    }
-+    // <<< NEMOTRON BF16 gemm1_output dump <<<
++    if (!show_semantic) {
++      for (int sig = 0; sig < safe_raw_sig_count; ++sig) {
++        if (entry.copy_view_raw_semantic_rows[sig] >= 0 ||
++            entry.copy_view_raw_semantic_byte_indices[sig] >= 0 ||
++            entry.copy_view_raw_semantic_k_tiles[sig] >= 0) {
++          show_semantic = true;
++          break;
++        }
++      }
++    }
++    if (show_semantic) {
++      std::fprintf(
++          probe_fp,
++          "semantic_copy_view=logical0=(%d,%d,%d) logical1=(%d,%d,%d) sig=",
++          entry.semantic_row0,
++          entry.semantic_byte0,
++          entry.semantic_k_tile0,
++          entry.semantic_row1,
++          entry.semantic_byte1,
++          entry.semantic_k_tile1);
++      for (int sig = 0; sig < safe_sig_count; ++sig) {
++        std::fprintf(
++            probe_fp,
++            "%s%d:%d:%d",
++            sig == 0 ? "" : ",",
++            entry.copy_view_semantic_rows[sig],
++            entry.copy_view_semantic_byte_indices[sig],
++            entry.copy_view_semantic_k_tiles[sig]);
++      }
++      std::fprintf(probe_fp, "\n");
++      if (safe_raw_sig_count > 0) {
++        std::fprintf(probe_fp, "semantic_raw_copy_view=");
++        for (int sig = 0; sig < safe_raw_sig_count; ++sig) {
++          std::fprintf(
++              probe_fp,
++              "%s(%d,%d):%d:%d:%d",
++              sig == 0 ? "" : ",",
++              entry.copy_view_raw_rows[sig],
++              entry.copy_view_raw_cols[sig],
++              entry.copy_view_raw_semantic_rows[sig],
++              entry.copy_view_raw_semantic_byte_indices[sig],
++              entry.copy_view_raw_semantic_k_tiles[sig]);
++        }
++        std::fprintf(probe_fp, "\n");
++      }
++    }
++  }
++
++  std::fclose(probe_fp);
++  std::fprintf(stderr, "[NEMOTRON] wrote operand probe to %s\n", probe_path);
++}
++
++template <class DumpElem>
++inline void dumpNemotronGemm1Boundary(
++    char const* dump_path,
++    void const* gemm_output,
++    std::size_t dump_rows,
++    std::size_t dump_cols,
++    bool is_gated_activation) {
++  std::size_t const dump_elems = dump_rows * dump_cols;
++  std::size_t const dump_bytes = dump_elems * sizeof(DumpElem);
++  std::vector<unsigned char> host_buf(dump_bytes);
++  cudaError_t const memcpy_err = cudaMemcpy(
++      host_buf.data(),
++      static_cast<DumpElem const*>(gemm_output),
++      dump_bytes,
++      cudaMemcpyDeviceToHost);
++  if (memcpy_err != cudaSuccess) {
++    std::fprintf(stderr,
++                 "[NEMOTRON] failed to copy BF16 gemm1_output: %s\n",
++                 cudaGetErrorString(memcpy_err));
++    return;
++  }
++
++  if (FILE* dump_fp = std::fopen(dump_path, "wb")) {
++    unsigned char header[64] = {};
++    header[0] = 'N'; header[1] = 'E'; header[2] = 'M';
++    header[3] = 'O'; header[4] = 'P'; header[5] = '1';
++    std::uint32_t const version = 1u;
++    std::uint32_t const rows_u32 = static_cast<std::uint32_t>(dump_rows);
++    std::uint32_t const cols_u32 = static_cast<std::uint32_t>(dump_cols);
++    std::uint32_t const elem_bytes_u32 = static_cast<std::uint32_t>(sizeof(DumpElem));
++    std::uint32_t const gated_u32 = static_cast<std::uint32_t>(is_gated_activation ? 1u : 0u);
++    std::memcpy(header + 8, &version, 4);
++    std::memcpy(header + 12, &rows_u32, 4);
++    std::memcpy(header + 16, &cols_u32, 4);
++    std::memcpy(header + 20, &elem_bytes_u32, 4);
++    std::memcpy(header + 24, &gated_u32, 4);
++    std::fwrite(header, 1, sizeof(header), dump_fp);
++    std::fwrite(host_buf.data(), 1, dump_bytes, dump_fp);
++    std::fclose(dump_fp);
++    std::fprintf(stderr,
++                 "[NEMOTRON] wrote %zu bytes of BF16 gemm1_output to %s (rows=%zu cols=%zu)\n",
++                 dump_bytes, dump_path, dump_rows, dump_cols);
++  }
++}
++
++inline void dumpNemotronRawBuffer(
++    char const* dump_path,
++    void const* device_ptr,
++    std::size_t dump_bytes,
++    char const* label) {
++  std::vector<unsigned char> host_buf(dump_bytes);
++  cudaError_t const memcpy_err =
++      cudaMemcpy(host_buf.data(), device_ptr, dump_bytes, cudaMemcpyDeviceToHost);
++  if (memcpy_err != cudaSuccess) {
++    std::fprintf(stderr,
++                 "[NEMOTRON] failed to copy %s: %s\n",
++                 label,
++                 cudaGetErrorString(memcpy_err));
++    return;
++  }
++
++  if (FILE* dump_fp = std::fopen(dump_path, "wb")) {
++    std::fwrite(host_buf.data(), 1, dump_bytes, dump_fp);
++    std::fclose(dump_fp);
++    std::fprintf(stderr,
++                 "[NEMOTRON] wrote %zu raw bytes of %s to %s\n",
++                 dump_bytes,
++                 label,
++                 dump_path);
++  }
++}
++
++enum class NemotronPackedBytePattern : int {
++  kDisabled = 0,
++  kRowIndex = 1,
++  kByteIndexLow8 = 2,
++  kLinearIndexLow8 = 3,
++  kRowXorByteLow8 = 4,
++};
++
++inline NemotronPackedBytePattern parseNemotronPackedBytePattern(char const* pattern_name) {
++  if (pattern_name == nullptr || pattern_name[0] == '\0') {
++    return NemotronPackedBytePattern::kDisabled;
++  }
++  if (std::strcmp(pattern_name, "row_index") == 0) {
++    return NemotronPackedBytePattern::kRowIndex;
++  }
++  if (std::strcmp(pattern_name, "byte_index_low8") == 0) {
++    return NemotronPackedBytePattern::kByteIndexLow8;
++  }
++  if (std::strcmp(pattern_name, "linear_index_low8") == 0) {
++    return NemotronPackedBytePattern::kLinearIndexLow8;
++  }
++  if (std::strcmp(pattern_name, "row_xor_byte_low8") == 0) {
++    return NemotronPackedBytePattern::kRowXorByteLow8;
++  }
++  return NemotronPackedBytePattern::kDisabled;
++}
++
++__global__ void nemotronFillPackedBytePatternKernel(
++    std::uint8_t* out,
++    std::size_t row_bytes,
++    int rows,
++    NemotronPackedBytePattern pattern) {
++  std::size_t const total = static_cast<std::size_t>(rows) * row_bytes;
++  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++  while (idx < total) {
++    std::size_t const row = idx / row_bytes;
++    std::size_t const col = idx % row_bytes;
++    std::uint8_t value = 0u;
++    switch (pattern) {
++      case NemotronPackedBytePattern::kRowIndex:
++        value = static_cast<std::uint8_t>(row & 0xffu);
++        break;
++      case NemotronPackedBytePattern::kByteIndexLow8:
++        value = static_cast<std::uint8_t>(col & 0xffu);
++        break;
++      case NemotronPackedBytePattern::kLinearIndexLow8:
++        value = static_cast<std::uint8_t>(idx & 0xffu);
++        break;
++      case NemotronPackedBytePattern::kRowXorByteLow8:
++        value = static_cast<std::uint8_t>((row ^ col) & 0xffu);
++        break;
++      default:
++        value = 0u;
++        break;
++    }
++    out[idx] = value;
++    idx += static_cast<std::size_t>(blockDim.x) * gridDim.x;
++  }
++}
++
++inline void maybeOverwriteNemotronGemm1Input(
++    char const* pattern_name,
++    void* device_ptr,
++    std::size_t row_bytes,
++    int rows,
++    cudaStream_t stream) {
++  NemotronPackedBytePattern const pattern = parseNemotronPackedBytePattern(pattern_name);
++  if (pattern == NemotronPackedBytePattern::kDisabled) {
++    return;
++  }
++  std::size_t const total = static_cast<std::size_t>(rows) * row_bytes;
++  int const threads = 256;
++  int const blocks = static_cast<int>((total + threads - 1) / threads);
++  nemotronFillPackedBytePatternKernel<<<blocks, threads, 0, stream>>>(
++      static_cast<std::uint8_t*>(device_ptr),
++      row_bytes,
++      rows,
++      pattern);
++  cudaError_t const kernel_err = cudaGetLastError();
++  if (kernel_err != cudaSuccess) {
++    std::fprintf(stderr,
++                 "[NEMOTRON] failed to launch gemm1_input overwrite pattern=%s: %s\n",
++                 pattern_name,
++                 cudaGetErrorString(kernel_err));
++  } else {
++    std::fprintf(stderr,
++                 "[NEMOTRON] overwrote gemm1_input with pattern=%s (rows=%d row_bytes=%zu)\n",
++                 pattern_name,
++                 rows,
++                 row_bytes);
++  }
++}
++
+ /**
+  * Takes the input maps and prepares the expanded maps for min latency
+  * @param num_active_experts_per_node: Number of active experts on current node
+@@ -3061,10 +3795,42 @@
+                                                                 /*use_fused_moe*/ false,
+                                                                 stream,
+                                                                 config};
++    char const* nemotron_dump_path = std::getenv("NEMOTRON_TRTLLM_DUMP_GEMM1");
++    char const* nemotron_operand_probe_path = std::getenv("NEMOTRON_TRTLLM_DUMP_OPERAND_PROBE");
++    resetNemotronBOperandProbe(
++        tma_ws_input.nemotron_operand_probe_workspace,
++        tma_ws_input.nemotron_operand_probe_workspace_size,
++        nemotron_operand_probe_path != nullptr,
++        tma_ws_input.swap_ab);
+     gemm_runner.moeGemm(universal_input, tma_ws_input);
+
+     sync_check_cuda_error(stream);
+
++    if (nemotron_dump_path || nemotron_operand_probe_path) {
++      cudaError_t const sync_err = cudaStreamSynchronize(stream);
++      if (sync_err != cudaSuccess) {
++        std::fprintf(stderr,
++                     "[NEMOTRON] post-GEMM sync failed: %s\n",
++                     cudaGetErrorString(sync_err));
++      } else {
++        if (nemotron_dump_path) {
++          using DumpElem = UnfusedGemmOutputType;
++          dumpNemotronGemm1Boundary<DumpElem>(
++              nemotron_dump_path,
++              gemm_output,
++              static_cast<std::size_t>(expanded_num_rows),
++              static_cast<std::size_t>(fc1_out_size),
++              is_gated_activation);
++        }
++        if (nemotron_operand_probe_path) {
++          dumpNemotronBOperandProbe(
++              nemotron_operand_probe_path,
++              tma_ws_input.nemotron_operand_probe_workspace,
++              tma_ws_input.nemotron_operand_probe_workspace_size);
++        }
++      }
++    }
 +
      // TODO: when bias_is_broadcast is false, fuse bias to gemm
      using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
      bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
+@@ -3870,6 +4636,60 @@
+                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
+     }
+     sync_check_cuda_error(stream);
++    char const* nemotron_gemm1_input_pattern = std::getenv("NEMOTRON_TRTLLM_GEMM1_INPUT_PATTERN");
++    if (nemotron_gemm1_input_pattern) {
++      std::size_t const gemm1_input_row_bytes =
++          use_fp4 ? (static_cast<std::size_t>(hidden_size) / 2) : (static_cast<std::size_t>(hidden_size) * sizeof(T));
++      maybeOverwriteNemotronGemm1Input(
++          nemotron_gemm1_input_pattern,
++          const_cast<void*>(static_cast<void const*>(gemm1_input)),
++          gemm1_input_row_bytes,
++          static_cast<int>(expanded_num_rows),
++          stream);
++      sync_check_cuda_error(stream);
++    }
++    char const* nemotron_gemm1_input_dump_path = std::getenv("NEMOTRON_TRTLLM_DUMP_GEMM1_INPUT");
++    if (nemotron_gemm1_input_dump_path) {
++      cudaError_t const sync_err = cudaStreamSynchronize(stream);
++      if (sync_err != cudaSuccess) {
++        std::fprintf(stderr,
++                     "[NEMOTRON] pre-GEMM1-input sync failed: %s\n",
++                     cudaGetErrorString(sync_err));
++      } else {
++        std::size_t const gemm1_input_elems =
++            static_cast<std::size_t>(expanded_num_rows) * static_cast<std::size_t>(hidden_size);
++        std::size_t const gemm1_input_bytes =
++            use_fp4 ? (gemm1_input_elems / 2) : (gemm1_input_elems * sizeof(T));
++        dumpNemotronRawBuffer(
++            nemotron_gemm1_input_dump_path,
++            gemm1_input,
++            gemm1_input_bytes,
++            "gemm1_input");
++      }
++    }
++    char const* nemotron_gemm1_weight_dump_path = std::getenv("NEMOTRON_TRTLLM_DUMP_GEMM1_WEIGHT");
++    if (nemotron_gemm1_weight_dump_path) {
++      cudaError_t const sync_err = cudaStreamSynchronize(stream);
++      if (sync_err != cudaSuccess) {
++        std::fprintf(stderr,
++                     "[NEMOTRON] pre-GEMM1-weight sync failed: %s\n",
++                     cudaGetErrorString(sync_err));
++      } else {
++        std::size_t const gemm1_weight_cols =
++            static_cast<std::size_t>(is_gated_activation ? inter_size * 2 : inter_size);
++        std::size_t const gemm1_weight_elems =
++            static_cast<std::size_t>(num_experts_per_node) *
++            static_cast<std::size_t>(hidden_size) *
++            gemm1_weight_cols;
++        std::size_t const gemm1_weight_bytes =
++            use_fp4 ? (gemm1_weight_elems / 2) : (gemm1_weight_elems * sizeof(WeightType));
++        dumpNemotronRawBuffer(
++            nemotron_gemm1_weight_dump_path,
++            fc1_expert_weights,
++            gemm1_weight_bytes,
++            "gemm1_weight");
++      }
++    }
+     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
+                 glu_inter_result_, expert_first_token_offset_, gemm1_tma_ws_input,
+                 fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
+--- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu
++++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu
+@@ -14,7 +14,9 @@
+  * limitations under the License.
+  */
+
++#define NEMOTRON_PROBE_DEFINE_DEVICE_SYMBOL
+ #include "cutlass_fused_moe_kernels.cuh"
++#undef NEMOTRON_PROBE_DEFINE_DEVICE_SYMBOL
+ #include "moe_kernels.h"
+
+ namespace tensorrt_llm::kernels::cutlass_kernels {
+--- a/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp
++++ b/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp
+@@ -39,6 +39,7 @@
+ #include "cutlass/detail/sm100_blockscaled_layout.hpp"
+ #include "cutlass/trace.h"
+ #include "cutlass/numeric_types.h"
++#include "cutlass/gemm/collective/nemotron_operand_probe.hpp"
+
+ #include "cute/arch/cluster_sm90.hpp"
+ #include "cute/arch/copy_sm90.hpp"
+@@ -316,6 +317,10 @@
+     TMA_SFB tma_load_sfb;
+     LayoutSFA layout_SFA;
+     LayoutSFB layout_SFB;
++    void const* const* raw_ptr_array_a = nullptr;
++    void const* const* raw_ptr_array_b = nullptr;
++    int raw_row_bytes_a = 0;
++    int raw_row_bytes_b = 0;
+     uint32_t tma_transaction_bytes = TmaTransactionBytes;
+     uint32_t tma_transaction_bytes_mk = TmaTransactionBytesMK;
+     uint32_t tma_transaction_bytes_nk = TmaTransactionBytesNK;
+@@ -333,6 +338,10 @@
+     // Optionally append 1s until problem shape is rank-4 (MNKL), in case it is only rank-3 (MNK)
+     auto problem_shape_MNKL = append<4>(problem_shape, 1);
+     auto [M, N, K, L] = problem_shape_MNKL;
++    int const raw_row_bytes_a =
++        (static_cast<int>(K) * cutlass::sizeof_bits<ElementA>::value + 7) / 8;
++    int const raw_row_bytes_b =
++        (static_cast<int>(K) * cutlass::sizeof_bits<ElementB>::value + 7) / 8;
+
+     auto ptr_A = recast_ptr<TmaInternalElementA>(args.ptr_A);
+     auto ptr_B = recast_ptr<TmaInternalElementB>(args.ptr_B);
+@@ -377,6 +386,10 @@
+       tma_load_sfb,
+       args.layout_SFA,
+       args.layout_SFB,
++      reinterpret_cast<void const* const*>(args.ptr_A),
++      reinterpret_cast<void const* const*>(args.ptr_B),
++      raw_row_bytes_a,
++      raw_row_bytes_b,
+       TmaTransactionBytes,
+       TmaTransactionBytesMK,
+       TmaTransactionBytesNK
+@@ -644,6 +657,28 @@
+
+       Tensor tBgSFB = block_tma_sfb.partition_S(gSFB);                                        // (TMA,TMA_N,TMA_K,k)
+       Tensor tBsSFB = block_tma_sfb.partition_D(sSFB);                                        // (TMA,TMA_N,TMA_K,PIPE)
++      auto* probe_state = nemotron_probe::ProbeStateResolver<Params>::get(params);
++      auto gA_coords = cute::make_identity_tensor(cute::shape(gA));
++      Tensor tAgA_coords = block_tma_a.partition_S(gA_coords);                                // (TMA,TMA_M,TMA_K,k)
++      auto sA_coords = cute::make_identity_tensor(cute::shape(sA));
++      Tensor tAsA_coords = block_tma_a.partition_D(sA_coords);                                // (TMA,TMA_M,TMA_K,PIPE)
++      auto stage0_A = SmemLayoutA{}(_, _, Int<0>{});
++      int const source_row_base_A =
++          nemotron_probe::CoordGet0(m_coord) * static_cast<int>(size<0>(gA));
++      int const source_k_span_A = static_cast<int>(size<1>(gA));
++      auto gB_coords = cute::make_identity_tensor(cute::shape(gB));
++      Tensor tBgB_coords = block_tma_b.partition_S(gB_coords);                                // (TMA,TMA_N,TMA_K,k)
++      auto sB_coords = cute::make_identity_tensor(cute::shape(sB));
++      Tensor tBsB_coords = block_tma_b.partition_D(sB_coords);                                // (TMA,TMA_N,TMA_K,PIPE)
++      auto stage0_B = SmemLayoutB{}(_, _, Int<0>{});
++      int const source_row_base_B =
++          nemotron_probe::CoordGet0(n_coord) * static_cast<int>(size<0>(gB));
++      int const source_k_span_B = static_cast<int>(size<1>(gB));
++      int const group_idx = nemotron_probe::CoordGet0(l_coord);
++      void const* raw_ptr_a =
++          params.raw_ptr_array_a == nullptr ? nullptr : params.raw_ptr_array_a[group_idx];
++      void const* raw_ptr_b =
++          params.raw_ptr_array_b == nullptr ? nullptr : params.raw_ptr_array_b[group_idx];
+
+       // Mainloop
+       CUTLASS_PRAGMA_NO_UNROLL
+@@ -660,7 +695,31 @@
+
+         int write_stage = smem_pipe_write.index();
+         copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
++        nemotron_probe::RecordSemanticWeightSourceStage(
++            probe_state,
++            nemotron_probe::ProbeLogicalOperandKindForPhysicalA(probe_state),
++            write_stage,
++            gA,
++            tAgA_coords(_,_,_,*k_tile_iter),
++            tAsA_coords(_,_,_,write_stage),
++            stage0_A,
++            source_row_base_A,
++            source_k_span_A,
++            raw_ptr_a,
++            params.raw_row_bytes_a);
+         copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
++        nemotron_probe::RecordSemanticWeightSourceStage(
++            probe_state,
++            nemotron_probe::ProbeLogicalOperandKindForPhysicalB(probe_state),
++            write_stage,
++            gB,
++            tBgB_coords(_,_,_,*k_tile_iter),
++            tBsB_coords(_,_,_,write_stage),
++            stage0_B,
++            source_row_base_B,
++            source_k_span_B,
++            raw_ptr_b,
++            params.raw_row_bytes_b);
+
+         copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_,_,_,*k_tile_iter), tAsSFA(_,_,_,write_stage));
+         copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_,_,_,*k_tile_iter), tBsSFB(_,_,_,write_stage));
+@@ -738,6 +797,8 @@
+     Tensor tCsA            = smem_thr_copy_A.partition_S(
+       as_position_independent_swizzle_tensor(sA));                                      // (CPY,CPY_M,CPY_K,PIPE)
+     Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                            //      (CPY,CPY_M,CPY_K)
++    auto a_coords          = cute::make_identity_tensor(cute::shape(sA));
++    Tensor tCsA_coords     = smem_thr_copy_A.partition_S(a_coords);                     // (CPY,CPY_M,CPY_K,PIPE)
+
+     // B
+     auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+@@ -745,11 +806,14 @@
+     Tensor tCsB            = smem_thr_copy_B.partition_S(
+       as_position_independent_swizzle_tensor(sB));                                      // (CPY,CPY_M,CPY_K,PIPE)
+     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                            //      (CPY,CPY_M,CPY_K)
++    auto b_coords          = cute::make_identity_tensor(cute::shape(sB));
++    auto tCsB_coords       = smem_thr_copy_B.partition_S(b_coords);                     // (CPY,CPY_M,CPY_K,PIPE)
+
+     // SFA
+     auto tile_shape_mnk = tile_shape(tiled_mma);
++    auto layout_sfa_tv = get_layoutSFA_TV(tiled_mma);
+     auto smem_tiled_copy_SFA = make_tiled_copy_impl(SmemCopyAtomSFA{},
+-                                                    get_layoutSFA_TV(tiled_mma),
++                                                    layout_sfa_tv,
+                                                     make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk))
+                                                   );
+     auto smem_thr_copy_SFA   = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+@@ -762,6 +826,7 @@
+                                                     get_layoutSFB_TV(tiled_mma),
+                                                     make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk))
+                                                   );
++    auto layout_sfb_tv = get_layoutSFB_TV(tiled_mma);
+     auto smem_thr_copy_SFB   = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+     Tensor tCsSFB            = smem_thr_copy_SFB.partition_S(
+       as_position_independent_swizzle_tensor(sSFB));                                       // (CPY,CPY_N,CPY_K,PIPE)
+@@ -791,6 +856,11 @@
+
+     // Size of the register pipeline
+     auto K_BLOCK_MAX = size<2>(tCrA);
++    auto dense_c = cute::make_identity_tensor(
++      cute::make_shape(size<0>(TileShape{}), size<1>(TileShape{})));
++    auto part_c = thread_mma.partition_C(dense_c);
++    auto stage0_A = SmemLayoutA{}(_, _, Int<0>{});
++    auto stage0_B = SmemLayoutB{}(_, _, Int<0>{});
+
+     int read_stage = smem_pipe_read.index();
+     auto tCsA_stage   = tCsA(_,_,_,read_stage);
+@@ -801,17 +871,99 @@
+     auto copy_kblock = [&](auto k_block) {
+         // copy smem->rmem for A/B operand
+       copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
++      if (nemotron_probe::ProbeSyntheticBOverwriteEnabled()) {
++        nemotron_probe::MaybeOverwriteBOperandSource(
++          thread_idx,
++          tCsB_coords(_,_,k_block,read_stage),
++          shared_tensors.smem_B.begin(),
++          stage0_B);
++      }
+       copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
+
++      if (nemotron_probe::ProbeActivationOperandEnabled()) {
++        nemotron_probe::RecordAOperandPre(
++          thread_idx,
++          read_stage,
++          k_block,
++          tCsA_coords,
++          tCsSFA,
++          part_c,
++          stage0_A,
++          shared_tensors.smem_A.begin(),
++          tCrA,
++          tCrA_copy_view,
++          tCrSFA,
++          tCrSFA_copy_view,
++          SFVecSize,
++          static_cast<int>(size<0>(SmemLayoutAtomSFA{})),
++          static_cast<int>(size<1>(SmemLayoutAtomSFA{})),
++          static_cast<int>(cosize(take<0,2>(SmemLayoutSFA{}))),
++          static_cast<int>(cute::cosize_v<SmemLayoutSFA>),
++          static_cast<int>(size<0>(SmemLayoutSFA{})),
++          static_cast<int>(size<1>(SmemLayoutSFA{})),
++          static_cast<int>(size<0>(layout_sfa_tv)),
++          static_cast<int>(size<1>(layout_sfa_tv)));
++      } else {
++        nemotron_probe::RecordBOperandPre(
++          thread_idx,
++          read_stage,
++          k_block,
++          tCsB_coords,
++          tCsSFB,
++          part_c,
++          stage0_B,
++          shared_tensors.smem_B.begin(),
++          tCrB,
++          tCrB_copy_view,
++          tCrSFB,
++          tCrSFB_copy_view,
++          SFVecSize,
++          static_cast<int>(size<0>(SmemLayoutAtomSFB{})),
++          static_cast<int>(size<1>(SmemLayoutAtomSFB{})),
++          static_cast<int>(cosize(take<0,2>(SmemLayoutSFB{}))),
++          static_cast<int>(cute::cosize_v<SmemLayoutSFB>),
++          static_cast<int>(size<0>(SmemLayoutSFB{})),
++          static_cast<int>(size<1>(SmemLayoutSFB{})),
++          static_cast<int>(size<0>(layout_sfb_tv)),
++          static_cast<int>(size<1>(layout_sfb_tv)));
++      }
++
+       // Left shift A,B for FP4
+       using MMAOp = typename TiledMma::MMA_Op;
+       fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+       fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
+
++      if (nemotron_probe::ProbeActivationOperandEnabled()) {
++        nemotron_probe::RecordAOperandPost(
++          thread_idx,
++          k_block,
++          part_c,
++          tCrA);
++      } else {
++        nemotron_probe::RecordBOperandPost(
++          thread_idx,
++          k_block,
++          part_c,
++          tCrB);
++      }
++
+
+       // Copy smem->rmem for SFA/SFB operand
+       copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
+       copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
++      if (nemotron_probe::ProbeActivationOperandEnabled()) {
++        nemotron_probe::RecordAOperandScalePost(
++          thread_idx,
++          k_block,
++          part_c,
++          tCrSFA);
++      } else {
++        nemotron_probe::RecordBOperandScalePost(
++          thread_idx,
++          k_block,
++          part_c,
++          tCrSFB);
++      }
+     };
+
+     auto gemm_kblock = [&](auto k_block) {
+--- a/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp
++++ b/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp
+@@ -39,6 +39,7 @@
+ #include "cutlass/detail/sm100_blockscaled_layout.hpp"
+ #include "cutlass/trace.h"
+ #include "cutlass/numeric_types.h"
++#include "cutlass/gemm/collective/nemotron_operand_probe.hpp"
+
+ #include "cute/arch/cluster_sm90.hpp"
+ #include "cute/arch/copy_sm90.hpp"
+@@ -290,6 +291,7 @@
+     LayoutSFA layout_SFA{};
+     ElementSF const** ptr_SFB{nullptr};
+     LayoutSFB layout_SFB{};
++    nemotron_probe::BOperandProbeState* probe_state{nullptr};
+   };
+
+   // Device side kernel params
+@@ -331,11 +333,14 @@
+     uint32_t tma_transaction_bytes = TmaTransactionBytes;
+     uint32_t tma_transaction_bytes_mk = TmaTransactionBytesMK;
+     uint32_t tma_transaction_bytes_nk = TmaTransactionBytesNK;
++    nemotron_probe::BOperandProbeState* probe_state;
+     cute::TmaDescriptor* tensormaps;
+     ElementA const** ptr_A;
+     StrideA dA;
+     ElementB const** ptr_B;
+     StrideB dB;
++    int raw_row_bytes_a = 0;
++    int raw_row_bytes_b = 0;
+     ElementSF const** ptr_SFA;
+     LayoutSFA layout_SFA;
+     ElementSF const** ptr_SFB;
+@@ -349,7 +354,7 @@
+   template <class ProblemShape>
+   static constexpr Params
+   to_underlying_arguments(ProblemShape const& problem_shapes, Arguments const& args, void* workspace) {
+-    (void) workspace;
++    auto* tensormaps = reinterpret_cast<cute::TmaDescriptor*>(workspace);
+     // These tensor shapes (only applicable for grouped gemm) and pointers are only used to create tensormap/tma desc.
+     // These will be replaced with correct values before the initial tma load.
+     auto init_M = int32_t(size<0>(TileShape{}));
+@@ -419,6 +424,10 @@
+         SmemLayoutSFB{}(_,_,cute::Int<0>{}),
+         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
+         _1{}); // No programmatic multicast
++    int const raw_row_bytes_a =
++        (init_K * cutlass::sizeof_bits<ElementA>::value + 7) / 8;
++    int const raw_row_bytes_b =
++        (init_K * cutlass::sizeof_bits<ElementB>::value + 7) / 8;
+
+     return {
+       tma_load_a,
+@@ -428,11 +437,14 @@
+       TmaTransactionBytes,
+       TmaTransactionBytesMK,
+       TmaTransactionBytesNK,
+-      reinterpret_cast<cute::TmaDescriptor*>(workspace),
++      args.probe_state,
++      tensormaps,
+       reinterpret_cast<ArrayElementA const**>(args.ptr_A),
+       args.dA,
+       reinterpret_cast<ArrayElementB const**>(args.ptr_B),
+       args.dB,
++      raw_row_bytes_a,
++      raw_row_bytes_b,
+       reinterpret_cast<ElementSF const**>(args.ptr_SFA),
+       args.layout_SFA,
+       reinterpret_cast<ElementSF const**>(args.ptr_SFB),
+@@ -446,7 +458,7 @@
+     constexpr uint32_t NumInputTensors = 4;
+     constexpr size_t SizeOfCuTensorMap = sizeof(cute::TmaDescriptor);
+     // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies
+-    return (NumInputTensors * SizeOfCuTensorMap * sm_count);
++    return NumInputTensors * SizeOfCuTensorMap * sm_count;
+   }
+
+   template <class ProblemShape>
+@@ -729,6 +741,28 @@
+
+       Tensor tBgSFB = block_tma_sfb.partition_S(gSFB);                                        // (TMA,TMA_N,TMA_K,k)
+       Tensor tBsSFB = block_tma_sfb.partition_D(sSFB);                                        // (TMA,TMA_N,TMA_K,PIPE)
++      auto* probe_state = nemotron_probe::ProbeStateResolver<Params>::get(params);
++      auto gA_coords = cute::make_identity_tensor(cute::shape(gA));
++      Tensor tAgA_coords = block_tma_a.partition_S(gA_coords);                                // (TMA,TMA_M,TMA_K,k)
++      auto sA_coords = cute::make_identity_tensor(cute::shape(sA));
++      Tensor tAsA_coords = block_tma_a.partition_D(sA_coords);                                // (TMA,TMA_M,TMA_K,PIPE)
++      auto stage0_A = SmemLayoutA{}(_, _, Int<0>{});
++      int const source_row_base_A =
++          nemotron_probe::CoordGet0(m_coord) * static_cast<int>(size<0>(gA));
++      int const source_k_span_A = static_cast<int>(size<1>(gA));
++      auto gB_coords = cute::make_identity_tensor(cute::shape(gB));
++      Tensor tBgB_coords = block_tma_b.partition_S(gB_coords);                                // (TMA,TMA_N,TMA_K,k)
++      auto sB_coords = cute::make_identity_tensor(cute::shape(sB));
++      Tensor tBsB_coords = block_tma_b.partition_D(sB_coords);                                // (TMA,TMA_N,TMA_K,PIPE)
++      auto stage0_B = SmemLayoutB{}(_, _, Int<0>{});
++      int const source_row_base_B =
++          nemotron_probe::CoordGet0(n_coord) * static_cast<int>(size<0>(gB));
++      int const source_k_span_B = static_cast<int>(size<1>(gB));
++      int const group_idx = nemotron_probe::CoordGet0(l_coord);
++      void const* raw_ptr_a =
++          params.ptr_A == nullptr ? nullptr : params.ptr_A[group_idx];
++      void const* raw_ptr_b =
++          params.ptr_B == nullptr ? nullptr : params.ptr_B[group_idx];
+
+       // Mainloop
+       CUTLASS_PRAGMA_NO_UNROLL
+@@ -745,7 +779,31 @@
+
+         int write_stage = smem_pipe_write.index();
+         copy(params.tma_load_a.with(get<0>(input_tensormaps),*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
++        nemotron_probe::RecordSemanticWeightSourceStage(
++            probe_state,
++            nemotron_probe::ProbeLogicalOperandKindForPhysicalA(probe_state),
++            write_stage,
++            gA,
++            tAgA_coords(_,_,_,*k_tile_iter),
++            tAsA_coords(_,_,_,write_stage),
++            stage0_A,
++            source_row_base_A,
++            source_k_span_A,
++            raw_ptr_a,
++            params.raw_row_bytes_a);
+         copy(params.tma_load_b.with(get<1>(input_tensormaps),*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
++        nemotron_probe::RecordSemanticWeightSourceStage(
++            probe_state,
++            nemotron_probe::ProbeLogicalOperandKindForPhysicalB(probe_state),
++            write_stage,
++            gB,
++            tBgB_coords(_,_,_,*k_tile_iter),
++            tBsB_coords(_,_,_,write_stage),
++            stage0_B,
++            source_row_base_B,
++            source_k_span_B,
++            raw_ptr_b,
++            params.raw_row_bytes_b);
+
+         copy(params.tma_load_sfa.with(get<2>(input_tensormaps),*tma_barrier), tAgSFA(_,_,_,*k_tile_iter), tAsSFA(_,_,_,write_stage));
+         copy(params.tma_load_sfb.with(get<3>(input_tensormaps),*tma_barrier), tBgSFB(_,_,_,*k_tile_iter), tBsSFB(_,_,_,write_stage));
+@@ -823,6 +881,8 @@
+     Tensor tCsA            = smem_thr_copy_A.partition_S(
+       as_position_independent_swizzle_tensor(sA));                                      // (CPY,CPY_M,CPY_K,PIPE)
+     Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                            //      (CPY,CPY_M,CPY_K)
++    auto a_coords          = cute::make_identity_tensor(cute::shape(sA));
++    Tensor tCsA_coords     = smem_thr_copy_A.partition_S(a_coords);                     // (CPY,CPY_M,CPY_K,PIPE)
+
+     // B
+     auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+@@ -830,11 +890,14 @@
+     Tensor tCsB            = smem_thr_copy_B.partition_S(
+       as_position_independent_swizzle_tensor(sB));                                      // (CPY,CPY_M,CPY_K,PIPE)
+     Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                            //      (CPY,CPY_M,CPY_K)
++    auto b_coords          = cute::make_identity_tensor(cute::shape(sB));
++    Tensor tCsB_coords     = smem_thr_copy_B.partition_S(b_coords);                     // (CPY,CPY_M,CPY_K,PIPE)
+
+     // SFA
+     auto tile_shape_mnk = tile_shape(tiled_mma);
++    auto layout_sfa_tv = get_layoutSFA_TV(tiled_mma);
+     auto smem_tiled_copy_SFA = make_tiled_copy_impl(SmemCopyAtomSFA{},
+-                                                    get_layoutSFA_TV(tiled_mma),
++                                                    layout_sfa_tv,
+                                                     make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk))
+                                                   );
+     auto smem_thr_copy_SFA   = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+@@ -847,6 +910,7 @@
+                                                     get_layoutSFB_TV(tiled_mma),
+                                                     make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk))
+                                                   );
++    auto layout_sfb_tv = get_layoutSFB_TV(tiled_mma);
+     auto smem_thr_copy_SFB   = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+     Tensor tCsSFB            = smem_thr_copy_SFB.partition_S(
+       as_position_independent_swizzle_tensor(sSFB));                                       // (CPY,CPY_N,CPY_K,PIPE)
+@@ -876,6 +940,11 @@
+
+     // Size of the register pipeline
+     auto K_BLOCK_MAX = size<2>(tCrA);
++    auto dense_c = cute::make_identity_tensor(
++      cute::make_shape(size<0>(TileShape{}), size<1>(TileShape{})));
++    auto part_c = thread_mma.partition_C(dense_c);
++    auto stage0_A = SmemLayoutA{}(_, _, Int<0>{});
++    auto stage0_B = SmemLayoutB{}(_, _, Int<0>{});
+
+     int read_stage = smem_pipe_read.index();
+     auto tCsA_stage   = tCsA(_,_,_,read_stage);
+@@ -886,17 +955,106 @@
+     auto copy_kblock = [&](auto k_block) {
+         // copy smem->rmem for A/B operand
+       copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
++      if (nemotron_probe::ProbeSyntheticBOverwriteEnabled(params.probe_state)) {
++        nemotron_probe::MaybeOverwriteBOperandSource(
++          params.probe_state,
++          thread_idx,
++          tCsB_coords(_,_,k_block,read_stage),
++          shared_tensors.smem_B.begin(),
++          stage0_B);
++      }
+       copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
+
++      if (nemotron_probe::ProbeActivationOperandEnabled(params.probe_state)) {
++        nemotron_probe::RecordAOperandPre(
++          params.probe_state,
++          thread_idx,
++          read_stage,
++          k_block,
++          tCsA_coords,
++          tCsSFA,
++          part_c,
++          stage0_A,
++          shared_tensors.smem_A.begin(),
++          tCrA,
++          tCrA_copy_view,
++          tCrSFA,
++          tCrSFA_copy_view,
++          SFVecSize,
++          static_cast<int>(size<0>(SmemLayoutAtomSFA{})),
++          static_cast<int>(size<1>(SmemLayoutAtomSFA{})),
++          static_cast<int>(cosize(take<0,2>(SmemLayoutSFA{}))),
++          static_cast<int>(cute::cosize_v<SmemLayoutSFA>),
++          static_cast<int>(size<0>(SmemLayoutSFA{})),
++          static_cast<int>(size<1>(SmemLayoutSFA{})),
++          static_cast<int>(size<0>(layout_sfa_tv)),
++          static_cast<int>(size<1>(layout_sfa_tv)));
++      } else {
++        nemotron_probe::RecordBOperandPre(
++          params.probe_state,
++          thread_idx,
++          read_stage,
++          k_block,
++          tCsB_coords,
++          tCsSFB,
++          part_c,
++          stage0_B,
++          shared_tensors.smem_B.begin(),
++          tCrB,
++          tCrB_copy_view,
++          tCrSFB,
++          tCrSFB_copy_view,
++          SFVecSize,
++          static_cast<int>(size<0>(SmemLayoutAtomSFB{})),
++          static_cast<int>(size<1>(SmemLayoutAtomSFB{})),
++          static_cast<int>(cosize(take<0,2>(SmemLayoutSFB{}))),
++          static_cast<int>(cute::cosize_v<SmemLayoutSFB>),
++          static_cast<int>(size<0>(SmemLayoutSFB{})),
++          static_cast<int>(size<1>(SmemLayoutSFB{})),
++          static_cast<int>(size<0>(layout_sfb_tv)),
++          static_cast<int>(size<1>(layout_sfb_tv)));
++      }
++
+       // Left shift A,B for FP4
+       using MMAOp = typename TiledMma::MMA_Op;
+       fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+       fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
+
++      if (nemotron_probe::ProbeActivationOperandEnabled(params.probe_state)) {
++        nemotron_probe::RecordAOperandPost(
++          params.probe_state,
++          thread_idx,
++          k_block,
++          part_c,
++          tCrA);
++      } else {
++        nemotron_probe::RecordBOperandPost(
++          params.probe_state,
++          thread_idx,
++          k_block,
++          part_c,
++          tCrB);
++      }
++
+
+       // Copy smem->rmem for SFA/SFB operand
+       copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
+       copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
++      if (nemotron_probe::ProbeActivationOperandEnabled(params.probe_state)) {
++        nemotron_probe::RecordAOperandScalePost(
++          params.probe_state,
++          thread_idx,
++          k_block,
++          part_c,
++          tCrSFA);
++      } else {
++        nemotron_probe::RecordBOperandScalePost(
++          params.probe_state,
++          thread_idx,
++          k_block,
++          part_c,
++          tCrSFB);
++      }
+     };
+
+     auto gemm_kblock = [&](auto k_block) {
+--- a/cutlass/include/cutlass/gemm/collective/nemotron_operand_probe.hpp
++++ b/cutlass/include/cutlass/gemm/collective/nemotron_operand_probe.hpp
+@@ -0,0 +1,1504 @@
++#pragma once
++
++#include <cstdint>
++#include <tuple>
++#include <type_traits>
++
++#include "cute/tensor.hpp"
++
++namespace cutlass::gemm::collective::nemotron_probe {
++
++using namespace cute;
++
++static constexpr int kMaxTrackedTidCount = 64;
++static constexpr int kDefaultTrackedTidCount = 4;
++static constexpr int kDefaultTrackedTids[kDefaultTrackedTidCount] = {0, 1, 128, 129};
++static constexpr int kMaxNTiles = 8;
++static constexpr int kMaxKBlocks = 2;
++static constexpr int kMaxCtaContextSlots = 8192;
++static constexpr int kCopyViewSignatureLen = 8;
++static constexpr int kCopyViewRawSignatureLen = 32;
++static constexpr int kEntryCount = kMaxTrackedTidCount * kMaxNTiles * kMaxKBlocks;
++// Semantic source-tag map keyed by (pipeline stage, packed stage byte slot).
++// We keep this debug-only table small enough for the probe workspace while
++// still covering the current SM120 grouped-GEMM shapes.
++static constexpr int kMaxSemanticStageCount = 16;
++static constexpr int kMaxSemanticStageByteSlots = 16384;
++static constexpr int kProducerDebugEntryCount = 4096;
++static constexpr int kProducerDebugComponentCount = 6;
++static constexpr int kStageByteSnapshotCount = 16;
++static constexpr int kProbeStorageAlignment = 128;
++static constexpr int kStageByteSnapshotSlots[kStageByteSnapshotCount] = {
++    0, 1, 2, 3, 4, 5, 6, 7,
++    256, 257, 258, 259, 260, 261, 262, 263,
++};
++
++enum class OperandKind : int {
++  kWeight = 0,
++  kActivation = 1,
++};
++
++struct BOperandProbeEntry {
++  int valid;
++  int thread_idx;
++  int block_idx_x;
++  int block_idx_y;
++  int block_idx_z;
++  int tile_m_idx;
++  int tile_n_idx;
++  int tile_l_idx;
++  int work_k_tile_start;
++  int work_k_tile_count;
++  int read_stage;
++  int n_tile;
++  int k_block;
++  int dispatch_stages;
++  int dispatch_scheduler_stages;
++  int tcrb_k_blocks;
++  int tcrb_copy_view_k_blocks;
++  int tcsb_coord_k_blocks;
++  int tcrsfb_k_blocks;
++  int tcrsfb_copy_view_k_blocks;
++  int tcssfb_coord_k_blocks;
++  int tcrb_dim0;
++  int tcrb_dim1;
++  int tcrb_copy_view_dim0;
++  int tcrb_copy_view_dim1;
++  int tcsb_coord_dim0;
++  int tcsb_coord_dim1;
++  int tcsb_coord_stage_count;
++  int tcrsfb_dim0;
++  int tcrsfb_dim1;
++  int tcrsfb_copy_view_dim0;
++  int tcrsfb_copy_view_dim1;
++  int tcssfb_coord_dim0;
++  int tcssfb_coord_dim1;
++  int tcssfb_coord_stage_count;
++  int sf_vec_size;
++  int smem_layout_atom_sfb_dim0;
++  int smem_layout_atom_sfb_dim1;
++  int sfb_stage_elems;
++  int sfb_total_elems;
++  int sfb_stage_shape_dim0;
++  int sfb_stage_shape_dim1;
++  int layout_sfb_tv_dim0;
++  int layout_sfb_tv_dim1;
++  int part_c_row0;
++  int part_c_col0;
++  int local_row0;
++  int local_col0;
++  int local_row1;
++  int local_col1;
++  int stage0_offset0;
++  int stage0_offset1;
++  int copy_view_sig_count;
++  int copy_view_stage_offsets[kCopyViewSignatureLen];
++  int copy_view_stage_bytes[kCopyViewSignatureLen];
++  int copy_view_raw_sig_count;
++  int copy_view_raw_rows[kCopyViewRawSignatureLen];
++  int copy_view_raw_cols[kCopyViewRawSignatureLen];
++  int copy_view_raw_stage_offsets[kCopyViewRawSignatureLen];
++  int copy_view_raw_stage_bytes[kCopyViewRawSignatureLen];
++  int copy_view_raw_byte_indices[kCopyViewRawSignatureLen];
++  int copy_view_raw_coord_components[kCopyViewRawSignatureLen][kProducerDebugComponentCount];
++  int semantic_row0;
++  int semantic_byte0;
++  int semantic_k_tile0;
++  int semantic_row1;
++  int semantic_byte1;
++  int semantic_k_tile1;
++  int copy_view_semantic_rows[kCopyViewSignatureLen];
++  int copy_view_semantic_byte_indices[kCopyViewSignatureLen];
++  int copy_view_semantic_k_tiles[kCopyViewSignatureLen];
++  int copy_view_raw_semantic_rows[kCopyViewRawSignatureLen];
++  int copy_view_raw_semantic_byte_indices[kCopyViewRawSignatureLen];
++  int copy_view_raw_semantic_k_tiles[kCopyViewRawSignatureLen];
++  int sf_reg_word_count;
++  std::uint32_t sf_reg_words_pre[4];
++  std::uint32_t sf_reg_words_post[4];
++  std::uint32_t reg0_pre;
++  std::uint32_t reg1_pre;
++  std::uint32_t reg0_post;
++  std::uint32_t reg1_post;
++};
++
++struct CtaTileContextEntry {
++  int valid;
++  int block_idx_x;
++  int block_idx_y;
++  int block_idx_z;
++  int tile_m_idx;
++  int tile_n_idx;
++  int tile_l_idx;
++  int work_k_tile_start;
++  int work_k_tile_count;
++};
++
++struct BOperandProbeState {
++  int enabled;
++  int entry_count;
++  int max_n_tiles;
++  int max_k_blocks;
++  int dispatch_stages;
++  int dispatch_scheduler_stages;
++  int epilogue_shared_storage_bytes;
++  int mainloop_shared_storage_bytes;
++  int next_slot;
++  int capture_any_thread;
++  int overwrite_all_threads;
++  int filter_block_idx_x;
++  int filter_block_idx_y;
++  int filter_block_idx_z;
++  int synthetic_b_mode;
++  int synthetic_b_arg;
++  int operand_kind;
++  int swap_ab;
++  int physical_a_operand_kind;
++  int physical_b_operand_kind;
++  int tracked_tid_count;
++  int tracked_tids[kMaxTrackedTidCount];
++  std::int16_t semantic_weight_rows[kMaxSemanticStageCount][kMaxSemanticStageByteSlots];
++  std::int16_t semantic_weight_byte_indices[kMaxSemanticStageCount][kMaxSemanticStageByteSlots];
++  std::int16_t semantic_weight_k_tiles[kMaxSemanticStageCount][kMaxSemanticStageByteSlots];
++  std::int16_t semantic_weight_rows_alt[kMaxSemanticStageCount][kMaxSemanticStageByteSlots];
++  std::int16_t semantic_weight_byte_indices_alt[kMaxSemanticStageCount][kMaxSemanticStageByteSlots];
++  std::int16_t semantic_weight_k_tiles_alt[kMaxSemanticStageCount][kMaxSemanticStageByteSlots];
++  int producer_debug_count;
++  int producer_debug_stage[kProducerDebugEntryCount];
++  int producer_debug_slot[kProducerDebugEntryCount];
++  int producer_debug_value[kProducerDebugEntryCount];
++  int producer_debug_src[kProducerDebugEntryCount][kProducerDebugComponentCount];
++  int producer_debug_dst[kProducerDebugEntryCount][kProducerDebugComponentCount];
++  int stage_byte_snapshot_valid;
++  int stage_byte_snapshot_read_stage;
++  int stage_byte_snapshot_values[kStageByteSnapshotCount];
++  CtaTileContextEntry cta_contexts[kMaxCtaContextSlots];
++  BOperandProbeEntry entries[kEntryCount];
++};
++
++CUTE_HOST_DEVICE constexpr int ProbeStorageBytes() {
++  return ((static_cast<int>(sizeof(BOperandProbeState)) + kProbeStorageAlignment - 1) /
++          kProbeStorageAlignment) * kProbeStorageAlignment;
++}
++
++#ifdef NEMOTRON_PROBE_DEFINE_DEVICE_SYMBOL
++__device__ BOperandProbeState g_b_operand_probe;
++#else
++extern __device__ BOperandProbeState g_b_operand_probe;
++#endif
++
++template <class Coord>
++CUTE_HOST_DEVICE constexpr void FlattenCoordPair(Coord const& coord, int& row, int& col, int& count) {
++  if (count >= 2) {
++    return;
++  }
++  if constexpr (cute::is_tuple<Coord>::value) {
++    constexpr std::size_t kTupleSize = std::tuple_size_v<std::remove_cv_t<std::remove_reference_t<Coord>>>;
++    FlattenCoordPair(cute::get<0>(coord), row, col, count);
++    if constexpr (kTupleSize > 1) {
++      if (count < 2) {
++        FlattenCoordPair(cute::get<1>(coord), row, col, count);
++      }
++    }
++    if constexpr (kTupleSize > 2) {
++      if (count < 2) {
++        FlattenCoordPair(cute::get<2>(coord), row, col, count);
++      }
++    }
++  } else {
++    if (count == 0) {
++      row = static_cast<int>(coord);
++    } else {
++      col = static_cast<int>(coord);
++    }
++    ++count;
++  }
++}
++
++template <class Coord>
++CUTE_HOST_DEVICE constexpr void FlattenCoordTriple(
++    Coord const& coord,
++    int& row,
++    int& col,
++    int& depth,
++    int& count) {
++  if (count >= 3) {
++    return;
++  }
++  if constexpr (cute::is_tuple<Coord>::value) {
++    constexpr std::size_t kTupleSize = std::tuple_size_v<std::remove_cv_t<std::remove_reference_t<Coord>>>;
++    FlattenCoordTriple(cute::get<0>(coord), row, col, depth, count);
++    if constexpr (kTupleSize > 1) {
++      if (count < 3) {
++        FlattenCoordTriple(cute::get<1>(coord), row, col, depth, count);
++      }
++    }
++    if constexpr (kTupleSize > 2) {
++      if (count < 3) {
++        FlattenCoordTriple(cute::get<2>(coord), row, col, depth, count);
++      }
++    }
++  } else {
++    if (count == 0) {
++      row = static_cast<int>(coord);
++    } else if (count == 1) {
++      col = static_cast<int>(coord);
++    } else {
++      depth = static_cast<int>(coord);
++    }
++    ++count;
++  }
++}
++
++template <class Coord>
++CUTE_HOST_DEVICE constexpr void FlattenCoordComponents(
++    Coord const& coord,
++    int* values,
++    int max_count,
++    int& count) {
++  if (count >= max_count) {
++    return;
++  }
++  if constexpr (cute::is_tuple<Coord>::value) {
++    constexpr std::size_t kTupleSize = std::tuple_size_v<std::remove_cv_t<std::remove_reference_t<Coord>>>;
++    FlattenCoordComponents(cute::get<0>(coord), values, max_count, count);
++    if constexpr (kTupleSize > 1) {
++      if (count < max_count) {
++        FlattenCoordComponents(cute::get<1>(coord), values, max_count, count);
++      }
++    }
++    if constexpr (kTupleSize > 2) {
++      if (count < max_count) {
++        FlattenCoordComponents(cute::get<2>(coord), values, max_count, count);
++      }
++    }
++  } else {
++    values[count++] = static_cast<int>(coord);
++  }
++}
++
++template <class Coord>
++CUTE_HOST_DEVICE constexpr int CoordGet0(Coord const& coord) {
++  int row = 0;
++  int col = 0;
++  int count = 0;
++  FlattenCoordPair(coord, row, col, count);
++  (void) col;
++  return row;
++}
++
++template <class Coord>
++CUTE_HOST_DEVICE constexpr int CoordGet1(Coord const& coord) {
++  int row = 0;
++  int col = 0;
++  int count = 0;
++  FlattenCoordPair(coord, row, col, count);
++  (void) row;
++  return count >= 2 ? col : 0;
++}
++
++CUTE_HOST_DEVICE constexpr int ClampSemanticCoordComponent(int value) {
++  return value >= -32767 && value <= 32767 ? value : -1;
++}
++
++CUTE_HOST_DEVICE constexpr int ProbeSemanticWeightRowFromPackedCoord(int packed_coord) {
++  return ((packed_coord & ~0x7) << 2) +
++         ((packed_coord & 0x4) << 1) +
++         ((packed_coord & 0x1) << 2);
++}
++
++CUTE_HOST_DEVICE constexpr int ProbeSemanticActivationRowFromPackedCoord(int packed_coord) {
++  return ((packed_coord & ~0x1) << 3) +
++         ((packed_coord & 0x1) << 2);
++}
++
++template <class Coord>
++CUTE_HOST_DEVICE constexpr int CoordGet2(Coord const& coord) {
++  int row = 0;
++  int col = 0;
++  int depth = 0;
++  int count = 0;
++  FlattenCoordTriple(coord, row, col, depth, count);
++  (void) row;
++  (void) col;
++  return count >= 3 ? depth : 0;
++}
++
++CUTE_DEVICE int ProbeThreadSlot(BOperandProbeState const* probe_state, int tid) {
++  if (probe_state == nullptr) {
++    return -1;
++  }
++  int const tracked_count = probe_state->tracked_tid_count;
++  for (int idx = 0; idx < tracked_count && idx < kMaxTrackedTidCount; ++idx) {
++    if (probe_state->tracked_tids[idx] == tid) {
++      return idx;
++    }
++  }
++  return -1;
++}
++
++CUTE_DEVICE bool ProbeCurrentBlockMatches(BOperandProbeState const* probe_state) {
++  if (probe_state == nullptr) {
++    return false;
++  }
++  if (probe_state->filter_block_idx_x >= 0 &&
++      probe_state->filter_block_idx_x != static_cast<int>(blockIdx.x)) {
++    return false;
++  }
++  if (probe_state->filter_block_idx_y >= 0 &&
++      probe_state->filter_block_idx_y != static_cast<int>(blockIdx.y)) {
++    return false;
++  }
++  if (probe_state->filter_block_idx_z >= 0 &&
++      probe_state->filter_block_idx_z != static_cast<int>(blockIdx.z)) {
++    return false;
++  }
++  return true;
++}
++
++CUTE_HOST_DEVICE constexpr bool ProbeHasBlockFilter(BOperandProbeState const* probe_state) {
++  return probe_state != nullptr &&
++         (probe_state->filter_block_idx_x >= 0 ||
++          probe_state->filter_block_idx_y >= 0 ||
++          probe_state->filter_block_idx_z >= 0);
++}
++
++CUTE_DEVICE bool ProbeActiveForThread(BOperandProbeState const* probe_state, int tid) {
++  return probe_state != nullptr &&
++         probe_state->enabled != 0 &&
++         ProbeCurrentBlockMatches(probe_state) &&
++         (probe_state->capture_any_thread != 0 || ProbeThreadSlot(probe_state, tid) >= 0);
++}
++
++CUTE_DEVICE bool ProbeActiveForThread(int tid) {
++  return ProbeActiveForThread(&g_b_operand_probe, tid);
++}
++
++template <class Params, class = void>
++struct ProbeStateResolver {
++  CUTE_DEVICE static BOperandProbeState* get(Params const&) {
++    return &g_b_operand_probe;
++  }
++};
++
++template <class Params>
++struct ProbeStateResolver<Params, std::void_t<decltype(std::declval<Params const&>().probe_state)>> {
++  CUTE_DEVICE static BOperandProbeState* get(Params const& params) {
++    return params.probe_state;
++  }
++};
++
++CUTE_HOST_DEVICE constexpr bool ProbeActivationOperandEnabled(
++    BOperandProbeState const* probe_state) {
++  return probe_state != nullptr &&
++         probe_state->operand_kind == probe_state->physical_a_operand_kind;
++}
++
++CUTE_HOST_DEVICE constexpr bool ProbeActivationOperandEnabled() {
++  return ProbeActivationOperandEnabled(&g_b_operand_probe);
++}
++
++CUTE_HOST_DEVICE constexpr bool ProbeSemanticSourceEnabled(
++    BOperandProbeState const* probe_state,
++    OperandKind operand_kind) {
++  return probe_state != nullptr &&
++         probe_state->enabled != 0 &&
++         probe_state->operand_kind == int(operand_kind) &&
++         ProbeHasBlockFilter(probe_state);
++}
++
++CUTE_HOST_DEVICE constexpr int ProbePhysicalAOperandKind(
++    BOperandProbeState const* probe_state) {
++  if (probe_state == nullptr) {
++    return int(OperandKind::kActivation);
++  }
++  return probe_state->physical_a_operand_kind;
++}
++
++CUTE_HOST_DEVICE constexpr int ProbePhysicalBOperandKind(
++    BOperandProbeState const* probe_state) {
++  if (probe_state == nullptr) {
++    return int(OperandKind::kWeight);
++  }
++  return probe_state->physical_b_operand_kind;
++}
++
++CUTE_HOST_DEVICE constexpr OperandKind ProbeLogicalOperandKindForPhysicalA(
++    BOperandProbeState const* probe_state) {
++  return ProbePhysicalAOperandKind(probe_state) == int(OperandKind::kActivation)
++             ? OperandKind::kActivation
++             : OperandKind::kWeight;
++}
++
++CUTE_HOST_DEVICE constexpr OperandKind ProbeLogicalOperandKindForPhysicalB(
++    BOperandProbeState const* probe_state) {
++  return ProbePhysicalBOperandKind(probe_state) == int(OperandKind::kActivation)
++             ? OperandKind::kActivation
++             : OperandKind::kWeight;
++}
++
++CUTE_HOST_DEVICE constexpr bool ProbeSelectedOperandUsesPhysicalB(
++    BOperandProbeState const* probe_state) {
++  return probe_state != nullptr &&
++         probe_state->operand_kind == probe_state->physical_b_operand_kind;
++}
++
++template <class CoordTensorA, class CoordTensorB, class F>
++CUTE_HOST_DEVICE void ForEachProbeCoordPair(CoordTensorA const& coords_a, CoordTensorB const& coords_b, F&& f) {
++  static_assert(
++      std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank ==
++          std::remove_cv_t<std::remove_reference_t<CoordTensorB>>::rank,
++      "coord tensor rank mismatch");
++  if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 1) {
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      auto const idx = make_coord(i);
++      f(coords_a(idx), coords_b(idx), i);
++    }
++  } else if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 2) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      for (int j = 0; j < size<1>(coords_a); ++j) {
++        auto const idx = make_coord(i, j);
++        f(coords_a(idx), coords_b(idx), physical++);
++      }
++    }
++  } else if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 3) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      for (int j = 0; j < size<1>(coords_a); ++j) {
++        for (int k = 0; k < size<2>(coords_a); ++k) {
++          auto const idx = make_coord(i, j, k);
++          f(coords_a(idx), coords_b(idx), physical++);
++        }
++      }
++    }
++  } else if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 4) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      for (int j = 0; j < size<1>(coords_a); ++j) {
++        for (int k = 0; k < size<2>(coords_a); ++k) {
++          for (int l = 0; l < size<3>(coords_a); ++l) {
++            auto const idx = make_coord(i, j, k, l);
++            f(coords_a(idx), coords_b(idx), physical++);
++          }
++        }
++      }
++    }
++  } else {
++    static_assert(
++        std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank <= 4,
++        "ForEachProbeCoordPair only supports rank <= 4");
++  }
++}
++
++template <class CoordTensorA, class CoordTensorB, class F>
++CUTE_HOST_DEVICE void ForEachProbeCoordPairIndexed(
++    CoordTensorA const& coords_a,
++    CoordTensorB const& coords_b,
++    F&& f) {
++  static_assert(
++      std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank ==
++          std::remove_cv_t<std::remove_reference_t<CoordTensorB>>::rank,
++      "coord tensor rank mismatch");
++  if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 1) {
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      auto const idx = make_coord(i);
++      f(coords_a(idx), coords_b(idx), i);
++    }
++  } else if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 2) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      for (int j = 0; j < size<1>(coords_a); ++j) {
++        auto const idx = make_coord(i, j);
++        f(coords_a(idx), coords_b(idx), physical++);
++      }
++    }
++  } else if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 3) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      for (int j = 0; j < size<1>(coords_a); ++j) {
++        for (int k = 0; k < size<2>(coords_a); ++k) {
++          auto const idx = make_coord(i, j, k);
++          f(coords_a(idx), coords_b(idx), physical++);
++        }
++      }
++    }
++  } else if constexpr (std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank == 4) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coords_a); ++i) {
++      for (int j = 0; j < size<1>(coords_a); ++j) {
++        for (int k = 0; k < size<2>(coords_a); ++k) {
++          for (int l = 0; l < size<3>(coords_a); ++l) {
++            auto const idx = make_coord(i, j, k, l);
++            f(coords_a(idx), coords_b(idx), physical++);
++          }
++        }
++      }
++    }
++  } else {
++    static_assert(
++        std::remove_cv_t<std::remove_reference_t<CoordTensorA>>::rank <= 4,
++        "ForEachProbeCoordPairIndexed only supports rank <= 4");
++  }
++}
++
++enum class SyntheticBMode : int {
++  kDisabled = 0,
++  kStageSlotLowByte = 1,
++  kStageSlotBit = 2,
++};
++
++CUTE_HOST_DEVICE constexpr bool ProbeSyntheticBOverwriteEnabled(BOperandProbeState const* probe_state) {
++  return probe_state != nullptr &&
++         probe_state->enabled != 0 &&
++         ProbeSelectedOperandUsesPhysicalB(probe_state) &&
++         probe_state->synthetic_b_mode != int(SyntheticBMode::kDisabled);
++}
++
++CUTE_HOST_DEVICE constexpr bool ProbeSyntheticBOverwriteEnabled() {
++  return ProbeSyntheticBOverwriteEnabled(&g_b_operand_probe);
++}
++
++CUTE_HOST_DEVICE constexpr std::uint8_t SyntheticBByteForStageOffset(
++    BOperandProbeState const* probe_state,
++    int stage0_offset) {
++  if (probe_state == nullptr) {
++    return 0u;
++  }
++  int const stage_slot = stage0_offset / 2;
++  if (probe_state->synthetic_b_mode == int(SyntheticBMode::kStageSlotLowByte)) {
++    return static_cast<std::uint8_t>(stage_slot & 0xff);
++  }
++  if (probe_state->synthetic_b_mode == int(SyntheticBMode::kStageSlotBit)) {
++    int const bit = probe_state->synthetic_b_arg;
++    return static_cast<std::uint8_t>((stage_slot >> bit) & 0x1);
++  }
++  return 0u;
++}
++
++CUTE_DEVICE int BlockContextSlot() {
++  int const slot =
++      static_cast<int>(blockIdx.x) +
++      static_cast<int>(gridDim.x) *
++          (static_cast<int>(blockIdx.y) +
++           static_cast<int>(gridDim.y) * static_cast<int>(blockIdx.z));
++  if (slot < 0 || slot >= kMaxCtaContextSlots) {
++    return -1;
++  }
++  return slot;
++}
++
++CUTE_DEVICE CtaTileContextEntry const* LoadCurrentCtaTileContext(
++    BOperandProbeState const* probe_state) {
++  if (probe_state == nullptr || !ProbeCurrentBlockMatches(probe_state)) {
++    return nullptr;
++  }
++  int const slot = BlockContextSlot();
++  if (slot < 0) {
++    return nullptr;
++  }
++  CtaTileContextEntry const& entry = probe_state->cta_contexts[slot];
++  if (entry.valid == 0 ||
++      entry.block_idx_x != static_cast<int>(blockIdx.x) ||
++      entry.block_idx_y != static_cast<int>(blockIdx.y) ||
++      entry.block_idx_z != static_cast<int>(blockIdx.z)) {
++    return nullptr;
++  }
++  return &entry;
++}
++
++CUTE_DEVICE void ClearSemanticWeightStage(BOperandProbeState* probe_state, int stage_idx) {
++  if (probe_state == nullptr ||
++      stage_idx < 0 ||
++      stage_idx >= kMaxSemanticStageCount) {
++    return;
++  }
++  for (int slot = 0; slot < kMaxSemanticStageByteSlots; ++slot) {
++    probe_state->semantic_weight_rows[stage_idx][slot] = static_cast<std::int16_t>(-1);
++    probe_state->semantic_weight_byte_indices[stage_idx][slot] = static_cast<std::int16_t>(-1);
++    probe_state->semantic_weight_k_tiles[stage_idx][slot] = static_cast<std::int16_t>(-1);
++    probe_state->semantic_weight_rows_alt[stage_idx][slot] = static_cast<std::int16_t>(-1);
++    probe_state->semantic_weight_byte_indices_alt[stage_idx][slot] = static_cast<std::int16_t>(-1);
++    probe_state->semantic_weight_k_tiles_alt[stage_idx][slot] = static_cast<std::int16_t>(-1);
++  }
++}
++
++CUTE_DEVICE void StoreSemanticWeightStageSlot(
++    BOperandProbeState* probe_state,
++    int stage_idx,
++    int stage_byte_slot,
++    int source_row,
++    int source_byte_index,
++    int source_k_tile) {
++  if (probe_state == nullptr ||
++      stage_idx < 0 ||
++      stage_idx >= kMaxSemanticStageCount ||
++      stage_byte_slot < 0 ||
++      stage_byte_slot >= kMaxSemanticStageByteSlots) {
++    return;
++  }
++  if (probe_state->semantic_weight_rows[stage_idx][stage_byte_slot] ==
++      static_cast<std::int16_t>(-1)) {
++    probe_state->semantic_weight_rows[stage_idx][stage_byte_slot] =
++        static_cast<std::int16_t>(ClampSemanticCoordComponent(source_row));
++    probe_state->semantic_weight_byte_indices[stage_idx][stage_byte_slot] =
++        static_cast<std::int16_t>(ClampSemanticCoordComponent(source_byte_index));
++    probe_state->semantic_weight_k_tiles[stage_idx][stage_byte_slot] =
++        static_cast<std::int16_t>(ClampSemanticCoordComponent(source_k_tile));
++    return;
++  }
++  if (probe_state->semantic_weight_rows_alt[stage_idx][stage_byte_slot] ==
++      static_cast<std::int16_t>(-1)) {
++    probe_state->semantic_weight_rows_alt[stage_idx][stage_byte_slot] =
++        static_cast<std::int16_t>(ClampSemanticCoordComponent(source_row));
++    probe_state->semantic_weight_byte_indices_alt[stage_idx][stage_byte_slot] =
++        static_cast<std::int16_t>(ClampSemanticCoordComponent(source_byte_index));
++    probe_state->semantic_weight_k_tiles_alt[stage_idx][stage_byte_slot] =
++        static_cast<std::int16_t>(ClampSemanticCoordComponent(source_k_tile));
++  }
++}
++
++template <class SrcCoord, class DstCoord>
++CUTE_DEVICE void RecordProducerSemanticDebug(
++    BOperandProbeState* probe_state,
++    int stage_idx,
++    int stage_byte_slot,
++    int source_byte_value,
++    SrcCoord const& src_coord,
++    DstCoord const& dst_coord) {
++  if (probe_state == nullptr) {
++    return;
++  }
++  int slot = probe_state->producer_debug_count;
++  if (slot < 0 || slot >= kProducerDebugEntryCount) {
++    return;
++  }
++  probe_state->producer_debug_count = slot + 1;
++  probe_state->producer_debug_stage[slot] = stage_idx;
++  probe_state->producer_debug_slot[slot] = stage_byte_slot;
++  probe_state->producer_debug_value[slot] = source_byte_value;
++  for (int idx = 0; idx < kProducerDebugComponentCount; ++idx) {
++    probe_state->producer_debug_src[slot][idx] = -1;
++    probe_state->producer_debug_dst[slot][idx] = -1;
++  }
++  int src_count = 0;
++  FlattenCoordComponents(
++      src_coord,
++      probe_state->producer_debug_src[slot],
++      kProducerDebugComponentCount,
++      src_count);
++  int dst_count = 0;
++  FlattenCoordComponents(
++      dst_coord,
++      probe_state->producer_debug_dst[slot],
++      kProducerDebugComponentCount,
++      dst_count);
++}
++
++template <class Value>
++CUTE_DEVICE int ProbeSourceValueLowByte(Value const& value) {
++  auto value_copy = value;
++  auto const* value_bytes =
++      reinterpret_cast<std::uint8_t const*>(&value_copy);
++  return static_cast<int>(value_bytes[0]);
++}
++
++template <class SrcCoord>
++CUTE_DEVICE int ProbeRawPackedByteValue(
++    void const* raw_packed_bytes,
++    int raw_row_bytes,
++    int source_row_base,
++    int source_k_span,
++    SrcCoord const& src_coord) {
++  if (raw_packed_bytes == nullptr || raw_row_bytes <= 0) {
++    return -1;
++  }
++  int const global_row = source_row_base + CoordGet0(src_coord);
++  int const global_byte =
++      CoordGet1(src_coord) + CoordGet2(src_coord) * source_k_span;
++  if (global_row < 0 || global_byte < 0 || global_byte >= raw_row_bytes) {
++    return -1;
++  }
++  auto const* raw_bytes =
++      reinterpret_cast<std::uint8_t const*>(raw_packed_bytes);
++  std::size_t const linear_index =
++      static_cast<std::size_t>(global_row) * static_cast<std::size_t>(raw_row_bytes) +
++      static_cast<std::size_t>(global_byte);
++  return static_cast<int>(raw_bytes[linear_index]);
++}
++
++CUTE_DEVICE void LoadSemanticWeightStageSlot(
++    BOperandProbeState const* probe_state,
++    int stage_idx,
++    int stage_byte_slot,
++    int packed_selector,
++    int& source_row,
++    int& source_byte_index,
++    int& source_k_tile) {
++  source_row = -1;
++  source_byte_index = -1;
++  source_k_tile = -1;
++  if (probe_state == nullptr ||
++      stage_idx < 0 ||
++      stage_idx >= kMaxSemanticStageCount ||
++      stage_byte_slot < 0 ||
++      stage_byte_slot >= kMaxSemanticStageByteSlots) {
++    return;
++  }
++  bool const use_alt =
++      packed_selector != 0 &&
++      probe_state->semantic_weight_rows_alt[stage_idx][stage_byte_slot] !=
++          static_cast<std::int16_t>(-1);
++  if (use_alt) {
++    source_row = static_cast<int>(probe_state->semantic_weight_rows_alt[stage_idx][stage_byte_slot]);
++    source_byte_index = static_cast<int>(probe_state->semantic_weight_byte_indices_alt[stage_idx][stage_byte_slot]);
++    source_k_tile = static_cast<int>(probe_state->semantic_weight_k_tiles_alt[stage_idx][stage_byte_slot]);
++    return;
++  }
++  source_row = static_cast<int>(probe_state->semantic_weight_rows[stage_idx][stage_byte_slot]);
++  source_byte_index = static_cast<int>(probe_state->semantic_weight_byte_indices[stage_idx][stage_byte_slot]);
++  source_k_tile = static_cast<int>(probe_state->semantic_weight_k_tiles[stage_idx][stage_byte_slot]);
++}
++
++template <class GmemTensor, class SrcCoordTensor, class DstCoordTensor, class Stage0Layout>
++CUTE_DEVICE void RecordSemanticWeightSourceStage(
++    BOperandProbeState* probe_state,
++    OperandKind operand_kind,
++    int write_stage,
++    GmemTensor const& g_values,
++    SrcCoordTensor const& src_coords,
++    DstCoordTensor const& dst_coords,
++    Stage0Layout const& stage0_layout,
++    int source_row_base,
++    int source_k_span,
++    void const* raw_packed_bytes = nullptr,
++    int raw_row_bytes = 0) {
++  if (!ProbeSemanticSourceEnabled(probe_state, operand_kind) ||
++      !ProbeCurrentBlockMatches(probe_state)) {
++    return;
++  }
++
++  ClearSemanticWeightStage(probe_state, write_stage);
++  ForEachProbeCoordPairIndexed(
++      src_coords,
++      dst_coords,
++      [&](auto const& src_coord, auto const& dst_coord, int /*physical*/) {
++    int const dst_row = CoordGet0(dst_coord);
++    int const dst_col = CoordGet2(dst_coord);
++    int const stage_byte_slot =
++        static_cast<int>(stage0_layout(dst_row, dst_col)) / 2;
++    int const source_packed_coord = CoordGet1(src_coord);
++    int const source_row_delta =
++        operand_kind == OperandKind::kActivation
++            ? ProbeSemanticActivationRowFromPackedCoord(source_packed_coord)
++            : ProbeSemanticWeightRowFromPackedCoord(source_packed_coord);
++    int const source_row = source_row_base + source_row_delta;
++    int const source_k_tile = CoordGet2(src_coord);
++    int const source_byte_index =
++        (source_packed_coord / 2) + source_k_tile * source_k_span;
++    StoreSemanticWeightStageSlot(
++        probe_state,
++        write_stage,
++        stage_byte_slot,
++        source_row,
++        source_byte_index,
++        source_k_tile);
++    int source_byte_value = ProbeSourceValueLowByte(g_values(src_coord));
++    int const raw_byte_value = ProbeRawPackedByteValue(
++        raw_packed_bytes,
++        raw_row_bytes,
++        source_row_base,
++        source_k_span,
++        src_coord);
++    if (raw_byte_value >= 0) {
++      source_byte_value = raw_byte_value;
++    }
++    RecordProducerSemanticDebug(
++        probe_state,
++        write_stage,
++        stage_byte_slot,
++        source_byte_value,
++        src_coord,
++        dst_coord);
++  });
++}
++
++template <class BlkCoord>
++CUTE_DEVICE void RecordCurrentCtaTileContext(
++    BOperandProbeState* probe_state,
++    BlkCoord const& blk_coord,
++    int work_k_tile_start,
++    int work_k_tile_count) {
++  if (probe_state == nullptr || probe_state->enabled == 0 || !ProbeCurrentBlockMatches(probe_state)) {
++    return;
++  }
++  int const slot = BlockContextSlot();
++  if (slot < 0) {
++    return;
++  }
++  auto& entry = probe_state->cta_contexts[slot];
++  entry.valid = 1;
++  entry.block_idx_x = static_cast<int>(blockIdx.x);
++  entry.block_idx_y = static_cast<int>(blockIdx.y);
++  entry.block_idx_z = static_cast<int>(blockIdx.z);
++  entry.tile_m_idx = CoordGet0(cute::get<0>(blk_coord));
++  entry.tile_n_idx = CoordGet0(cute::get<1>(blk_coord));
++  entry.tile_l_idx = CoordGet0(cute::get<3>(blk_coord));
++  entry.work_k_tile_start = work_k_tile_start;
++  entry.work_k_tile_count = work_k_tile_count;
++}
++
++template <class MainloopParams, class BlkCoord>
++CUTE_DEVICE void RecordCurrentCtaTileContextForParams(
++    MainloopParams const& mainloop_params,
++    BlkCoord const& blk_coord,
++    int work_k_tile_start,
++    int work_k_tile_count) {
++  RecordCurrentCtaTileContext(
++      ProbeStateResolver<MainloopParams>::get(mainloop_params),
++      blk_coord,
++      work_k_tile_start,
++      work_k_tile_count);
++}
++
++template <class CoordTensor, class BytePtr, class Stage0Layout>
++CUTE_DEVICE void MaybeOverwriteBOperandSource(
++    BOperandProbeState const* probe_state,
++    int thread_idx,
++    CoordTensor const& coord_tensor,
++    BytePtr smem_b_bytes,
++    Stage0Layout const& stage0_B) {
++  if (!ProbeSyntheticBOverwriteEnabled(probe_state) ||
++      !ProbeCurrentBlockMatches(probe_state) ||
++      (!(probe_state != nullptr && probe_state->overwrite_all_threads != 0) &&
++       !ProbeActiveForThread(probe_state, thread_idx))) {
++    return;
++  }
++
++  using CoordTensorT = typename std::remove_cv<typename std::remove_reference<CoordTensor>::type>::type;
++
++  if constexpr (CoordTensorT::rank == 1) {
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      auto const idx = make_coord(i);
++      auto const coord = coord_tensor(idx);
++      int const stage0_offset =
++          static_cast<int>(stage0_B(CoordGet0(coord), CoordGet1(coord)));
++      smem_b_bytes[stage0_offset / 2] = SyntheticBByteForStageOffset(probe_state, stage0_offset);
++    }
++  } else if constexpr (CoordTensorT::rank == 2) {
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      for (int j = 0; j < size<1>(coord_tensor); ++j) {
++        auto const idx = make_coord(i, j);
++        auto const coord = coord_tensor(idx);
++        int const stage0_offset =
++            static_cast<int>(stage0_B(CoordGet0(coord), CoordGet1(coord)));
++        smem_b_bytes[stage0_offset / 2] = SyntheticBByteForStageOffset(probe_state, stage0_offset);
++      }
++    }
++  } else if constexpr (CoordTensorT::rank == 3) {
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      for (int j = 0; j < size<1>(coord_tensor); ++j) {
++        for (int k = 0; k < size<2>(coord_tensor); ++k) {
++          auto const idx = make_coord(i, j, k);
++          auto const coord = coord_tensor(idx);
++          int const stage0_offset =
++              static_cast<int>(stage0_B(CoordGet0(coord), CoordGet1(coord)));
++          smem_b_bytes[stage0_offset / 2] = SyntheticBByteForStageOffset(probe_state, stage0_offset);
++        }
++      }
++    }
++  } else if constexpr (CoordTensorT::rank == 4) {
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      for (int j = 0; j < size<1>(coord_tensor); ++j) {
++        for (int k = 0; k < size<2>(coord_tensor); ++k) {
++          for (int l = 0; l < size<3>(coord_tensor); ++l) {
++            auto const idx = make_coord(i, j, k, l);
++            auto const coord = coord_tensor(idx);
++            int const stage0_offset =
++                static_cast<int>(stage0_B(CoordGet0(coord), CoordGet1(coord)));
++            smem_b_bytes[stage0_offset / 2] = SyntheticBByteForStageOffset(probe_state, stage0_offset);
++          }
++        }
++      }
++    }
++  } else {
++    static_assert(
++        CoordTensorT::rank <= 4,
++        "MaybeOverwriteBOperandSource only supports rank <= 4");
++  }
++}
++
++template <class CoordTensor, class BytePtr, class Stage0Layout>
++CUTE_DEVICE void MaybeOverwriteBOperandSource(
++    int thread_idx,
++    CoordTensor const& coord_tensor,
++    BytePtr smem_b_bytes,
++    Stage0Layout const& stage0_B) {
++  MaybeOverwriteBOperandSource(&g_b_operand_probe, thread_idx, coord_tensor, smem_b_bytes, stage0_B);
++}
++
++CUTE_HOST_DEVICE constexpr int EntryIndex(int tid_slot, int n_tile, int k_block) {
++  return tid_slot * (kMaxNTiles * kMaxKBlocks) + n_tile * kMaxKBlocks + k_block;
++}
++
++template <class CoordTensor, class F>
++CUTE_HOST_DEVICE void ForEachProbeCoord(CoordTensor const& coord_tensor, F&& f) {
++  using CoordTensorT =
++      typename std::remove_cv<typename std::remove_reference<CoordTensor>::type>::type;
++  if constexpr (CoordTensorT::rank == 1) {
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      f(coord_tensor(make_coord(i)), i);
++    }
++  } else if constexpr (CoordTensorT::rank == 2) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      for (int j = 0; j < size<1>(coord_tensor); ++j) {
++        f(coord_tensor(make_coord(i, j)), physical++);
++      }
++    }
++  } else if constexpr (CoordTensorT::rank == 3) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      for (int j = 0; j < size<1>(coord_tensor); ++j) {
++        for (int k = 0; k < size<2>(coord_tensor); ++k) {
++          f(coord_tensor(make_coord(i, j, k)), physical++);
++        }
++      }
++    }
++  } else if constexpr (CoordTensorT::rank == 4) {
++    int physical = 0;
++    for (int i = 0; i < size<0>(coord_tensor); ++i) {
++      for (int j = 0; j < size<1>(coord_tensor); ++j) {
++        for (int k = 0; k < size<2>(coord_tensor); ++k) {
++          for (int l = 0; l < size<3>(coord_tensor); ++l) {
++            f(coord_tensor(make_coord(i, j, k, l)), physical++);
++          }
++        }
++      }
++    }
++  } else {
++    static_assert(CoordTensorT::rank <= 4, "ForEachProbeCoord only supports rank <= 4");
++  }
++}
++
++template <class BytePtr>
++CUTE_DEVICE void CaptureStageByteSnapshot(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    int read_stage,
++    BytePtr smem_bytes) {
++  if (probe_state == nullptr || !ProbeActiveForThread(probe_state, thread_idx)) {
++    return;
++  }
++  int const lead_tracked_tid =
++      probe_state->tracked_tid_count > 0 ? probe_state->tracked_tids[0] : -1;
++  if (thread_idx != lead_tracked_tid) {
++    return;
++  }
++  if (atomicCAS(&probe_state->stage_byte_snapshot_valid, 0, 1) != 0) {
++    return;
++  }
++  probe_state->stage_byte_snapshot_read_stage = read_stage;
++  auto volatile* smem_storage =
++      reinterpret_cast<volatile std::uint8_t*>(cute::raw_pointer_cast(smem_bytes));
++  constexpr int snapshot_slots[kStageByteSnapshotCount] = {
++      0, 1, 2, 3, 4, 5, 6, 7,
++      256, 257, 258, 259, 260, 261, 262, 263,
++  };
++  for (int idx = 0; idx < kStageByteSnapshotCount; ++idx) {
++    probe_state->stage_byte_snapshot_values[idx] =
++        static_cast<int>(smem_storage[snapshot_slots[idx]]);
++  }
++}
++
++template <class KBlock, class TCsCoords, class TCsSFCoords, class PartC, class Stage0Layout, class BytePtr, class TCr, class TCrCopyView, class TCrSF, class TCrSFCopyView>
++CUTE_DEVICE void RecordOperandPreImpl(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    int read_stage,
++    KBlock k_block,
++    TCsCoords const& tCs_coords,
++    TCsSFCoords const& tCsSF,
++    PartC const& part_c,
++    Stage0Layout const& stage0_layout,
++    BytePtr smem_bytes,
++    TCr const& tCr,
++    TCrCopyView const& tCr_copy_view,
++    TCrSF const& tCrSF,
++    TCrSFCopyView const& tCrSF_copy_view,
++    int sf_vec_size,
++    int smem_layout_atom_sfb_dim0,
++    int smem_layout_atom_sfb_dim1,
++    int sfb_stage_elems,
++    int sfb_total_elems,
++    int sfb_stage_shape_dim0,
++    int sfb_stage_shape_dim1,
++    int layout_sfb_tv_dim0,
++    int layout_sfb_tv_dim1) {
++  if (!ProbeActiveForThread(probe_state, thread_idx)) {
++    return;
++  }
++
++  int const n_tiles = static_cast<int>(size<2>(part_c));
++  bool const capture_any_thread = probe_state->capture_any_thread != 0;
++  int const tid_slot = ProbeThreadSlot(probe_state, thread_idx);
++  for (int n_tile = 0; n_tile < n_tiles && n_tile < kMaxNTiles; ++n_tile) {
++    auto c_atom_coords = part_c(_, 0, n_tile);
++    auto coord0 = c_atom_coords(0);
++
++    auto row_anchor = tCs_coords(_, n_tile, k_block, read_stage);
++    auto copy_coord0 = row_anchor(0);
++    auto copy_coord1 = row_anchor(1);
++
++    auto words = cute::recast<std::uint32_t>(tCr(_, n_tile, k_block));
++    int entry_index = 0;
++    if (capture_any_thread) {
++      entry_index = atomicAdd(&probe_state->next_slot, 1);
++      if (entry_index >= kEntryCount) {
++        return;
++      }
++    } else {
++      if (tid_slot < 0) {
++        return;
++      }
++      entry_index = EntryIndex(tid_slot, n_tile, int(k_block));
++    }
++    BOperandProbeEntry& entry = probe_state->entries[entry_index];
++    entry.valid = 1;
++    entry.thread_idx = thread_idx;
++    entry.block_idx_x = static_cast<int>(blockIdx.x);
++    entry.block_idx_y = static_cast<int>(blockIdx.y);
++    entry.block_idx_z = static_cast<int>(blockIdx.z);
++    entry.tile_m_idx = -1;
++    entry.tile_n_idx = -1;
++    entry.tile_l_idx = -1;
++    entry.work_k_tile_start = -1;
++    entry.work_k_tile_count = -1;
++    if (auto const* cta_context = LoadCurrentCtaTileContext(probe_state)) {
++      entry.tile_m_idx = cta_context->tile_m_idx;
++      entry.tile_n_idx = cta_context->tile_n_idx;
++      entry.tile_l_idx = cta_context->tile_l_idx;
++      entry.work_k_tile_start = cta_context->work_k_tile_start;
++      entry.work_k_tile_count = cta_context->work_k_tile_count;
++    }
++    entry.read_stage = read_stage;
++    entry.n_tile = n_tile;
++    entry.k_block = int(k_block);
++    entry.dispatch_stages = probe_state->dispatch_stages;
++    entry.dispatch_scheduler_stages = probe_state->dispatch_scheduler_stages;
++    entry.tcrb_k_blocks = static_cast<int>(size<2>(tCr));
++    entry.tcrb_copy_view_k_blocks = static_cast<int>(size<2>(tCr_copy_view));
++    entry.tcsb_coord_k_blocks = static_cast<int>(size<2>(tCs_coords));
++    entry.tcrsfb_k_blocks = static_cast<int>(size<2>(tCrSF));
++    entry.tcrsfb_copy_view_k_blocks = static_cast<int>(size<2>(tCrSF_copy_view));
++    entry.tcssfb_coord_k_blocks = static_cast<int>(size<2>(tCsSF));
++    entry.tcrb_dim0 = static_cast<int>(size<0>(tCr));
++    entry.tcrb_dim1 = static_cast<int>(size<1>(tCr));
++    entry.tcrb_copy_view_dim0 = static_cast<int>(size<0>(tCr_copy_view));
++    entry.tcrb_copy_view_dim1 = static_cast<int>(size<1>(tCr_copy_view));
++    entry.tcsb_coord_dim0 = static_cast<int>(size<0>(tCs_coords));
++    entry.tcsb_coord_dim1 = static_cast<int>(size<1>(tCs_coords));
++    entry.tcsb_coord_stage_count = static_cast<int>(size<3>(tCs_coords));
++    entry.tcrsfb_dim0 = static_cast<int>(size<0>(tCrSF));
++    entry.tcrsfb_dim1 = static_cast<int>(size<1>(tCrSF));
++    entry.tcrsfb_copy_view_dim0 = static_cast<int>(size<0>(tCrSF_copy_view));
++    entry.tcrsfb_copy_view_dim1 = static_cast<int>(size<1>(tCrSF_copy_view));
++    entry.tcssfb_coord_dim0 = static_cast<int>(size<0>(tCsSF));
++    entry.tcssfb_coord_dim1 = static_cast<int>(size<1>(tCsSF));
++    entry.tcssfb_coord_stage_count = static_cast<int>(size<3>(tCsSF));
++    entry.sf_vec_size = sf_vec_size;
++    entry.smem_layout_atom_sfb_dim0 = smem_layout_atom_sfb_dim0;
++    entry.smem_layout_atom_sfb_dim1 = smem_layout_atom_sfb_dim1;
++    entry.sfb_stage_elems = sfb_stage_elems;
++    entry.sfb_total_elems = sfb_total_elems;
++    entry.sfb_stage_shape_dim0 = sfb_stage_shape_dim0;
++    entry.sfb_stage_shape_dim1 = sfb_stage_shape_dim1;
++    entry.layout_sfb_tv_dim0 = layout_sfb_tv_dim0;
++    entry.layout_sfb_tv_dim1 = layout_sfb_tv_dim1;
++    entry.part_c_row0 = CoordGet0(coord0);
++    entry.part_c_col0 = CoordGet1(coord0);
++    entry.local_row0 = CoordGet0(copy_coord0);
++    entry.local_col0 = CoordGet1(copy_coord0);
++    entry.local_row1 = CoordGet0(copy_coord1);
++    entry.local_col1 = CoordGet1(copy_coord1);
++    entry.stage0_offset0 = static_cast<int>(stage0_layout(entry.local_row0, entry.local_col0));
++    entry.stage0_offset1 = static_cast<int>(stage0_layout(entry.local_row1, entry.local_col1));
++    if (n_tile == 0 && int(k_block) == 0) {
++      CaptureStageByteSnapshot(probe_state, thread_idx, read_stage, smem_bytes);
++    }
++    entry.copy_view_sig_count = 0;
++    for (int sig = 0; sig < kCopyViewSignatureLen; ++sig) {
++      entry.copy_view_stage_offsets[sig] = -1;
++      entry.copy_view_stage_bytes[sig] = -1;
++    }
++    entry.copy_view_raw_sig_count = 0;
++    for (int sig = 0; sig < kCopyViewRawSignatureLen; ++sig) {
++      entry.copy_view_raw_rows[sig] = -1;
++      entry.copy_view_raw_cols[sig] = -1;
++      entry.copy_view_raw_stage_offsets[sig] = -1;
++      entry.copy_view_raw_stage_bytes[sig] = -1;
++      entry.copy_view_raw_byte_indices[sig] = -1;
++      for (int comp = 0; comp < kProducerDebugComponentCount; ++comp) {
++        entry.copy_view_raw_coord_components[sig][comp] = -1;
++      }
++      entry.copy_view_raw_semantic_rows[sig] = -1;
++      entry.copy_view_raw_semantic_byte_indices[sig] = -1;
++      entry.copy_view_raw_semantic_k_tiles[sig] = -1;
++    }
++    entry.semantic_row0 = -1;
++    entry.semantic_byte0 = -1;
++    entry.semantic_k_tile0 = -1;
++    entry.semantic_row1 = -1;
++    entry.semantic_byte1 = -1;
++    entry.semantic_k_tile1 = -1;
++    for (int sig = 0; sig < kCopyViewSignatureLen; ++sig) {
++      entry.copy_view_semantic_rows[sig] = -1;
++      entry.copy_view_semantic_byte_indices[sig] = -1;
++      entry.copy_view_semantic_k_tiles[sig] = -1;
++    }
++    entry.sf_reg_word_count = 0;
++    for (int word = 0; word < 4; ++word) {
++      entry.sf_reg_words_pre[word] = 0u;
++      entry.sf_reg_words_post[word] = 0u;
++    }
++    auto volatile* smem_storage =
++        reinterpret_cast<volatile std::uint8_t*>(cute::raw_pointer_cast(smem_bytes));
++    auto sf_words = cute::recast<std::uint32_t>(cute::filter_zeros(tCrSF(_, n_tile, k_block)));
++    LoadSemanticWeightStageSlot(
++        probe_state,
++        read_stage,
++        entry.stage0_offset0 / 2,
++        entry.stage0_offset0 & 0x1,
++        entry.semantic_row0,
++        entry.semantic_byte0,
++        entry.semantic_k_tile0);
++    LoadSemanticWeightStageSlot(
++        probe_state,
++        read_stage,
++        entry.stage0_offset1 / 2,
++        entry.stage0_offset1 & 0x1,
++        entry.semantic_row1,
++        entry.semantic_byte1,
++        entry.semantic_k_tile1);
++    ForEachProbeCoord(row_anchor, [&](auto const& coord, int physical) {
++      int const row = CoordGet0(coord);
++      int const col = CoordGet1(coord);
++      int const stage0_offset =
++          static_cast<int>(stage0_layout(row, col));
++      int const stage_byte = static_cast<int>(smem_storage[stage0_offset / 2]);
++      int semantic_row = -1;
++      int semantic_byte_index = -1;
++      int semantic_k_tile = -1;
++      LoadSemanticWeightStageSlot(
++          probe_state,
++          read_stage,
++          stage0_offset / 2,
++          stage0_offset & 0x1,
++          semantic_row,
++          semantic_byte_index,
++          semantic_k_tile);
++      if (physical < kCopyViewSignatureLen) {
++        entry.copy_view_sig_count = physical + 1;
++        entry.copy_view_stage_offsets[physical] = stage0_offset;
++        entry.copy_view_stage_bytes[physical] = stage_byte;
++        entry.copy_view_semantic_rows[physical] = semantic_row;
++        entry.copy_view_semantic_byte_indices[physical] = semantic_byte_index;
++        entry.copy_view_semantic_k_tiles[physical] = semantic_k_tile;
++      }
++      if (physical < kCopyViewRawSignatureLen) {
++        entry.copy_view_raw_sig_count = physical + 1;
++        entry.copy_view_raw_rows[physical] = row;
++        entry.copy_view_raw_cols[physical] = col;
++        entry.copy_view_raw_stage_offsets[physical] = stage0_offset;
++        entry.copy_view_raw_stage_bytes[physical] = stage_byte;
++        entry.copy_view_raw_byte_indices[physical] = col / 2;
++        int coord_component_count = 0;
++        FlattenCoordComponents(
++            coord,
++            entry.copy_view_raw_coord_components[physical],
++            kProducerDebugComponentCount,
++            coord_component_count);
++        entry.copy_view_raw_semantic_rows[physical] = semantic_row;
++        entry.copy_view_raw_semantic_byte_indices[physical] = semantic_byte_index;
++        entry.copy_view_raw_semantic_k_tiles[physical] = semantic_k_tile;
++      }
++    });
++    entry.sf_reg_word_count = static_cast<int>(size(sf_words));
++    if (entry.sf_reg_word_count > 0) {
++      entry.sf_reg_words_pre[0] = static_cast<std::uint32_t>(sf_words(0));
++    }
++    if (entry.sf_reg_word_count > 1) {
++      entry.sf_reg_words_pre[1] = static_cast<std::uint32_t>(sf_words(1));
++    }
++    if (entry.sf_reg_word_count > 2) {
++      entry.sf_reg_words_pre[2] = static_cast<std::uint32_t>(sf_words(2));
++    }
++    if (entry.sf_reg_word_count > 3) {
++      entry.sf_reg_words_pre[3] = static_cast<std::uint32_t>(sf_words(3));
++    }
++    entry.reg0_pre = static_cast<std::uint32_t>(words(0));
++    entry.reg1_pre = static_cast<std::uint32_t>(words(1));
++  }
++}
++
++template <class KBlock, class PartC, class TCr>
++CUTE_DEVICE void RecordOperandPostImpl(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCr const& tCr) {
++  if (probe_state == nullptr || probe_state->capture_any_thread != 0) {
++    return;
++  }
++  int const tid_slot = ProbeThreadSlot(probe_state, thread_idx);
++  if (tid_slot < 0 || !ProbeActiveForThread(probe_state, thread_idx)) {
++    return;
++  }
++
++  int const n_tiles = static_cast<int>(size<2>(part_c));
++  for (int n_tile = 0; n_tile < n_tiles && n_tile < kMaxNTiles; ++n_tile) {
++    auto words = cute::recast<std::uint32_t>(tCr(_, n_tile, k_block));
++    BOperandProbeEntry& entry = probe_state->entries[EntryIndex(tid_slot, n_tile, int(k_block))];
++    entry.reg0_post = static_cast<std::uint32_t>(words(0));
++    entry.reg1_post = static_cast<std::uint32_t>(words(1));
++  }
++}
++
++template <class KBlock, class PartC, class TCrSF>
++CUTE_DEVICE void RecordOperandScalePostImpl(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrSF const& tCrSF) {
++  if (probe_state == nullptr || probe_state->capture_any_thread != 0) {
++    return;
++  }
++  int const tid_slot = ProbeThreadSlot(probe_state, thread_idx);
++  if (tid_slot < 0 || !ProbeActiveForThread(probe_state, thread_idx)) {
++    return;
++  }
++
++  int const n_tiles = static_cast<int>(size<2>(part_c));
++  for (int n_tile = 0; n_tile < n_tiles && n_tile < kMaxNTiles; ++n_tile) {
++    auto sf_words = cute::recast<std::uint32_t>(cute::filter_zeros(tCrSF(_, n_tile, k_block)));
++    BOperandProbeEntry& entry = probe_state->entries[EntryIndex(tid_slot, n_tile, int(k_block))];
++    int const word_count = static_cast<int>(size(sf_words));
++    if (entry.sf_reg_word_count < word_count) {
++      entry.sf_reg_word_count = word_count;
++    }
++    if (word_count > 0) {
++      entry.sf_reg_words_post[0] = static_cast<std::uint32_t>(sf_words(0));
++    }
++    if (word_count > 1) {
++      entry.sf_reg_words_post[1] = static_cast<std::uint32_t>(sf_words(1));
++    }
++    if (word_count > 2) {
++      entry.sf_reg_words_post[2] = static_cast<std::uint32_t>(sf_words(2));
++    }
++    if (word_count > 3) {
++      entry.sf_reg_words_post[3] = static_cast<std::uint32_t>(sf_words(3));
++    }
++  }
++}
++
++template <class KBlock, class TCsBCoords, class TCsSFBCoords, class PartC, class Stage0Layout, class BytePtr, class TCrB, class TCrBCopyView, class TCrSFB, class TCrSFBCopyView>
++CUTE_DEVICE void RecordBOperandPre(
++    int thread_idx,
++    int read_stage,
++    KBlock k_block,
++    TCsBCoords const& tCsB_coords,
++    TCsSFBCoords const& tCsSFB,
++    PartC const& part_c,
++    Stage0Layout const& stage0_B,
++    BytePtr smem_b_bytes,
++    TCrB const& tCrB,
++    TCrBCopyView const& tCrB_copy_view,
++    TCrSFB const& tCrSFB,
++    TCrSFBCopyView const& tCrSFB_copy_view,
++    int sf_vec_size,
++    int smem_layout_atom_sfb_dim0,
++    int smem_layout_atom_sfb_dim1,
++    int sfb_stage_elems,
++    int sfb_total_elems,
++    int sfb_stage_shape_dim0,
++    int sfb_stage_shape_dim1,
++    int layout_sfb_tv_dim0,
++    int layout_sfb_tv_dim1) {
++  RecordOperandPreImpl(&g_b_operand_probe, thread_idx, read_stage, k_block, tCsB_coords, tCsSFB,
++                       part_c, stage0_B, smem_b_bytes, tCrB, tCrB_copy_view, tCrSFB, tCrSFB_copy_view,
++                       sf_vec_size, smem_layout_atom_sfb_dim0, smem_layout_atom_sfb_dim1,
++                       sfb_stage_elems, sfb_total_elems, sfb_stage_shape_dim0, sfb_stage_shape_dim1,
++                       layout_sfb_tv_dim0, layout_sfb_tv_dim1);
++}
++
++template <class KBlock, class PartC, class TCrB>
++CUTE_DEVICE void RecordBOperandPost(
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrB const& tCrB) {
++  RecordOperandPostImpl(&g_b_operand_probe, thread_idx, k_block, part_c, tCrB);
++}
++
++template <class KBlock, class PartC, class TCrSFB>
++CUTE_DEVICE void RecordBOperandScalePost(
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrSFB const& tCrSFB) {
++  RecordOperandScalePostImpl(&g_b_operand_probe, thread_idx, k_block, part_c, tCrSFB);
++}
++
++template <class KBlock, class TCsBCoords, class TCsSFBCoords, class PartC, class Stage0Layout, class BytePtr, class TCrB, class TCrBCopyView, class TCrSFB, class TCrSFBCopyView>
++CUTE_DEVICE void RecordBOperandPre(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    int read_stage,
++    KBlock k_block,
++    TCsBCoords const& tCsB_coords,
++    TCsSFBCoords const& tCsSFB,
++    PartC const& part_c,
++    Stage0Layout const& stage0_B,
++    BytePtr smem_b_bytes,
++    TCrB const& tCrB,
++    TCrBCopyView const& tCrB_copy_view,
++    TCrSFB const& tCrSFB,
++    TCrSFBCopyView const& tCrSFB_copy_view,
++    int sf_vec_size,
++    int smem_layout_atom_sfb_dim0,
++    int smem_layout_atom_sfb_dim1,
++    int sfb_stage_elems,
++    int sfb_total_elems,
++    int sfb_stage_shape_dim0,
++    int sfb_stage_shape_dim1,
++    int layout_sfb_tv_dim0,
++    int layout_sfb_tv_dim1) {
++  RecordOperandPreImpl(probe_state, thread_idx, read_stage, k_block, tCsB_coords, tCsSFB,
++                       part_c, stage0_B, smem_b_bytes, tCrB, tCrB_copy_view, tCrSFB, tCrSFB_copy_view,
++                       sf_vec_size, smem_layout_atom_sfb_dim0, smem_layout_atom_sfb_dim1,
++                       sfb_stage_elems, sfb_total_elems, sfb_stage_shape_dim0, sfb_stage_shape_dim1,
++                       layout_sfb_tv_dim0, layout_sfb_tv_dim1);
++}
++
++template <class KBlock, class PartC, class TCrB>
++CUTE_DEVICE void RecordBOperandPost(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrB const& tCrB) {
++  RecordOperandPostImpl(probe_state, thread_idx, k_block, part_c, tCrB);
++}
++
++template <class KBlock, class PartC, class TCrSFB>
++CUTE_DEVICE void RecordBOperandScalePost(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrSFB const& tCrSFB) {
++  RecordOperandScalePostImpl(probe_state, thread_idx, k_block, part_c, tCrSFB);
++}
++
++template <class KBlock, class TCsACoords, class TCsSFACoords, class PartC, class Stage0Layout, class BytePtr, class TCrA, class TCrACopyView, class TCrSFA, class TCrSFACopyView>
++CUTE_DEVICE void RecordAOperandPre(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    int read_stage,
++    KBlock k_block,
++    TCsACoords const& tCsA_coords,
++    TCsSFACoords const& tCsSFA,
++    PartC const& part_c,
++    Stage0Layout const& stage0_A,
++    BytePtr smem_a_bytes,
++    TCrA const& tCrA,
++    TCrACopyView const& tCrA_copy_view,
++    TCrSFA const& tCrSFA,
++    TCrSFACopyView const& tCrSFA_copy_view,
++    int sf_vec_size,
++    int smem_layout_atom_sfa_dim0,
++    int smem_layout_atom_sfa_dim1,
++    int sfa_stage_elems,
++    int sfa_total_elems,
++    int sfa_stage_shape_dim0,
++    int sfa_stage_shape_dim1,
++    int layout_sfa_tv_dim0,
++    int layout_sfa_tv_dim1) {
++  RecordOperandPreImpl(probe_state, thread_idx, read_stage, k_block, tCsA_coords, tCsSFA,
++                       part_c, stage0_A, smem_a_bytes, tCrA, tCrA_copy_view, tCrSFA, tCrSFA_copy_view,
++                       sf_vec_size, smem_layout_atom_sfa_dim0, smem_layout_atom_sfa_dim1,
++                       sfa_stage_elems, sfa_total_elems, sfa_stage_shape_dim0, sfa_stage_shape_dim1,
++                       layout_sfa_tv_dim0, layout_sfa_tv_dim1);
++}
++
++template <class KBlock, class TCsACoords, class TCsSFACoords, class PartC, class Stage0Layout, class BytePtr, class TCrA, class TCrACopyView, class TCrSFA, class TCrSFACopyView>
++CUTE_DEVICE void RecordAOperandPre(
++    int thread_idx,
++    int read_stage,
++    KBlock k_block,
++    TCsACoords const& tCsA_coords,
++    TCsSFACoords const& tCsSFA,
++    PartC const& part_c,
++    Stage0Layout const& stage0_A,
++    BytePtr smem_a_bytes,
++    TCrA const& tCrA,
++    TCrACopyView const& tCrA_copy_view,
++    TCrSFA const& tCrSFA,
++    TCrSFACopyView const& tCrSFA_copy_view,
++    int sf_vec_size,
++    int smem_layout_atom_sfa_dim0,
++    int smem_layout_atom_sfa_dim1,
++    int sfa_stage_elems,
++    int sfa_total_elems,
++    int sfa_stage_shape_dim0,
++    int sfa_stage_shape_dim1,
++    int layout_sfa_tv_dim0,
++    int layout_sfa_tv_dim1) {
++  RecordAOperandPre(&g_b_operand_probe, thread_idx, read_stage, k_block, tCsA_coords, tCsSFA,
++                    part_c, stage0_A, smem_a_bytes, tCrA, tCrA_copy_view, tCrSFA, tCrSFA_copy_view,
++                    sf_vec_size, smem_layout_atom_sfa_dim0, smem_layout_atom_sfa_dim1,
++                    sfa_stage_elems, sfa_total_elems, sfa_stage_shape_dim0, sfa_stage_shape_dim1,
++                    layout_sfa_tv_dim0, layout_sfa_tv_dim1);
++}
++
++template <class KBlock, class PartC, class TCrA>
++CUTE_DEVICE void RecordAOperandPost(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrA const& tCrA) {
++  RecordOperandPostImpl(probe_state, thread_idx, k_block, part_c, tCrA);
++}
++
++template <class KBlock, class PartC, class TCrSFA>
++CUTE_DEVICE void RecordAOperandScalePost(
++    BOperandProbeState* probe_state,
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrSFA const& tCrSFA) {
++  RecordOperandScalePostImpl(probe_state, thread_idx, k_block, part_c, tCrSFA);
++}
++
++template <class KBlock, class PartC, class TCrA>
++CUTE_DEVICE void RecordAOperandPost(
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrA const& tCrA) {
++  RecordAOperandPost(&g_b_operand_probe, thread_idx, k_block, part_c, tCrA);
++}
++
++template <class KBlock, class PartC, class TCrSFA>
++CUTE_DEVICE void RecordAOperandScalePost(
++    int thread_idx,
++    KBlock k_block,
++    PartC const& part_c,
++    TCrSFA const& tCrSFA) {
++  RecordAOperandScalePost(&g_b_operand_probe, thread_idx, k_block, part_c, tCrSFA);
++}
++
++}  // namespace cutlass::gemm::collective::nemotron_probe

@@ -29,7 +29,7 @@ add_executable(
 )
 
 target_link_libraries(prefix_cache_test PRIVATE nemotron_runtime_cache)
-target_compile_features(prefix_cache_test PRIVATE cxx_std_17)
+target_compile_features(prefix_cache_test PRIVATE cxx_std_20)
 
 nemotron_add_test(prefix_cache_test)
 
@@ -39,7 +39,7 @@ add_executable(
 )
 
 target_link_libraries(reusable_state_test PRIVATE nemotron_runtime_state)
-target_compile_features(reusable_state_test PRIVATE cxx_std_17)
+target_compile_features(reusable_state_test PRIVATE cxx_std_20)
 
 nemotron_add_test(reusable_state_test)
 
@@ -49,7 +49,7 @@ add_executable(
 )
 
 target_link_libraries(paged_kv_cache_test PRIVATE nemotron_runtime_state)
-target_compile_features(paged_kv_cache_test PRIVATE cxx_std_17)
+target_compile_features(paged_kv_cache_test PRIVATE cxx_std_20)
 
 nemotron_add_test(paged_kv_cache_test)
 
@@ -59,7 +59,7 @@ add_executable(
 )
 
 target_link_libraries(paged_attention_plan_test PRIVATE nemotron_runtime_state)
-target_compile_features(paged_attention_plan_test PRIVATE cxx_std_17)
+target_compile_features(paged_attention_plan_test PRIVATE cxx_std_20)
 
 nemotron_add_test(paged_attention_plan_test)
 
@@ -69,7 +69,7 @@ add_executable(
 )
 
 target_link_libraries(memory_budget_test PRIVATE nemotron_runtime_planning)
-target_compile_features(memory_budget_test PRIVATE cxx_std_17)
+target_compile_features(memory_budget_test PRIVATE cxx_std_20)
 
 nemotron_add_test(memory_budget_test)
 
@@ -79,7 +79,7 @@ add_executable(
 )
 
 target_link_libraries(loader_plan_test PRIVATE nemotron_runtime_loader)
-target_compile_features(loader_plan_test PRIVATE cxx_std_17)
+target_compile_features(loader_plan_test PRIVATE cxx_std_20)
 
 nemotron_add_test(loader_plan_test)
 
@@ -89,7 +89,7 @@ add_executable(
 )
 
 target_link_libraries(manifest_io_test PRIVATE nemotron_runtime_loader nemotron_runtime_api)
-target_compile_features(manifest_io_test PRIVATE cxx_std_17)
+target_compile_features(manifest_io_test PRIVATE cxx_std_20)
 
 nemotron_add_test(manifest_io_test)
 
@@ -99,7 +99,7 @@ add_executable(
 )
 
 target_link_libraries(model_schedule_test PRIVATE nemotron_runtime_loader)
-target_compile_features(model_schedule_test PRIVATE cxx_std_17)
+target_compile_features(model_schedule_test PRIVATE cxx_std_20)
 
 nemotron_add_test(model_schedule_test)
 
@@ -109,7 +109,7 @@ add_executable(
 )
 
 target_link_libraries(artifact_loader_test PRIVATE nemotron_runtime_loader)
-target_compile_features(artifact_loader_test PRIVATE cxx_std_17)
+target_compile_features(artifact_loader_test PRIVATE cxx_std_20)
 
 nemotron_add_test(artifact_loader_test)
 
@@ -119,7 +119,7 @@ add_executable(
 )
 
 target_link_libraries(tensor_catalog_test PRIVATE nemotron_runtime_loader)
-target_compile_features(tensor_catalog_test PRIVATE cxx_std_17)
+target_compile_features(tensor_catalog_test PRIVATE cxx_std_20)
 
 nemotron_add_test(tensor_catalog_test)
 
@@ -129,7 +129,7 @@ add_executable(
 )
 
 target_link_libraries(weight_arena_plan_test PRIVATE nemotron_runtime_loader)
-target_compile_features(weight_arena_plan_test PRIVATE cxx_std_17)
+target_compile_features(weight_arena_plan_test PRIVATE cxx_std_20)
 
 nemotron_add_test(weight_arena_plan_test)
 
@@ -139,7 +139,7 @@ add_executable(
 )
 
 target_link_libraries(weight_arena_test PRIVATE nemotron_runtime_loader)
-target_compile_features(weight_arena_test PRIVATE cxx_std_17)
+target_compile_features(weight_arena_test PRIVATE cxx_std_20)
 
 nemotron_add_test(weight_arena_test)
 
@@ -149,7 +149,7 @@ add_executable(
 )
 
 target_link_libraries(kernel_catalog_test PRIVATE nemotron_runtime_loader)
-target_compile_features(kernel_catalog_test PRIVATE cxx_std_17)
+target_compile_features(kernel_catalog_test PRIVATE cxx_std_20)
 
 nemotron_add_test(kernel_catalog_test)
 
@@ -159,7 +159,7 @@ add_executable(
 )
 
 target_link_libraries(gemm_catalog_test PRIVATE nemotron_runtime_loader)
-target_compile_features(gemm_catalog_test PRIVATE cxx_std_17)
+target_compile_features(gemm_catalog_test PRIVATE cxx_std_20)
 
 nemotron_add_test(gemm_catalog_test)
 
@@ -169,7 +169,7 @@ add_executable(
 )
 
 target_link_libraries(embedding_catalog_test PRIVATE nemotron_runtime_loader)
-target_compile_features(embedding_catalog_test PRIVATE cxx_std_17)
+target_compile_features(embedding_catalog_test PRIVATE cxx_std_20)
 
 nemotron_add_test(embedding_catalog_test)
 
@@ -179,7 +179,7 @@ add_executable(
 )
 
 target_link_libraries(gemm_planner_test PRIVATE nemotron_runtime_loader)
-target_compile_features(gemm_planner_test PRIVATE cxx_std_17)
+target_compile_features(gemm_planner_test PRIVATE cxx_std_20)
 
 nemotron_add_test(gemm_planner_test)
 
@@ -189,7 +189,7 @@ add_executable(
 )
 
 target_link_libraries(gemm_execution_test PRIVATE nemotron_runtime_loader)
-target_compile_features(gemm_execution_test PRIVATE cxx_std_17)
+target_compile_features(gemm_execution_test PRIVATE cxx_std_20)
 
 nemotron_add_test(gemm_execution_test)
 
@@ -199,7 +199,7 @@ add_executable(
 )
 
 target_link_libraries(cublaslt_gemm_plan_test PRIVATE nemotron_runtime_loader)
-target_compile_features(cublaslt_gemm_plan_test PRIVATE cxx_std_17)
+target_compile_features(cublaslt_gemm_plan_test PRIVATE cxx_std_20)
 
 nemotron_add_test(cublaslt_gemm_plan_test)
 
@@ -209,7 +209,7 @@ add_executable(
 )
 
 target_link_libraries(device_tensor_test PRIVATE nemotron_runtime_backend)
-target_compile_features(device_tensor_test PRIVATE cxx_std_17)
+target_compile_features(device_tensor_test PRIVATE cxx_std_20)
 
 nemotron_add_test(device_tensor_test)
 
@@ -219,7 +219,7 @@ add_executable(
 )
 
 target_link_libraries(device_argmax_test PRIVATE nemotron_runtime_backend)
-target_compile_features(device_argmax_test PRIVATE cxx_std_17)
+target_compile_features(device_argmax_test PRIVATE cxx_std_20)
 
 nemotron_add_test(device_argmax_test)
 
@@ -229,7 +229,7 @@ add_executable(
 )
 
 target_link_libraries(expert_routing_device_test PRIVATE nemotron_runtime_backend)
-target_compile_features(expert_routing_device_test PRIVATE cxx_std_17)
+target_compile_features(expert_routing_device_test PRIVATE cxx_std_20)
 
 nemotron_add_test(expert_routing_device_test)
 
@@ -239,7 +239,7 @@ add_executable(
 )
 
 target_link_libraries(moe_launch_plan_device_test PRIVATE nemotron_runtime_backend)
-target_compile_features(moe_launch_plan_device_test PRIVATE cxx_std_17)
+target_compile_features(moe_launch_plan_device_test PRIVATE cxx_std_20)
 
 nemotron_add_test(moe_launch_plan_device_test)
 
@@ -249,7 +249,7 @@ add_executable(
 )
 
 target_link_libraries(expert_layer_fastpath_test PRIVATE nemotron_runtime_backend)
-target_compile_features(expert_layer_fastpath_test PRIVATE cxx_std_17)
+target_compile_features(expert_layer_fastpath_test PRIVATE cxx_std_20)
 
 nemotron_add_test(expert_layer_fastpath_test)
 
@@ -259,7 +259,7 @@ add_executable(
 )
 
 target_link_libraries(routed_profile_matrix_probe PRIVATE nemotron_runtime_backend)
-target_compile_features(routed_profile_matrix_probe PRIVATE cxx_std_17)
+target_compile_features(routed_profile_matrix_probe PRIVATE cxx_std_20)
 
 add_executable(
   swap_false_fp4_oracle_test
@@ -273,7 +273,7 @@ target_link_libraries(
     CUDA::cudart
 )
 
-target_compile_features(swap_false_fp4_oracle_test PRIVATE cxx_std_17)
+target_compile_features(swap_false_fp4_oracle_test PRIVATE cxx_std_20)
 
 nemotron_add_test(swap_false_fp4_oracle_test)
 
@@ -396,7 +396,7 @@ add_executable(
 )
 
 target_link_libraries(device_nvfp4_matrix_test PRIVATE nemotron_runtime_backend)
-target_compile_features(device_nvfp4_matrix_test PRIVATE cxx_std_17)
+target_compile_features(device_nvfp4_matrix_test PRIVATE cxx_std_20)
 
 nemotron_add_test(device_nvfp4_matrix_test)
 
@@ -406,7 +406,7 @@ add_executable(
 )
 
 target_link_libraries(dense_weight_test PRIVATE nemotron_runtime_backend)
-target_compile_features(dense_weight_test PRIVATE cxx_std_17)
+target_compile_features(dense_weight_test PRIVATE cxx_std_20)
 
 nemotron_add_test(dense_weight_test)
 
@@ -416,7 +416,7 @@ add_executable(
 )
 
 target_link_libraries(linear_op_test PRIVATE nemotron_runtime_backend)
-target_compile_features(linear_op_test PRIVATE cxx_std_17)
+target_compile_features(linear_op_test PRIVATE cxx_std_20)
 
 nemotron_add_test(linear_op_test)
 
@@ -426,7 +426,7 @@ add_executable(
 )
 
 target_link_libraries(scaled_fp8_linear_test PRIVATE nemotron_runtime_backend)
-target_compile_features(scaled_fp8_linear_test PRIVATE cxx_std_17)
+target_compile_features(scaled_fp8_linear_test PRIVATE cxx_std_20)
 
 nemotron_add_test(scaled_fp8_linear_test)
 
@@ -436,7 +436,7 @@ add_executable(
 )
 
 target_link_libraries(scaled_fp8_linear_compare_test PRIVATE nemotron_runtime_backend)
-target_compile_features(scaled_fp8_linear_compare_test PRIVATE cxx_std_17)
+target_compile_features(scaled_fp8_linear_compare_test PRIVATE cxx_std_20)
 
 nemotron_add_test(scaled_fp8_linear_compare_test)
 
@@ -472,7 +472,7 @@ target_link_libraries(
     ${CMAKE_DL_LIBS}
 )
 
-target_compile_features(nano_paged_attention_test PRIVATE cxx_std_17)
+target_compile_features(nano_paged_attention_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nano_paged_attention_test)
 
@@ -487,7 +487,7 @@ target_link_libraries(
     nemotron_runtime_backend
 )
 
-target_compile_features(nano_attention_layer_integration_test PRIVATE cxx_std_17)
+target_compile_features(nano_attention_layer_integration_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nano_attention_layer_integration_test)
 
@@ -497,7 +497,7 @@ add_executable(
 )
 
 target_link_libraries(primitive_ops_test PRIVATE nemotron_runtime_backend)
-target_compile_features(primitive_ops_test PRIVATE cxx_std_17)
+target_compile_features(primitive_ops_test PRIVATE cxx_std_20)
 
 nemotron_add_test(primitive_ops_test)
 
@@ -507,7 +507,7 @@ add_executable(
 )
 
 target_link_libraries(attention_layer_test PRIVATE nemotron_runtime_backend)
-target_compile_features(attention_layer_test PRIVATE cxx_std_17)
+target_compile_features(attention_layer_test PRIVATE cxx_std_20)
 
 nemotron_add_test(attention_layer_test)
 
@@ -517,7 +517,7 @@ add_executable(
 )
 
 target_link_libraries(nvfp4_weight_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_weight_test PRIVATE cxx_std_17)
+target_compile_features(nvfp4_weight_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nvfp4_weight_test)
 
@@ -527,7 +527,7 @@ add_executable(
 )
 
 target_link_libraries(nvfp4_packing_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_packing_test PRIVATE cxx_std_17)
+target_compile_features(nvfp4_packing_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nvfp4_packing_test)
 
@@ -543,7 +543,7 @@ add_executable(
 )
 
 target_link_libraries(staged_fp4_pack_test PRIVATE nemotron_runtime_backend)
-target_compile_features(staged_fp4_pack_test PRIVATE cxx_std_17)
+target_compile_features(staged_fp4_pack_test PRIVATE cxx_std_20)
 
 nemotron_add_test(staged_fp4_pack_test)
 
@@ -558,7 +558,7 @@ target_link_libraries(
     nemotron_runtime_backend
     CUDA::cudart
 )
-target_compile_features(nano_p1_mainloop_oracle_test PRIVATE cxx_std_17)
+target_compile_features(nano_p1_mainloop_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   nano_p1_mainloop_oracle_test
   PRIVATE
@@ -597,6 +597,93 @@ endif()
 target_compile_features(nano_p1_b_operand_probe PRIVATE cxx_std_20)
 
 add_executable(
+  nano_p1_a_operand_probe
+  backend/nano_p1_a_operand_probe.cu
+)
+
+target_link_libraries(
+  nano_p1_a_operand_probe
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  nano_p1_a_operand_probe
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nano_p1_a_operand_probe
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+endif()
+
+target_compile_features(nano_p1_a_operand_probe PRIVATE cxx_std_20)
+
+add_executable(
+  nano_p1_layout_compare
+  backend/nano_p1_layout_compare.cu
+)
+
+target_link_libraries(
+  nano_p1_layout_compare
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  nano_p1_layout_compare
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nano_p1_layout_compare
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+endif()
+
+target_compile_features(nano_p1_layout_compare PRIVATE cxx_std_20)
+
+add_executable(
+  nano_p1_a_scale_probe
+  backend/nano_p1_a_scale_probe.cu
+)
+
+target_link_libraries(
+  nano_p1_a_scale_probe
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  nano_p1_a_scale_probe
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nano_p1_a_scale_probe
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+endif()
+
+target_compile_features(nano_p1_a_scale_probe PRIVATE cxx_std_20)
+
+add_executable(
   nano_p1_reference_a_operand_probe
   backend/nano_p1_reference_a_operand_probe.cu
 )
@@ -626,6 +713,35 @@ endif()
 target_compile_features(nano_p1_reference_a_operand_probe PRIVATE cxx_std_20)
 
 add_executable(
+  nano_p1_reference_b_operand_probe
+  backend/nano_p1_reference_b_operand_probe.cu
+)
+
+target_link_libraries(
+  nano_p1_reference_b_operand_probe
+  PRIVATE
+    nemotron_runtime_backend
+    CUDA::cudart
+)
+
+target_include_directories(
+  nano_p1_reference_b_operand_probe
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+)
+
+if(NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR)
+  target_include_directories(
+    nano_p1_reference_b_operand_probe
+    PRIVATE
+      ${NEMOTRON_TEST_LOCAL_CUTLASS_INCLUDE_DIR}
+  )
+endif()
+
+target_compile_features(nano_p1_reference_b_operand_probe PRIVATE cxx_std_20)
+
+add_executable(
   nano_p1_direct_pack_oracle_test
   backend/nano_p1_direct_pack_oracle_test.cpp
 )
@@ -636,7 +752,7 @@ target_link_libraries(
     nemotron_runtime_backend
     CUDA::cudart
 )
-target_compile_features(nano_p1_direct_pack_oracle_test PRIVATE cxx_std_17)
+target_compile_features(nano_p1_direct_pack_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   nano_p1_direct_pack_oracle_test
   PRIVATE
@@ -651,7 +767,7 @@ add_executable(
 )
 
 target_link_libraries(nvfp4_pack_compare_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_pack_compare_test PRIVATE cxx_std_17)
+target_compile_features(nvfp4_pack_compare_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nvfp4_pack_compare_test)
 
@@ -661,7 +777,7 @@ add_executable(
 )
 
 target_link_libraries(nvfp4_linear_compare_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_linear_compare_test PRIVATE cxx_std_17)
+target_compile_features(nvfp4_linear_compare_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nvfp4_linear_compare_test)
 
@@ -671,7 +787,7 @@ add_executable(
 )
 
 target_link_libraries(nvfp4_gemm_runner_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_gemm_runner_test PRIVATE cxx_std_17)
+target_compile_features(nvfp4_gemm_runner_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nvfp4_gemm_runner_test)
 
@@ -681,7 +797,7 @@ add_executable(
 )
 
 target_link_libraries(nvfp4_vllm_golden_test PRIVATE nemotron_runtime_backend)
-target_compile_features(nvfp4_vllm_golden_test PRIVATE cxx_std_17)
+target_compile_features(nvfp4_vllm_golden_test PRIVATE cxx_std_20)
 target_compile_definitions(
   nvfp4_vllm_golden_test
   PRIVATE
@@ -701,7 +817,7 @@ add_executable(
 )
 
 target_link_libraries(mamba_conv_prefill_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_conv_prefill_test PRIVATE cxx_std_17)
+target_compile_features(mamba_conv_prefill_test PRIVATE cxx_std_20)
 
 nemotron_add_test(mamba_conv_prefill_test)
 
@@ -711,7 +827,7 @@ add_executable(
 )
 
 target_link_libraries(mamba_ssd_prefill_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_ssd_prefill_test PRIVATE cxx_std_17)
+target_compile_features(mamba_ssd_prefill_test PRIVATE cxx_std_20)
 
 nemotron_add_test(mamba_ssd_prefill_test)
 
@@ -721,7 +837,7 @@ add_executable(
 )
 
 target_link_libraries(mamba_gated_group_norm_test PRIVATE nemotron_runtime_backend)
-target_compile_features(mamba_gated_group_norm_test PRIVATE cxx_std_17)
+target_compile_features(mamba_gated_group_norm_test PRIVATE cxx_std_20)
 
 nemotron_add_test(mamba_gated_group_norm_test)
 
@@ -731,7 +847,7 @@ add_executable(
 )
 
 target_link_libraries(embedding_lookup_test PRIVATE nemotron_runtime_backend)
-target_compile_features(embedding_lookup_test PRIVATE cxx_std_17)
+target_compile_features(embedding_lookup_test PRIVATE cxx_std_20)
 
 nemotron_add_test(embedding_lookup_test)
 
@@ -741,7 +857,7 @@ add_executable(
 )
 
 target_link_libraries(dense_gemm_runner_test PRIVATE nemotron_runtime_backend)
-target_compile_features(dense_gemm_runner_test PRIVATE cxx_std_17)
+target_compile_features(dense_gemm_runner_test PRIVATE cxx_std_20)
 
 nemotron_add_test(dense_gemm_runner_test)
 
@@ -751,7 +867,7 @@ add_executable(
 )
 
 target_link_libraries(embedding_projection_fragment_test PRIVATE nemotron_runtime_backend)
-target_compile_features(embedding_projection_fragment_test PRIVATE cxx_std_17)
+target_compile_features(embedding_projection_fragment_test PRIVATE cxx_std_20)
 
 nemotron_add_test(embedding_projection_fragment_test)
 
@@ -762,7 +878,7 @@ if(NEMOTRON_RUNTIME_HAVE_CUDNN_FE)
   )
 
   target_link_libraries(cudnn_paged_attention_test PRIVATE nemotron_runtime_backend)
-  target_compile_features(cudnn_paged_attention_test PRIVATE cxx_std_17)
+  target_compile_features(cudnn_paged_attention_test PRIVATE cxx_std_20)
 
   nemotron_add_test(cudnn_paged_attention_test)
 endif()
@@ -773,7 +889,7 @@ add_executable(
 )
 
 target_link_libraries(runtime_config_test PRIVATE nemotron_runtime_api nemotron_runtime_cache nemotron_runtime_state)
-target_compile_features(runtime_config_test PRIVATE cxx_std_17)
+target_compile_features(runtime_config_test PRIVATE cxx_std_20)
 
 nemotron_add_test(runtime_config_test)
 
@@ -783,7 +899,7 @@ add_executable(
 )
 
 target_link_libraries(runtime_environment_test PRIVATE nemotron_runtime_api)
-target_compile_features(runtime_environment_test PRIVATE cxx_std_17)
+target_compile_features(runtime_environment_test PRIVATE cxx_std_20)
 
 nemotron_add_test(runtime_environment_test)
 
@@ -793,7 +909,7 @@ add_executable(
 )
 
 target_link_libraries(cudnn_feasibility_test PRIVATE nemotron_runtime_api)
-target_compile_features(cudnn_feasibility_test PRIVATE cxx_std_17)
+target_compile_features(cudnn_feasibility_test PRIVATE cxx_std_20)
 
 nemotron_add_test(cudnn_feasibility_test)
 
@@ -803,7 +919,7 @@ add_executable(
 )
 
 target_link_libraries(state_snapshot_test PRIVATE nemotron_runtime_api)
-target_compile_features(state_snapshot_test PRIVATE cxx_std_17)
+target_compile_features(state_snapshot_test PRIVATE cxx_std_20)
 
 nemotron_add_test(state_snapshot_test)
 
@@ -853,7 +969,7 @@ add_executable(
 )
 
 target_link_libraries(split_prefill_localization_test PRIVATE nemotron_runtime_api)
-target_compile_features(split_prefill_localization_test PRIVATE cxx_std_17)
+target_compile_features(split_prefill_localization_test PRIVATE cxx_std_20)
 target_compile_definitions(
   split_prefill_localization_test
   PRIVATE
@@ -866,7 +982,7 @@ add_executable(
 )
 
 target_link_libraries(nano_loader_budget_test PRIVATE nemotron_runtime_api)
-target_compile_features(nano_loader_budget_test PRIVATE cxx_std_17)
+target_compile_features(nano_loader_budget_test PRIVATE cxx_std_20)
 target_compile_definitions(
   nano_loader_budget_test
   PRIVATE
@@ -881,7 +997,7 @@ add_executable(
 )
 
 target_link_libraries(nano_16_token_correctness_test PRIVATE nemotron_runtime_api)
-target_compile_features(nano_16_token_correctness_test PRIVATE cxx_std_17)
+target_compile_features(nano_16_token_correctness_test PRIVATE cxx_std_20)
 
 nemotron_add_test(nano_16_token_correctness_test)
 
@@ -891,7 +1007,7 @@ add_executable(
 )
 
 target_link_libraries(continuation_prefill_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(continuation_prefill_oracle_test PRIVATE cxx_std_17)
+target_compile_features(continuation_prefill_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   continuation_prefill_oracle_test
   PRIVATE
@@ -906,7 +1022,7 @@ add_executable(
 )
 
 target_link_libraries(nano_24_token_prefill_regression_test PRIVATE nemotron_runtime_api)
-target_compile_features(nano_24_token_prefill_regression_test PRIVATE cxx_std_17)
+target_compile_features(nano_24_token_prefill_regression_test PRIVATE cxx_std_20)
 target_compile_definitions(
   nano_24_token_prefill_regression_test
   PRIVATE
@@ -921,7 +1037,7 @@ add_executable(
 )
 
 target_link_libraries(nano_save_prompt_oracle PRIVATE nemotron_runtime_api)
-target_compile_features(nano_save_prompt_oracle PRIVATE cxx_std_17)
+target_compile_features(nano_save_prompt_oracle PRIVATE cxx_std_20)
 
 nemotron_add_test(nano_save_prompt_oracle)
 
@@ -941,7 +1057,7 @@ add_executable(
 )
 
 target_link_libraries(prefill_prefix_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(prefill_prefix_oracle_test PRIVATE cxx_std_17)
+target_compile_features(prefill_prefix_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   prefill_prefix_oracle_test
   PRIVATE
@@ -956,7 +1072,7 @@ add_executable(
 )
 
 target_link_libraries(single_token_decode_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(single_token_decode_oracle_test PRIVATE cxx_std_17)
+target_compile_features(single_token_decode_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   single_token_decode_oracle_test
   PRIVATE
@@ -971,7 +1087,7 @@ add_executable(
 )
 
 target_link_libraries(expert_layer_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(expert_layer_oracle_test PRIVATE cxx_std_17)
+target_compile_features(expert_layer_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   expert_layer_oracle_test
   PRIVATE
@@ -986,7 +1102,7 @@ add_executable(
 )
 
 target_link_libraries(expert_layer8_oracle_test PRIVATE nemotron_runtime_backend)
-target_compile_features(expert_layer8_oracle_test PRIVATE cxx_std_17)
+target_compile_features(expert_layer8_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   expert_layer8_oracle_test
   PRIVATE
@@ -1001,7 +1117,7 @@ add_executable(
 )
 
 target_link_libraries(mamba_layer_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(mamba_layer_oracle_test PRIVATE cxx_std_17)
+target_compile_features(mamba_layer_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   mamba_layer_oracle_test
   PRIVATE
@@ -1016,7 +1132,7 @@ add_executable(
 )
 
 target_link_libraries(mamba_layer9_oracle_test PRIVATE nemotron_runtime_api)
-target_compile_features(mamba_layer9_oracle_test PRIVATE cxx_std_17)
+target_compile_features(mamba_layer9_oracle_test PRIVATE cxx_std_20)
 target_compile_definitions(
   mamba_layer9_oracle_test
   PRIVATE

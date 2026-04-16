@@ -224,6 +224,181 @@ float ClampNvfp4TensorScale(float value) {
   return value;
 }
 
+enum class ScaleOverrideMode {
+  kCaptured = 0,
+  kUnit = 1,
+  kZero = 2,
+};
+
+enum class ScaleOverrideRegion {
+  kAll = 0,
+  kLo4 = 1,
+  kHi4 = 2,
+  kSlot0 = 3,
+  kSlot1 = 4,
+  kSlot2 = 5,
+  kSlot3 = 6,
+  kSlot4 = 7,
+  kSlot5 = 8,
+  kSlot6 = 9,
+  kSlot7 = 10,
+};
+
+ScaleOverrideMode ParseScaleOverrideMode(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "captured") == 0) {
+    return ScaleOverrideMode::kCaptured;
+  }
+  if (std::strcmp(value, "unit") == 0 || std::strcmp(value, "ones") == 0) {
+    return ScaleOverrideMode::kUnit;
+  }
+  if (std::strcmp(value, "zero") == 0 || std::strcmp(value, "zeros") == 0) {
+    return ScaleOverrideMode::kZero;
+  }
+  std::printf(
+      "nano_p1_direct_pack_oracle_test: unknown %s=%s, expected captured|unit|zero\n",
+      env_name,
+      value);
+  return ScaleOverrideMode::kCaptured;
+}
+
+const char* ScaleOverrideModeName(ScaleOverrideMode mode) {
+  switch (mode) {
+    case ScaleOverrideMode::kCaptured:
+      return "captured";
+    case ScaleOverrideMode::kUnit:
+      return "unit";
+    case ScaleOverrideMode::kZero:
+      return "zero";
+  }
+  return "unknown";
+}
+
+ScaleOverrideRegion ParseScaleOverrideRegion(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "all") == 0) {
+    return ScaleOverrideRegion::kAll;
+  }
+  if (std::strcmp(value, "lo4") == 0 || std::strcmp(value, "low4") == 0) {
+    return ScaleOverrideRegion::kLo4;
+  }
+  if (std::strcmp(value, "hi4") == 0 || std::strcmp(value, "high4") == 0) {
+    return ScaleOverrideRegion::kHi4;
+  }
+  if (std::strcmp(value, "slot0") == 0) {
+    return ScaleOverrideRegion::kSlot0;
+  }
+  if (std::strcmp(value, "slot1") == 0) {
+    return ScaleOverrideRegion::kSlot1;
+  }
+  if (std::strcmp(value, "slot2") == 0) {
+    return ScaleOverrideRegion::kSlot2;
+  }
+  if (std::strcmp(value, "slot3") == 0) {
+    return ScaleOverrideRegion::kSlot3;
+  }
+  if (std::strcmp(value, "slot4") == 0) {
+    return ScaleOverrideRegion::kSlot4;
+  }
+  if (std::strcmp(value, "slot5") == 0) {
+    return ScaleOverrideRegion::kSlot5;
+  }
+  if (std::strcmp(value, "slot6") == 0) {
+    return ScaleOverrideRegion::kSlot6;
+  }
+  if (std::strcmp(value, "slot7") == 0) {
+    return ScaleOverrideRegion::kSlot7;
+  }
+  std::printf(
+      "nano_p1_direct_pack_oracle_test: unknown %s=%s, expected all|lo4|hi4|slot0..slot7\n",
+      env_name,
+      value);
+  return ScaleOverrideRegion::kAll;
+}
+
+const char* ScaleOverrideRegionName(ScaleOverrideRegion region) {
+  switch (region) {
+    case ScaleOverrideRegion::kAll:
+      return "all";
+    case ScaleOverrideRegion::kLo4:
+      return "lo4";
+    case ScaleOverrideRegion::kHi4:
+      return "hi4";
+    case ScaleOverrideRegion::kSlot0:
+      return "slot0";
+    case ScaleOverrideRegion::kSlot1:
+      return "slot1";
+    case ScaleOverrideRegion::kSlot2:
+      return "slot2";
+    case ScaleOverrideRegion::kSlot3:
+      return "slot3";
+    case ScaleOverrideRegion::kSlot4:
+      return "slot4";
+    case ScaleOverrideRegion::kSlot5:
+      return "slot5";
+    case ScaleOverrideRegion::kSlot6:
+      return "slot6";
+    case ScaleOverrideRegion::kSlot7:
+      return "slot7";
+  }
+  return "unknown";
+}
+
+bool ScaleOverrideAppliesToBlock(std::size_t block, ScaleOverrideRegion region) {
+  const std::size_t slot = block & 7u;
+  switch (region) {
+    case ScaleOverrideRegion::kAll:
+      return true;
+    case ScaleOverrideRegion::kLo4:
+      return slot < 4u;
+    case ScaleOverrideRegion::kHi4:
+      return slot >= 4u;
+    case ScaleOverrideRegion::kSlot0:
+      return slot == 0u;
+    case ScaleOverrideRegion::kSlot1:
+      return slot == 1u;
+    case ScaleOverrideRegion::kSlot2:
+      return slot == 2u;
+    case ScaleOverrideRegion::kSlot3:
+      return slot == 3u;
+    case ScaleOverrideRegion::kSlot4:
+      return slot == 4u;
+    case ScaleOverrideRegion::kSlot5:
+      return slot == 5u;
+    case ScaleOverrideRegion::kSlot6:
+      return slot == 6u;
+    case ScaleOverrideRegion::kSlot7:
+      return slot == 7u;
+  }
+  return true;
+}
+
+void ApplyScaleOverride(
+    std::vector<std::uint8_t>* scales,
+    ScaleOverrideMode mode,
+    int rows,
+    int cols,
+    ScaleOverrideRegion region) {
+  if (scales == nullptr || mode == ScaleOverrideMode::kCaptured) {
+    return;
+  }
+  const std::uint8_t fill =
+      mode == ScaleOverrideMode::kUnit ? EncodeFp8(1.0f) : static_cast<std::uint8_t>(0u);
+  const std::size_t logical_blocks_per_row = static_cast<std::size_t>(cols / kNvfp4BlockWidth);
+  const std::size_t padded_blocks_per_row = RoundUp(logical_blocks_per_row, 4u);
+  for (int row = 0; row < rows; ++row) {
+    for (std::size_t block = 0; block < logical_blocks_per_row; ++block) {
+      if (!ScaleOverrideAppliesToBlock(block, region)) {
+        continue;
+      }
+      (*scales)[ExecutionScaleOffset(
+          static_cast<std::size_t>(row),
+          block,
+          padded_blocks_per_row)] = fill;
+    }
+  }
+}
+
 float Relu2(float value) {
   return value > 0.0f ? value * value : 0.0f;
 }
@@ -912,6 +1087,33 @@ bool RunPhase3NanoBucketK2688() {
     std::printf("nano_p1_direct_pack_oracle_test: Phase 3 unexpected tensor sizes\n");
     return false;
   }
+
+  const ScaleOverrideMode input_scale_mode =
+      ParseScaleOverrideMode("NEMOTRON_NANO_P1_DIRECT_PACK_INPUT_SCALE_MODE");
+  const ScaleOverrideMode weight_scale_mode =
+      ParseScaleOverrideMode("NEMOTRON_NANO_P1_DIRECT_PACK_WEIGHT_SCALE_MODE");
+  const ScaleOverrideRegion input_scale_region =
+      ParseScaleOverrideRegion("NEMOTRON_NANO_P1_DIRECT_PACK_INPUT_SCALE_REGION");
+  const ScaleOverrideRegion weight_scale_region =
+      ParseScaleOverrideRegion("NEMOTRON_NANO_P1_DIRECT_PACK_WEIGHT_SCALE_REGION");
+  ApplyScaleOverride(
+      &input_sf,
+      input_scale_mode,
+      kNanoNumRows,
+      kNanoHiddenSize,
+      input_scale_region);
+  ApplyScaleOverride(
+      &weight_sf,
+      weight_scale_mode,
+      kNanoInterSize,
+      kNanoHiddenSize,
+      weight_scale_region);
+  std::printf(
+      "nano_p1_direct_pack_oracle_test: Phase 3 scale_modes input=%s/%s weight=%s/%s\n",
+      ScaleOverrideModeName(input_scale_mode),
+      ScaleOverrideRegionName(input_scale_region),
+      ScaleOverrideModeName(weight_scale_mode),
+      ScaleOverrideRegionName(weight_scale_region));
 
   DirectPackOutputs actual;
   if (!RunNanoP1DirectPackKernelForShape(

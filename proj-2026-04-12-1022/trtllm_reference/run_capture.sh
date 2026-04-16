@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Step 2b helper: apply the flashinfer BF16 dump patch, run the capture harness,
-# and revert the patch (always, via EXIT trap).
+# Step 2b helper: apply the repo-managed flashinfer live-oracle patch set, run
+# the capture harness, and revert the patch (always, via EXIT trap).
 #
 # Auto-detects the flashinfer source tree that the warm JIT cache is wired to,
 # patches THAT tree, and runs from THAT venv so the cached ninja build picks up
@@ -112,10 +112,15 @@ fi
 # Derive the venv root (strip /lib/python*/site-packages/flashinfer/data/csrc).
 VENV_ROOT="$(echo "${FLASHINFER_SRC_ROOT}" | sed -E 's#/lib/python[^/]+/site-packages/flashinfer/data/csrc##')"
 VENV_PYTHON="${VENV_ROOT}/bin/python"
-PATCH_TARGET="${FLASHINFER_SRC_ROOT}/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+FLASHINFER_DATA_ROOT="${FLASHINFER_SRC_ROOT%/csrc}"
+PATCH_TARGET="${FLASHINFER_DATA_ROOT}/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
 
 if [[ ! -x "${VENV_PYTHON}" ]]; then
   echo "ERROR: resolved venv python does not exist at ${VENV_PYTHON}" >&2
+  exit 1
+fi
+if [[ ! -d "${FLASHINFER_DATA_ROOT}" ]]; then
+  echo "ERROR: flashinfer data root not found at ${FLASHINFER_DATA_ROOT}" >&2
   exit 1
 fi
 if [[ ! -f "${PATCH_TARGET}" ]]; then
@@ -123,12 +128,14 @@ if [[ ! -f "${PATCH_TARGET}" ]]; then
   exit 1
 fi
 echo "[run_capture] venv python:  ${VENV_PYTHON}"
+echo "[run_capture] data root:    ${FLASHINFER_DATA_ROOT}"
 echo "[run_capture] patch target: ${PATCH_TARGET}"
 
 # --- Clean stale artifacts BEFORE the run so stale dumps cannot false-pass.
 mkdir -p "${GOLDEN_DIR}"
 rm -f \
   "${GOLDEN_DIR}"/bf16_gemm1_tactic*.bin \
+  "${GOLDEN_DIR}"/operand_probe_tactic*.txt \
   "${GOLDEN_DIR}"/input_fp4_permuted.bin \
   "${GOLDEN_DIR}"/input_sf_permuted.bin \
   "${GOLDEN_DIR}"/tactic_divergence_report.md \
@@ -141,17 +148,14 @@ echo "[run_capture] cleared stale artifacts under ${GOLDEN_DIR}"
 
 revert_patch() {
   echo "[run_capture] reverting flashinfer patch..."
-  (cd "${FLASHINFER_SRC_ROOT}" && patch -p1 -R --silent < "${PATCH_FILE}") || {
+  (cd "${FLASHINFER_DATA_ROOT}" && patch -p1 -R --silent < "${PATCH_FILE}") || {
     echo "[run_capture] WARNING: patch revert failed; inspect ${PATCH_TARGET}" >&2
   }
 }
 trap revert_patch EXIT
 
-echo "[run_capture] applying flashinfer BF16 dump patch..."
-(cd "${FLASHINFER_SRC_ROOT}" && patch -p1 < "${PATCH_FILE}")
-
-echo "[run_capture] touching patch target so ninja invalidates the affected .o files..."
-touch "${PATCH_TARGET}"
+echo "[run_capture] applying flashinfer live-oracle patch set..."
+(cd "${FLASHINFER_DATA_ROOT}" && patch -p1 < "${PATCH_FILE}")
 
 echo "[run_capture] running harness:"
 echo "  M=${M} K=${K} N=${N} E=${E} topk=${TOPK} seed=${SEED}"
@@ -170,4 +174,5 @@ stdbuf -oL -eL "${VENV_PYTHON}" "${PROJ_REF_DIR}/capture_bf16_gemm1.py" \
 
 echo "[run_capture] capture complete. Dump files:"
 ls -la "${GOLDEN_DIR}"/bf16_gemm1_tactic*.bin 2>&1 || echo "  (no tactic dumps found!)"
+ls -la "${GOLDEN_DIR}"/operand_probe_tactic*.txt 2>&1 || echo "  (no operand probe dumps found!)"
 ls -la "${METADATA_PATH}" "${INPUT_SAVE_DIR}/inputs.pt" 2>&1 || true

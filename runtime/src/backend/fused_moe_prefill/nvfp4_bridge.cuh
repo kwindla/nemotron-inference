@@ -381,6 +381,40 @@ CUTE_HOST_DEVICE constexpr int NanoP1PermuteBSourceRow(int row) {
   return row;
 }
 
+CUTE_HOST_DEVICE constexpr int NanoP1SourceRowForBStageOffset(int stage_offset) {
+  const int band_offset = stage_offset & 0x1ff;
+  const int window = band_offset & ~31;
+  const int x = (band_offset & 31) >> 1;
+  const int permuted =
+      ((x & 0x1) << 4) |
+      (((x >> 1) & 0x1) << 3) |
+      (((x >> 2) & 0x1) << 5) |
+      (((x >> 3) & 0x1) << 6);
+  if (window == 0) {
+    return permuted;
+  }
+  if (window == 128) {
+    const int permuted_rot =
+        (((x ^ 0x8) & 0x1) << 4) |
+        ((((x ^ 0x8) >> 1) & 0x1) << 3) |
+        ((((x ^ 0x8) >> 2) & 0x1) << 5) |
+        ((((x ^ 0x8) >> 3) & 0x1) << 6);
+    return 2 + permuted_rot;
+  }
+  if (window == 288) {
+    return 4 + permuted;
+  }
+  if (window == 416) {
+    const int permuted_rot =
+        (((x ^ 0x8) & 0x1) << 4) |
+        ((((x ^ 0x8) >> 1) & 0x1) << 3) |
+        ((((x ^ 0x8) >> 2) & 0x1) << 5) |
+        ((((x ^ 0x8) >> 3) & 0x1) << 6);
+    return 6 + permuted_rot;
+  }
+  return -1;
+}
+
 enum class NanoP1EpilogueMode {
   kBf16Dense,
   kDirectPack,

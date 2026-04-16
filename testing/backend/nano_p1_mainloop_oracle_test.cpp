@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -64,6 +65,33 @@ constexpr int kAccumProbeDebugOffset = kAccumProbeCount;
 constexpr int kAccumProbeFinalThread0Offset = kAccumProbeDebugOffset + 8;
 constexpr int kAccumProbeDeadLaneDebugOffset = kAccumProbeFinalThread0Offset + 64;
 constexpr int kAccumProbeFinalThread2Offset = kAccumProbeDeadLaneDebugOffset + 8;
+constexpr int kAccumProbeBOperandCopySigLen = 8;
+constexpr int kAccumProbeBOperandCopyRawSigLen = 32;
+constexpr int kAccumProbeBOperandFragRawSigLen = 16;
+constexpr int kAccumProbeBOperandScaleWordCount = 4;
+constexpr int kAccumProbeBOperandEntryWords = 53;
+constexpr int kAccumProbeBOperandTrackedTidCount = 4;
+constexpr int kAccumProbeBOperandKStepCap = 2;
+constexpr int kAccumProbeBOperandEntries =
+    kAccumProbeBOperandTrackedTidCount * kAccumProbeBOperandKStepCap * 8 * 2;
+constexpr int kAccumProbeBOperandOffset = kAccumProbeFinalThread2Offset + 64;
+constexpr int kAccumProbeAScaleEntryWords = 16;
+constexpr int kAccumProbeAScaleTrackedTidCount = 2;
+constexpr int kAccumProbeAScaleKStepCap = 32;
+constexpr int kAccumProbeAScaleEntries =
+    kAccumProbeAScaleTrackedTidCount * kAccumProbeAScaleKStepCap * 8 * 2;
+constexpr int kAccumProbeAScaleOffset =
+    kAccumProbeBOperandOffset + kAccumProbeBOperandEntries * kAccumProbeBOperandEntryWords;
+constexpr int kAccumProbeAOperandCopySigLen = 8;
+constexpr int kAccumProbeAOperandEntryWords = 35;
+constexpr int kAccumProbeAOperandTrackedTidCount = 4;
+constexpr int kAccumProbeAOperandKStepCap = 2;
+constexpr int kAccumProbeAOperandEntries =
+    kAccumProbeAOperandTrackedTidCount * kAccumProbeAOperandKStepCap * 8 * 2;
+constexpr int kAccumProbeAOperandOffset =
+    kAccumProbeAScaleOffset + kAccumProbeAScaleEntries * kAccumProbeAScaleEntryWords;
+constexpr int kAccumProbeScratchCount =
+    kAccumProbeAOperandOffset + kAccumProbeAOperandEntries * kAccumProbeAOperandEntryWords;
 
 struct DumpHeader {
   std::uint32_t version = 0;
@@ -271,6 +299,214 @@ std::uint8_t EncodeFp8(float value) {
       __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3));
 }
 
+enum class ScaleOverrideMode {
+  kCaptured = 0,
+  kUnit = 1,
+  kZero = 2,
+};
+
+enum class PackedPayloadMode {
+  kCaptured = 0,
+  kZero = 1,
+  kRowIndex = 2,
+  kByteIndex = 3,
+  kRowIndexHighBits = 4,
+  kByteIndexHighBits = 5,
+};
+
+enum class ScaleOverrideRegion {
+  kAll = 0,
+  kLo4 = 1,
+  kHi4 = 2,
+};
+
+ScaleOverrideMode ParseScaleOverrideMode(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "captured") == 0) {
+    return ScaleOverrideMode::kCaptured;
+  }
+  if (std::strcmp(value, "unit") == 0 || std::strcmp(value, "ones") == 0) {
+    return ScaleOverrideMode::kUnit;
+  }
+  if (std::strcmp(value, "zero") == 0 || std::strcmp(value, "zeros") == 0) {
+    return ScaleOverrideMode::kZero;
+  }
+  std::printf(
+      "nano_p1_mainloop_oracle_test: unknown %s=%s, expected captured|unit|zero\n",
+      env_name,
+      value);
+  return ScaleOverrideMode::kCaptured;
+}
+
+const char* ScaleOverrideModeName(ScaleOverrideMode mode) {
+  switch (mode) {
+    case ScaleOverrideMode::kCaptured:
+      return "captured";
+    case ScaleOverrideMode::kUnit:
+      return "unit";
+    case ScaleOverrideMode::kZero:
+      return "zero";
+  }
+  return "unknown";
+}
+
+PackedPayloadMode ParsePackedPayloadMode(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "captured") == 0) {
+    return PackedPayloadMode::kCaptured;
+  }
+  if (std::strcmp(value, "zero") == 0 || std::strcmp(value, "zeros") == 0) {
+    return PackedPayloadMode::kZero;
+  }
+  if (std::strcmp(value, "row_index") == 0) {
+    return PackedPayloadMode::kRowIndex;
+  }
+  if (std::strcmp(value, "byte_index") == 0) {
+    return PackedPayloadMode::kByteIndex;
+  }
+  if (std::strcmp(value, "row_index_high_bits") == 0) {
+    return PackedPayloadMode::kRowIndexHighBits;
+  }
+  if (std::strcmp(value, "byte_index_high_bits") == 0) {
+    return PackedPayloadMode::kByteIndexHighBits;
+  }
+  std::printf(
+      "nano_p1_mainloop_oracle_test: unknown %s=%s, expected captured|zero|row_index|byte_index|row_index_high_bits|byte_index_high_bits\n",
+      env_name,
+      value);
+  return PackedPayloadMode::kCaptured;
+}
+
+const char* PackedPayloadModeName(PackedPayloadMode mode) {
+  switch (mode) {
+    case PackedPayloadMode::kCaptured:
+      return "captured";
+    case PackedPayloadMode::kZero:
+      return "zero";
+    case PackedPayloadMode::kRowIndex:
+      return "row_index";
+    case PackedPayloadMode::kByteIndex:
+      return "byte_index";
+    case PackedPayloadMode::kRowIndexHighBits:
+      return "row_index_high_bits";
+    case PackedPayloadMode::kByteIndexHighBits:
+      return "byte_index_high_bits";
+  }
+  return "unknown";
+}
+
+std::uint8_t PackedPayloadByteForMode(PackedPayloadMode mode, int row, int byte_index) {
+  switch (mode) {
+    case PackedPayloadMode::kCaptured:
+      return 0u;
+    case PackedPayloadMode::kZero:
+      return 0u;
+    case PackedPayloadMode::kRowIndex:
+      return static_cast<std::uint8_t>(row & 0xff);
+    case PackedPayloadMode::kByteIndex:
+      return static_cast<std::uint8_t>(byte_index & 0xff);
+    case PackedPayloadMode::kRowIndexHighBits:
+      return static_cast<std::uint8_t>((row >> 8) & 0xff);
+    case PackedPayloadMode::kByteIndexHighBits:
+      return static_cast<std::uint8_t>((byte_index >> 8) & 0xff);
+  }
+  return 0u;
+}
+
+void ApplyPackedPayloadOverride(
+    std::vector<std::uint8_t>* packed,
+    PackedPayloadMode mode,
+    int rows,
+    int packed_row_bytes) {
+  if (packed == nullptr || mode == PackedPayloadMode::kCaptured) {
+    return;
+  }
+  for (int row = 0; row < rows; ++row) {
+    const std::size_t row_base =
+        static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_row_bytes);
+    for (int byte_index = 0; byte_index < packed_row_bytes; ++byte_index) {
+      (*packed)[row_base + static_cast<std::size_t>(byte_index)] =
+          PackedPayloadByteForMode(mode, row, byte_index);
+    }
+  }
+}
+
+ScaleOverrideRegion ParseScaleOverrideRegion(const char* env_name) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "all") == 0) {
+    return ScaleOverrideRegion::kAll;
+  }
+  if (std::strcmp(value, "lo4") == 0 || std::strcmp(value, "low4") == 0) {
+    return ScaleOverrideRegion::kLo4;
+  }
+  if (std::strcmp(value, "hi4") == 0 || std::strcmp(value, "high4") == 0) {
+    return ScaleOverrideRegion::kHi4;
+  }
+  std::printf(
+      "nano_p1_mainloop_oracle_test: unknown %s=%s, expected all|lo4|hi4\n",
+      env_name,
+      value);
+  return ScaleOverrideRegion::kAll;
+}
+
+const char* ScaleOverrideRegionName(ScaleOverrideRegion region) {
+  switch (region) {
+    case ScaleOverrideRegion::kAll:
+      return "all";
+    case ScaleOverrideRegion::kLo4:
+      return "lo4";
+    case ScaleOverrideRegion::kHi4:
+      return "hi4";
+  }
+  return "unknown";
+}
+
+bool ScaleOverrideAppliesToBlock(std::size_t block, ScaleOverrideRegion region) {
+  switch (region) {
+    case ScaleOverrideRegion::kAll:
+      return true;
+    case ScaleOverrideRegion::kLo4:
+      return (block & 7u) < 4u;
+    case ScaleOverrideRegion::kHi4:
+      return (block & 7u) >= 4u;
+  }
+  return true;
+}
+
+const char* OverridePathFromEnv(const char* env_name, const char* default_path) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_path;
+  }
+  return value;
+}
+
+void ApplyScaleOverride(
+    std::vector<std::uint8_t>* scales,
+    ScaleOverrideMode mode,
+    int rows,
+    int cols,
+    ScaleOverrideRegion region) {
+  if (scales == nullptr || mode == ScaleOverrideMode::kCaptured) {
+    return;
+  }
+  const std::uint8_t fill =
+      mode == ScaleOverrideMode::kUnit ? EncodeFp8(1.0f) : static_cast<std::uint8_t>(0u);
+  const std::size_t logical_blocks_per_row = static_cast<std::size_t>(cols / kNvfp4BlockWidth);
+  const std::size_t padded_blocks_per_row = RoundUp(logical_blocks_per_row, 4u);
+  for (int row = 0; row < rows; ++row) {
+    for (std::size_t block = 0; block < logical_blocks_per_row; ++block) {
+      if (!ScaleOverrideAppliesToBlock(block, region)) {
+        continue;
+      }
+      (*scales)[ExecutionScaleOffset(
+          static_cast<std::size_t>(row),
+          block,
+          padded_blocks_per_row)] = fill;
+    }
+  }
+}
+
 bool RunNanoP1Kernel(
     const std::vector<std::uint8_t>& input_fp4,
     const std::vector<std::uint8_t>& weight_fp4,
@@ -304,7 +540,7 @@ bool RunNanoP1Kernel(
       !output_bf16_dev.Allocate(static_cast<std::size_t>(kNumRows * kInterSize)) ||
       (accumulator_probe != nullptr &&
        !accumulator_probe_dev.Allocate(
-           static_cast<std::size_t>(kAccumProbeFinalThread2Offset + 64)))) {
+           static_cast<std::size_t>(kAccumProbeScratchCount)))) {
     std::printf("nano_p1_mainloop_oracle_test: cudaMalloc failed\n");
     return false;
   }
@@ -410,7 +646,8 @@ bool RunNanoP1KernelForShape(
     int num_rows,
     int hidden_size,
     int inter_size,
-    std::vector<__nv_bfloat16>* output_bf16) {
+    std::vector<__nv_bfloat16>* output_bf16,
+    std::vector<float>* accumulator_probe = nullptr) {
   const std::size_t packed_row_bytes = static_cast<std::size_t>(hidden_size / 2);
   const std::size_t scale_bytes_per_row =
       static_cast<std::size_t>(hidden_size / kNvfp4BlockWidth);
@@ -433,13 +670,17 @@ bool RunNanoP1KernelForShape(
   DeviceBuffer<std::uint8_t> weight_sf_dev;
   DeviceBuffer<float> g1_alphas_dev;
   DeviceBuffer<__nv_bfloat16> output_bf16_dev;
+  DeviceBuffer<float> accumulator_probe_dev;
 
   if (!input_fp4_dev.Allocate(input_fp4.size()) ||
       !weight_fp4_dev.Allocate(weight_fp4.size()) ||
       !input_sf_dev.Allocate(input_sf.size()) ||
       !weight_sf_dev.Allocate(weight_sf.size()) ||
       !g1_alphas_dev.Allocate(g1_alphas.size()) ||
-      !output_bf16_dev.Allocate(static_cast<std::size_t>(num_rows) * inter_size)) {
+      !output_bf16_dev.Allocate(static_cast<std::size_t>(num_rows) * inter_size) ||
+      (accumulator_probe != nullptr &&
+       !accumulator_probe_dev.Allocate(
+           static_cast<std::size_t>(kAccumProbeScratchCount)))) {
     std::printf("nano_p1_mainloop_oracle_test: cudaMalloc failed\n");
     return false;
   }
@@ -484,7 +725,14 @@ bool RunNanoP1KernelForShape(
               output_bf16_dev.data(),
               0,
               output_bf16_dev.size() * sizeof(__nv_bfloat16)),
-          "zero output_bf16")) {
+          "zero output_bf16") ||
+      (accumulator_probe != nullptr &&
+       !CheckCuda(
+           cudaMemset(
+               accumulator_probe_dev.data(),
+               0,
+               accumulator_probe_dev.size() * sizeof(float)),
+           "zero accumulator_probe"))) {
     return false;
   }
 
@@ -499,7 +747,7 @@ bool RunNanoP1KernelForShape(
           hidden_size,
           inter_size,
           nullptr,
-          nullptr)) {
+          accumulator_probe != nullptr ? accumulator_probe_dev.data() : nullptr)) {
     std::printf("nano_p1_mainloop_oracle_test: RunNanoP1KernelForTesting returned false\n");
     return false;
   }
@@ -515,6 +763,18 @@ bool RunNanoP1KernelForShape(
               cudaMemcpyDeviceToHost),
           "copy output_bf16")) {
     return false;
+  }
+  if (accumulator_probe != nullptr) {
+    accumulator_probe->assign(accumulator_probe_dev.size(), 0.0f);
+    if (!CheckCuda(
+            cudaMemcpy(
+                accumulator_probe->data(),
+                accumulator_probe_dev.data(),
+                accumulator_probe->size() * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            "copy accumulator_probe")) {
+      return false;
+    }
   }
   return true;
 }
@@ -768,6 +1028,195 @@ void PrintAccumulatorProbeSummary(const std::vector<float>& accumulator_probe) {
     std::printf(
         "nano_p1_mainloop_oracle_test: probe final_accum thread=2 matches_expected_256=%zu total=64\n",
         final_matches_256);
+  }
+  if (accumulator_probe.size() >= static_cast<std::size_t>(kAccumProbeScratchCount)) {
+    for (int entry = 0; entry < kAccumProbeBOperandEntries; ++entry) {
+      const std::size_t entry_base =
+          static_cast<std::size_t>(kAccumProbeBOperandOffset +
+                                   entry * kAccumProbeBOperandEntryWords);
+      auto load_word = [&](int word_index) {
+        std::uint32_t bits = 0u;
+        const float value = accumulator_probe[entry_base + static_cast<std::size_t>(word_index)];
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+      };
+      if (load_word(0) == 0u) {
+        continue;
+      }
+      std::string copy_sig;
+      const std::uint32_t copy_sig_count =
+          std::min(load_word(16), static_cast<std::uint32_t>(kAccumProbeBOperandCopySigLen));
+      for (std::uint32_t sig = 0; sig < copy_sig_count; ++sig) {
+        char buffer[32];
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%s%u:%u",
+            sig == 0 ? "" : ",",
+            load_word(17 + static_cast<int>(sig) * 2),
+            load_word(18 + static_cast<int>(sig) * 2));
+        copy_sig += buffer;
+      }
+      std::string copy_view_raw_packed;
+      for (int packed_word = 0; packed_word < kAccumProbeBOperandCopyRawSigLen / 4; ++packed_word) {
+        char buffer[32];
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%s0x%08x",
+            packed_word == 0 ? "" : ",",
+            load_word(35 + packed_word));
+        copy_view_raw_packed += buffer;
+      }
+      std::string frag_raw_packed;
+      for (int packed_word = 0; packed_word < kAccumProbeBOperandFragRawSigLen / 4; ++packed_word) {
+        char buffer[32];
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%s0x%08x",
+            packed_word == 0 ? "" : ",",
+            load_word(43 + packed_word));
+        frag_raw_packed += buffer;
+      }
+      std::string scale_reg_post_packed;
+      for (int word = 0; word < kAccumProbeBOperandScaleWordCount; ++word) {
+        char buffer[32];
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%s0x%08x",
+            word == 0 ? "" : ",",
+            load_word(47 + word));
+        scale_reg_post_packed += buffer;
+      }
+      std::printf(
+          "nano_p1_mainloop_oracle_test: probe b_operand tid=%u k_step=%u k_base=%u "
+          "n_tile=%u k_block=%u part_token_row0=%u part_output_col0=%u "
+          "local_row0=%u local_col0=%u local_row1=%u local_col1=%u "
+          "stage0_offset0=%u stage0_offset1=%u "
+          "copy_sig_count=%u copy_sig=%s copy_view_raw_packed=(%s) "
+          "frag_raw_packed=(%s) scale_reg_post=(%s) reg_post=(0x%08x,0x%08x) "
+          "reg_after_all_b_copies=(0x%08x,0x%08x) "
+          "reg_after_own_b_copy=(0x%08x,0x%08x)\n",
+          load_word(1),
+          load_word(2),
+          load_word(3),
+          load_word(4),
+          load_word(5),
+          load_word(7),
+          load_word(6),
+          load_word(8),
+          load_word(9),
+          load_word(10),
+          load_word(11),
+          load_word(12),
+          load_word(13),
+          copy_sig_count,
+          copy_sig.c_str(),
+          copy_view_raw_packed.c_str(),
+          frag_raw_packed.c_str(),
+          scale_reg_post_packed.c_str(),
+          load_word(14),
+          load_word(15),
+          load_word(33),
+          load_word(34),
+          load_word(51),
+          load_word(52));
+    }
+    for (int entry = 0; entry < kAccumProbeAScaleEntries; ++entry) {
+      const std::size_t entry_base =
+          static_cast<std::size_t>(kAccumProbeAScaleOffset +
+                                   entry * kAccumProbeAScaleEntryWords);
+      auto load_word = [&](int word_index) {
+        std::uint32_t bits = 0u;
+        const float value = accumulator_probe[entry_base + static_cast<std::size_t>(word_index)];
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+      };
+      if (load_word(0) == 0u) {
+        continue;
+      }
+      const std::uint32_t reg_word_count = std::min(load_word(9), 4u);
+      std::string reg_words;
+      for (std::uint32_t word = 0; word < reg_word_count; ++word) {
+        char buffer[32];
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%s0x%08x",
+            word == 0 ? "" : ",",
+            load_word(10 + static_cast<int>(word)));
+        reg_words += buffer;
+      }
+      std::printf(
+          "nano_p1_mainloop_oracle_test: probe a_scale tid=%u k_step=%u k_base=%u "
+          "block_base=%u n_tile=%u k_block=%u part_token_row0=%u part_output_col0=%u "
+          "reg_post=(%s)\n",
+          load_word(1),
+          load_word(2),
+          load_word(3),
+          load_word(4),
+          load_word(5),
+          load_word(6),
+          load_word(8),
+          load_word(7),
+          reg_words.c_str());
+    }
+    for (int entry = 0; entry < kAccumProbeAOperandEntries; ++entry) {
+      const std::size_t entry_base =
+          static_cast<std::size_t>(kAccumProbeAOperandOffset +
+                                   entry * kAccumProbeAOperandEntryWords);
+      auto load_word = [&](int word_index) {
+        std::uint32_t bits = 0u;
+        const float value = accumulator_probe[entry_base + static_cast<std::size_t>(word_index)];
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+      };
+      if (load_word(0) == 0u) {
+        continue;
+      }
+      std::string copy_sig;
+      const std::uint32_t copy_sig_count =
+          std::min(load_word(18), static_cast<std::uint32_t>(kAccumProbeAOperandCopySigLen));
+      for (std::uint32_t sig = 0; sig < copy_sig_count; ++sig) {
+        char buffer[32];
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%s%u:%u",
+            sig == 0 ? "" : ",",
+            load_word(19 + static_cast<int>(sig) * 2),
+            load_word(20 + static_cast<int>(sig) * 2));
+        copy_sig += buffer;
+      }
+      std::printf(
+          "nano_p1_mainloop_oracle_test: probe a_operand tid=%u k_step=%u k_base=%u "
+          "n_tile=%u k_block=%u part_token_row0=%u part_output_col0=%u "
+          "local_row0=%u local_col0=%u local_row1=%u local_col1=%u "
+          "stage0_offset0=%u stage0_offset1=%u "
+          "copy_sig_count=%u copy_sig=%s reg_pre=(0x%08x,0x%08x) "
+          "reg_post=(0x%08x,0x%08x)\n",
+          load_word(1),
+          load_word(2),
+          load_word(3),
+          load_word(4),
+          load_word(5),
+          load_word(7),
+          load_word(6),
+          load_word(8),
+          load_word(9),
+          load_word(10),
+          load_word(11),
+          load_word(12),
+          load_word(13),
+          copy_sig_count,
+          copy_sig.c_str(),
+          load_word(14),
+          load_word(15),
+          load_word(16),
+          load_word(17));
+    }
   }
   std::printf(
       "nano_p1_mainloop_oracle_test: probe first_k_step nonzero=%zu matches_expected_64=%zu total=%zu\n",
@@ -1197,15 +1646,16 @@ void PrintDeferredTactic1Compare() {
 }
 
 bool RunPhase3NanoBucketK2688() {
+  const char* input_fp4_path = OverridePathFromEnv(
+      "NEMOTRON_NANO_P1_MAINLOOP_INPUT_FP4_FILE",
+      "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_fp4_permuted.bin");
   std::vector<std::uint8_t> input_fp4;
   std::vector<std::uint8_t> input_sf;
   std::vector<std::uint8_t> weight_fp4;
   std::vector<std::uint8_t> weight_sf;
   std::vector<float> g1_alphas;
   std::vector<std::uint8_t> tactic1_dump;
-  if (!ReadBinaryFile(
-          "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_fp4_permuted.bin",
-          &input_fp4) ||
+  if (!ReadBinaryFile(input_fp4_path, &input_fp4) ||
       !ReadBinaryFile(
           "proj-2026-04-12-1022/trtllm_reference/golden_nano_k2688/input_sf_permuted.bin",
           &input_sf) ||
@@ -1232,6 +1682,50 @@ bool RunPhase3NanoBucketK2688() {
     std::printf("nano_p1_mainloop_oracle_test: Phase 3 unexpected tensor sizes\n");
     return false;
   }
+  std::printf("nano_p1_mainloop_oracle_test: Phase 3 input_fp4=%s\n", input_fp4_path);
+
+  const ScaleOverrideMode input_scale_mode =
+      ParseScaleOverrideMode("NEMOTRON_NANO_P1_MAINLOOP_INPUT_SCALE_MODE");
+  const ScaleOverrideMode weight_scale_mode =
+      ParseScaleOverrideMode("NEMOTRON_NANO_P1_MAINLOOP_WEIGHT_SCALE_MODE");
+  const PackedPayloadMode input_payload_mode =
+      ParsePackedPayloadMode("NEMOTRON_NANO_P1_MAINLOOP_INPUT_PAYLOAD_MODE");
+  const PackedPayloadMode weight_payload_mode =
+      ParsePackedPayloadMode("NEMOTRON_NANO_P1_MAINLOOP_WEIGHT_PAYLOAD_MODE");
+  const ScaleOverrideRegion input_scale_region =
+      ParseScaleOverrideRegion("NEMOTRON_NANO_P1_MAINLOOP_INPUT_SCALE_REGION");
+  const ScaleOverrideRegion weight_scale_region =
+      ParseScaleOverrideRegion("NEMOTRON_NANO_P1_MAINLOOP_WEIGHT_SCALE_REGION");
+  ApplyPackedPayloadOverride(
+      &input_fp4,
+      input_payload_mode,
+      kNanoNumRows,
+      kNanoPackedRowBytes);
+  ApplyPackedPayloadOverride(
+      &weight_fp4,
+      weight_payload_mode,
+      kNanoInterSize,
+      kNanoPackedRowBytes);
+  ApplyScaleOverride(
+      &input_sf,
+      input_scale_mode,
+      kNanoNumRows,
+      kNanoHiddenSize,
+      input_scale_region);
+  ApplyScaleOverride(
+      &weight_sf,
+      weight_scale_mode,
+      kNanoInterSize,
+      kNanoHiddenSize,
+      weight_scale_region);
+  std::printf(
+      "nano_p1_mainloop_oracle_test: Phase 3 scale_modes input=%s/%s weight=%s/%s input_payload=%s weight_payload=%s\n",
+      ScaleOverrideModeName(input_scale_mode),
+      ScaleOverrideRegionName(input_scale_region),
+      ScaleOverrideModeName(weight_scale_mode),
+      ScaleOverrideRegionName(weight_scale_region),
+      PackedPayloadModeName(input_payload_mode),
+      PackedPayloadModeName(weight_payload_mode));
 
   DumpHeader header;
   if (!ParseDumpHeaderFull(tactic1_dump, &header)) {
@@ -1292,6 +1786,7 @@ bool RunPhase3NanoBucketK2688() {
       reference_bits);
 
   std::vector<__nv_bfloat16> output_bf16;
+  std::vector<float> accumulator_probe;
   if (!RunNanoP1KernelForShape(
           input_fp4,
           weight_fp4,
@@ -1301,7 +1796,8 @@ bool RunPhase3NanoBucketK2688() {
           kNanoNumRows,
           kNanoHiddenSize,
           kNanoInterSize,
-          &output_bf16)) {
+          &output_bf16,
+          &accumulator_probe)) {
     return false;
   }
 
@@ -1414,6 +1910,7 @@ bool RunPhase3NanoBucketK2688() {
   // 2026-04-14 probe chain) while still allowing them to silently
   // corrupt downstream results.
   if (flashinfer_bitwise_mismatches > kPhase3FlashinferMaxAllowedBitwiseMismatches) {
+    PrintAccumulatorProbeSummary(accumulator_probe);
     std::printf(
         "nano_p1_mainloop_oracle_test: Phase 3 Nano bucket K=2688 FAIL "
         "(%zu bitwise mismatches vs flashinfer tactic1 dump; "

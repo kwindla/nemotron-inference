@@ -42,6 +42,75 @@ EXPECTED_GEMM1_TACTICS = [
     ("CtaShape128x256x64B_Cluster1x1x1",  True),
     ("CtaShape256x128x64B_Cluster1x1x1",  True),
 ]
+
+
+def maybe_override_w1_fp4_pattern(w1_fp4: torch.Tensor) -> str | None:
+    mode = os.getenv("NEMOTRON_TRTLLM_W1_FP4_PATTERN")
+    if mode is None or mode == "":
+        return None
+    if w1_fp4.ndim != 3:
+        raise ValueError(f"w1_fp4 override expects rank-3 tensor, got shape {tuple(w1_fp4.shape)}")
+    if mode == "row_index":
+        row_ids = torch.arange(w1_fp4.shape[1], device=w1_fp4.device, dtype=torch.uint8)
+        w1_fp4.copy_(row_ids.view(1, -1, 1).expand_as(w1_fp4))
+        return mode
+    if mode == "row_index_high_bits":
+        row_ids = torch.arange(w1_fp4.shape[1], device=w1_fp4.device, dtype=torch.int32)
+        w1_fp4.copy_(((row_ids >> 8) & 0xFF).to(torch.uint8).view(1, -1, 1).expand_as(w1_fp4))
+        return mode
+    if mode == "byte_index":
+        byte_ids = torch.arange(w1_fp4.shape[2], device=w1_fp4.device, dtype=torch.uint8)
+        w1_fp4.copy_(byte_ids.view(1, 1, -1).expand_as(w1_fp4))
+        return mode
+    if mode == "byte_index_high_bits":
+        byte_ids = torch.arange(w1_fp4.shape[2], device=w1_fp4.device, dtype=torch.int32)
+        w1_fp4.copy_(((byte_ids >> 8) & 0xFF).to(torch.uint8).view(1, 1, -1).expand_as(w1_fp4))
+        return mode
+    raise ValueError(
+        f"unsupported NEMOTRON_TRTLLM_W1_FP4_PATTERN={mode!r}; "
+        "expected one of: row_index, row_index_high_bits, byte_index, byte_index_high_bits"
+    )
+
+
+def maybe_override_input_fp4_pattern(input_fp4_permuted: torch.Tensor) -> str | None:
+    mode = os.getenv("NEMOTRON_TRTLLM_INPUT_FP4_PATTERN")
+    if mode is None or mode == "":
+        return None
+    if input_fp4_permuted.ndim != 2:
+        raise ValueError(
+            "input_fp4 override expects rank-2 tensor, "
+            f"got shape {tuple(input_fp4_permuted.shape)}"
+        )
+    row_ids = torch.arange(
+        input_fp4_permuted.shape[0], device=input_fp4_permuted.device, dtype=torch.int32
+    )
+    byte_ids = torch.arange(
+        input_fp4_permuted.shape[1], device=input_fp4_permuted.device, dtype=torch.int32
+    )
+    if mode == "row_index":
+        input_fp4_permuted.copy_(
+            row_ids.to(torch.uint8).view(-1, 1).expand_as(input_fp4_permuted)
+        )
+        return mode
+    if mode == "byte_index_low8":
+        input_fp4_permuted.copy_(
+            (byte_ids & 0xFF).to(torch.uint8).view(1, -1).expand_as(input_fp4_permuted)
+        )
+        return mode
+    if mode == "byte_index_high_bits":
+        input_fp4_permuted.copy_(
+            ((byte_ids >> 8) & 0xFF).to(torch.uint8).view(1, -1).expand_as(input_fp4_permuted)
+        )
+        return mode
+    if mode == "row_xor_byte_low8":
+        pattern = (row_ids.view(-1, 1) ^ byte_ids.view(1, -1)) & 0xFF
+        input_fp4_permuted.copy_(pattern.to(torch.uint8))
+        return mode
+    raise ValueError(
+        f"unsupported NEMOTRON_TRTLLM_INPUT_FP4_PATTERN={mode!r}; "
+        "expected one of: row_index, byte_index_low8, byte_index_high_bits, row_xor_byte_low8"
+    )
+
 # The P1 profile that plan v6 references is `CtaShape128x128x64B` with
 # SwapAB=false (per moe_gemm_tma_ws_launcher.inl:818). In the enumerated
 # list above, that is tactic_id 1.
@@ -125,17 +194,24 @@ def main() -> int:
     # Fail fast if the patch hook is not compiled into the .so we are about
     # to import: a missing env var check in the kernel means the dump never
     # fires, regardless of what we do on the Python side. The check is simple:
-    # the patched source contains the sentinel "NEMOTRON_TRTLLM_DUMP_GEMM1".
+    # the patched source contains the sentinels used by the live dump hooks.
     patched_cuh = args.flashinfer_src_root / "fused_moe" / "cutlass_backend" / "cutlass_fused_moe_kernels.cuh"
     if not patched_cuh.exists():
         sys.stderr.write(f"patch target not found: {patched_cuh}\n")
         return 2
-    if "NEMOTRON_TRTLLM_DUMP_GEMM1" not in patched_cuh.read_text():
+    patched_cuh_text = patched_cuh.read_text()
+    if "NEMOTRON_TRTLLM_DUMP_GEMM1" not in patched_cuh_text:
         sys.stderr.write(
             f"ERROR: {patched_cuh} does NOT contain the dump hook sentinel.\n"
             "       Patch is not applied — did run_capture.sh revert prematurely?\n"
         )
         return 3
+    if "NEMOTRON_TRTLLM_DUMP_GEMM1_INPUT" not in patched_cuh_text:
+        sys.stderr.write(
+            f"ERROR: {patched_cuh} does NOT contain the GEMM1 input dump hook sentinel.\n"
+            "       Patch is not applied — the live activation-byte oracle is still unavailable.\n"
+        )
+        return 8
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
@@ -183,6 +259,10 @@ def main() -> int:
     w2_sf = torch.stack(w2_sf_l)
     w1_gs = torch.stack(w1_gs_l)
     w2_gs = torch.stack(w2_gs_l)
+    w1_fp4_override_mode = maybe_override_w1_fp4_pattern(w1_fp4)
+    if w1_fp4_override_mode is not None:
+        print(f"[harness] overriding w1_fp4 with pattern={w1_fp4_override_mode}")
+    input_fp4_override_mode: str | None = None
 
     a1_gscale = torch.ones(num_experts, device=device, dtype=torch.float32)
     a2_gscale = torch.ones(num_experts, device=device, dtype=torch.float32)
@@ -232,6 +312,9 @@ def main() -> int:
             sfLayout=SfLayout.layout_128x4,
             do_shuffle=True,
         )
+        input_fp4_override_mode = maybe_override_input_fp4_pattern(input_fp4_permuted)
+        if input_fp4_override_mode is not None:
+            print(f"[harness] overriding input_fp4_permuted with pattern={input_fp4_override_mode}")
         write_tensor_raw(
             input_fp4_permuted,
             args.input_save_dir / "input_fp4_permuted.bin",
@@ -279,11 +362,23 @@ def main() -> int:
 
     captured: List[dict] = []
     overall_t0 = time.monotonic()
-    for tactic_id in range(gemm1_tactic_count):
+    only_tactic_env = os.getenv("NEMOTRON_TRTLLM_ONLY_GEMM1_TACTIC")
+    if only_tactic_env is not None and only_tactic_env != "":
+        tactic_ids = [int(only_tactic_env)]
+    else:
+        tactic_ids = list(range(gemm1_tactic_count))
+
+    for tactic_id in tactic_ids:
         dump_path = args.golden_dir / f"bf16_gemm1_tactic{tactic_id}.bin"
+        probe_path = args.golden_dir / f"operand_probe_tactic{tactic_id}.txt"
+        input_dump_path = args.golden_dir / f"gemm1_input_tactic{tactic_id}.bin"
         dump_path.unlink(missing_ok=True)  # ensure no stale bytes survive
+        probe_path.unlink(missing_ok=True)
+        input_dump_path.unlink(missing_ok=True)
 
         os.environ["NEMOTRON_TRTLLM_DUMP_GEMM1"] = str(dump_path)
+        os.environ["NEMOTRON_TRTLLM_DUMP_OPERAND_PROBE"] = str(probe_path)
+        os.environ["NEMOTRON_TRTLLM_DUMP_GEMM1_INPUT"] = str(input_dump_path)
 
         # Pre-run wall clock so we can verify the dump actually fires this run.
         t0 = time.time()
@@ -317,19 +412,43 @@ def main() -> int:
                 "       Did the patch actually get compiled into the .so?\n"
             )
             return 4
+        if not probe_path.exists():
+            sys.stderr.write(
+                f"ERROR: tactic {tactic_id} finished but no operand probe at {probe_path}\n"
+                "       Did the live B operand patch actually get compiled into the .so?\n"
+            )
+            return 7
+        if not input_dump_path.exists():
+            sys.stderr.write(
+                f"ERROR: tactic {tactic_id} finished but no GEMM1 input dump at {input_dump_path}\n"
+                "       Did the live activation-byte dump patch actually get compiled into the .so?\n"
+            )
+            return 9
         stat = dump_path.stat()
+        input_stat = input_dump_path.stat()
         if stat.st_mtime < t0 - 0.5:  # tolerate small clock skew
             sys.stderr.write(
                 f"ERROR: dump file {dump_path} has stale mtime ({stat.st_mtime}) "
                 f"compared to pre-run timestamp ({t0}). Stale write, not this run.\n"
             )
             return 5
+        if input_stat.st_mtime < t0 - 0.5:
+            sys.stderr.write(
+                f"ERROR: input dump file {input_dump_path} has stale mtime ({input_stat.st_mtime}) "
+                f"compared to pre-run timestamp ({t0}). Stale write, not this run.\n"
+            )
+            return 10
         if stat.st_size <= 64:
             sys.stderr.write(
                 f"ERROR: dump file {dump_path} is too small ({stat.st_size} bytes) "
                 "— expected 64 byte header plus BF16 body.\n"
             )
             return 6
+        if input_stat.st_size == 0:
+            sys.stderr.write(
+                f"ERROR: input dump file {input_dump_path} is empty.\n"
+            )
+            return 11
 
         if tactic_id < len(EXPECTED_GEMM1_TACTICS):
             label, expected_swap_ab = EXPECTED_GEMM1_TACTICS[tactic_id]
@@ -340,9 +459,15 @@ def main() -> int:
             "expected_tile_label": label,
             "expected_swap_ab": expected_swap_ab,
             "dump_path": str(dump_path),
+            "operand_probe_path": str(probe_path),
+            "gemm1_input_dump_path": str(input_dump_path),
             "dump_size": stat.st_size,
+            "gemm1_input_dump_size": input_stat.st_size,
             "dump_mtime": stat.st_mtime,
+            "gemm1_input_dump_mtime": input_stat.st_mtime,
             "is_plan_v6_p1": tactic_id == P1_GEMM1_TACTIC_ID,
+            "w1_fp4_override_mode": w1_fp4_override_mode,
+            "input_fp4_override_mode": input_fp4_override_mode,
         })
         swap_tag = "swap_ab=true" if expected_swap_ab else "swap_ab=false"
         print(f"[harness] tactic {tactic_id} ({label}, {swap_tag}): {stat.st_size} bytes -> {dump_path.name}")
@@ -387,6 +512,8 @@ def main() -> int:
             "input_sf_permuted": str((args.input_save_dir / "input_sf_permuted.bin").resolve())
             if num_experts == 1 and top_k == 1 else None,
         },
+        "w1_fp4_override_mode": w1_fp4_override_mode,
+        "input_fp4_override_mode": input_fp4_override_mode,
         "elapsed_sec": round(time.monotonic() - overall_t0, 3),
     }
     args.metadata_path.parent.mkdir(parents=True, exist_ok=True)

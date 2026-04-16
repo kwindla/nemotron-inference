@@ -6,6 +6,33 @@ constexpr int kNanoP1ProbeDebugOffset =
 constexpr int kNanoP1ProbeFinalThread0Offset = kNanoP1ProbeDebugOffset + 8;
 constexpr int kNanoP1ProbeDeadLaneDebugOffset = kNanoP1ProbeFinalThread0Offset + 64;
 constexpr int kNanoP1ProbeFinalThread2Offset = kNanoP1ProbeDeadLaneDebugOffset + 8;
+constexpr int kNanoP1BOperandCopySigLen = 8;
+constexpr int kNanoP1BOperandCopyRawSigLen = 32;
+constexpr int kNanoP1BOperandFragRawSigLen = 16;
+constexpr int kNanoP1BOperandScaleWordCount = 4;
+constexpr int kNanoP1BOperandProbeEntryWords = 53;
+constexpr int kNanoP1BOperandProbeTrackedTidCount = 4;
+constexpr int kNanoP1BOperandProbeKStepCap = 2;
+constexpr int kNanoP1BOperandProbeEntries =
+    kNanoP1BOperandProbeTrackedTidCount * kNanoP1BOperandProbeKStepCap * 8 * 2;
+constexpr int kNanoP1BOperandProbeOffset = kNanoP1ProbeFinalThread2Offset + 64;
+constexpr int kNanoP1AScaleProbeEntryWords = 16;
+constexpr int kNanoP1AScaleProbeTrackedTidCount = 2;
+constexpr int kNanoP1AScaleProbeKStepCap = 32;
+constexpr int kNanoP1AScaleProbeEntries =
+    kNanoP1AScaleProbeTrackedTidCount * kNanoP1AScaleProbeKStepCap * 8 * 2;
+constexpr int kNanoP1AScaleProbeOffset =
+    kNanoP1BOperandProbeOffset + kNanoP1BOperandProbeEntries * kNanoP1BOperandProbeEntryWords;
+constexpr int kNanoP1AOperandCopySigLen = 8;
+constexpr int kNanoP1AOperandProbeEntryWords = 35;
+constexpr int kNanoP1AOperandProbeTrackedTidCount = 4;
+constexpr int kNanoP1AOperandProbeKStepCap = 2;
+constexpr int kNanoP1AOperandProbeEntries =
+    kNanoP1AOperandProbeTrackedTidCount * kNanoP1AOperandProbeKStepCap * 8 * 2;
+constexpr int kNanoP1AOperandProbeOffset =
+    kNanoP1AScaleProbeOffset + kNanoP1AScaleProbeEntries * kNanoP1AScaleProbeEntryWords;
+constexpr int kNanoP1AScaleProbeScratchCount =
+    kNanoP1AOperandProbeOffset + kNanoP1AOperandProbeEntries * kNanoP1AOperandProbeEntryWords;
 static_assert(kNanoP1MicroScaleBytes == 4);
 
 struct NanoP1SharedStorage {
@@ -23,6 +50,145 @@ struct NanoP1SharedStorage {
 
 __device__ __forceinline__ void NanoP1CtaBarrier() {
   asm volatile("bar.sync 0;\n" : : : "memory");
+}
+
+__device__ __forceinline__ int NanoP1BOperandProbeTidSlot(int tid) {
+  switch (tid) {
+    case 32:
+      return 0;
+    case 48:
+      return 1;
+    case 64:
+      return 2;
+    case 80:
+      return 3;
+    default:
+      return -1;
+  }
+}
+
+__device__ __forceinline__ int NanoP1AScaleProbeTidSlot(int tid) {
+  switch (tid) {
+    case 0:
+      return 0;
+    case 2:
+      return 1;
+    default:
+      return -1;
+  }
+}
+
+__device__ __forceinline__ int NanoP1AOperandProbeTidSlot(int tid) {
+  switch (tid) {
+    case 32:
+      return 0;
+    case 48:
+      return 1;
+    case 64:
+      return 2;
+    case 80:
+      return 3;
+    default:
+      return -1;
+  }
+}
+
+template <class CoordTensor, class F>
+CUTE_HOST_DEVICE void NanoP1ForEachProbeCoord(CoordTensor const& coord_tensor, F&& f) {
+  using CoordTensorT = std::remove_cvref_t<CoordTensor>;
+  if constexpr (CoordTensorT::rank == 1) {
+    for (int i = 0; i < cute::size<0>(coord_tensor); ++i) {
+      f(coord_tensor(cute::make_coord(i)), i);
+    }
+  } else if constexpr (CoordTensorT::rank == 2) {
+    int physical = 0;
+    for (int i = 0; i < cute::size<0>(coord_tensor); ++i) {
+      for (int j = 0; j < cute::size<1>(coord_tensor); ++j) {
+        f(coord_tensor(cute::make_coord(i, j)), physical++);
+      }
+    }
+  } else if constexpr (CoordTensorT::rank == 3) {
+    int physical = 0;
+    for (int i = 0; i < cute::size<0>(coord_tensor); ++i) {
+      for (int j = 0; j < cute::size<1>(coord_tensor); ++j) {
+        for (int k = 0; k < cute::size<2>(coord_tensor); ++k) {
+          f(coord_tensor(cute::make_coord(i, j, k)), physical++);
+        }
+      }
+    }
+  } else if constexpr (CoordTensorT::rank == 4) {
+    int physical = 0;
+    for (int i = 0; i < cute::size<0>(coord_tensor); ++i) {
+      for (int j = 0; j < cute::size<1>(coord_tensor); ++j) {
+        for (int k = 0; k < cute::size<2>(coord_tensor); ++k) {
+          for (int l = 0; l < cute::size<3>(coord_tensor); ++l) {
+            f(coord_tensor(cute::make_coord(i, j, k, l)), physical++);
+          }
+        }
+      }
+    }
+  } else {
+    static_assert(CoordTensorT::rank <= 4, "NanoP1ForEachProbeCoord only supports rank <= 4");
+  }
+}
+
+template <class ValueTensor, class F>
+CUTE_HOST_DEVICE void NanoP1ForEachProbeValue(ValueTensor const& value_tensor, F&& f) {
+  using ValueTensorT = std::remove_cvref_t<ValueTensor>;
+  if constexpr (ValueTensorT::rank == 1) {
+    for (int i = 0; i < cute::size<0>(value_tensor); ++i) {
+      f(value_tensor(cute::make_coord(i)), i);
+    }
+  } else if constexpr (ValueTensorT::rank == 2) {
+    int physical = 0;
+    for (int i = 0; i < cute::size<0>(value_tensor); ++i) {
+      for (int j = 0; j < cute::size<1>(value_tensor); ++j) {
+        f(value_tensor(cute::make_coord(i, j)), physical++);
+      }
+    }
+  } else if constexpr (ValueTensorT::rank == 3) {
+    int physical = 0;
+    for (int i = 0; i < cute::size<0>(value_tensor); ++i) {
+      for (int j = 0; j < cute::size<1>(value_tensor); ++j) {
+        for (int k = 0; k < cute::size<2>(value_tensor); ++k) {
+          f(value_tensor(cute::make_coord(i, j, k)), physical++);
+        }
+      }
+    }
+  } else if constexpr (ValueTensorT::rank == 4) {
+    int physical = 0;
+    for (int i = 0; i < cute::size<0>(value_tensor); ++i) {
+      for (int j = 0; j < cute::size<1>(value_tensor); ++j) {
+        for (int k = 0; k < cute::size<2>(value_tensor); ++k) {
+          for (int l = 0; l < cute::size<3>(value_tensor); ++l) {
+            f(value_tensor(cute::make_coord(i, j, k, l)), physical++);
+          }
+        }
+      }
+    }
+  } else {
+    static_assert(ValueTensorT::rank <= 4, "NanoP1ForEachProbeValue only supports rank <= 4");
+  }
+}
+
+template <class PackedValue>
+CUTE_HOST_DEVICE std::uint8_t NanoP1LoadPackedValueByte(PackedValue const& value) {
+  if constexpr (requires { value.raw(); }) {
+    return static_cast<std::uint8_t>(value.raw());
+  } else if constexpr (requires { value.get(); }) {
+    auto const unpacked = value.get();
+    if constexpr (requires { unpacked.raw(); }) {
+      return static_cast<std::uint8_t>(unpacked.raw());
+    } else if constexpr (requires { unpacked.storage; }) {
+      return static_cast<std::uint8_t>(unpacked.storage);
+    } else {
+      return static_cast<std::uint8_t>(unpacked);
+    }
+  } else if constexpr (requires { value.storage; }) {
+    return static_cast<std::uint8_t>(value.storage);
+  } else {
+    return static_cast<std::uint8_t>(value);
+  }
 }
 
 template <bool kCaptureAccumulatorScratch>
@@ -95,11 +261,15 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
   auto s2r_copy_A = cute::make_tiled_copy_A(nvfp4_bridge::NanoP1SmemCopyAtomA{}, mma);
   auto s2r_thr_A = s2r_copy_A.get_thread_slice(tid);
   auto tCsA = s2r_thr_A.partition_S(sA);
+  auto a_coords = cute::make_identity_tensor(cute::shape(sA));
+  auto tCsA_coords = s2r_thr_A.partition_S(a_coords);
   auto tCrA_cv = s2r_thr_A.retile_D(tCrA);
 
   auto s2r_copy_B = cute::make_tiled_copy_B(nvfp4_bridge::NanoP1SmemCopyAtomB{}, mma);
   auto s2r_thr_B = s2r_copy_B.get_thread_slice(tid);
   auto tCsB = s2r_thr_B.partition_S(sB);
+  auto b_coords = cute::make_identity_tensor(cute::shape(sB));
+  auto tCsB_coords = s2r_thr_B.partition_S(b_coords);
   auto tCrB_cv = s2r_thr_B.retile_D(tCrB);
 
   auto tile_shape_mnk = cute::tile_shape(mma);
@@ -118,6 +288,12 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
   auto s2r_thr_SFB = s2r_copy_SFB.get_thread_slice(tid);
   auto tCsSFB = s2r_thr_SFB.partition_S(sScaleB);
   auto tCrSFB_cv = s2r_thr_SFB.retile_D(tCrSFB);
+
+  auto dense_c = cute::make_identity_tensor(
+      cute::make_shape(
+          cute::size<0>(nvfp4_bridge::NanoP1MmaTileShape{}),
+          cute::size<1>(nvfp4_bridge::NanoP1MmaTileShape{})));
+  auto part_c = thread_mma.partition_C(dense_c);
 
   static_assert(cute::size<1>(decltype(tCrA){}) == cute::size<1>(decltype(tCrSFA){}));
   static_assert(cute::size<1>(decltype(tCrB){}) == cute::size<1>(decltype(tCrSFB){}));
@@ -169,32 +345,23 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
       }
     }
 
-    // TracedP5PermTileN in NanoP1ValLayoutMNK introduces a per-32-row
-    // permutation on the B (token) axis of the MMA tile: [0..7]→identity,
-    // [8..15]↔[16..23] swap, [24..31]→identity. The staging loop on the
-    // source side accounts for this so that the physical smem positions
-    // each MMA atom invocation reads contain the correct token data.
-    // This is a partial fix — Phase 3 still reports structured mismatches
-    // (4074/245760 matches after this permutation vs. 2149/245760 without),
-    // so additional per-mf or per-K staging corrections are required for
-    // bitwise match against the flashinfer reference. See Phase 3 deferral
-    // in testing/backend/nano_p1_mainloop_oracle_test.cpp.
+    // Live tactic-5 activation row-index probes match identity source rows at
+    // this boundary, so B staging should read the logical token row directly
+    // instead of applying an extra source-row permutation here.
     for (int row = tid; row < kTileM; row += blockDim.x) {
       const bool row_valid = row < valid_rows;
-      const int permuted_row = nvfp4_bridge::NanoP1PermuteBSourceRow(row);
-      const bool permuted_row_valid = row_valid && permuted_row < valid_rows;
-      const std::size_t source_row = static_cast<std::size_t>(row_start + permuted_row);
+      const std::size_t source_row = static_cast<std::size_t>(row_start + row);
       const std::size_t src_offset = source_row * packed_row_bytes + packed_byte_offset;
       for (int byte_index = 0; byte_index < kMacroTileBytes; ++byte_index) {
-        std::uint8_t value = 0u;
-        if (permuted_row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
-          value = input_packed[src_offset + static_cast<std::size_t>(byte_index)];
+        std::uint8_t packed = 0u;
+        if (row_valid && static_cast<std::size_t>(byte_index) < available_bytes) {
+          packed = input_packed[src_offset + static_cast<std::size_t>(byte_index)];
         }
         const auto elem_offset = stage0_B(row, byte_index * 2);
-        swizzled_b_bytes[static_cast<int>(elem_offset) / 2] = value;
+        swizzled_b_bytes[static_cast<int>(elem_offset) / 2] = packed;
       }
       std::uint8_t scale_bytes[kMacroScaleBytes];
-      if (permuted_row_valid) {
+      if (row_valid) {
 #pragma unroll
         for (int scale_index = 0; scale_index < kMacroScaleBytes; ++scale_index) {
           std::uint8_t value = unit_scale_byte;
@@ -219,9 +386,403 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
     NanoP1CtaBarrier();
 
     cute::copy(s2r_copy_A, tCsA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrA_cv);
-    cute::copy(s2r_copy_B, tCsB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrB_cv);
+    int probe_k_step_slot = -1;
+    if constexpr (kCaptureAccumulatorScratch) {
+      if (accumulator_scratch != nullptr &&
+          output_col_base == 0 &&
+          row_start == 0) {
+        if (k_base == 0) {
+          probe_k_step_slot = 0;
+        } else if (k_base + kTileK >= hidden_size) {
+          probe_k_step_slot = 1;
+        }
+      }
+    }
+    for (int k_block = 0; k_block < cute::size<2>(decltype(tCrB){}) ; ++k_block) {
+      cute::copy(
+          s2r_copy_B,
+          tCsB(cute::_, cute::_, k_block, cute::Int<0>{}),
+          tCrB_cv(cute::_, cute::_, k_block));
+      if constexpr (kCaptureAccumulatorScratch) {
+        if (probe_k_step_slot >= 0) {
+          constexpr int kProbeNTiles = cute::size<2>(NanoP1AccumLayout{});
+          constexpr int kProbeKBlocks = cute::size<2>(decltype(tCrB){});
+          const int probe_tid_slot = NanoP1BOperandProbeTidSlot(tid);
+          if (probe_tid_slot >= 0) {
+            for (int n_tile = 0; n_tile < kProbeNTiles; ++n_tile) {
+              auto b_words_after_own_copy =
+                  cute::recast<nvfp4_bridge::BRegister>(tCrB(cute::_, n_tile, k_block));
+              int const entry_index =
+                  (((probe_tid_slot * kNanoP1BOperandProbeKStepCap + probe_k_step_slot) *
+                    kProbeNTiles) +
+                   n_tile) *
+                      kProbeKBlocks +
+                  k_block;
+              int const entry_base =
+                  kNanoP1BOperandProbeOffset + entry_index * kNanoP1BOperandProbeEntryWords;
+              accumulator_scratch[entry_base + 51] =
+                  __uint_as_float(static_cast<std::uint32_t>(b_words_after_own_copy(0)));
+              accumulator_scratch[entry_base + 52] =
+                  __uint_as_float(static_cast<std::uint32_t>(b_words_after_own_copy(1)));
+            }
+          }
+        }
+      }
+    }
+    if constexpr (kCaptureAccumulatorScratch) {
+      if (accumulator_scratch != nullptr &&
+          output_col_base == 0 &&
+          row_start == 0) {
+        constexpr int kProbeNTiles = cute::size<2>(NanoP1AccumLayout{});
+        constexpr int kProbeKBlocks = cute::size<2>(decltype(tCrB){});
+        const int probe_tid_slot = NanoP1BOperandProbeTidSlot(tid);
+        if (probe_tid_slot >= 0 && probe_k_step_slot >= 0) {
+          for (int n_tile = 0; n_tile < kProbeNTiles; ++n_tile) {
+            for (int k_block = 0; k_block < kProbeKBlocks; ++k_block) {
+              auto b_words_after_all_b_copies =
+                  cute::recast<nvfp4_bridge::BRegister>(tCrB(cute::_, n_tile, k_block));
+              int const entry_index =
+                  (((probe_tid_slot * kNanoP1BOperandProbeKStepCap + probe_k_step_slot) *
+                    kProbeNTiles) +
+                   n_tile) *
+                      kProbeKBlocks +
+                  k_block;
+              int const entry_base =
+                  kNanoP1BOperandProbeOffset + entry_index * kNanoP1BOperandProbeEntryWords;
+              accumulator_scratch[entry_base + 33] =
+                  __uint_as_float(static_cast<std::uint32_t>(b_words_after_all_b_copies(0)));
+              accumulator_scratch[entry_base + 34] =
+                  __uint_as_float(static_cast<std::uint32_t>(b_words_after_all_b_copies(1)));
+            }
+          }
+        }
+      }
+    }
     cute::copy(tCsSFA(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFA_cv);
     cute::copy(tCsSFB(cute::_, cute::_, cute::_, cute::Int<0>{}), tCrSFB_cv);
+
+    if constexpr (kCaptureAccumulatorScratch) {
+      if (accumulator_scratch != nullptr &&
+          output_col_base == 0 &&
+          row_start == 0) {
+        if (tid == 0 || tid == 2) {
+          auto rA = cute::recast<nvfp4_bridge::ARegister>(tCrA);
+          auto rB = cute::recast<nvfp4_bridge::BRegister>(tCrB);
+          auto rSFA = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFA));
+          auto rSFB = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFB));
+          const int debug_offset =
+              tid == 0 ? kNanoP1ProbeDebugOffset : kNanoP1ProbeDeadLaneDebugOffset;
+          accumulator_scratch[debug_offset + 0] =
+              __uint_as_float(static_cast<std::uint32_t>(rA(0)));
+          accumulator_scratch[debug_offset + 1] =
+              __uint_as_float(static_cast<std::uint32_t>(rA(1)));
+          accumulator_scratch[debug_offset + 2] =
+              __uint_as_float(static_cast<std::uint32_t>(rA(2)));
+          accumulator_scratch[debug_offset + 3] =
+              __uint_as_float(static_cast<std::uint32_t>(rA(3)));
+          accumulator_scratch[debug_offset + 4] =
+              __uint_as_float(static_cast<std::uint32_t>(rSFA(0)));
+          accumulator_scratch[debug_offset + 5] =
+              __uint_as_float(static_cast<std::uint32_t>(rB(0)));
+          accumulator_scratch[debug_offset + 6] =
+              __uint_as_float(static_cast<std::uint32_t>(rB(1)));
+          accumulator_scratch[debug_offset + 7] =
+              __uint_as_float(static_cast<std::uint32_t>(rSFB(0)));
+        }
+
+        constexpr int kProbeNTiles = cute::size<2>(NanoP1AccumLayout{});
+        constexpr int kProbeKBlocks = cute::size<2>(decltype(tCrB){});
+        static_assert(kProbeNTiles == 8);
+        static_assert(kProbeKBlocks == 2);
+        const int probe_tid_slot = NanoP1BOperandProbeTidSlot(tid);
+        if (probe_tid_slot >= 0 && probe_k_step_slot >= 0) {
+          const int k_step = static_cast<int>(k_base / kTileK);
+          for (int n_tile = 0; n_tile < kProbeNTiles; ++n_tile) {
+            auto c_atom_coords = part_c(cute::_, 0, n_tile);
+            auto coord0 = c_atom_coords(0);
+            int const part_output_col0 = nvfp4_bridge::CoordGet0(coord0);
+            int const part_token_row0 = nvfp4_bridge::CoordGet1(coord0);
+            for (int k_block = 0; k_block < kProbeKBlocks; ++k_block) {
+              auto row_anchor = tCsB_coords(cute::_, n_tile, k_block, cute::Int<0>{});
+              auto copy_coord0 = row_anchor(0);
+              auto copy_coord1 = row_anchor(1);
+              int const local_row0 = nvfp4_bridge::CoordGet0(copy_coord0);
+              int const local_col0 = nvfp4_bridge::CoordGet1(copy_coord0);
+              int const local_row1 = nvfp4_bridge::CoordGet0(copy_coord1);
+              int const local_col1 = nvfp4_bridge::CoordGet1(copy_coord1);
+              int const stage0_offset0 = static_cast<int>(stage0_B(local_row0, local_col0));
+              int const stage0_offset1 = static_cast<int>(stage0_B(local_row1, local_col1));
+              auto b_words = cute::recast<nvfp4_bridge::BRegister>(tCrB(cute::_, n_tile, k_block));
+              int const entry_index =
+                  (((probe_tid_slot * kNanoP1BOperandProbeKStepCap + probe_k_step_slot) *
+                    kProbeNTiles) +
+                   n_tile) *
+                      kProbeKBlocks +
+                  k_block;
+              int const entry_base =
+                  kNanoP1BOperandProbeOffset + entry_index * kNanoP1BOperandProbeEntryWords;
+              accumulator_scratch[entry_base + 0] = __uint_as_float(1u);
+              accumulator_scratch[entry_base + 1] =
+                  __uint_as_float(static_cast<std::uint32_t>(tid));
+              accumulator_scratch[entry_base + 2] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_step));
+              accumulator_scratch[entry_base + 3] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_base));
+              accumulator_scratch[entry_base + 4] =
+                  __uint_as_float(static_cast<std::uint32_t>(n_tile));
+              accumulator_scratch[entry_base + 5] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_block));
+              accumulator_scratch[entry_base + 6] =
+                  __uint_as_float(static_cast<std::uint32_t>(part_output_col0));
+              accumulator_scratch[entry_base + 7] =
+                  __uint_as_float(static_cast<std::uint32_t>(part_token_row0));
+              accumulator_scratch[entry_base + 8] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_row0));
+              accumulator_scratch[entry_base + 9] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_col0));
+              accumulator_scratch[entry_base + 10] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_row1));
+              accumulator_scratch[entry_base + 11] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_col1));
+              accumulator_scratch[entry_base + 12] =
+                  __uint_as_float(static_cast<std::uint32_t>(stage0_offset0));
+              accumulator_scratch[entry_base + 13] =
+                  __uint_as_float(static_cast<std::uint32_t>(stage0_offset1));
+              accumulator_scratch[entry_base + 14] =
+                  __uint_as_float(static_cast<std::uint32_t>(b_words(0)));
+              accumulator_scratch[entry_base + 15] =
+                  __uint_as_float(static_cast<std::uint32_t>(b_words(1)));
+              int copy_sig_count = 0;
+              for (int sig = 0; sig < kNanoP1BOperandCopySigLen; ++sig) {
+                accumulator_scratch[entry_base + 17 + sig * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(0xffffffffu));
+                accumulator_scratch[entry_base + 18 + sig * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(0xffffffffu));
+              }
+              NanoP1ForEachProbeCoord(row_anchor, [&](auto const& coord, int physical) {
+                if (physical >= kNanoP1BOperandCopySigLen) {
+                  return;
+                }
+                int const sig_stage_offset =
+                    static_cast<int>(stage0_B(
+                        nvfp4_bridge::CoordGet0(coord),
+                        nvfp4_bridge::CoordGet1(coord)));
+                copy_sig_count = physical + 1;
+                accumulator_scratch[entry_base + 17 + physical * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(sig_stage_offset));
+                accumulator_scratch[entry_base + 18 + physical * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(
+                        swizzled_b_bytes[sig_stage_offset / 2]));
+              });
+              accumulator_scratch[entry_base + 16] =
+                  __uint_as_float(static_cast<std::uint32_t>(copy_sig_count));
+              std::uint8_t copy_view_raw_bytes[kNanoP1BOperandCopyRawSigLen] = {};
+              auto byte_view = tCrB_cv(cute::_, n_tile, k_block);
+              NanoP1ForEachProbeValue(byte_view, [&](auto const& value, int physical) {
+                if (physical < kNanoP1BOperandCopyRawSigLen) {
+                  copy_view_raw_bytes[physical] = NanoP1LoadPackedValueByte(value);
+                }
+              });
+              for (int packed_word = 0; packed_word < kNanoP1BOperandCopyRawSigLen / 4; ++packed_word) {
+                std::uint32_t packed = 0u;
+                packed |= static_cast<std::uint32_t>(copy_view_raw_bytes[packed_word * 4 + 0]) << 0;
+                packed |= static_cast<std::uint32_t>(copy_view_raw_bytes[packed_word * 4 + 1]) << 8;
+                packed |= static_cast<std::uint32_t>(copy_view_raw_bytes[packed_word * 4 + 2]) << 16;
+                packed |= static_cast<std::uint32_t>(copy_view_raw_bytes[packed_word * 4 + 3]) << 24;
+                accumulator_scratch[entry_base + 35 + packed_word] = __uint_as_float(packed);
+              }
+              std::uint8_t frag_raw_bytes[kNanoP1BOperandFragRawSigLen] = {};
+              auto frag_view = tCrB(cute::_, n_tile, k_block);
+              NanoP1ForEachProbeValue(frag_view, [&](auto const& value, int physical) {
+                if (physical < kNanoP1BOperandFragRawSigLen) {
+                  frag_raw_bytes[physical] = NanoP1LoadPackedValueByte(value);
+                }
+              });
+              for (int packed_word = 0; packed_word < kNanoP1BOperandFragRawSigLen / 4; ++packed_word) {
+                std::uint32_t packed = 0u;
+                packed |= static_cast<std::uint32_t>(frag_raw_bytes[packed_word * 4 + 0]) << 0;
+                packed |= static_cast<std::uint32_t>(frag_raw_bytes[packed_word * 4 + 1]) << 8;
+                packed |= static_cast<std::uint32_t>(frag_raw_bytes[packed_word * 4 + 2]) << 16;
+                packed |= static_cast<std::uint32_t>(frag_raw_bytes[packed_word * 4 + 3]) << 24;
+                accumulator_scratch[entry_base + 43 + packed_word] = __uint_as_float(packed);
+              }
+              for (int word = 0; word < kNanoP1BOperandScaleWordCount; ++word) {
+                accumulator_scratch[entry_base + 47 + word] =
+                    __uint_as_float(static_cast<std::uint32_t>(0u));
+              }
+              auto scale_words_post =
+                  cute::recast<std::uint32_t>(cute::filter_zeros(tCrSFB(cute::_, n_tile, k_block)));
+              NanoP1ForEachProbeValue(scale_words_post, [&](auto const& value, int physical) {
+                if (physical < kNanoP1BOperandScaleWordCount) {
+                  accumulator_scratch[entry_base + 47 + physical] =
+                      __uint_as_float(static_cast<std::uint32_t>(value));
+                }
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if constexpr (kCaptureAccumulatorScratch) {
+      if (accumulator_scratch != nullptr &&
+          output_col_base == 0 &&
+          row_start == 0) {
+        constexpr int kProbeScaleNTiles = cute::size<2>(NanoP1AccumLayout{});
+        constexpr int kProbeScaleKBlocks = cute::size<2>(decltype(tCrSFA){});
+        static_assert(kProbeScaleNTiles == 8);
+        static_assert(kProbeScaleKBlocks == 2);
+        const int probe_tid_slot = NanoP1AScaleProbeTidSlot(tid);
+        const int k_step = static_cast<int>(k_base / kTileK);
+        if (probe_tid_slot >= 0 && k_step < kNanoP1AScaleProbeKStepCap) {
+          for (int n_tile = 0; n_tile < kProbeScaleNTiles; ++n_tile) {
+            auto c_atom_coords = part_c(cute::_, 0, n_tile);
+            auto coord0 = c_atom_coords(0);
+            int const part_output_col0 = nvfp4_bridge::CoordGet0(coord0);
+            int const part_token_row0 = nvfp4_bridge::CoordGet1(coord0);
+            for (int k_block = 0; k_block < kProbeScaleKBlocks; ++k_block) {
+              auto reg_words =
+                  cute::recast<std::uint32_t>(cute::filter_zeros(tCrSFA(cute::_, n_tile, k_block)));
+              int const entry_index =
+                  (((probe_tid_slot * kNanoP1AScaleProbeKStepCap + k_step) * kProbeScaleNTiles) +
+                   n_tile) *
+                      kProbeScaleKBlocks +
+                  k_block;
+              int const entry_base =
+                  kNanoP1AScaleProbeOffset + entry_index * kNanoP1AScaleProbeEntryWords;
+              accumulator_scratch[entry_base + 0] = __uint_as_float(1u);
+              accumulator_scratch[entry_base + 1] =
+                  __uint_as_float(static_cast<std::uint32_t>(tid));
+              accumulator_scratch[entry_base + 2] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_step));
+              accumulator_scratch[entry_base + 3] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_base));
+              accumulator_scratch[entry_base + 4] =
+                  __uint_as_float(static_cast<std::uint32_t>(block_base));
+              accumulator_scratch[entry_base + 5] =
+                  __uint_as_float(static_cast<std::uint32_t>(n_tile));
+              accumulator_scratch[entry_base + 6] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_block));
+              accumulator_scratch[entry_base + 7] =
+                  __uint_as_float(static_cast<std::uint32_t>(part_output_col0));
+              accumulator_scratch[entry_base + 8] =
+                  __uint_as_float(static_cast<std::uint32_t>(part_token_row0));
+              accumulator_scratch[entry_base + 9] =
+                  __uint_as_float(static_cast<std::uint32_t>(cute::size(reg_words)));
+              for (int word = 0; word < 4; ++word) {
+                std::uint32_t value = 0u;
+                if (word < cute::size(reg_words)) {
+                  value = static_cast<std::uint32_t>(reg_words(word));
+                }
+                accumulator_scratch[entry_base + 10 + word] = __uint_as_float(value);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if constexpr (kCaptureAccumulatorScratch) {
+      if (accumulator_scratch != nullptr &&
+          output_col_base == 0 &&
+          row_start == 0) {
+        constexpr int kProbeATiles = cute::size<1>(decltype(tCrA){});
+        constexpr int kProbeAKBlocks = cute::size<2>(decltype(tCrA){});
+        const int probe_tid_slot = NanoP1AOperandProbeTidSlot(tid);
+        int probe_k_step_slot = -1;
+        if (k_base == 0) {
+          probe_k_step_slot = 0;
+        } else if (k_base + kTileK >= hidden_size) {
+          probe_k_step_slot = 1;
+        }
+        if (probe_tid_slot >= 0 && probe_k_step_slot >= 0) {
+          const int k_step = static_cast<int>(k_base / kTileK);
+          for (int n_tile = 0; n_tile < kProbeATiles; ++n_tile) {
+            auto c_atom_coords = part_c(cute::_, 0, n_tile);
+            auto coord0 = c_atom_coords(0);
+            int const part_output_col0 = nvfp4_bridge::CoordGet0(coord0);
+            int const part_token_row0 = nvfp4_bridge::CoordGet1(coord0);
+            for (int k_block = 0; k_block < kProbeAKBlocks; ++k_block) {
+              auto row_anchor = tCsA_coords(cute::_, n_tile, k_block, cute::Int<0>{});
+              auto copy_coord0 = row_anchor(0);
+              auto copy_coord1 = row_anchor(1);
+              int const local_row0 = nvfp4_bridge::CoordGet0(copy_coord0);
+              int const local_col0 = nvfp4_bridge::CoordGet1(copy_coord0);
+              int const local_row1 = nvfp4_bridge::CoordGet0(copy_coord1);
+              int const local_col1 = nvfp4_bridge::CoordGet1(copy_coord1);
+              int const stage0_offset0 = static_cast<int>(stage0_A(local_row0, local_col0));
+              int const stage0_offset1 = static_cast<int>(stage0_A(local_row1, local_col1));
+              auto a_words_pre = cute::recast<nvfp4_bridge::ARegister>(tCrA(cute::_, n_tile, k_block));
+              int const entry_index =
+                  (((probe_tid_slot * kNanoP1AOperandProbeKStepCap + probe_k_step_slot) * kProbeATiles) +
+                   n_tile) *
+                      kProbeAKBlocks +
+                  k_block;
+              int const entry_base =
+                  kNanoP1AOperandProbeOffset + entry_index * kNanoP1AOperandProbeEntryWords;
+              accumulator_scratch[entry_base + 0] = __uint_as_float(1u);
+              accumulator_scratch[entry_base + 1] =
+                  __uint_as_float(static_cast<std::uint32_t>(tid));
+              accumulator_scratch[entry_base + 2] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_step));
+              accumulator_scratch[entry_base + 3] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_base));
+              accumulator_scratch[entry_base + 4] =
+                  __uint_as_float(static_cast<std::uint32_t>(n_tile));
+              accumulator_scratch[entry_base + 5] =
+                  __uint_as_float(static_cast<std::uint32_t>(k_block));
+              accumulator_scratch[entry_base + 6] =
+                  __uint_as_float(static_cast<std::uint32_t>(part_output_col0));
+              accumulator_scratch[entry_base + 7] =
+                  __uint_as_float(static_cast<std::uint32_t>(part_token_row0));
+              accumulator_scratch[entry_base + 8] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_row0));
+              accumulator_scratch[entry_base + 9] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_col0));
+              accumulator_scratch[entry_base + 10] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_row1));
+              accumulator_scratch[entry_base + 11] =
+                  __uint_as_float(static_cast<std::uint32_t>(local_col1));
+              accumulator_scratch[entry_base + 12] =
+                  __uint_as_float(static_cast<std::uint32_t>(stage0_offset0));
+              accumulator_scratch[entry_base + 13] =
+                  __uint_as_float(static_cast<std::uint32_t>(stage0_offset1));
+              accumulator_scratch[entry_base + 14] =
+                  __uint_as_float(static_cast<std::uint32_t>(a_words_pre(0)));
+              accumulator_scratch[entry_base + 15] =
+                  __uint_as_float(static_cast<std::uint32_t>(a_words_pre(1)));
+              accumulator_scratch[entry_base + 16] = __uint_as_float(0u);
+              accumulator_scratch[entry_base + 17] = __uint_as_float(0u);
+              accumulator_scratch[entry_base + 18] = __uint_as_float(0u);
+              for (int sig = 0; sig < kNanoP1AOperandCopySigLen; ++sig) {
+                accumulator_scratch[entry_base + 19 + sig * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(0xffffffffu));
+                accumulator_scratch[entry_base + 20 + sig * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(0xffffffffu));
+              }
+              int copy_sig_count = 0;
+              NanoP1ForEachProbeCoord(row_anchor, [&](auto const& coord, int physical) {
+                if (physical >= kNanoP1AOperandCopySigLen) {
+                  return;
+                }
+                int const sig_stage_offset =
+                    static_cast<int>(stage0_A(
+                        nvfp4_bridge::CoordGet0(coord),
+                        nvfp4_bridge::CoordGet1(coord)));
+                copy_sig_count = physical + 1;
+                accumulator_scratch[entry_base + 19 + physical * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(sig_stage_offset));
+                accumulator_scratch[entry_base + 20 + physical * 2] =
+                    __uint_as_float(static_cast<std::uint32_t>(
+                        swizzled_a_bytes[sig_stage_offset / 2]));
+              });
+              accumulator_scratch[entry_base + 18] =
+                  __uint_as_float(static_cast<std::uint32_t>(copy_sig_count));
+            }
+          }
+        }
+      }
+    }
 
     using MMAOp = typename NanoP1TiledMma::MMA_Op;
     for (int k_block = 0; k_block < cute::size<2>(tCrA_cv); ++k_block) {
@@ -231,32 +792,35 @@ __device__ __forceinline__ void ComputeNanoP1AccumTile(
 
     if constexpr (kCaptureAccumulatorScratch) {
       if (accumulator_scratch != nullptr &&
-          k_base == 0 &&
           output_col_base == 0 &&
-          row_start == 0 &&
-          (tid == 0 || tid == 2)) {
-        auto rA = cute::recast<nvfp4_bridge::ARegister>(tCrA);
-        auto rB = cute::recast<nvfp4_bridge::BRegister>(tCrB);
-        auto rSFA = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFA));
-        auto rSFB = cute::recast<nvfp4_bridge::SFRegister>(cute::filter_zeros(tCrSFB));
-        const int debug_offset =
-            tid == 0 ? kNanoP1ProbeDebugOffset : kNanoP1ProbeDeadLaneDebugOffset;
-        accumulator_scratch[debug_offset + 0] =
-            __uint_as_float(static_cast<std::uint32_t>(rA(0)));
-        accumulator_scratch[debug_offset + 1] =
-            __uint_as_float(static_cast<std::uint32_t>(rA(1)));
-        accumulator_scratch[debug_offset + 2] =
-            __uint_as_float(static_cast<std::uint32_t>(rA(2)));
-        accumulator_scratch[debug_offset + 3] =
-            __uint_as_float(static_cast<std::uint32_t>(rA(3)));
-        accumulator_scratch[debug_offset + 4] =
-            __uint_as_float(static_cast<std::uint32_t>(rSFA(0)));
-        accumulator_scratch[debug_offset + 5] =
-            __uint_as_float(static_cast<std::uint32_t>(rB(0)));
-        accumulator_scratch[debug_offset + 6] =
-            __uint_as_float(static_cast<std::uint32_t>(rB(1)));
-        accumulator_scratch[debug_offset + 7] =
-            __uint_as_float(static_cast<std::uint32_t>(rSFB(0)));
+          row_start == 0) {
+        constexpr int kProbeATiles = cute::size<1>(decltype(tCrA){});
+        constexpr int kProbeAKBlocks = cute::size<2>(decltype(tCrA){});
+        const int probe_tid_slot = NanoP1AOperandProbeTidSlot(tid);
+        int probe_k_step_slot = -1;
+        if (k_base == 0) {
+          probe_k_step_slot = 0;
+        } else if (k_base + kTileK >= hidden_size) {
+          probe_k_step_slot = 1;
+        }
+        if (probe_tid_slot >= 0 && probe_k_step_slot >= 0) {
+          for (int n_tile = 0; n_tile < kProbeATiles; ++n_tile) {
+            for (int k_block = 0; k_block < kProbeAKBlocks; ++k_block) {
+              auto a_words_post = cute::recast<nvfp4_bridge::ARegister>(tCrA(cute::_, n_tile, k_block));
+              int const entry_index =
+                  (((probe_tid_slot * kNanoP1AOperandProbeKStepCap + probe_k_step_slot) * kProbeATiles) +
+                   n_tile) *
+                      kProbeAKBlocks +
+                  k_block;
+              int const entry_base =
+                  kNanoP1AOperandProbeOffset + entry_index * kNanoP1AOperandProbeEntryWords;
+              accumulator_scratch[entry_base + 16] =
+                  __uint_as_float(static_cast<std::uint32_t>(a_words_post(0)));
+              accumulator_scratch[entry_base + 17] =
+                  __uint_as_float(static_cast<std::uint32_t>(a_words_post(1)));
+            }
+          }
+        }
       }
     }
 
